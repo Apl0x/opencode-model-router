@@ -83,7 +83,7 @@ export function createChangedFileStore(options: ChangedFileStoreOptions = {}) {
     baselines: Map<string, Promise<TestBaseline | undefined>>;
   }>();
   const cache = new Map<string, {
-    cwd: string; pending: boolean; contaminated: boolean; stamp: number;
+    cwd: string; command: string; pending: boolean; contaminated: boolean; stamp: number;
     controller: AbortController; result: Promise<TestBaseline | undefined>;
   }>();
 
@@ -124,9 +124,13 @@ export function createChangedFileStore(options: ChangedFileStoreOptions = {}) {
           for (const command of new Set(commands)) {
             const key = JSON.stringify([pathKey(snapshot.cwd), snapshot.head, snapshot.fingerprint, command]);
             let entry = cache.get(key);
+            // A suite already running in this directory is not started again under a new
+            // fingerprint: concurrent full suites saturate every core, and the dispatch
+            // falls back to the same "no baseline" path as a contaminated capture.
+            if (!entry && [...cache.values()].some(c => c.pending && c.command === command && pathKey(c.cwd) === pathKey(cwd))) continue;
             if (!entry) {
               const capture = {
-                cwd, pending: true, contaminated: false, stamp: now(),
+                cwd, command, pending: true, contaminated: false, stamp: now(),
                 controller: new AbortController(), result: Promise.resolve<TestBaseline | undefined>(undefined),
               };
               cache.set(key, capture);

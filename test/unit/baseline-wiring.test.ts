@@ -12,12 +12,12 @@ const state = vi.hoisted(() => ({
   held: false, finish: undefined as (() => void) | undefined,
 }));
 vi.mock("../../src/verify/tree", () => ({ snapshotTree: async () => state.snapshot }));
-vi.mock("node:child_process", () => ({
-  exec: (command: string, opts: { timeout: number }, callback: (error: { code: number } | null, stdout: string, stderr: string) => void) => {
-    state.commands.push(command); state.budgets.push(opts.timeout);
-    const finish = () => callback(state.code ? { code: state.code } : null, state.stdout, "");
+vi.mock("../../src/verify/exec", () => ({
+  runShell: (command: string, opts: { timeoutMs: number }) => new Promise(resolve => {
+    state.commands.push(command); state.budgets.push(opts.timeoutMs);
+    const finish = () => resolve({ code: state.code, stdout: state.stdout, stderr: "", timedOut: false });
     if (state.held) state.finish = finish; else finish();
-  },
+  }),
 }));
 const cwd = resolve("baseline-wiring-project");
 const dod: DoD = { kind: "deterministic", source: "explicit", criteria: [], deliverable: null, checks: [{ kind: "testsPass", command: "pnpm test" }] };
@@ -56,13 +56,12 @@ describe("baseline wiring", () => {
     expect((await wiring.prepareVerification(store, "disabled", "child")).changeBaseline).toBe("available");
     expect(await (await wiring.prepareVerification(store, "warm", "child")).testBaseline("pnpm test")).toBeUndefined();
   });
-  it("read-only dispatches warm the default command and forbidden commands never execute", async () => {
+  it("read-only dispatches run no tests and forbidden commands never execute", async () => {
     const { wiring, store } = harness();
     wiring.beginVerification(store, "readonly", undefined, { ...dod, kind: "checker", checks: [], criteria: ["investigate"] });
-    await store.baseline("readonly", "npm test", "HEAD");
-    expect(state.commands).toEqual(["npm test"]);
+    expect(await store.baseline("readonly", "npm test", "HEAD")).toBeUndefined();
     wiring.beginVerification(store, "blocked", undefined, { ...dod, checks: [{ kind: "testsPass", command: "npm test && evil" }] });
     expect(await store.baseline("blocked", "npm test && evil", "HEAD")).toBeUndefined();
-    expect(state.commands).toEqual(["npm test"]);
+    expect(state.commands).toEqual([]);
   });
 });

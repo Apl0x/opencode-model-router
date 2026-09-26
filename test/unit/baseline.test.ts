@@ -123,6 +123,21 @@ describe("conservative capture and shared cache in changed-file store", () => {
     await h.get("other-dir");
     expect(h.run).toHaveBeenCalledTimes(3);
   });
+  it("runs at most one capture per directory and command, whatever the fingerprint", async () => {
+    const h = harness(); const held = deferred<ExecResult>(); const started = deferred<void>();
+    h.run.mockImplementationOnce(async () => { started.resolve(); return held.promise; });
+    h.start("first"); await started.promise;
+    h.setTree(tree({ fingerprint: "changed" }));
+    h.start("second");
+    expect(await h.get("second")).toBeUndefined();
+    expect(h.run).toHaveBeenCalledTimes(1);
+    held.resolve(green);
+    h.setTree(tree());
+    expect(await h.get("first")).toEqual(baseline(green));
+    h.setTree(tree({ fingerprint: "changed" }));
+    h.start("third"); await h.get("third");
+    expect(h.run).toHaveBeenCalledTimes(2);
+  });
   it.each(["fingerprint", "edit", "patch", "bash"])("discards a baseline contaminated by %s mid-capture", async cause => {
     const h = harness();
     const held = deferred<ExecResult>();
