@@ -5,6 +5,45 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+Test baselines could saturate every core on a machine running several delegations: a
+full test suite was started on every dispatch, and on Windows a timed-out suite kept
+running as orphaned workers after the router had given up on it.
+
+### Changed
+
+- **The bundled `anthropic` preset moves heavy to Opus 5.5 and lowers medium's
+  effort.** `heavy` is now `anthropic/claude-opus-5-5` at `xhigh` effort (was
+  `anthropic/claude-fable-5-1` at `max`), and `medium` stays on Opus 5.5 with
+  `effort`/`variant` `low` (was `high`). Tier descriptions state the new settings.
+  Presets overridden in `opencode-model-router.overrides.jsonc` are unaffected.
+
+### Fixed
+
+- **A timed-out or aborted test baseline no longer leaves the suite running.**
+  Verification commands ran through `child_process.exec`, whose `timeout` and
+  `signal` only kill the shell it spawned. A test command is a process tree
+  (`cmd /c npm test` → npm → vitest → one worker per core), so on Windows the
+  60-second baseline budget expired, the shell died, and every worker kept running
+  until the suite finished on its own. Commands now run through a helper that kills
+  the whole tree on timeout or abort: `taskkill /T /F` on Windows, the process group
+  on POSIX. This also covers `testsPass`, `buildPasses`, `lintClean` and `run`
+  checks.
+
+- **Read-only dispatches no longer run the test suite.** Every `task` or `delegate`
+  dispatch started a baseline capture of the default test command to warm the cache,
+  including exploration fan-outs that are never judged by `testsPass`. Those captures
+  were almost always discarded, because any shell or edit tool in the directory
+  contaminates them, so each dispatch paid for a full suite and gained nothing. A
+  baseline is now captured only when the dispatch's DoD carries a `testsPass` check.
+
+- **At most one baseline capture runs per directory and command.** Captures are
+  cached by tree fingerprint, which changes with every edit, so dispatches landing
+  while a suite was already running each started another. A dispatch that finds a
+  capture in flight for the same directory and command now gets no baseline — the
+  same `unverifiable` outcome as a contaminated capture — instead of a second suite.
+
 ## [1.13.0] - 2026-09-24
 
 A forced delegation of a request that carries no task produced a `task` call with no
