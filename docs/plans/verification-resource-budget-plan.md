@@ -167,12 +167,23 @@ dispatch**, including read-only ones. `1.14.0` fixed three defects:
 a dispatch-time baseline, then the `testsPass` check after the producer returns. The injected
 protocol tells orchestrators to prefer `testsPass` in acceptance blocks, so that means most
 implementation delegations. The native `task` path also has no gate budget at all
-(`accept(…)` is not wrapped in `withTimeout` there). The owner's constraint:
-**the router must not run a test suite per delegation.**
+(`accept(…)` is not wrapped in `withTimeout` there). The owner's constraints:
+
+1. **The router must not run a test suite per delegation.**
+2. **Verification must never slow implementation down.** The owner runs many sessions and many
+   subagents in parallel on one machine and prefers speed to absolute safety. The fast tier is
+   already a mid-tier model (Sonnet 5 class).
+3. **No CPU is spent on verification nobody asked for.** Verification runs only when the
+   orchestrator marks a delegation as fundamental or explicitly asks for a verdict. No background
+   verification by default.
+4. **The orchestrator decides the risk.** It sets, per dispatch, how long to wait for the reference
+   and whether the verification is fundamental. The router supplies a deterministic risk signal
+   and a way to get the verdict on demand. It never forces the wait.
 
 ### 1.2 Guardrail semantics to preserve
 
-`testsPass` must still:
+Whenever a verification **does** run (a `VERIFY:required` dispatch or a `router_verify` call,
+S7), `testsPass` must still:
 
 - **reject** a delegation that introduces a failing test (green → red, or a new failure next to
   old ones);
@@ -180,7 +191,10 @@ implementation delegations. The native `task` path also has no gate budget at al
 - say **`unverifiable`** (accepted with a caveat, or rejected under `strictUnverifiable`), never a
   false pass, when it cannot tell those two apart.
 
-### 1.3 The six mechanisms (all implemented by this plan)
+A delegation that is **not** verified is never reported as verified. It carries an explicit
+"unverified" disclaimer, its risk signal and the handle to verify it later.
+
+### 1.3 The seven mechanisms (all implemented by this plan)
 
 | # | Mechanism | Replaces |
 |---|---|---|
@@ -188,8 +202,9 @@ implementation delegations. The native `task` path also has no gate budget at al
 | S2 | **Failure-only recheck at a dispatch reference.** At dispatch, only a git reference is captured (`git stash create` or HEAD, plus hashes of untracked files) — no tests. Only when scoped tests fail are **those failing test files** re-run in an ephemeral worktree at the reference, to separate pre-existing failures from introduced ones. | dispatch-time full-suite baseline |
 | S3 | **Machine-wide verification slot.** A cross-process semaphore (lock files in the OS temp dir) allows at most `maxConcurrentVerifications` (default 1) verification commands at a time, across every opencode process on the machine. | per-process, per-cwd mutex only |
 | S4 | **Per-run resource caps.** The adapter adds the runner's worker cap (`--maxWorkers=N`, default 2). Every verification command runs at below-normal OS priority. The gate budget's abort signal reaches the process tree. | uncapped workers at normal priority; gate timeout that abandons the command without killing it |
-| S5 | **Batching.** `testsPass` requests for the same runner root that arrive within `batchWindowMs` are merged into one scoped run over the union of changed files. Failures are attributed back per request. | one run per producer |
+| S5 | **Batching.** Verification requests (from `VERIFY:required` gates, `router_verify` calls, or background runs if enabled) for the same runner root that arrive within `batchWindowMs` are merged into one scoped run over the union of changed files. Failures are attributed back per request. | one run per producer |
 | S6 | **The full suite is CI's job.** The router never falls back to a full suite. When scoping is impossible (unknown runner, composite script, config-file change), the result is `unverifiable` with a caveat. A full suite runs only with explicit `testScope: "full"`. | silent full-suite fallback |
+| S7 | **Verification on the orchestrator's terms.** Each dispatch carries `VERIFY:required` or `VERIFY:deferred` (the default) and optionally `VERIFY_WAIT:<n>s`. A **deferred** delegation returns immediately with an "unverified" disclaimer, a deterministic risk signal and a handle (`vrf_…`). **No verification process runs** unless the orchestrator calls the new `router_verify` tool with that handle, or `background: true` is configured. A **required** delegation is gated synchronously (S1–S6) and keeps the escalation ladder. The reference capture waits at most `VERIFY_WAIT` (default 5 s) before the producer starts, and never blocks beyond that. | unconditional synchronous gate on every `testsPass` DoD |
 
 ### 1.4 Configuration surface (`enforcement.verify`, all optional)
 
@@ -198,14 +213,18 @@ implementation delegations. The native `task` path also has no gate budget at al
 | `testScope` | `"affected" \| "full"` | `"affected"` | S1/S6. `"full"` is the explicit opt-in to run the whole suite. It still gets S2–S5. |
 | `maxWorkers` | integer ≥ 1 | `2` | S4. Worker cap the adapter passes to runners that support one. |
 | `lowPriority` | boolean | `true` | S4. Run verification commands at below-normal priority. |
-| `maxConcurrentVerifications` | integer ≥ 1 | `1` | S3. Machine-wide verification slots. |
+| `maxConcurrentVerifications` | integer ≥ 1 | `max(1, floor(os.availableParallelism() / 8))` | S3. Machine-wide verification slots (2 on a 16-core machine: at most 2 × `maxWorkers` = 4 cores for verification). |
+| `defaultVerify` | `"deferred" \| "required"` | `"deferred"` | S7. Mode for dispatches that carry no `VERIFY:` directive. |
+| `captureWaitMs` | integer ≥ 0 | `5000` | S7. Default for `VERIFY_WAIT`: the longest the dispatch waits for the reference capture before the producer starts. `0` = never wait. |
+| `background` | boolean | `false` | S7. When `true`, deferred verifications also run in the background (slot, low priority) and failures reach the orchestrator as late notices. Off by default: no CPU for verdicts nobody asked for. |
+| `pendingTtlMs` | integer ≥ 1 | `3600000` | S7. How long an unverified delegation stays verifiable through `router_verify` (its reference and change set are kept that long). |
 | `slotWaitMs` | integer ≥ 0 | `60000` | S3. Maximum wait for a slot; on expiry the check is `unverifiable` ("verification slot busy"). |
 | `batchWindowMs` | integer ≥ 0 | `2000` | S5. Coalescing window; `0` disables batching. |
 | `failureRecheck` | boolean | `true` | S2. When `false`, no reference is captured and no recheck runs: a green scoped run still passes, and any scoped failure is `unverifiable` (it can neither be excused nor proven introduced). |
 | `recheckTimeoutMs` | integer ≥ 1 | `60000` | S2. Budget for the reference re-run. |
 | `testBaseline` | boolean | — | **Deprecated.** Accepted. `false` maps to `failureRecheck: false`. Logs a one-time deprecation warning through the plugin logger. |
-| `baselineTimeoutMs` | integer ≥ 1 | `15000` (was `60000`) | Now bounds the git-only reference capture, which is awaited at dispatch (§1.5-14). |
-| `gateBudgetMs` | integer ≥ 1 | `90000` (unchanged) | Now also applies to the native `task` path, and is the deadline every S2–S5 step is bounded by (§1.5-13). |
+| `baselineTimeoutMs` | integer ≥ 1 | `15000` (was `60000`) | Now bounds the whole git-only reference capture, which continues in the background after `VERIFY_WAIT` expires (§1.5-14). |
+| `gateBudgetMs` | integer ≥ 1 | `90000` (unchanged) | The deadline for every synchronous verification: a `VERIFY:required` gate (now also in the native `task` path) and each `router_verify` call. Every S2–S5 step is bounded by it (§1.5-13). |
 
 ### 1.5 Decisions taken (the executor does not re-open these)
 
@@ -237,9 +256,11 @@ implementation delegations. The native `task` path also has no gate budget at al
    reference-side failure then does not excuse anything → `unverifiable`.
 8. **Collection/setup errors at the reference** (missing generated files, env) mean the reference is
    unusable → `unverifiable`, never "pre-existing".
-9. **Release as `1.15.0` (minor).** `testsPass` narrows from "suite is green" to "affected tests
-   pass". The old behaviour stays available through `testScope: "full"` plus the deprecated keys, so
-   nothing breaks without an opt-out.
+9. **Release as `1.15.0` (minor).** Two behaviour changes: `testsPass` narrows from "suite is green"
+   to "affected tests pass", and delegations are deferred (unverified) by default. Each has a
+   one-key opt-out that restores the previous behaviour: `testScope: "full"` and
+   `defaultVerify: "required"`, plus the deprecated keys still load. So nothing breaks without an
+   opt-out, and the CHANGELOG states both changes prominently.
 10. **Scope of `lintClean`.** When the resolved lint command is a plain `eslint` invocation, or a
     package script that is one, it is scoped to changed lintable files in the same adapter (same
     no-shell, cap and slot rules). Otherwise it is unchanged, but runs under S3/S4.
@@ -249,26 +270,93 @@ implementation delegations. The native `task` path also has no gate budget at al
     so it is not rewritten or scoped. It does run under the slot (S3), at low priority, and under the
     gate deadline (S4). The protocol text (Phase 2.3) steers orchestrators away from full-suite `run`
     checks. G1 is stated accordingly.
-13. **One deadline per gate.** Every gate invocation, in the `delegate` tool **and** the native `task`
-    path, gets a deadline of `gateBudgetMs` and an `AbortController`. Every wait and command inside it
-    (slot wait, scoped run, S2 recheck, batch wait) is bounded by
-    `min(its own configured budget, time remaining until the deadline)`. The recheck is skipped
-    (→ `unverifiable`, reason "gate budget exhausted before recheck") when less than 10 s remain. The
-    native `task` path gains the same `withTimeout` + abort wrapping as the `delegate` path.
-14. **The reference capture is awaited, not raced.** The `task` before-hook and the `delegate`
-    dispatch **await** `captureReference` before the producer starts. It runs git only, bounded by
-    `baselineTimeoutMs` (default lowered to `15000` for this purpose; the key keeps its name).
-    Edit-contamination tracking stays as a safety net: an edit observed in the directory before the
-    capture resolves discards the reference.
+13. **One deadline per synchronous verification.** A `VERIFY:required` gate (in the `delegate` tool
+    **and** the native `task` path) and each `router_verify` call get a deadline of `gateBudgetMs` and
+    an `AbortController`. Every wait and command inside it (slot wait, scoped run, S2 recheck, batch
+    wait) is bounded by `min(its own configured budget, time remaining until the deadline)`. The
+    recheck is skipped (→ `unverifiable`, reason "gate budget exhausted before recheck") when less
+    than 10 s remain. The native `task` path gains the same `withTimeout` + abort wrapping as the
+    `delegate` path for required gates. Deferred delegations run no gate at all, so there is nothing
+    to bound.
+14. **The reference capture waits at most `VERIFY_WAIT`.** For every dispatch whose DoD carries
+    `testsPass`, whatever its mode, the dispatch awaits `captureReference` for at most `VERIFY_WAIT`
+    (default `captureWaitMs` = 5 s), then lets the producer start regardless. The capture keeps
+    running (git only, ≤ `baselineTimeoutMs`). It stays valid only if no edit is observed in an
+    overlapping directory before it resolves; otherwise it is discarded, and any later verdict says
+    "no reference: pre-existing failures cannot be told apart". Capturing even for deferred
+    delegations is deliberate: it is cheap (git only, no tests), and a later `router_verify` needs it.
+15. **Dispatch directives.** Parsed from the dispatch text with the same rules as `CAP:`
+    (`parseCapDirective` in `D:\git\opencode-model-router\src\router\sessions.ts`: first occurrence
+    wins, and instructional examples injected by the router itself are ignored):
+    - `VERIFY:required` / `VERIFY:deferred`: case-insensitive value, anything else is ignored with a
+      log line; absent means `defaultVerify`.
+    - `VERIFY_WAIT:<n>s` / `VERIFY_WAIT:<n>ms`: `0` allowed, capped at `baselineTimeoutMs`; absent
+      means `captureWaitMs`.
+
+    An explicit acceptance block with deterministic checks does **not** imply `required`: the
+    orchestrator states the mode. The directives stay in the dispatch text, which is harmless to the
+    subagent.
+16. **Deferred result format.** A deferred delegation's result is returned unchanged, with a
+    `[router]` footer appended:
+    - "unverified";
+    - the handle `vrf_<id>`;
+    - the risk signal (§1.5-17);
+    - the one-line instruction "call `router_verify` with this handle before building on this work
+      if the risk matters".
+
+    A deferred delegation is **never** labelled accepted or verified.
+17. **Risk signal: deterministic, no process spawn.** It is computed only from data the router
+    already holds (the changed-file set, git status of those files, the reference state and the
+    producer tier). It never runs a test runner, a listing command or an LLM. Fields:
+    - changed file count;
+    - deleted and renamed count;
+    - whether any test file was modified or deleted;
+    - whether config, lock or CI files changed (`package.json`, lockfiles, `tsconfig*.json`,
+      `vitest|jest.config.*`, `conftest.py`, `pyproject.toml`, `.github/**`);
+    - whether the scoping would be impossible (S6 reason, decided statically by the runner adapter's
+      planning, which spawns nothing);
+    - whether a reference exists;
+    - the producer tier.
+
+    It is rolled into `low|medium|high` by a fixed, documented table. It is advice; nothing is
+    blocked by it.
+18. **`router_verify` tool.** A new plugin tool registered next to `delegate`.
+    - **Input:** `handles: string[]`, or `"pending"` for every unverified delegation of the calling
+      session.
+    - **Behaviour:** it runs the S1–S6 pipeline (the same path as a required gate) for those delegations, batched (S5),
+      under the slot (S3) and caps (S4), bounded by one `gateBudgetMs` deadline. It returns one
+      verdict per handle with the same wording as a required gate, and marks those delegations
+      verified.
+    - **Tree drift:** the tree may have changed since the producer finished (other agents edited).
+      The run always uses the current tree, and the verdict says so when the producer's files were
+      modified afterwards ("tree drifted since delegation; verdict reflects current state").
+    - **Rejections:** a rejected verdict includes the forcing note with the suggested next tier, but
+      triggers **no** automatic retry. Escalation is the orchestrator's call.
+19. **Background verification is opt-in (`background: true`).** When on, deferred delegations are
+    queued for background verification (slot, low priority, batched, coalesced so that a newer
+    request for the same files supersedes an older queued one). Introduced failures reach the
+    orchestrator as a late notice through `experimental.chat.system.transform` on its next turn,
+    deduplicated per handle and dropped when the session is gone. When off (the default), the queue
+    does not exist and nothing is spawned.
+20. **Pending list in the orchestrator prompt.** The system transform lists the calling session's
+    still-unverified delegations: at most 5, newest first, handle + risk + short description. This
+    is text only and costs no CPU, so the orchestrator can decide before its final answer. Entries
+    leave the list once verified or when older than `pendingTtlMs`.
 
 ### 1.6 Target flow
 
 ```
-dispatch (task / delegate)
+dispatch (task / delegate)   directives: VERIFY:required|deferred (default deferred), VERIFY_WAIT:<n>s (default 5 s)
   └─ DoD has testsPass (and failureRecheck)? ──no──► nothing
-        └─yes─► await reference.capture(cwd)      git only, ≤ baselineTimeoutMs, before the producer starts
+        └─yes─► reference.capture(cwd)            git only; the dispatch awaits it ≤ VERIFY_WAIT, then the
+                                                  producer starts anyway and the capture continues ≤ baselineTimeoutMs
 producer returns
-  └─ gate.accept  (deadline = now + gateBudgetMs, AbortController; every step below ≤ remaining time)
+  ├─ VERIFY:deferred ─► return result NOW + footer [router] unverified · vrf_<id> · risk low|medium|high
+  │                     register pending (TTL pendingTtlMs); spawn NOTHING
+  │                     (background:true only → queue background verification → late notice on failure)
+  │     later, only if the orchestrator decides:  router_verify(["vrf_<id>"] | "pending")
+  │           └─ same synchronous pipeline as below (deadline = gateBudgetMs) → verdict, no auto-retry
+  └─ VERIFY:required ─► gate.accept  (deadline = now + gateBudgetMs, AbortController; every step ≤ remaining)
         ─► testsPass
         ├─ adapter.resolve(command, changedFiles)  → scoped spec | unverifiable(S6)
         ├─ batch.submit(spec)                      window batchWindowMs (S5)
@@ -297,17 +385,22 @@ The same file appears under exactly one phase per wave.
 | `D:\git\opencode-model-router\src\verify\deterministic.ts` | 1.3 (allowlist constants only) | 2.1 | — |
 | `D:\git\opencode-model-router\src\verify\slot.ts` (new) | 1.4 | — | — |
 | `D:\git\opencode-model-router\src\verify\reference.ts` (new) | 1.5 | — | — |
+| `D:\git\opencode-model-router\src\verify\directives.ts` (new), `D:\git\opencode-model-router\src\verify\risk.ts` (new) | 1.6 | — | — |
+| `D:\git\opencode-model-router\src\verify\pending.ts` (new) | — | 2.4 | — |
+| `D:\git\opencode-model-router\src\router\protocol.ts` | — | 2.3 | — |
 | `D:\git\opencode-model-router\src\verify\baseline.ts` | — | 2.1 | — |
 | `D:\git\opencode-model-router\src\verify\dispatch.ts` | — | 2.1 | — |
-| `D:\git\opencode-model-router\src\verify\wiring.ts` | — | 2.1, then 2.2 (sequential) | — |
+| `D:\git\opencode-model-router\src\verify\wiring.ts` | — | 2.1, then 2.2, then 2.4 (sequential) | — |
 | `D:\git\opencode-model-router\src\verify\batch.ts` (new) | — | 2.2 | — |
-| `D:\git\opencode-model-router\src\index.ts` | — | 2.1 (gate signal, reference GC), then 2.3 (protocol text) — sequential | — |
+| `D:\git\opencode-model-router\src\index.ts` | — | 2.1 (required gate, deadline, reference GC), then 2.4 (directives, deferred path, `router_verify`, system transform), then 2.3 (acceptance-block guidance text) — sequential | — |
 | `D:\git\opencode-model-router\docs\**`, `D:\git\opencode-model-router\README.md`, `D:\git\opencode-model-router\CHANGELOG.md` | — | 2.3 | 3.3 (CHANGELOG version header only) |
 | `D:\git\opencode-model-router\test\unit\config-verify-budget.test.ts` (new) | 1.1 | 2.3 (docs-consistency case only) | — |
 | `D:\git\opencode-model-router\test\unit\exec.test.ts` | 1.2 | — | — |
 | `D:\git\opencode-model-router\test\unit\runner.test.ts` (new) + `D:\git\opencode-model-router\test\fixtures\runner\**` (new) | 1.3 | — | — |
 | `D:\git\opencode-model-router\test\unit\slot.test.ts` (new) | 1.4 | — | — |
 | `D:\git\opencode-model-router\test\unit\reference.test.ts` (new) | 1.5 | — | — |
+| `D:\git\opencode-model-router\test\unit\directives.test.ts` (new), `D:\git\opencode-model-router\test\unit\risk.test.ts` (new) | 1.6 | — | — |
+| `D:\git\opencode-model-router\test\unit\deferred-verification.test.ts` (new), `D:\git\opencode-model-router\test\unit\router-verify-tool.test.ts` (new) | — | 2.4 | — |
 | `D:\git\opencode-model-router\test\unit\baseline.test.ts`, `D:\git\opencode-model-router\test\unit\baseline-wiring.test.ts`, `D:\git\opencode-model-router\test\unit\tests-pass-pipeline.test.ts` (new) | — | 2.1 | — |
 | `D:\git\opencode-model-router\test\unit\batch.test.ts` (new), `D:\git\opencode-model-router\test\unit\batch-wiring.test.ts` (new) | — | 2.2 | — |
 | `D:\git\opencode-model-router\test\golden\**` | — | 2.3 | — |
@@ -323,15 +416,18 @@ The same file appears under exactly one phase per wave.
 ### Dependency graph
 
 ```
-Phase 0.P ─► Wave 1: 1.1 ║ 1.2 ║ 1.3 ║ 1.4 ║ 1.5     (all parallel; 1.3 and 1.5 code against
-                                                      the ExecSeam/ArgvSeam contract of task 1.2.2
-                                                      and are merged after 1.2; 1.4 needs no seam)
-         ─► Wave 2: 2.1.1 (design) ─► 2.1.2–2.1.6 ─► 2.2.3 (wiring) ─► 2.3
+Phase 0.P ─► Wave 1: 1.1 ║ 1.2 ║ 1.3 ║ 1.4 ║ 1.5 ║ 1.6   (all parallel; 1.3 and 1.5 code against
+                                                            the ExecSeam/ArgvSeam contract of task 1.2.2
+                                                            and are merged after 1.2; 1.4 and 1.6 need
+                                                            no seam; 1.6's static-scoping flag uses the
+                                                            1.3 planning API, merged after 1.3)
+         ─► Wave 2: 2.1.1 (design) ─► 2.1.2–2.1.6 ─► 2.2.3 (wiring) ─► 2.4.2–2.4.6 ─► 2.3
                     2.1.1 (design) ─► 2.2.1–2.2.2 (batch.ts core, parallel with 2.1.2–2.1.6)
+                    2.1.1 (design) ─► 2.4.1 (pending.ts core, parallel with 2.1.2–2.1.6 and 2.2)
          ─► Wave 3: 3.1 ─► 3.2 (global QA) ─► 3.3 (release)
 ```
 
-Merge order into `vrb/wave-1`: 1.1, 1.2, then 1.4, 1.3, 1.5. Parallel **work** is not affected:
+Merge order into `vrb/wave-1`: 1.1, 1.2, then 1.4, 1.3, 1.5, 1.6. Parallel **work** is not affected:
 task 1.2.2 commits the seam types first, and the orchestrator pastes them verbatim into the 1.3 and
 1.5 dispatches, so those phases need not wait for 1.2's merge. Only their merge waits.
 
@@ -399,7 +495,13 @@ deprecated keys map correctly.
 - Every key rejects wrong types: `0` for the ≥1 keys, negative numbers, `NaN`, `Infinity`, `1.5`,
   strings, `null` where not allowed.
 - `testScope` rejects `"all"` and `"Affected"` (case-sensitive).
-- `slotWaitMs: 0` and `batchWindowMs: 0` are valid and mean "no wait" and "no batching".
+- `slotWaitMs: 0` and `batchWindowMs: 0` are valid and mean "no wait" and "no batching";
+  `captureWaitMs: 0` is valid and means "never wait for the reference".
+- `defaultVerify` accepts only `"deferred"`/`"required"` and defaults to `"deferred"`; `background`
+  defaults to `false`.
+- The `maxConcurrentVerifications` default is computed from an **injected** core count
+  (`resolveVerifyBudget(cfg, { cores })`): 1 core → 1, 8 → 1, 16 → 2, 64 → 8. An explicit value
+  always wins.
 - Deprecation: `testBaseline: false` → `failureRecheck: false`; `testBaseline: true` → no change;
   explicit `failureRecheck: true` + `testBaseline: false` → `true`; the warning fires once across
   repeated resolves.
@@ -713,6 +815,68 @@ is needed, and document it), and temp-dir exhaustion.
 
 ---
 
+#### Phase 1.6 — Dispatch directives and risk signal (S7 core) `[tier:medium]`
+
+**Goal:** two pure modules. One parses the orchestrator's per-dispatch verification choices. The
+other computes the deterministic risk signal that goes with every deferred delegation. Neither
+spawns a process.
+
+**Pre-flight (in addition to §0.9)**
+- [ ] Gather `[tier:fast]`: `parseCapDirective` and its tests
+      (`D:\git\opencode-model-router\src\router\sessions.ts`, plus the test files that
+      `rg -l parseCapDirective D:\git\omr-p16\test` lists), and the dispatch-header text in
+      `D:\git\opencode-model-router\src\router\dispatch-header.ts` that injects instructional `CAP:`
+      examples the parser must ignore.
+- [ ] The static-scoping flag needs `planScopedRun` from 1.3. Code against the 1.3 function
+      signature (pasted from the 1.3.1 design note), and merge after 1.3.
+
+**Tasks**
+- **1.6.1** `[tier:medium]` `D:\git\opencode-model-router\src\verify\directives.ts`:
+  `parseVerifyDirectives(text, defaults)` → `{ mode: "required" | "deferred", waitMs: number,
+  source: "directive" | "default" }`. It follows §1.5-15 exactly and reuses the same
+  "ignore router-injected examples" rule as `parseCapDirective`: import the shared helper if one
+  exists; otherwise add the rule here and **do not** edit `sessions.ts`.
+- **1.6.2** `[tier:medium]` `D:\git\opencode-model-router\src\verify\risk.ts`:
+  `assessRisk({ changedFiles, reference, producerTier, scopingPlan })` →
+  `{ level: "low" | "medium" | "high", reasons: string[] }`. It uses the fixed table from §1.5-17,
+  written as a table in the file header, and is pure and synchronous.
+- **1.6.3** `[tier:medium]` Tests in `D:\git\opencode-model-router\test\unit\directives.test.ts`
+  and `D:\git\opencode-model-router\test\unit\risk.test.ts`.
+
+**New tests (edge cases required)**
+- Directives:
+  - case variants (`verify:Required`);
+  - first occurrence wins; unknown value → default + log;
+  - `VERIFY_WAIT:0s`, `VERIFY_WAIT:750ms`, and `VERIFY_WAIT:99999s` → capped at `baselineTimeoutMs`;
+  - malformed values (`VERIFY_WAIT:-1s`, `VERIFY_WAIT:abc`, `VERIFY_WAIT:5`) → default;
+  - directives inside a router-injected instructional example → ignored;
+  - a directive inside a fenced code block of the prompt → still parsed, the same behaviour as `CAP:`
+    (assert parity with `parseCapDirective` on the same inputs);
+  - `CAP:` and `VERIFY:` together, in either order.
+- Risk:
+  - every row of the table has a test;
+  - boundaries (the exact file-count thresholds);
+  - a test file deleted → `high`;
+  - only docs changed → `low`;
+  - a lockfile or `.github/**` changed → at least `medium`;
+  - no reference → the level rises one step, with a reason;
+  - scoping impossible → a reason is present;
+  - an empty change set → `low`, with the reason "no changes attributed";
+  - the reasons are stable strings (they are shown to the orchestrator).
+
+**Acceptance criteria**
+- Neither module imports `child_process`, `fs` or the network; `risk.ts` takes the scoping plan as
+  input (the caller runs the static planner).
+
+**Definition of Done** — as in 1.1; QA report `D:\git\opencode-model-router\docs\qa\verification-resource-budget\phase-1.6.md`.
+
+**QA review** `[tier:heavy]` — adversarial focus: directive injection by the **subagent** (it cannot
+set its own mode, because directives are read from the dispatch text only, never from the
+subagent's output); parity gaps with `CAP:` parsing; a risk table that rates a destructive change
+(a test deleted, a CI file changed) as `low`.
+
+---
+
 ### Wave 2 — Integration: the final `testsPass` pipeline
 
 `vrb/wave-2` is branched from `vrb/wave-1` after all Wave 1 phases are merged and clean.
@@ -780,10 +944,16 @@ abort (S4), with a failure-only recheck at the reference (S2), and never a full 
       and the same `unverifiableGateResult` fallback as the `delegate` path.
 
     Either way, the running command tree dies with the gate.
-  - 2.1.5.b **Await** the reference capture before the producer runs (§1.5-14): the `task`
-    before-hook (`tool.execute.before`, where `beginVerification` is called today) and the
-    `delegate` dispatch both `await beginVerification(…)`, bounded by `baselineTimeoutMs`. A timeout
-    or error means "no reference" and must never block or fail the dispatch.
+  - 2.1.5.b **Bounded wait** for the reference capture (§1.5-14). The `task` before-hook
+    (`tool.execute.before`, where `beginVerification` is called today) and the `delegate` dispatch
+    both await `beginVerification(…)` for at most `captureWaitMs`, then proceed. The capture keeps
+    running up to `baselineTimeoutMs`. Phase 2.4 replaces the fixed `captureWaitMs` with the
+    per-dispatch `VERIFY_WAIT`. A timeout or error means "no reference" and must never block or fail
+    the dispatch.
+
+  Scope note: 2.1 builds the **synchronous (required) path**, which `router_verify` also reuses.
+  Until 2.4 is merged, every `testsPass` DoD takes that path. 2.4 adds the mode routing that makes
+  deferred the default. Both land in the same release; no intermediate behaviour ships.
   - 2.1.5.c Call `gcStaleReferences` once at plugin start, fire-and-forget, with logged failures.
   - 2.1.5.d Switch every read of `baselineTimeoutMs`/`gateBudgetMs` defaults to `resolveVerifyBudget`
     (the list comes from the Phase 1.1 QA report).
@@ -819,9 +989,10 @@ abort (S4), with a failure-only recheck at the reference (S2), and never a full 
 - **Native `task` gate budget:** an `accept` that exceeds `gateBudgetMs` in the `tool.execute.after`
   path yields the `unverifiable` gate result, aborts the controller and kills the tree. Before this
   plan it hung without limit, so this is a new regression test.
-- **Awaited capture:** the producer prompt (`delegate`) and the `task` execution start only after
-  `captureReference` resolves, or after `baselineTimeoutMs` expires with "no reference" and the
-  dispatch proceeds. A capture that throws never fails the dispatch.
+- **Bounded capture wait:** the producer prompt (`delegate`) and the `task` execution start when
+  `captureReference` resolves or when `captureWaitMs` expires, whichever is first (fake timers: a
+  capture at 2 s → start at 2 s; a capture at 20 s → start at 5 s, and the capture still completes
+  and is usable if no edit was observed). A capture that throws never fails the dispatch.
 - **Contamination:** an `edit` observed for the directory while the capture is in flight → the
   reference is discarded → a later scoped failure is `unverifiable`.
 - **Retry:** an escalated retry reuses the first dispatch's reference, never a new one taken after
@@ -907,33 +1078,179 @@ gate budget (a batch longer than one requester's budget).
 
 ---
 
+#### Phase 2.4 — Deferred verification, `router_verify`, pending list (S7) `[tier:heavy]` design + `[tier:medium]` implementation
+
+**Goal:** by default, no delegation waits for verification and no verification process runs. The
+orchestrator decides per dispatch (`VERIFY:required|deferred`, `VERIFY_WAIT`) and can fetch a verdict
+at any time with `router_verify`. Background verification exists only behind `background: true`.
+
+**Parallelism:** task 2.4.1 (the new file `D:\git\opencode-model-router\src\verify\pending.ts` and its
+unit tests) starts once 2.1.1's types are committed, and runs in parallel with 2.1.2–2.1.6 and 2.2.
+Tasks 2.4.2–2.4.6 start after 2.2.3 is merged, because they write
+`D:\git\opencode-model-router\src\verify\wiring.ts` and `D:\git\opencode-model-router\src\index.ts`.
+
+**Pre-flight (in addition to §0.9)**
+- [ ] 2.1 and 2.2 are merged and their QA is clean (for tasks 2.4.2+).
+- [ ] Gather `[tier:fast]`:
+  - the `tool:` registration block with the `delegate` tool in
+    `D:\git\opencode-model-router\src\index.ts` (the `tool({ … })` pattern and its arg schema);
+  - the `experimental.chat.system.transform` hook;
+  - `tool.execute.before`/`tool.execute.after` for `task`;
+  - the forcing-note builder (`buildForcingNote`);
+  - how session ids of the orchestrator vs its subagents are told apart
+    (`D:\git\opencode-model-router\src\router\sessions.ts`).
+- [ ] **Spike F** `[tier:fast]`: confirm in a scratch plugin (or the existing smoke harness) that a
+      second plugin tool can be registered next to `delegate`, that its `execute` can run for up to
+      `gateBudgetMs` without the host timing it out, and that text appended to a native `task` tool
+      output in `tool.execute.after` reaches the orchestrator verbatim (it does today for forcing
+      notes; re-confirm with a footer that contains a handle).
+
+**Tasks**
+- **2.4.1** `[tier:heavy]` design, then `[tier:medium]` implementation of
+  `D:\git\opencode-model-router\src\verify\pending.ts`: the pending registry, keyed by
+  `vrf_<random>` handle.
+  - **Entry:** `{ orchestratorSessionID, dispatchID, producerSessionID, description, cwd, dod,
+    reference promise, changedFiles, risk, createdAt, state: "unverified" | "verifying" | "verified" }`.
+  - **Operations:** `register`, `get`, `listUnverified(sessionID, limit)`, `markVerifying` (a
+    second concurrent `router_verify` for the same handle joins the in-flight run instead of starting
+    another), `settle(verdict)`, and TTL eviction (`pendingTtlMs`) through the existing sweep.
+  - **Scoping:** an orchestrator can only see and verify **its own** handles. A handle from another
+    session is an "unknown handle".
+- **2.4.2** `[tier:medium]` Route by mode in `D:\git\opencode-model-router\src\index.ts` and
+  `D:\git\opencode-model-router\src\verify\wiring.ts`:
+  - parse the directives with `parseVerifyDirectives` (1.6) from the dispatch text at dispatch;
+  - start the reference capture and await it for at most `waitMs` (§1.5-14);
+  - on return, **required** → the 2.1 synchronous gate (unchanged, including escalation);
+  - **deferred** → no gate: compute the changed files and the static scoping plan (1.3 planner,
+    no spawn), compute the risk (1.6), register the pending entry, and append the §1.5-16 footer to
+    the result, in both the native `task` output and the `delegate` tool return.
+- **2.4.3** `[tier:medium]` Register the `router_verify` tool (§1.5-18) next to `delegate`.
+  - **Arg schema:** `{ handles: string[] } | { pending: true }`.
+  - **Execution:** it runs the synchronous pipeline through the 2.2 batch coordinator under one
+    `gateBudgetMs` deadline, and returns a compact per-handle verdict list (handle, verdict, named
+    introduced failures, notes and caveats, drift notice, suggested next tier on rejection).
+  - **Registration:** the tool is registered whenever verification is enabled; it does not depend on
+    `enableDelegateTool`.
+- **2.4.4** `[tier:medium]` System transform (§1.5-20): list the calling session's unverified
+  delegations (≤ 5, newest first). Keep it to one short block, emitted only when the list is
+  non-empty, so the prompt does not grow for sessions that never defer.
+- **2.4.5** `[tier:medium]` Background mode (§1.5-19), only when `background: true`:
+  - a per-plugin-instance queue with coalescing (a newer request for an overlapping file set
+    supersedes a queued older one);
+  - it runs through the same batch coordinator, slot and caps;
+  - late notices are queued per orchestrator session and emitted once by the system transform;
+  - the queue object is not even constructed when `background` is `false` (assert by test).
+- **2.4.6** `[tier:medium]` Tests in `D:\git\opencode-model-router\test\unit\deferred-verification.test.ts`
+  and `D:\git\opencode-model-router\test\unit\router-verify-tool.test.ts`.
+
+**New tests (edge cases required)**
+- **Default deferred, zero cost:** a `testsPass` delegation with no directive returns immediately
+  with the footer. The argv seam records **zero** spawns, and the slot is never acquired (assert on
+  the seams). The only process-free work is git capture, which also goes through a seam and is
+  asserted to be git-only.
+- **Latency:** with a capture seam that resolves after 20 s and `VERIFY_WAIT:5s`, the producer
+  starts at 5 s (fake timers). With `VERIFY_WAIT:0s` it starts at 0. A capture that resolves at 2 s
+  under a 5 s wait → the producer starts at 2 s, not 5 s.
+- **Capture after the wait:** the capture resolves after the producer started. Valid if no edit was
+  observed in between; discarded if one was. A later `router_verify` says "no reference".
+- **Required:** `VERIFY:required` → the synchronous gate runs, rejection escalates exactly as in 2.1.
+  `defaultVerify: "required"` with no directive → the same.
+- **`router_verify`:**
+  - a single handle and `pending: true`;
+  - an unknown handle; a handle from another session (→ unknown); an expired handle (TTL);
+  - two concurrent calls for the same handle → one run;
+  - several handles → one batched run;
+  - drift (the producer's file edited after the producer returned) → the verdict carries the drift
+    notice;
+  - the deadline expires mid-run → `unverifiable` for the handles not yet judged, and the tree is
+    killed;
+  - a rejected verdict → forcing note + suggested tier, and **no** retry dispatched (assert no new
+    session is created).
+- **Pending list:** it appears only when non-empty, is capped at 5 and orders newest first; a
+  verified entry leaves it; a TTL-expired one leaves it; sessions never see each other's entries.
+- **Background (only when `background: true`):**
+  - a queued deferred delegation is verified with no `router_verify` call;
+  - an introduced failure produces exactly one late notice on the next transform;
+  - a green result produces no notice;
+  - coalescing drops a superseded queued request;
+  - with `background: false`, the queue does not exist and nothing is spawned across 50 deferred
+    delegations.
+- **Subagent cannot self-select:** a producer whose final text contains `VERIFY:required` or
+  `router_verify` does not change its own mode or trigger a verification.
+
+**Acceptance criteria**
+- With the default config, N parallel implementation delegations spawn **no** verification
+  processes and add at most `VERIFY_WAIT` (≤ 5 s by default, usually under 1 s) to dispatch latency
+  and **0 ms** to result latency.
+- Every deferred result carries the footer; no deferred result is ever labelled accepted or verified.
+
+**Definition of Done** — as in 2.1; QA report `D:\git\opencode-model-router\docs\qa\verification-resource-budget\phase-2.4.md`.
+
+**QA review** `[tier:heavy]` CAP:none — reason: the reviewer must read the mode routing in both call paths, the tool, the registry and the transform together.
+Adversarial focus:
+- a path where a deferred delegation is reported as verified, or a required one silently becomes
+  deferred;
+- handle leakage across sessions;
+- unbounded registry growth;
+- the transform bloating the prompt;
+- `router_verify` running without a deadline;
+- background code paths reachable with `background: false`;
+- a slow capture that still blocks the producer beyond `VERIFY_WAIT`.
+
+---
+
 #### Phase 2.3 — Protocol, documentation, ADR, changelog `[tier:medium]`
 
 **Goal:** everything a user or orchestrator reads describes the final behaviour exactly.
 
 **Pre-flight (in addition to §0.9)**
-- [ ] 2.1 and 2.2 are merged and their QA is clean (the docs describe merged behaviour only).
+- [ ] 2.1, 2.2 and 2.4 are merged and their QA is clean (the docs describe merged behaviour only).
 
 **Tasks**
-- **2.3.1** `[tier:medium]` `D:\git\opencode-model-router\src\index.ts` protocol strings (the
-  acceptance-block guidance near `"check: <testsPass | buildPasses | …>"` and
-  `"Prefer deterministic checks …"`): state that `testsPass` means "the tests affected by the
-  producer's changes pass; the full suite is CI's job", and that dispatch acceptance blocks should
-  prefer `testsPass` over hand-written full-suite `run` commands. Regenerate the goldens under
+- **2.3.1** `[tier:medium]` Protocol text.
+  - **Acceptance-block guidance** in `D:\git\opencode-model-router\src\index.ts` (near
+    `"check: <testsPass | buildPasses | …>"` and `"Prefer deterministic checks …"`): `testsPass`
+    means "the tests affected by the producer's changes pass; the full suite is CI's job", and
+    acceptance blocks should prefer `testsPass` over hand-written full-suite `run` commands.
+  - **Per-dispatch sentence** in `D:\git\opencode-model-router\src\router\protocol.ts`, next to the
+    existing `CAP:N` sentence: explain `VERIFY:required|deferred` and `VERIFY_WAIT:<n>s`. Deferred is
+    the default and returns immediately with a handle and a risk level. Use `VERIFY:required` when
+    later work depends on this delegation being correct, or `router_verify` before building on a
+    deferred result whose risk is medium or high. Unverified delegations are listed in the prompt
+    until verified.
+  - **Size:** keep it to two short sentences, following the terse style of the `CAP:` sentence. The
+    added prompt size is measured and reported.
+
+  Regenerate the goldens under
   `D:\git\opencode-model-router\test\golden\` and review the diff line by line (only the intended
   text may change). Update the README's measured prompt-size figures if they move.
 - **2.3.2** `[tier:medium]` `D:\git\opencode-model-router\docs\CONFIG_REFERENCE.md`: add the §1.4
   keys to the `verify` table; rewrite "Test and changed-file baselines" into
-  "Affected-test verification" (S1–S6, reference capture, recheck, slot, batching, the deprecations).
+  "Affected-test verification" (S1–S7, reference capture, recheck, slot, batching, the deprecations);
+  add a "Deferred verification" section (the directives, the footer format, the risk table,
+  `router_verify`, the pending list, `background`, and an explicit statement that by default an
+  unverified delegation is **not** checked unless the orchestrator asks). Document the
+  `router_verify` tool in `D:\git\opencode-model-router\docs\COMMAND_REFERENCE_INDEX.md` alongside
+  `delegate`.
 - **2.3.3** `[tier:medium]` `D:\git\opencode-model-router\docs\VERIFICATION.md` and
   `D:\git\opencode-model-router\docs\FLOW_DIAGRAMS.md`: the new flow (§1.6).
 - **2.3.4** `[tier:medium]` ADR `D:\git\opencode-model-router\docs\adr\0003-affected-test-verification.md`:
-  context (the incident, with its evidence), decision (S1–S6), consequences (what `testsPass` no
-  longer proves, and why CI is the full-suite gate), and the alternatives rejected (the dispatch-time
-  full baseline; running the full suite at low priority only).
-- **2.3.5** `[tier:medium]` `D:\git\opencode-model-router\CHANGELOG.md` `## [Unreleased]`: Added
-  (the keys, pytest), Changed (the `testsPass` semantics, the deprecations), Fixed (gate abort kills
-  the tree), written in the house style of the 1.14.0 entry.
+  context (the incident with its evidence, and the owner's constraints from §1.1), decision (S1–S7),
+  and consequences:
+  - what `testsPass` no longer proves, and why CI is the full-suite gate;
+  - that deferred-by-default trades the enforced-verification guarantee for speed, which is the
+    owner's explicit choice. The router's own motivating evidence (instructed models false-finish)
+    is cited as the known risk, mitigated by the risk signal, the pending list and `router_verify`.
+
+  Alternatives rejected: the dispatch-time full baseline; running the full suite at low priority
+  only; background verification on by default.
+- **2.3.5** `[tier:medium]` `D:\git\opencode-model-router\CHANGELOG.md` `## [Unreleased]`:
+  - **Added:** the keys, the directives, `router_verify`, the pending list, pytest.
+  - **Changed:** the `testsPass` semantics, deferred verification by default, the deprecations.
+  - **Fixed:** the gate abort kills the tree; the native `task` required gate has a budget.
+
+  Written in the house style of the 1.14.0 entry. It must say plainly that, by default, delegations
+  are no longer verified unless the orchestrator asks.
 - **2.3.6** `[tier:medium]` `D:\git\opencode-model-router\docs\plans\README.md`: list this plan
   under Active plans.
 
@@ -953,7 +1270,8 @@ gate budget (a batch longer than one requester's budget).
 
 **QA review** `[tier:heavy]` — adversarial focus: docs that promise more than the code does
 (especially about what `unverifiable` means and about Windows), protocol text that would lead an
-orchestrator to write full-suite `run` checks, and golden diffs that include unintended text.
+orchestrator to write full-suite `run` checks, protocol text that implies deferred delegations are
+checked automatically, and golden diffs that include unintended text.
 
 ---
 
@@ -979,10 +1297,12 @@ bound holds.
 - **3.1.2** `[tier:medium]` `D:\git\opencode-model-router\test\integration\verify-resource-budget.test.ts`,
   gated by `RUN_VERIFY_E2E=1`, which drives the real wiring (plugin factory + gate) against temp
   git copies of the fixtures:
-  - 3.1.2.a Guardrail matrix per runner: introduced failure → rejected; pre-existing → accepted with
-    the note; pre-existing + introduced → rejected naming only the introduced; docs-only change →
-    pass note; `conftest.py` change → `unverifiable`.
-  - 3.1.2.b **Resource bound:** 5 concurrent implementation gates on `vitest-app` with the defaults.
+  - 3.1.2.a Guardrail matrix per runner, driven through **both** entry points: `VERIFY:required`
+    dispatches, and deferred dispatches followed by `router_verify`. Introduced failure → rejected;
+    pre-existing → accepted with the note; pre-existing + introduced → rejected naming only the
+    introduced; docs-only change → pass note; `conftest.py` change → `unverifiable`.
+  - 3.1.2.b **Resource bound:** 5 concurrent `VERIFY:required` implementation gates on `vitest-app`,
+    then 5 deferred delegations verified by one `router_verify({pending:true})`, with the defaults.
     A process sampler polls every 100 ms (Windows: `Get-CimInstance Win32_Process`; POSIX: `ps -eo pid,ppid,ni,args`)
     and records the descendant processes of the test process. Assert:
     - peak concurrent runner worker processes ≤ `maxWorkers` × `maxConcurrentVerifications`;
@@ -995,6 +1315,15 @@ bound holds.
   - 3.1.2.d **No orphans:** force the gate budget to expire mid-run; 3 s later no descendant is alive.
   - 3.1.2.e **Cleanup:** after the suite, no `omr-ref-*` worktrees remain, and the fixture's real
     `node_modules` sentinel file still exists.
+  - 3.1.2.f **Deferred costs nothing:** 20 parallel deferred implementation delegations on
+    `vitest-app` with the default config. The sampler must observe **zero** runner processes and no
+    slot files. Each result returns with the footer within 50 ms of the producer finishing, and each
+    dispatch waits ≤ `VERIFY_WAIT` for the capture (with a real repo, measured and reported; expected
+    < 1 s).
+  - 3.1.2.g **Orchestrator control:** a dispatch with `VERIFY_WAIT:0s` starts the producer without
+    waiting; `VERIFY:required` blocks until a verdict; `router_verify` after drift reports the drift.
+  - 3.1.2.h **Background opt-in:** with `background: true`, an introduced failure in a deferred
+    delegation surfaces as one late notice; with `background: false` (repeat 3.1.2.f), nothing runs.
 - **3.1.3** `[tier:medium]` `D:\git\opencode-model-router\.github\workflows\test.yml`: add an `e2e`
   job (`ubuntu-latest` and `windows-latest`, Node 22) that runs with `RUN_VERIFY_E2E=1` and has
   `uv`/pytest set up. Every new third-party action is **pinned by full commit SHA with a version
@@ -1010,24 +1339,27 @@ bound holds.
     installed vitest; decide in the pre-flight of this phase).
 
   `D:\git\opencode-model-router\vitest.config.ts`: per-file coverage thresholds of ≥ 90% lines and
-  branches for `src/verify/{exec,runner,slot,reference,batch}.ts`, evaluated on the merged report,
+  branches for `src/verify/{exec,runner,slot,reference,batch,directives,risk,pending}.ts`, evaluated on the merged report,
   and keep the
   existing per-directory gates.
 - **3.1.4** `[tier:medium]` Smoke: extend
-  `D:\git\opencode-model-router\test\smoke\layer2-gate.smoke.test.ts` so that a real-opencode
-  delegation with a `testsPass` acceptance block runs a scoped command (asserted from the plugin log).
+  `D:\git\opencode-model-router\test\smoke\layer2-gate.smoke.test.ts` so that, in real opencode:
+  - a `VERIFY:required` delegation with a `testsPass` acceptance block runs a scoped command
+    (asserted from the plugin log);
+  - a deferred one returns the footer and spawns nothing;
+  - the `router_verify` tool is registered and callable.
 - **3.1.5** `[tier:fast]` Run the full unit suite (`npx vitest run --maxWorkers=2`), the e2e suite locally on Windows (serialized, never alongside another full run), and the smoke
   keyless lane, then push and collect the CI results for every job; report.
 
 **New tests** — as listed in 3.1.2 and 3.1.4 (this phase *is* the system-level test phase).
 
-**Acceptance criteria** — the global criteria G1–G6 (§4.1) are demonstrated by passing tests on
+**Acceptance criteria** — the global criteria G1–G8 (§4.1) are demonstrated by passing tests on
 both OSes in CI.
 
 **Definition of Done** — as in 1.1; the CI `test`, `e2e`, `smoke-keyless`, CodeQL and GitGuardian
 checks are green; QA report `D:\git\opencode-model-router\docs\qa\verification-resource-budget\phase-3.1.md`.
 
-**QA review** `[tier:heavy]` CAP:none — reason: the reviewer must judge whether the e2e assertions actually prove G1–G6 or can pass vacuously.
+**QA review** `[tier:heavy]` CAP:none — reason: the reviewer must judge whether the e2e assertions actually prove G1–G8 or can pass vacuously.
 Adversarial focus: sampling that could miss short-lived workers (the poll interval vs worker
 lifetime; assert a minimum observed count so the sampler provably saw workers), tests that pass
 because nothing ran, flaky timing, and fixtures that differ from real repos (pnpm layout, monorepo).
@@ -1042,7 +1374,7 @@ because nothing ran, flaky timing, and fixtures that differ from real repos (pnp
       the file list, the e2e and bench output, the spike logs, and every phase QA report.
 
 **Task**
-- **3.2.1** `[tier:heavy]` Adversarial global review against §1.2, §1.5 and G1–G6. It is saved to
+- **3.2.1** `[tier:heavy]` Adversarial global review against §1.2, §1.5 and G1–G8. It is saved to
   `D:\git\opencode-model-router\docs\qa\verification-resource-budget\global.md`. It must at least
   attempt to:
   - construct a false pass;
@@ -1050,6 +1382,10 @@ because nothing ran, flaky timing, and fixtures that differ from real repos (pnp
   - make cleanup delete real data;
   - deadlock the slot;
   - run a full suite with the default config;
+  - make a deferred delegation spawn a verification process, or be labelled verified, with the
+    default config;
+  - make a subagent choose its own verification mode, or read another session's handles;
+  - make the dispatch wait longer than `VERIFY_WAIT`;
   - leave an orphan process.
 
   Each attempt is recorded with its outcome.
@@ -1072,7 +1408,7 @@ because nothing ran, flaky timing, and fixtures that differ from real repos (pnp
 **Tasks**
 - **3.3.1** `[tier:medium]` Open the PR `vrb/wave-3` → `master` titled
   `feat(verify): affected-test verification under a machine-wide resource budget`. The body gives the
-  summary, S1–S6, the evidence, the G1–G6 proof links and the QA report links. It ends with the
+  summary, S1–S7, the evidence, the G1–G8 proof links and the QA report links. It ends with the
   repo's PR attribution line.
 - **3.3.2** `[tier:fast]` Watch the CI; on red, route per §0.8 (fix on the branch, never merge red).
 - **3.3.3** `[tier:medium]` Merge with a merge commit (the repo convention). On `master`: set
@@ -1103,27 +1439,42 @@ checkout is at `v1.15.0`; no `omr-*` worktrees or `vrb/*` branches remain.
   written (§1.5-12) but still under S3, S4 and the gate deadline. The injected protocol steers
   orchestrators away from full-suite `run` checks. Proven by 3.1.2.b, the 2.1 argv assertions and
   the 2.3 golden protocol text.
-- **G2 — The guardrail holds.** Introduced failures are rejected and named; pre-existing failures
-  (exact reference) are accepted with an explicit "suite not green" note; anything unprovable is
-  `unverifiable`. Proven by the 2.1 truth-table tests and the 3.1.2.a runner matrix.
+- **G2 — The guardrail holds when verification runs.** For `VERIFY:required` gates and
+  `router_verify` calls, introduced failures are rejected and named; pre-existing failures (exact
+  reference) are accepted with an explicit "suite not green" note; anything unprovable is
+  `unverifiable`. An unverified delegation is never labelled accepted or verified. Proven by the 2.1
+  truth-table tests, the 2.4 tests and the 3.1.2.a runner matrix.
 - **G3 — Bounded CPU/RAM.** Peak concurrent runner workers from verification ≤ `maxWorkers` ×
-  `maxConcurrentVerifications` (default 2 × 1) machine-wide, across opencode processes, all at
-  below-normal priority. Proven by 3.1.2.b and 3.1.2.c on Windows and Linux.
-- **G4 — Nothing outlives its budget.** Every gate, in both the `delegate` and the native `task`
-  paths, has one deadline (`gateBudgetMs`). No slot wait, run, recheck or batch step outlives it.
-  Its expiry kills the whole process tree; no orphans after 3 s. Proven by 1.2, the 2.1 deadline and
-  native-`task` tests, and 3.1.2.d.
+  `maxConcurrentVerifications` (default 2 × `max(1, floor(cores/8))`) machine-wide, across opencode
+  processes, all at below-normal priority. Proven by 3.1.2.b and 3.1.2.c on Windows and Linux.
+- **G4 — Nothing outlives its budget.** Every synchronous verification (a required gate in the
+  `delegate` and the native `task` paths, and each `router_verify` call) has one deadline
+  (`gateBudgetMs`). No slot wait, run, recheck or batch step outlives it. Its expiry kills the whole
+  process tree; no orphans after 3 s. Proven by 1.2, the 2.1 deadline and native-`task` tests, the
+  2.4 `router_verify` deadline test, and 3.1.2.d.
 - **G5 — Safe cleanup.** No reference worktree survives a run or a crash (GC). No cleanup path
   touches real `node_modules` or user files. Proven by 1.5 and 3.1.2.e.
 - **G6 — Compatibility.** Existing configs load unchanged; the deprecated keys work with a warning;
-  `testScope: "full"` restores full-suite semantics (still resource-bounded); `npm test`,
+  `testScope: "full"` restores full-suite semantics (still resource-bounded);
+  `defaultVerify: "required"` restores synchronous gating for every `testsPass` delegation; `npm test`,
   typecheck, smoke-keyless, CodeQL and GitGuardian are green on ubuntu/windows × Node 20/22/24.
+- **G7 — Speed first, zero idle cost.** With the default config:
+  - verification adds **0 ms** to the time a delegation's result reaches the orchestrator;
+  - the dispatch waits at most `VERIFY_WAIT` (default 5 s) for the git-only reference capture;
+  - **no verification process is spawned** unless a dispatch says `VERIFY:required`, the orchestrator
+    calls `router_verify`, or `background: true` is configured.
+
+  Proven by the 2.4 tests and 3.1.2.f.
+- **G8 — The orchestrator is in control and informed.** Per dispatch, the orchestrator chooses the
+  mode and the wait. Every deferred result carries a deterministic risk level and a handle, and
+  unverified delegations stay listed in its prompt until verified or expired. A subagent can never
+  change its own verification mode. Proven by the 1.6, 2.4 and 3.1.2.g tests.
 
 ### 4.2 Global Definition of Done
 
 - [ ] All phases meet their DoD; every phase QA report and `global.md` show zero open findings.
-- [ ] G1–G6 are demonstrated by tests that run in CI on both OSes.
-- [ ] Coverage is ≥ 90% lines and branches for `src/verify/{exec,runner,slot,reference,batch}.ts`,
+- [ ] G1–G8 are demonstrated by tests that run in CI on both OSes.
+- [ ] Coverage is ≥ 90% lines and branches for `src/verify/{exec,runner,slot,reference,batch,directives,risk,pending}.ts`,
       enforced in `D:\git\opencode-model-router\vitest.config.ts` on the Windows + Linux merged
       coverage report (3.1.3).
 - [ ] The executing session never saturated the machine: the run log records that every full run
@@ -1131,7 +1482,7 @@ checkout is at `v1.15.0`; no `omr-*` worktrees or `vrb/*` branches remain.
 - [ ] Docs, ADR 0003, CHANGELOG and the protocol text describe the shipped behaviour exactly.
 - [ ] `1.15.0` is published with provenance; the main checkout is synced; no temporary worktrees or
       branches remain.
-- [ ] Final report to the human: what shipped, the G1–G6 evidence (the CI links and measured peak
+- [ ] Final report to the human: what shipped, the G1–G8 evidence (the CI links and measured peak
       process counts), the known limits (runners without scoping → `unverifiable`), and the
       reminder to restart the opencode sessions.
 
@@ -1151,6 +1502,7 @@ re-reviewed until clean. The global DoD cannot be ticked before it closes.
 | Windows junction cleanup deletes real `node_modules` | Spike D gate, a code-level ban on unsafe methods, sentinel-file tests on real junctions, and a heavy QA focus in 1.5 and 3.2. |
 | Cross-process lock left behind by a crash blocks verification | Stale detection by PID, hostname and age; compare-before-delete; the busy result after `slotWaitMs` is `unverifiable`, never a hang. |
 | Runner CLI differences across versions | Spike C pins the behaviour; the reporter-file parsing falls back to text; an unknown shape → `unverifiable`. |
+| Deferred-by-default lets the orchestrator build on broken work (the "instructed models false-finish" risk from the router's own motivation) | The owner's explicit trade-off (§1.1), stated in the ADR and CHANGELOG. Mitigated by the risk level on every deferred result, the pending list in the prompt, `router_verify`, `VERIFY:required` for fundamental work, `defaultVerify: "required"` and `background: true` as opt-ins, and CI as the final gate. |
 | The executing session's own plugin runs full suites during execution | Phase 0.P syncs to `1.14.0`; §0.5 forbids `check: testsPass` in dispatches until `1.15.0`. |
 
 ## 6. Out of scope
