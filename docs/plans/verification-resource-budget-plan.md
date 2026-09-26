@@ -68,8 +68,11 @@ Heavy dispatches follow the router protocol: gather context with `[tier:fast]` f
 into the heavy prompt; heavy reasons over supplied context. QA dispatches may use
 `CAP:none` **with** a `reason:` line (an adversarial review must read every changed file).
 
+The router honours `CAP:none` **only** when the dispatch text also carries a `reason:` line. Every
+dispatch marked `CAP:none` below copies its reason into the dispatch as a separate `reason: …` line.
+
 **Dispatch acceptance blocks while executing this plan:** use scoped checks such as
-`check: run command="npx vitest run D:\git\omr-w1-p13\test\unit\runner.test.ts"`, **never**
+`check: run command="npx vitest run --maxWorkers=2 D:\git\omr-p13\test\unit\runner.test.ts"`, **never**
 `check: testsPass`, until `1.15.0` is installed. The plugin loaded by the executing
 session is the one this plan replaces, and a bare `testsPass` would run this repo's full suite per
 delegation.
@@ -82,13 +85,14 @@ no agent reads a file another agent is editing.**
 1. **Ownership map.** §2 assigns every file a single owning phase per wave. A task may write only
    files in its phase's write-set. Files not listed are read-only for everyone.
 2. **Isolation by worktree.** Each concurrently running phase works in its own git worktree on
-   its own branch, created from the wave's integration branch:
-   `git -C D:\git\opencode-model-router worktree add -b vrb/<phase-id> D:\git\omr-<phase-id> vrb/wave-<n>`.
+   its own branch, created from the wave's integration branch. Phase ids are written without the
+   dot (`1.3` → `p13`):
+   `git -C D:\git\opencode-model-router worktree add -b vrb/p13 D:\git\omr-p13 vrb/wave-1`.
    An agent reads and writes only inside its own worktree. It never opens another phase's worktree.
    Reads of files owned by another in-flight phase come from the **wave base branch**, which no one
    edits while the wave runs.
 3. **Serial integration.** Only the orchestrator merges phase branches into `vrb/wave-<n>`, one at a
-   time, after that phase's QA is clean. It runs the full unit suite after each merge. Conflicts are
+   time, after that phase's QA is clean. It runs the full unit suite (capped, §0.6.7) after each merge. Conflicts are
    resolved by the orchestrator, never by two agents.
 4. **Cross-phase dependencies.** A phase that needs another phase's output (types, APIs) starts only
    after that phase is merged into the wave branch. The dependency graph in §3 is authoritative;
@@ -101,6 +105,13 @@ no agent reads a file another agent is editing.**
 6. **Main checkout.** `D:\git\opencode-model-router` (branch `master`) is the directory the live
    opencode sessions load the plugin from. Never edit, check out a branch, or run `npm ci` there
    during execution, except in Phase 0.P and the final sync in Phase 3.3.
+7. **Do not recreate the problem this plan fixes.** Parallel agents share one machine:
+   - **This repo's own test suite always runs capped:** `npx vitest run --maxWorkers=2 …`, never a
+     bare `npm test` (this repo's `vitest.config.ts` sets no worker cap, so a bare run uses every core).
+   - **Full-suite runs of this repo are serialized:** only the orchestrator runs them, and only one
+     at a time across all worktrees (pre-flights and post-merge checks). Delegated agents run only
+     the test files they touch.
+   - **`npm ci` in new worktrees runs one at a time.**
 
 ### 0.7 Pre-flight before each phase, QA after each phase
 
@@ -127,8 +138,9 @@ with that record. If heavy's approach also fails, this is a blocking problem und
 - [ ] The worktree for the phase exists, is on the right branch, and `git status` is clean.
 - [ ] The phase branch is based on the current tip of `vrb/wave-<n>` (after all merged dependencies).
 - [ ] Every dependency phase listed in §3 is merged and its QA report shows zero open findings.
-- [ ] `npm ci` completed in the worktree. Then `npm run typecheck` and `npm test` pass there (this
-      repo's own suite: ~1 min, run once per phase by the orchestrator, **not** per delegation).
+- [ ] `npm ci` completed in the worktree (serialized, §0.6.7). Then `npm run typecheck` and
+      `npx vitest run --maxWorkers=2` pass there. This is this repo's own suite: the orchestrator runs
+      it once per phase, one worktree at a time, **not** per delegation.
 - [ ] The phase's write-set (§2) does not overlap any other in-flight phase's write-set.
 - [ ] No orphaned `node`/`vitest` processes from earlier phases are running
       (Windows: `Get-CimInstance Win32_Process -Filter "Name='node.exe'"`, filtered to command lines
@@ -151,8 +163,11 @@ dispatch**, including read-only ones. `1.14.0` fixed three defects:
 - no baseline for read-only dispatches;
 - one capture per directory and command, per process.
 
-**It still runs the full suite up to twice per implementation delegation** (a dispatch-time
-baseline, then the `testsPass` check after the producer returns). The owner's constraint:
+**It still runs the full suite up to twice for every delegation whose DoD carries `testsPass`**:
+a dispatch-time baseline, then the `testsPass` check after the producer returns. The injected
+protocol tells orchestrators to prefer `testsPass` in acceptance blocks, so that means most
+implementation delegations. The native `task` path also has no gate budget at all
+(`accept(…)` is not wrapped in `withTimeout` there). The owner's constraint:
 **the router must not run a test suite per delegation.**
 
 ### 1.2 Guardrail semantics to preserve
@@ -189,7 +204,8 @@ baseline, then the `testsPass` check after the producer returns). The owner's co
 | `failureRecheck` | boolean | `true` | S2. When `false`, no reference is captured and no recheck runs: a green scoped run still passes, and any scoped failure is `unverifiable` (it can neither be excused nor proven introduced). |
 | `recheckTimeoutMs` | integer ≥ 1 | `60000` | S2. Budget for the reference re-run. |
 | `testBaseline` | boolean | — | **Deprecated.** Accepted. `false` maps to `failureRecheck: false`. Logs a one-time deprecation warning through the plugin logger. |
-| `baselineTimeoutMs` | integer ≥ 1 | `60000` | Now bounds the git-only reference capture at dispatch. |
+| `baselineTimeoutMs` | integer ≥ 1 | `15000` (was `60000`) | Now bounds the git-only reference capture, which is awaited at dispatch (§1.5-14). |
+| `gateBudgetMs` | integer ≥ 1 | `90000` (unchanged) | Now also applies to the native `task` path, and is the deadline every S2–S5 step is bounded by (§1.5-13). |
 
 ### 1.5 Decisions taken (the executor does not re-open these)
 
@@ -208,7 +224,8 @@ baseline, then the `testsPass` check after the producer returns). The owner's co
    `unverifiable`.
 4. **Package-script resolution.** `npm|pnpm|yarn|bun test` resolves `scripts.test` from the nearest
    `package.json`. A single `vitest …`/`jest …` invocation is rewritten into its scoped form. A
-   composite script (`&&`, `;`, `|`, several commands) is S6 `unverifiable`.
+   leading `cross-env K=V …` prefix is supported: its assignments go into the spec's `env`. A
+   composite script (`&&`, `;`, `|`, several commands, or any other wrapper) is S6 `unverifiable`.
 5. **Deleted and renamed sources.** They cannot be passed to `related`. Tests are added by searching
    test files for the module's stem (`git grep -l -F <stem> -- <test globs>`). If none are found,
    the result for that file is S6 `unverifiable`.
@@ -226,15 +243,33 @@ baseline, then the `testsPass` check after the producer returns). The owner's co
 10. **Scope of `lintClean`.** When the resolved lint command is a plain `eslint` invocation, or a
     package script that is one, it is scoped to changed lintable files in the same adapter (same
     no-shell, cap and slot rules). Otherwise it is unchanged, but runs under S3/S4.
+11. **Worker cap conflicts.** If the user's script already sets a worker cap, the spec uses
+    `min(user value, maxWorkers)`, emitted exactly once. The router never raises a cap.
+12. **Explicit `run` checks run as written.** A `check: run command="…"` is an explicit instruction,
+    so it is not rewritten or scoped. It does run under the slot (S3), at low priority, and under the
+    gate deadline (S4). The protocol text (Phase 2.3) steers orchestrators away from full-suite `run`
+    checks. G1 is stated accordingly.
+13. **One deadline per gate.** Every gate invocation, in the `delegate` tool **and** the native `task`
+    path, gets a deadline of `gateBudgetMs` and an `AbortController`. Every wait and command inside it
+    (slot wait, scoped run, S2 recheck, batch wait) is bounded by
+    `min(its own configured budget, time remaining until the deadline)`. The recheck is skipped
+    (→ `unverifiable`, reason "gate budget exhausted before recheck") when less than 10 s remain. The
+    native `task` path gains the same `withTimeout` + abort wrapping as the `delegate` path.
+14. **The reference capture is awaited, not raced.** The `task` before-hook and the `delegate`
+    dispatch **await** `captureReference` before the producer starts. It runs git only, bounded by
+    `baselineTimeoutMs` (default lowered to `15000` for this purpose; the key keeps its name).
+    Edit-contamination tracking stays as a safety net: an edit observed in the directory before the
+    capture resolves discards the reference.
 
 ### 1.6 Target flow
 
 ```
 dispatch (task / delegate)
-  └─ DoD has testsPass? ──no──► nothing
-        └─yes─► reference.capture(cwd)            git only, ≤ baselineTimeoutMs
+  └─ DoD has testsPass (and failureRecheck)? ──no──► nothing
+        └─yes─► await reference.capture(cwd)      git only, ≤ baselineTimeoutMs, before the producer starts
 producer returns
-  └─ gate.accept ─► testsPass
+  └─ gate.accept  (deadline = now + gateBudgetMs, AbortController; every step below ≤ remaining time)
+        ─► testsPass
         ├─ adapter.resolve(command, changedFiles)  → scoped spec | unverifiable(S6)
         ├─ batch.submit(spec)                      window batchWindowMs (S5)
         │    └─ slot.acquire (S3) ─► runShellArgs(spec, lowPriority, maxWorkers, signal) (S4)
@@ -288,17 +323,17 @@ The same file appears under exactly one phase per wave.
 ### Dependency graph
 
 ```
-Phase 0.P ─► Wave 1: 1.1 ║ 1.2 ║ 1.3 ║ 1.4 ║ 1.5     (all parallel; 1.3 and 1.5 read 1.2's
-                                                      ExecSeam type from the base branch
-                                                      contract in §3.1.2 and are merged after 1.2)
-         ─► Wave 2: 2.1 ─► 2.2(integration) ─► 2.3
-                    2.2(batch.ts core) runs in parallel with 2.1
+Phase 0.P ─► Wave 1: 1.1 ║ 1.2 ║ 1.3 ║ 1.4 ║ 1.5     (all parallel; 1.3 and 1.5 code against
+                                                      the ExecSeam/ArgvSeam contract of task 1.2.2
+                                                      and are merged after 1.2; 1.4 needs no seam)
+         ─► Wave 2: 2.1.1 (design) ─► 2.1.2–2.1.6 ─► 2.2.3 (wiring) ─► 2.3
+                    2.1.1 (design) ─► 2.2.1–2.2.2 (batch.ts core, parallel with 2.1.2–2.1.6)
          ─► Wave 3: 3.1 ─► 3.2 (global QA) ─► 3.3 (release)
 ```
 
-Merge order into `vrb/wave-1`: 1.1, 1.2, 1.4, then 1.3, then 1.5. Parallel **work** is not affected: 1.3
-and 1.5 code against the ExecSeam contract written down in §3.1.2, so they need not wait for 1.2's
-merge. Only their merge waits.
+Merge order into `vrb/wave-1`: 1.1, 1.2, then 1.4, 1.3, 1.5. Parallel **work** is not affected:
+task 1.2.2 commits the seam types first, and the orchestrator pastes them verbatim into the 1.3 and
+1.5 dispatches, so those phases need not wait for 1.2's merge. Only their merge waits.
 
 ---
 
@@ -313,10 +348,14 @@ Not a delivery phase. It prepares a safe workspace.
       in the medium `description` line. Then run `git -C D:\git\opencode-model-router checkout -- tiers.json`
       and `git -C D:\git\opencode-model-router pull --ff-only`. If the diff shows anything else, this
       is a §0.1 critical item (user data): stop and ask.
-- [ ] **0.P.2** Ask nothing. Just note in the run log that opencode sessions must be restarted to
-      load `1.14.0`. A restart is not a blocker for executing this plan.
-- [ ] **0.P.3** Create the integration branch: `git -C D:\git\opencode-model-router branch vrb/wave-1 origin/master`
-      and push it.
+- [ ] **0.P.2** Record in the run log that the opencode sessions must be restarted to load `1.14.0`,
+      and tell the human once in the progress update. This is not a blocker and needs no answer.
+- [ ] **0.P.3** Create the integration branch from the branch that carries this plan, so every wave
+      branch contains it: `git -C D:\git\opencode-model-router fetch origin` then
+      `git -C D:\git\opencode-model-router branch vrb/wave-1 origin/docs/verification-budget-plan`.
+      Confirm that `origin/docs/verification-budget-plan` is `origin/master` plus plan commits only
+      (`git log origin/master..origin/docs/verification-budget-plan --stat` touches only
+      `D:\git\opencode-model-router\docs\plans\verification-resource-budget-plan.md`). Push it.
 - [ ] **0.P.4** Record machine facts in the run log: OS, core count, Node version, and whether
       `uv`/`pytest` are on PATH (for the pytest spikes).
 
@@ -345,9 +384,12 @@ deprecated keys map correctly.
   - 1.1.1.a Add validation in `validateConfig` with error messages in the existing
     `tiers.json: enforcement.verify.<key> must be …` form. Integers are checked with
     `Number.isInteger`; `testScope` against the literal union.
-  - 1.1.1.b Export a pure `resolveVerifyBudget(cfg): VerifyBudget` returning fully defaulted values.
-    It applies the deprecation mapping (`testBaseline: false` → `failureRecheck: false`). An explicit
-    `failureRecheck` wins over the deprecated key.
+  - 1.1.1.b Export a pure `resolveVerifyBudget(cfg): VerifyBudget` returning fully defaulted values,
+    including `baselineTimeoutMs` (new default `15000`) and `gateBudgetMs`. It applies the deprecation
+    mapping (`testBaseline: false` → `failureRecheck: false`). An explicit `failureRecheck` wins over
+    the deprecated key. Any existing reads of `baselineTimeoutMs`/`gateBudgetMs` defaults elsewhere
+    (`D:\git\opencode-model-router\src\verify\wiring.ts`, `D:\git\opencode-model-router\src\index.ts`)
+    are listed in the QA report for Phase 2.1 to switch over; 1.1 does not edit those files (§2).
   - 1.1.1.c Emit the deprecation warning once per process through the plugin logger seam that
     config already uses. Do not use `console`.
 - **1.1.2** `[tier:medium]` Tests in `D:\git\opencode-model-router\test\unit\config-verify-budget.test.ts`.
@@ -426,9 +468,11 @@ string.
 - Abort after natural exit is a no-op (no `taskkill` of a recycled PID: a `settled` guard).
 
 **Acceptance criteria**
-- No verification code path spawns a process except through `runShell`/`runArgv`
-  (`rg "child_process" D:\git\omr-p12\src` lists only `exec.ts` and `tree.ts`, and `tree.ts` only
-  runs git with a timeout).
+- No verification code path spawns a process except through `runShell`/`runArgv`.
+  `rg "child_process" D:\git\omr-p12\src` lists only `exec.ts` and the pre-existing `tree.ts`
+  (which only runs git with a timeout and is out of scope). New modules (`reference.ts`,
+  `runner.ts`, `batch.ts`, `slot.ts`) must receive `ArgvSeam` by injection and never import
+  `child_process`. Phase 3.2 re-checks this across the final tree.
 - A killed run reports `timedOut: true` and a non-zero code on both platforms.
 
 **Definition of Done** — as in 1.1; QA report `D:\git\opencode-model-router\docs\qa\verification-resource-budget\phase-1.2.md`.
@@ -466,7 +510,9 @@ results into failing identities and can build a "re-run exactly these test files
 - **1.3.1** `[tier:heavy]` Design note (committed as the header comment of
   `D:\git\opencode-model-router\src\verify\runner.ts`): the spec type, the runner-detection decision
   table, argument construction per runner, identity-extraction formats, and the S6 reasons. It
-  implements §1.5 decisions 1–6 and 10 exactly, and chooses the S5 attribution path from Spike C.
+  implements §1.5 decisions 1–6, 10 and 11 exactly, and chooses the S5 attribution path from Spike C.
+  For JS runners the spec is always `{ file: process.execPath, args: [<resolved bin entry>, …] }`, so
+  no `.cmd` shim and no shell are ever involved on Windows.
 - **1.3.2** `[tier:medium]` Implement `D:\git\opencode-model-router\src\verify\runner.ts`:
   - 1.3.2.a `detectRunner(command, cwd, fs)`: direct invocations (`vitest`, `npx vitest`,
     `pnpm exec vitest`, `jest`, `pytest`, `uv run pytest`) and package scripts (§1.5-4). The nearest
@@ -498,9 +544,9 @@ results into failing identities and can build a "re-run exactly these test files
 - Detection for each direct form, and `npm test`/`pnpm test`/`yarn test`/`bun test` → the script,
   for vitest and jest scripts with extra flags (`vitest run --coverage` → coverage flag dropped for
   scoped runs).
-- Composite scripts (`vitest run && eslint .`, `npm run a; npm run b`, `cross-env X=1 vitest run`)
-  → decide explicitly. `cross-env` is supported **only if** the design note says so; otherwise it is
-  `unverifiable`.
+- Composite scripts (`vitest run && eslint .`, `npm run a; npm run b`, `dotenv -- vitest run`) →
+  `unverifiable`, with the reason naming the construct. `cross-env X=1 Y="a b" vitest run` →
+  supported, `env` = `{X:"1", Y:"a b"}` (§1.5-4). `cross-env` followed by a composite → `unverifiable`.
 - Monorepo: `cwd` in a package, runner hoisted to the root; pnpm `.pnpm` store layout; runner missing → `unverifiable`.
 - Changed files: outside the git root (dropped); `..` traversal (dropped); absolute Windows paths with
   a different drive letter case; paths with spaces and unicode; a deleted source that has
@@ -509,8 +555,10 @@ results into failing identities and can build a "re-run exactly these test files
 - pytest: `conftest.py` changed → `unverifiable`; `src/pkg/mod.py` → `tests/test_mod.py` and `tests/pkg/mod_test.py`; `uv run pytest` allowed, `uv run python -c` refused.
 - `readResult`: JSON with failures, zero tests, a collection error, a truncated or missing report
   file (falls back to text), a report file already deleted.
-- `maxWorkers` is injected exactly once, even if the user script already has one (the user's value
-  is replaced by the budget's, as the design note specifies).
+- Worker cap (§1.5-11): no user flag → `--maxWorkers=<budget>`; user `--maxWorkers=1` with
+  budget 2 → `1`; user `--maxWorkers=8` → `2`; user `--maxWorkers=50%` (percent form) →
+  `min(ceil(0.5 × os.availableParallelism()), 2)`, tested with an injected core count of 1 and 16; the
+  flag appears exactly once; the `--maxWorkers 4` two-token form is recognised too.
 
 **Acceptance criteria**
 - `runner.ts` performs **no** process spawning: it returns specs and uses `fs` only through the seam.
@@ -539,15 +587,20 @@ same machine, recovers from crashes and never deadlocks.
 - **1.4.1** `[tier:medium]` `D:\git\opencode-model-router\src\verify\slot.ts`:
   `acquireSlot({ max, waitMs, signal, meta })` → `{ release(): Promise<void> } | { busy: true }`.
   - 1.4.1.a Lock files live at `path.join(os.tmpdir(), "opencode-model-router", "verify-slots", "slot-<i>.lock")`
-    and contain JSON `{pid, hostname, startedAt, cwd, command}`.
-  - 1.4.1.b Stale detection: a dead PID, a hostname mismatch (shared temp dirs), or an age above
-    `maxHold` (= the largest configured command budget + 60 s). Stale files are removed with a
-    compare-before-delete (re-read the content and delete only if it is unchanged) to avoid deleting
-    a freshly re-acquired slot.
-  - 1.4.1.c Waiting uses exponential backoff with jitter (250 ms → 2 s), honours `signal`, and stops at `waitMs`.
-  - 1.4.1.d `release()` is idempotent. It deletes only its own file (content check). Slots are also
-    released on `process.on("exit")`, synchronously, as best effort.
-  - 1.4.1.e If the temp dir is unwritable, degrade to an in-process semaphore with the same API,
+    and contain JSON `{pid, hostname, token, startedAt, cwd, command}`. `token` is a random UUID per
+    acquisition, used for ownership checks.
+  - 1.4.1.b **Heartbeat.** While a slot is held, the holder refreshes the file's mtime every 5 s
+    (`fs.utimes`, with an unref'd timer). The hold can span a whole batch plus recheck, so it cannot
+    be bounded by any single command budget.
+  - 1.4.1.c **Stale detection.** A lock is stale if (a) its `hostname` equals this host **and** its
+    PID is dead, or (b) its heartbeat (mtime) is older than 30 s, whatever the host. A lock from
+    another host is **never** judged by PID (the PID space is not ours), only by heartbeat. Stale
+    files are removed with a compare-before-delete: re-read the content, delete only if the `token`
+    is unchanged. This avoids deleting a freshly re-acquired slot.
+  - 1.4.1.d Waiting uses exponential backoff with jitter (250 ms → 2 s), honours `signal`, and stops at `waitMs`.
+  - 1.4.1.e `release()` is idempotent and stops the heartbeat. It deletes only its own file (token
+    check). Slots are also released on `process.on("exit")`, synchronously, as best effort.
+  - 1.4.1.f If the temp dir is unwritable, degrade to an in-process semaphore with the same API,
     and log the degradation once through the logger seam.
 - **1.4.2** `[tier:medium]` Tests in `D:\git\opencode-model-router\test\unit\slot.test.ts`. They
   include **real multi-process** cases that spawn child Node processes which acquire slots.
@@ -557,8 +610,12 @@ same machine, recovers from crashes and never deadlocks.
   in a shared file; assert no overlap). With `max=2`, at most two.
 - A crashed holder (child killed with SIGKILL/`taskkill /F`) → its slot is reclaimed by the next
   waiter within the backoff window.
-- A recycled PID (the file names a live but unrelated PID with a different `startedAt` beyond
-  `maxHold`) is reclaimed.
+- A recycled PID (the file names a live but unrelated PID) whose heartbeat stopped is reclaimed
+  after 30 s. A live holder whose hold lasts 3× the longest command budget keeps its slot, because
+  its heartbeat is fresh.
+- A lock written with a foreign `hostname` and a dead-looking PID but a fresh heartbeat is **not**
+  reclaimed. The same lock with a heartbeat older than 30 s is reclaimed.
+- A heartbeat timer does not keep the process alive (unref), and stops on release.
 - `waitMs=0` → an immediate `busy`. An abort while waiting → resolves `busy` promptly and leaks no timers.
 - Release twice; release after the file was already reclaimed as stale (it must not delete the new
   owner's file).
@@ -607,8 +664,13 @@ be re-run safely. Cleanup must never touch real data.
   `node_modules` directory in the repo (root and workspace packages), the cleanup order proven safe
   by Spike D, and crash GC.
 - **1.5.2** `[tier:medium]` Implement `D:\git\opencode-model-router\src\verify\reference.ts`:
-  - 1.5.2.a `captureReference(cwd, signal)` → `{ root, commit, untracked: Map<relPath, sha256> } | undefined`,
-    using `git stash create` or `HEAD`. Git runs through `execFile` with args (no shell), with a timeout.
+  - 1.5.2.a `captureReference(cwd, signal, deps: { argv: ArgvSeam, fs })` →
+    `{ root, commit, untracked: Map<relPath, sha256> } | undefined`, using `git stash create` or `HEAD`.
+    Every git call goes through the injected `ArgvSeam` (the contract in task 1.2.2), so it gets tree
+    kill, abort and a timeout; `reference.ts` never imports `child_process`. Unit tests inject a
+    thin real implementation (`runArgv` from 1.2, available once 1.2 is merged; until then a local
+    test helper with the same signature built on `node:child_process.execFile` **inside the test
+    file only**).
   - 1.5.2.b `materialize(ref, currentTree, signal)` → `{ dir, exact: boolean, dispose() }`:
     `git worktree add --detach <os.tmpdir()>/omr-ref-<pid>-<rand> <commit>`. It copies the untracked
     files whose current hash matches the reference hash (`exact=false` if any file is missing or
@@ -676,8 +738,17 @@ abort (S4), with a failure-only recheck at the reference (S2), and never a full 
   the new `testsPass` section in `D:\git\opencode-model-router\src\verify\deterministic.ts`). It must
   include a truth table covering: {scoped result green / failures / collection error / timeout / slot
   busy / S6 unverifiable} × {recheck exact-and-all-preexisting / exact-and-some-introduced /
-  approximate / unusable / disabled / timed out}, with the resulting `ok`, `unverifiable`, `reason`
-  and `note`. It preserves the §1.2 guarantees.
+  approximate / unusable / disabled / timed out / skipped for deadline}, with the resulting `ok`,
+  `unverifiable`, `reason` and `note`. It preserves the §1.2 guarantees. It also fixes, as exported
+  TypeScript types in `D:\git\opencode-model-router\src\verify\types.ts` committed **before any other
+  2.1 or 2.2 work starts**:
+  - `Deadline` (§1.5-13);
+  - `ScopedOutcome`, `RecheckOutcome`;
+  - `ScopedExecutor = (spec, deadline) => Promise<ScopedOutcome>`: slot + caps + run + `readResult`;
+  - `Rechecker = (reference, failingFiles, deadline) => Promise<RecheckOutcome>`;
+  - the signature of `judgeScoped(scoped, recheck)`.
+
+  Phase 2.2's `batch.ts` consumes exactly these types, so it has no hidden dependency on 2.1's internals.
 - **2.1.2** `[tier:medium]` Replace the testsPass branch of `runCommandCheck` with the pipeline
   (the batch hook is a direct call for now; 2.2 swaps in the coordinator behind the same function
   signature).
@@ -688,19 +759,34 @@ abort (S4), with a failure-only recheck at the reference (S2), and never a full 
     signal; `lintClean` uses scoping (§1.5-10).
   - 2.1.2.c `testScope: "full"` runs the resolved full command, and still uses S2–S4.
 - **2.1.3** `[tier:medium]` `D:\git\opencode-model-router\src\verify\dispatch.ts` +
-  `D:\git\opencode-model-router\src\verify\wiring.ts`: `beginVerification` captures a reference
-  (1.5) instead of running tests, only for DoDs with `testsPass`. Delete the test-baseline cache
-  (`cache`, `baselines`, the test half of `observeEdit` contamination) and `baseline()`. Keep the
-  changed-file tracking (`bySession`, `delta`) intact. `prepareVerification` returns the reference
-  and the changed files. The references follow the existing TTL sweep.
+  `D:\git\opencode-model-router\src\verify\wiring.ts`: `beginVerification` becomes async and captures
+  a reference (1.5) instead of running tests, only for DoDs with `testsPass` and only when
+  `failureRecheck` is on. Delete the test-baseline cache (`cache`, `baselines`) and `baseline()`.
+  **Keep `observeEdit` contamination**, now applied to the in-flight reference capture (§1.5-14):
+  an edit observed in an overlapping directory before the capture resolves discards the reference.
+  Keep the changed-file tracking (`bySession`, `delta`) intact. `prepareVerification` returns the
+  reference and the changed files. References follow the existing TTL sweep. A retry keeps the
+  original dispatch's reference, so a failed attempt can never become its own reference.
 - **2.1.4** `[tier:medium]` `D:\git\opencode-model-router\src\verify\baseline.ts`: replace
   `compareTests` with `judgeScoped(scoped, recheck | undefined)` implementing the 2.1.1 table. Keep
   `observeTests` as the text fallback that `runner.ts` uses.
 - **2.1.5** `[tier:medium]` `D:\git\opencode-model-router\src\index.ts`:
-  - 2.1.5.a Gate budget abort: create an `AbortController` per gate invocation, pass its signal into
-    the gate deps, and abort it when `withTimeout(… "verification gate")` rejects **and** in the
-    native `task` path when its own budget expires. The running command tree dies with the gate.
-  - 2.1.5.b Call `gcStaleReferences` once at plugin start, fire-and-forget, with logged failures.
+  - 2.1.5.a Gate deadline (§1.5-13): in **both** call sites, create a `Deadline` and an
+    `AbortController` per gate invocation, and pass both into the gate deps.
+    - `delegate` tool: keep its `withTimeout(… "verification gate")` and abort the controller when
+      it rejects.
+    - Native `task` path in `tool.execute.after`: `accept(…)` is currently unwrapped. Wrap it in the
+      same `withTimeout(accept(…), gateBudgetMs, "verification gate")`, with the same abort-on-reject
+      and the same `unverifiableGateResult` fallback as the `delegate` path.
+
+    Either way, the running command tree dies with the gate.
+  - 2.1.5.b **Await** the reference capture before the producer runs (§1.5-14): the `task`
+    before-hook (`tool.execute.before`, where `beginVerification` is called today) and the
+    `delegate` dispatch both `await beginVerification(…)`, bounded by `baselineTimeoutMs`. A timeout
+    or error means "no reference" and must never block or fail the dispatch.
+  - 2.1.5.c Call `gcStaleReferences` once at plugin start, fire-and-forget, with logged failures.
+  - 2.1.5.d Switch every read of `baselineTimeoutMs`/`gateBudgetMs` defaults to `resolveVerifyBudget`
+    (the list comes from the Phase 1.1 QA report).
 - **2.1.6** `[tier:medium]` Rewrite `D:\git\opencode-model-router\test\unit\baseline.test.ts` and
   `D:\git\opencode-model-router\test\unit\baseline-wiring.test.ts` to the new model (no behaviour
   from the removed cache is kept alive), and add
@@ -726,6 +812,20 @@ abort (S4), with a failure-only recheck at the reference (S2), and never a full 
 - `testScope: "full"` → the full command runs once, no dispatch-time run, S2 applies to its failures.
 - Escalation interplay: a rejected verdict still triggers the ladder exactly as before
   (reuse the existing escalation assertions in the rewritten `baseline.test.ts`).
+- **Deadline:** with `gateBudgetMs` = 5 s, a slot wait configured at 60 s is cut at the remaining
+  time; a scoped run that ends with 8 s left skips the recheck (→ `unverifiable`, "gate budget
+  exhausted before recheck"). No step ever outlives the deadline (assert through the seam
+  timestamps under fake timers).
+- **Native `task` gate budget:** an `accept` that exceeds `gateBudgetMs` in the `tool.execute.after`
+  path yields the `unverifiable` gate result, aborts the controller and kills the tree. Before this
+  plan it hung without limit, so this is a new regression test.
+- **Awaited capture:** the producer prompt (`delegate`) and the `task` execution start only after
+  `captureReference` resolves, or after `baselineTimeoutMs` expires with "no reference" and the
+  dispatch proceeds. A capture that throws never fails the dispatch.
+- **Contamination:** an `edit` observed for the directory while the capture is in flight → the
+  reference is discarded → a later scoped failure is `unverifiable`.
+- **Retry:** an escalated retry reuses the first dispatch's reference, never a new one taken after
+  the failed attempt.
 
 **Acceptance criteria**
 - `rg "testBaseline|baselines\.|compareTests" D:\git\omr-p21\src` returns only the deprecated config
@@ -733,7 +833,7 @@ abort (S4), with a failure-only recheck at the reference (S2), and never a full 
 - With default config, **no code path runs a test command at dispatch time**, and **no code path runs
   a full suite** (proven by tests that assert the argv of every spawned spec).
 
-**Definition of Done** — as in 1.1; full `npm test` + typecheck green; coverage of changed `src\verify\*` files ≥ 90% lines/branches (measured with `npx vitest run --coverage --coverage.include=src/verify/**`); QA report `D:\git\opencode-model-router\docs\qa\verification-resource-budget\phase-2.1.md`.
+**Definition of Done** — as in 1.1; full unit suite (`npx vitest run --maxWorkers=2`, §0.6.7) + typecheck green; coverage of changed `D:\git\opencode-model-router\src\verify\*` files ≥ 90% lines/branches (measured with `npx vitest run --maxWorkers=2 --coverage --coverage.include=src/verify/**`); QA report `D:\git\opencode-model-router\docs\qa\verification-resource-budget\phase-2.1.md`.
 
 **QA review** `[tier:heavy]` CAP:none — reason: the verdict algebra is the guardrail itself; the reviewer must read the whole pipeline, both gate call sites and the truth-table tests.
 Adversarial focus: **false passes** (any path where an introduced failure is excused), a stale
@@ -749,8 +849,10 @@ every exception path, and behaviour when the gate is aborted between the scoped 
 per-request verdicts.
 
 **Parallelism:** tasks 2.2.1–2.2.2 (the new file `D:\git\opencode-model-router\src\verify\batch.ts`
-and its unit tests) run **in parallel with Phase 2.1**, coding against the 1.3 spec types that are
-already on `vrb/wave-2`. Task 2.2.3 (wiring) starts only after 2.1 is merged, because it writes
+and its unit tests) start as soon as task 2.1.1 has committed its exported types. They then run
+**in parallel with tasks 2.1.2–2.1.6**, coding only against the 1.3 spec types and the 2.1.1
+`Deadline`/`ScopedExecutor`/`Rechecker` types, which are cherry-picked onto `vrb/p22` from the 2.1.1
+commit. Task 2.2.3 (wiring) starts only after 2.1 is merged, because it writes
 `D:\git\opencode-model-router\src\verify\wiring.ts`.
 
 **Pre-flight (in addition to §0.9)**
@@ -865,7 +967,7 @@ orchestrator to write full-suite `run` checks, and golden diffs that include uni
 bound holds.
 
 **Pre-flight (in addition to §0.9)**
-- [ ] Waves 1–2 are merged and clean; the full unit suite is green on `vrb/wave-3`.
+- [ ] Waves 1–2 are merged and clean; the full unit suite (`npx vitest run --maxWorkers=2`) is green on `vrb/wave-3`.
 
 **Tasks**
 - **3.1.1** `[tier:medium]` Fixture projects under `D:\git\opencode-model-router\test\fixtures\projects\`:
@@ -895,13 +997,26 @@ bound holds.
     `node_modules` sentinel file still exists.
 - **3.1.3** `[tier:medium]` `D:\git\opencode-model-router\.github\workflows\test.yml`: add an `e2e`
   job (`ubuntu-latest` and `windows-latest`, Node 22) that runs with `RUN_VERIFY_E2E=1` and has
-  `uv`/pytest set up. `D:\git\opencode-model-router\vitest.config.ts`: per-file coverage thresholds
-  of ≥ 90% lines and branches for `src/verify/{exec,runner,slot,reference,batch}.ts`, and keep the
+  `uv`/pytest set up. Every new third-party action is **pinned by full commit SHA with a version
+  comment**, like the existing `actions/checkout`/`actions/setup-node` lines; resolve the SHA from the
+  action's release tag with `gh api`.
+
+  Coverage: platform-specific branches (Windows tree kill and priority vs POSIX process groups and
+  `nice`, junction vs symlink) cannot all be covered on one OS. So:
+  - these branches are isolated in small per-platform functions;
+  - a new `coverage` job (ubuntu-latest, Node 22) and the Windows `e2e` job each produce coverage;
+  - the enforced gate combines both reports (upload the artifacts, merge with
+    `npx nyc merge`/`istanbul-merge` or vitest's `--merge-reports`, whichever works with the
+    installed vitest; decide in the pre-flight of this phase).
+
+  `D:\git\opencode-model-router\vitest.config.ts`: per-file coverage thresholds of ≥ 90% lines and
+  branches for `src/verify/{exec,runner,slot,reference,batch}.ts`, evaluated on the merged report,
+  and keep the
   existing per-directory gates.
 - **3.1.4** `[tier:medium]` Smoke: extend
   `D:\git\opencode-model-router\test\smoke\layer2-gate.smoke.test.ts` so that a real-opencode
   delegation with a `testsPass` acceptance block runs a scoped command (asserted from the plugin log).
-- **3.1.5** `[tier:fast]` Run the full unit suite, the e2e suite locally on Windows, and the smoke
+- **3.1.5** `[tier:fast]` Run the full unit suite (`npx vitest run --maxWorkers=2`), the e2e suite locally on Windows (serialized, never alongside another full run), and the smoke
   keyless lane, then push and collect the CI results for every job; report.
 
 **New tests** — as listed in 3.1.2 and 3.1.4 (this phase *is* the system-level test phase).
@@ -950,7 +1065,9 @@ because nothing ran, flaky timing, and fixtures that differ from real repos (pnp
 
 **Pre-flight**
 - [ ] Phase 3.2 closed with zero findings; `vrb/wave-3` is green in CI.
-- [ ] `npm view opencode-model-router version` is `1.14.0` (nobody published in between).
+- [ ] `npm view opencode-model-router version` is lower than `1.15.0`. If another release landed in
+      between, rebase `vrb/wave-3` on `master`, re-run 3.1.5, and release as the next minor after it
+      (update the version everywhere this phase mentions `1.15.0`).
 
 **Tasks**
 - **3.3.1** `[tier:medium]` Open the PR `vrb/wave-3` → `master` titled
@@ -980,16 +1097,22 @@ checkout is at `v1.15.0`; no `omr-*` worktrees or `vrb/*` branches remain.
 ### 4.1 Global acceptance criteria
 
 - **G1 — No suite per delegation.** With the default config, no delegation (read-only or
-  implementation) runs a test command at dispatch, and no verification ever runs the full test set.
-  Proven by 3.1.2.b and the 2.1 argv assertions.
+  implementation) runs a test command at dispatch, and no command that the router builds itself
+  (`testsPass`, `lintClean` scoping, S2 rechecks, S5 batches) ever runs the full test set. The one
+  exception is an explicit `check: run command="…"` written by the orchestrator, which runs as
+  written (§1.5-12) but still under S3, S4 and the gate deadline. The injected protocol steers
+  orchestrators away from full-suite `run` checks. Proven by 3.1.2.b, the 2.1 argv assertions and
+  the 2.3 golden protocol text.
 - **G2 — The guardrail holds.** Introduced failures are rejected and named; pre-existing failures
   (exact reference) are accepted with an explicit "suite not green" note; anything unprovable is
   `unverifiable`. Proven by the 2.1 truth-table tests and the 3.1.2.a runner matrix.
 - **G3 — Bounded CPU/RAM.** Peak concurrent runner workers from verification ≤ `maxWorkers` ×
   `maxConcurrentVerifications` (default 2 × 1) machine-wide, across opencode processes, all at
   below-normal priority. Proven by 3.1.2.b and 3.1.2.c on Windows and Linux.
-- **G4 — Nothing outlives its budget.** A gate or recheck budget expiry kills the whole process
-  tree; no orphans after 3 s. Proven by 1.2 and 3.1.2.d.
+- **G4 — Nothing outlives its budget.** Every gate, in both the `delegate` and the native `task`
+  paths, has one deadline (`gateBudgetMs`). No slot wait, run, recheck or batch step outlives it.
+  Its expiry kills the whole process tree; no orphans after 3 s. Proven by 1.2, the 2.1 deadline and
+  native-`task` tests, and 3.1.2.d.
 - **G5 — Safe cleanup.** No reference worktree survives a run or a crash (GC). No cleanup path
   touches real `node_modules` or user files. Proven by 1.5 and 3.1.2.e.
 - **G6 — Compatibility.** Existing configs load unchanged; the deprecated keys work with a warning;
@@ -1001,7 +1124,10 @@ checkout is at `v1.15.0`; no `omr-*` worktrees or `vrb/*` branches remain.
 - [ ] All phases meet their DoD; every phase QA report and `global.md` show zero open findings.
 - [ ] G1–G6 are demonstrated by tests that run in CI on both OSes.
 - [ ] Coverage is ≥ 90% lines and branches for `src/verify/{exec,runner,slot,reference,batch}.ts`,
-      enforced in `D:\git\opencode-model-router\vitest.config.ts`.
+      enforced in `D:\git\opencode-model-router\vitest.config.ts` on the Windows + Linux merged
+      coverage report (3.1.3).
+- [ ] The executing session never saturated the machine: the run log records that every full run
+      of this repo's suite was capped and serialized (§0.6.7).
 - [ ] Docs, ADR 0003, CHANGELOG and the protocol text describe the shipped behaviour exactly.
 - [ ] `1.15.0` is published with provenance; the main checkout is synced; no temporary worktrees or
       branches remain.
