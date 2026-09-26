@@ -193,7 +193,7 @@ may contain instruction text or paths.
 | `gateBudgetMs` | `integer ≥ 1` | `90000` (90 s) | Separate whole-gate ceiling for one delegate attempt. Expiry aborts that invocation's graders and produces `unverifiable`, not producer failure. Raise this too if a medium/heavy grader should use its full tier timeout. |
 | `strictUnverifiable` | `boolean` | `false` | Restores the former fail-closed rejection for unavailable verification. It does not buy producer retries or tier escalations. |
 | `testBaseline` | `boolean` | `true` | Capture conservative test baselines in the live working directory at dispatch, asynchronously. Set `false` to disable capture **and consumption**; `testsPass` then reports `unverifiable`, not a producer failure. Does not disable changed-file snapshots for grading. |
-| `baselineTimeoutMs` | `integer ≥ 1` | `60000` (60 s) | Independent ceiling for each dispatch fingerprint and baseline capture (test run plus closing fingerprint). Expiry discards the baseline and aborts its process. Neither is awaited before producer dispatch. |
+| `baselineTimeoutMs` | `integer ≥ 1` | `60000` (60 s) | Independent ceiling for each dispatch fingerprint and baseline capture (test run plus closing fingerprint). Expiry discards the baseline and kills its whole process tree (`taskkill /T` on Windows, the process group on POSIX), so a timed-out suite cannot keep running as orphaned workers. Neither is awaited before producer dispatch. |
 
 Verification has three outcomes: `pass` means checks ran successfully, `fail` means
 the work did not satisfy a performed check, and `unverifiable` carries the reason
@@ -207,9 +207,12 @@ for every non-zero exit.
 
 ### Test and changed-file baselines
 
-Both native `task` and plugin `delegate` start capture before producer execution.
-Read-only dispatches also warm the default test-command cache. Explicit `testsPass`
-commands use their own cache entries and the same command allowlist as verification.
+Both native `task` and plugin `delegate` start capture before producer execution,
+but only when the dispatch's DoD carries a `testsPass` check; read-only and other
+dispatches run no tests. `testsPass` commands use their own cache entries and the
+same command allowlist as verification. At most one capture runs per working
+directory and command: while one is in flight, a dispatch with a different tree
+fingerprint gets no baseline (`unverifiable`) instead of starting a second suite.
 No repository is copied and tests run only in the live directory; suites can still
 have external side effects (ports, databases, services). Disable `testBaseline` for
 projects where background execution is inappropriate.

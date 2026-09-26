@@ -13,11 +13,11 @@
  * settings that were active when the plugin loaded, and `/preset` would
  * silently stop applying to graded work.
  */
-import { exec as nodeExec } from "node:child_process";
 import { access, readFile as fsReadFile } from "node:fs/promises";
 import { isAbsolute, join, resolve } from "node:path";
 import { createMutexRegistry, DEFAULT_ALLOWLIST, isCommandAllowed, resolveRepoCommand } from "./deterministic";
 import { tierModel, type createChangedFileStore } from "./dispatch";
+import { runShell } from "./exec";
 import { snapshotTree } from "./tree";
 import type { DoD } from "./dod";
 import type { DeterministicDeps } from "./types";
@@ -107,32 +107,10 @@ export function createVerificationWiring(deps: {
     command: string,
     opts?: { cwd?: string; timeoutMs?: number; signal?: AbortSignal },
   ): Promise<ExecResult> =>
-    new Promise((resolve) => {
-      try {
-        nodeExec(
-          command,
-          {
-            cwd: opts?.cwd ?? directory,
-            timeout: opts?.timeoutMs ?? 120000,
-            maxBuffer: 10 * 1024 * 1024,
-            windowsHide: true,
-            signal: opts?.signal,
-          },
-          (err: any, stdout: any, stderr: any) => {
-            const timedOut = !!(err && err.killed && err.signal === "SIGTERM");
-            const code =
-              err && typeof err.code === "number" ? err.code : err ? 1 : 0;
-            resolve({
-              code,
-              stdout: String(stdout ?? ""),
-              stderr: String(stderr ?? ""),
-              timedOut,
-            });
-          },
-        );
-      } catch {
-        resolve({ code: 1, stdout: "", stderr: "exec failed", timedOut: false });
-      }
+    runShell(command, {
+      cwd: opts?.cwd ?? directory,
+      timeoutMs: opts?.timeoutMs ?? 120000,
+      signal: opts?.signal,
     });
 
   const fsSeam = {
@@ -268,9 +246,12 @@ export function createVerificationWiring(deps: {
     beginVerification(store, id, cwd, dod) {
       const verify = getConfig().enforcement?.verify;
       const base = resolve(directory, cwd || ".");
-      const checks = dod.checks.filter(c => c.kind === "testsPass");
-      // Read-only dispatches warm the default-command cache for later producers.
-      const commands = (checks.length ? checks : [{ kind: "testsPass" as const }])
+      // Only a dispatch that will be judged by testsPass captures a baseline. Warming
+      // the cache from read-only dispatches ran the full suite on every exploration
+      // fan-out, and the capture was almost always discarded anyway: any shell or
+      // edit tool in the directory contaminates it.
+      const commands = dod.checks
+        .filter(c => c.kind === "testsPass")
         .map(c => resolveRepoCommand(c, "testsPass", undefined))
         .filter(c => isCommandAllowed(c, DEFAULT_ALLOWLIST));
       const budget = verify?.baselineTimeoutMs ?? 60000;

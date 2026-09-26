@@ -79,7 +79,7 @@ const OVERRIDES_FILE = path.join(
  * Returns a restore function that is safe to call unconditionally.  When
  * MODEL_ROUTER_SMOKE_MODEL is unset this writes NOTHING and touches NOTHING.
  *
- * `variant: ""` matters: the bundled anthropic preset sets `variant: "max"` on
+ * `variant: ""` matters: the bundled anthropic preset sets a `variant` on
  * medium/heavy, the loader deep-merges (siblings survive, keys cannot be
  * deleted), and src/index.ts applies `variant` with a truthiness check — so an
  * empty string is the only way to stop an Anthropic-only knob from riding

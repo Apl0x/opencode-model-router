@@ -97,20 +97,20 @@ test("registers an effort key only for the tiers that set one", async () => {
     const ocCfg: any = {};
     await hooks.config(ocCfg);
 
-    // The bundled anthropic preset sets `effort: "high"` on medium only, and
-    // medium is an Anthropic model, so it maps onto `effort` (not
-    // `reasoning_effort`). fast and heavy set no effort and so carry no key.
-    for (const name of ["fast", "heavy"]) {
-      const options = ocCfg.agent[name].options;
-      if (options !== undefined) {
-        expect(options).not.toHaveProperty("effort");
-        expect(options).not.toHaveProperty("reasoning_effort");
-      }
+    // The bundled anthropic preset sets `effort` on medium ("low") and heavy
+    // ("xhigh"), both Anthropic models, so they map onto `effort` (not
+    // `reasoning_effort`). fast sets no effort and so carries no key.
+    const fastOptions = ocCfg.agent.fast.options;
+    if (fastOptions !== undefined) {
+      expect(fastOptions).not.toHaveProperty("effort");
+      expect(fastOptions).not.toHaveProperty("reasoning_effort");
     }
 
-    const mediumOptions = ocCfg.agent.medium.options;
-    expect(mediumOptions.effort).toBe("high");
-    expect(mediumOptions).not.toHaveProperty("reasoning_effort");
+    for (const [name, effort] of [["medium", "low"], ["heavy", "xhigh"]]) {
+      const options = ocCfg.agent[name].options;
+      expect(options.effort).toBe(effort);
+      expect(options).not.toHaveProperty("reasoning_effort");
+    }
   } finally {
     if (prevHome === undefined) delete process.env.HOME;
     else process.env.HOME = prevHome;
