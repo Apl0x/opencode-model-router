@@ -59,10 +59,10 @@
       },
       "medium": {
         "model": "anthropic/claude-opus-5-5",
-        "variant": "high",
-        "effort": "high",
+        "variant": "low",
+        "effort": "low",
         "costRatio": 5,
-        "description": "Opus 5.5 high for implementation, refactoring, and tests",
+        "description": "Opus 5.5 low for implementation, refactoring, and tests",
         "steps": 50,
         "whenToUse": [
           "Feature implementation",
@@ -73,10 +73,11 @@
         ]
       },
       "heavy": {
-        "model": "anthropic/claude-fable-5-1",
-        "variant": "max",
+        "model": "anthropic/claude-opus-5-5",
+        "variant": "xhigh",
+        "effort": "xhigh",
         "costRatio": 20,
-        "description": "Fable 5.1 max for architecture, complex debugging, and security",
+        "description": "Opus 5.5 xhigh for architecture, complex debugging, and security",
         "steps": 120,
         "whenToUse": [
           "Architecture decisions",

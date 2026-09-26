@@ -571,8 +571,8 @@ describe("effort through override layers", () => {
     expect(merged.presets.anthropic.medium.steps).toBe(
       base.presets.anthropic.medium.steps,
     );
-    expect(merged.presets.anthropic.fast).not.toHaveProperty("effort");
-    expect(merged.presets.anthropic.heavy).not.toHaveProperty("effort");
+    expect(merged.presets.anthropic.fast).toEqual(base.presets.anthropic.fast);
+    expect(merged.presets.anthropic.heavy).toEqual(base.presets.anthropic.heavy);
     expect(buildAgentOptions(merged.presets.anthropic.medium, "medium")).toEqual({
       ...buildAgentOptions(base.presets.anthropic.medium, "medium"),
       effort: "high",
