@@ -1,0 +1,1035 @@
+# Implementation Plan — Verification Resource Budget for `opencode-model-router`
+
+> **Status:** Ready to execute
+> **Owner:** Marco Jardim
+> **Executor:** one high-capability LLM orchestrator, start to finish, delegating per the `[tier:X]` annotations below.
+> **Base:** `origin/master` at tag `v1.14.0` (commit `60c2de3`). Target release: **`1.15.0`**.
+> **Scope:** keep the acceptance gate a real guardrail for delegated implementation work while removing
+> its CPU/RAM cost: the router must **never run a full test suite per delegation**.
+
+---
+
+## 0. Execution directives (read first — these override defaults)
+
+### 0.1 Run the whole plan without stopping
+
+Execute Wave 1 → Wave 2 → Wave 3 continuously, iterating phase by phase, **without pausing for
+confirmation**. Stop and ask the human **only** when one of these occurs:
+
+1. **Ambiguity that only the human can resolve** — two or more valid readings of a requirement whose
+   outcomes differ materially, and neither this plan nor the code settles it.
+2. **Critical problem** — data loss risk (e.g. a cleanup path that could delete a real
+   `node_modules`, a user file or a git ref), a security regression (command injection, allowlist
+   bypass), or a published artifact that is broken.
+3. **Blocking problem** — an assumption this plan depends on is disproven by a pre-flight spike and
+   no alternative in this plan applies, or the same failure persists after the recovery rule in §0.8.
+
+Everything else — test failures, QA findings, lint errors, refactors needed to land a phase — is
+work to be done, not a reason to stop.
+
+### 0.2 Definitive solutions only
+
+A high-capability agent executes this plan end to end. **Do not** ship stubs, TODO placeholders,
+feature flags that disable half-built code, "phase 1 of N" partial behaviour, or temporary
+compatibility shims. Every phase delivers the final implementation of its sub-objective. Wave 1
+builds complete, final components; Wave 2 integrates them into the final pipeline; Wave 3 proves it
+end to end and releases it. No phase exists only to be replaced later.
+
+### 0.3 Commit often
+
+- Commit at the end of **every subtask** that leaves the tree green (typecheck + the tests the
+  subtask touches). Never commit a red tree.
+- Conventional commits, matching the repo: `feat(verify): …`, `fix(verify): …`, `test(verify): …`,
+  `docs(verify): …`, `chore(release): …`.
+- Push the phase branch after every commit so no work exists only locally.
+- QA fixes are their own commits (`fix(verify): address QA-<phase>-<n> …`).
+
+### 0.4 Paths
+
+Every file reference in dispatches, commits, QA reports and code comments that point at files uses
+the **full path**. Repo root: `D:\git\opencode-model-router`. Never edit files in that main
+checkout directly (see §0.6.4): all work happens in worktrees under `D:\git\`.
+
+### 0.5 Model-router annotations
+
+Every task carries a routing tag the router honours (`[tier:X]→delegate X`):
+
+| Tag | Use for |
+|---|---|
+| `[tier:fast]` | Context gathering, pre-flight checks, running tests/CI and reporting results, mechanical file moves |
+| `[tier:medium]` | Implementation, test writing, refactors, docs, applying QA fixes |
+| `[tier:heavy]` | Reasoning-dense design (attribution semantics, cleanup safety, security of command construction) and **every QA review** |
+
+**QA is always a `[tier:heavy]` task. Always apply this rule.** Every phase and the global
+review delegate to heavy for an **adversarial** review of the work done: the reviewer's job is
+to break it, not to confirm it.
+
+Heavy dispatches follow the router protocol: gather context with `[tier:fast]` first and paste it
+into the heavy prompt; heavy reasons over supplied context. QA dispatches may use
+`CAP:none` **with** a `reason:` line (an adversarial review must read every changed file).
+
+**Dispatch acceptance blocks while executing this plan:** use scoped checks such as
+`check: run command="npx vitest run D:\git\omr-w1-p13\test\unit\runner.test.ts"`, **never**
+`check: testsPass`, until `1.15.0` is installed. The plugin loaded by the executing
+session is the one this plan replaces, and a bare `testsPass` would run this repo's full suite per
+delegation.
+
+### 0.6 Parallelism and file safety
+
+Maximise parallel work, but orchestrate it so **no file is ever written by two agents at once, and
+no agent reads a file another agent is editing.**
+
+1. **Ownership map.** §2 assigns every file a single owning phase per wave. A task may write only
+   files in its phase's write-set. Files not listed are read-only for everyone.
+2. **Isolation by worktree.** Each concurrently running phase works in its own git worktree on
+   its own branch, created from the wave's integration branch:
+   `git -C D:\git\opencode-model-router worktree add -b vrb/<phase-id> D:\git\omr-<phase-id> vrb/wave-<n>`.
+   An agent reads and writes only inside its own worktree. It never opens another phase's worktree.
+   Reads of files owned by another in-flight phase come from the **wave base branch**, which no one
+   edits while the wave runs.
+3. **Serial integration.** Only the orchestrator merges phase branches into `vrb/wave-<n>`, one at a
+   time, after that phase's QA is clean. It runs the full unit suite after each merge. Conflicts are
+   resolved by the orchestrator, never by two agents.
+4. **Cross-phase dependencies.** A phase that needs another phase's output (types, APIs) starts only
+   after that phase is merged into the wave branch. The dependency graph in §3 is authoritative;
+   anything without an edge between them runs in parallel.
+5. **Shared single-writer files.** `D:\git\opencode-model-router\CHANGELOG.md`,
+   `D:\git\opencode-model-router\vitest.config.ts`,
+   `D:\git\opencode-model-router\.github\workflows\test.yml` and
+   `D:\git\opencode-model-router\package.json` each have exactly one owner in the whole plan (§2).
+   Other phases record what they need in their QA report and the owner applies it.
+6. **Main checkout.** `D:\git\opencode-model-router` (branch `master`) is the directory the live
+   opencode sessions load the plugin from. Never edit, check out a branch, or run `npm ci` there
+   during execution, except in Phase 0.P and the final sync in Phase 3.3.
+
+### 0.7 Pre-flight before each phase, QA after each phase
+
+- **Before** every phase: run the standard pre-flight (§0.9) plus the phase's specific
+  items. A failed pre-flight item is fixed before the phase starts. If it cannot be fixed, §0.1 decides
+  whether to stop.
+- **After** every phase: a `[tier:heavy]` senior QA engineer performs an **adversarial review** of
+  the phase diff. **Every finding is fixed**, whatever its severity. The fixes are then re-reviewed
+  by heavy QA until the review reports zero open findings. The report is saved to
+  `D:\git\opencode-model-router\docs\qa\verification-resource-budget\phase-<id>.md` (inside the
+  phase worktree, committed with the phase).
+- After Wave 3: the same for the whole change set (global QA, §4.3).
+
+### 0.8 Failure recovery
+
+After **3 consecutive failed attempts on the same issue**: stop editing, revert to the last green
+commit, write down what was tried and the exact failure, and re-dispatch the problem to `[tier:heavy]`
+with that record. If heavy's approach also fails, this is a blocking problem under §0.1: ask the human.
+
+### 0.9 Standard pre-flight checklist (applies to every phase)
+
+`[tier:fast]` runs these and reports; the orchestrator reads the report before starting the phase.
+
+- [ ] The worktree for the phase exists, is on the right branch, and `git status` is clean.
+- [ ] The phase branch is based on the current tip of `vrb/wave-<n>` (after all merged dependencies).
+- [ ] Every dependency phase listed in §3 is merged and its QA report shows zero open findings.
+- [ ] `npm ci` completed in the worktree. Then `npm run typecheck` and `npm test` pass there (this
+      repo's own suite: ~1 min, run once per phase by the orchestrator, **not** per delegation).
+- [ ] The phase's write-set (§2) does not overlap any other in-flight phase's write-set.
+- [ ] No orphaned `node`/`vitest` processes from earlier phases are running
+      (Windows: `Get-CimInstance Win32_Process -Filter "Name='node.exe'"`, filtered to command lines
+      that contain the worktree path; POSIX: `pgrep -af <worktree path>`).
+- [ ] No stale `omr-ref-*` worktrees are left over (`git -C D:\git\opencode-model-router worktree list`).
+- [ ] The phase-specific pre-flight items below pass (spikes included).
+
+---
+
+## 1. Problem and design
+
+### 1.1 Evidence
+
+Two opencode sessions with many subagents drove a 16-core Windows machine to 80–100% CPU.
+A process monitor traced the load to `cmd.exe /d /s /c "npm test"` → `vitest run` → 8–16
+workers. The router's dispatch-time test baseline launched them **one second after each `task`
+dispatch**, including read-only ones. `1.14.0` fixed three defects:
+
+- tree kill on timeout and abort (`D:\git\opencode-model-router\src\verify\exec.ts`);
+- no baseline for read-only dispatches;
+- one capture per directory and command, per process.
+
+**It still runs the full suite up to twice per implementation delegation** (a dispatch-time
+baseline, then the `testsPass` check after the producer returns). The owner's constraint:
+**the router must not run a test suite per delegation.**
+
+### 1.2 Guardrail semantics to preserve
+
+`testsPass` must still:
+
+- **reject** a delegation that introduces a failing test (green → red, or a new failure next to
+  old ones);
+- **not blame** a producer for failures that already existed when it was dispatched;
+- say **`unverifiable`** (accepted with a caveat, or rejected under `strictUnverifiable`), never a
+  false pass, when it cannot tell those two apart.
+
+### 1.3 The six mechanisms (all implemented by this plan)
+
+| # | Mechanism | Replaces |
+|---|---|---|
+| S1 | **Affected-test scoping.** `testsPass` runs only the tests related to the producer's changed files (`vitest related`, `jest --findRelatedTests`, pytest module mapping). The command is built by a runner adapter and spawned **without a shell**. | full-suite `npm test` |
+| S2 | **Failure-only recheck at a dispatch reference.** At dispatch, only a git reference is captured (`git stash create` or HEAD, plus hashes of untracked files) — no tests. Only when scoped tests fail are **those failing test files** re-run in an ephemeral worktree at the reference, to separate pre-existing failures from introduced ones. | dispatch-time full-suite baseline |
+| S3 | **Machine-wide verification slot.** A cross-process semaphore (lock files in the OS temp dir) allows at most `maxConcurrentVerifications` (default 1) verification commands at a time, across every opencode process on the machine. | per-process, per-cwd mutex only |
+| S4 | **Per-run resource caps.** The adapter adds the runner's worker cap (`--maxWorkers=N`, default 2). Every verification command runs at below-normal OS priority. The gate budget's abort signal reaches the process tree. | uncapped workers at normal priority; gate timeout that abandons the command without killing it |
+| S5 | **Batching.** `testsPass` requests for the same runner root that arrive within `batchWindowMs` are merged into one scoped run over the union of changed files. Failures are attributed back per request. | one run per producer |
+| S6 | **The full suite is CI's job.** The router never falls back to a full suite. When scoping is impossible (unknown runner, composite script, config-file change), the result is `unverifiable` with a caveat. A full suite runs only with explicit `testScope: "full"`. | silent full-suite fallback |
+
+### 1.4 Configuration surface (`enforcement.verify`, all optional)
+
+| Key | Type | Default | Meaning |
+|---|---|---|---|
+| `testScope` | `"affected" \| "full"` | `"affected"` | S1/S6. `"full"` is the explicit opt-in to run the whole suite. It still gets S2–S5. |
+| `maxWorkers` | integer ≥ 1 | `2` | S4. Worker cap the adapter passes to runners that support one. |
+| `lowPriority` | boolean | `true` | S4. Run verification commands at below-normal priority. |
+| `maxConcurrentVerifications` | integer ≥ 1 | `1` | S3. Machine-wide verification slots. |
+| `slotWaitMs` | integer ≥ 0 | `60000` | S3. Maximum wait for a slot; on expiry the check is `unverifiable` ("verification slot busy"). |
+| `batchWindowMs` | integer ≥ 0 | `2000` | S5. Coalescing window; `0` disables batching. |
+| `failureRecheck` | boolean | `true` | S2. When `false`, no reference is captured and no recheck runs: a green scoped run still passes, and any scoped failure is `unverifiable` (it can neither be excused nor proven introduced). |
+| `recheckTimeoutMs` | integer ≥ 1 | `60000` | S2. Budget for the reference re-run. |
+| `testBaseline` | boolean | — | **Deprecated.** Accepted. `false` maps to `failureRecheck: false`. Logs a one-time deprecation warning through the plugin logger. |
+| `baselineTimeoutMs` | integer ≥ 1 | `60000` | Now bounds the git-only reference capture at dispatch. |
+
+### 1.5 Decisions taken (the executor does not re-open these)
+
+1. **No shell for generated commands.** Scoped commands are spawned as
+   `process.execPath <runner JS entry> <args…>`, with the entry resolved from the runner package's
+   `bin` in `node_modules`, or as native executables (`pytest`, `uv`) with an args array. Changed
+   file paths are passed as argv, never interpolated into a shell string. User-supplied `check`
+   commands keep today's allowlist + `FORBIDDEN_SHELL` validation and shell execution.
+2. **Identities come from machine-readable reporters.** vitest `--reporter=json --outputFile`, jest
+   `--json --outputFile`, pytest `--junitxml`, written to a temp file. Text parsing
+   (`observeTests` in `D:\git\opencode-model-router\src\verify\baseline.ts`) remains only a fallback.
+3. **pytest support is bounded.** The allowlist gains `pytest`, and `uv` only in the exact form
+   `uv run pytest …` (`uv run <other>` stays forbidden). Affected set = changed test files plus
+   `test_<stem>.py`/`<stem>_test.py` files for changed modules. A change to `conftest.py`,
+   `pyproject.toml`, `pytest.ini`, `setup.cfg` or `tox.ini` makes scoping impossible → S6
+   `unverifiable`.
+4. **Package-script resolution.** `npm|pnpm|yarn|bun test` resolves `scripts.test` from the nearest
+   `package.json`. A single `vitest …`/`jest …` invocation is rewritten into its scoped form. A
+   composite script (`&&`, `;`, `|`, several commands) is S6 `unverifiable`.
+5. **Deleted and renamed sources.** They cannot be passed to `related`. Tests are added by searching
+   test files for the module's stem (`git grep -l -F <stem> -- <test globs>`). If none are found,
+   the result for that file is S6 `unverifiable`.
+6. **No changed files.** With change attribution available and an empty change set, `testsPass`
+   passes with the note "no changed files, no affected tests". With attribution unavailable, it is
+   `unverifiable`.
+7. **Approximate references never excuse.** If an untracked file that existed at dispatch was
+   modified or deleted by the time of the recheck, the reference cannot be rebuilt exactly. A
+   reference-side failure then does not excuse anything → `unverifiable`.
+8. **Collection/setup errors at the reference** (missing generated files, env) mean the reference is
+   unusable → `unverifiable`, never "pre-existing".
+9. **Release as `1.15.0` (minor).** `testsPass` narrows from "suite is green" to "affected tests
+   pass". The old behaviour stays available through `testScope: "full"` plus the deprecated keys, so
+   nothing breaks without an opt-out.
+10. **Scope of `lintClean`.** When the resolved lint command is a plain `eslint` invocation, or a
+    package script that is one, it is scoped to changed lintable files in the same adapter (same
+    no-shell, cap and slot rules). Otherwise it is unchanged, but runs under S3/S4.
+
+### 1.6 Target flow
+
+```
+dispatch (task / delegate)
+  └─ DoD has testsPass? ──no──► nothing
+        └─yes─► reference.capture(cwd)            git only, ≤ baselineTimeoutMs
+producer returns
+  └─ gate.accept ─► testsPass
+        ├─ adapter.resolve(command, changedFiles)  → scoped spec | unverifiable(S6)
+        ├─ batch.submit(spec)                      window batchWindowMs (S5)
+        │    └─ slot.acquire (S3) ─► runShellArgs(spec, lowPriority, maxWorkers, signal) (S4)
+        ├─ green ─────────────────────────────────► pass
+        └─ failures F ─► attribute to this request
+              └─ reference.recheck(F) (S2, slot + caps, ≤ recheckTimeoutMs)
+                    ├─ F ⊆ failing@ref (exact ref) ──► pass, note "no worse than before"
+                    ├─ some f ∉ failing@ref ─────────► fail, name the introduced ones
+                    └─ ref approximate/unusable ─────► unverifiable
+```
+
+---
+
+## 2. File ownership map
+
+Paths are relative to each phase's worktree, whose root mirrors `D:\git\opencode-model-router`.
+The same file appears under exactly one phase per wave.
+
+| File | Wave 1 owner | Wave 2 owner | Wave 3 owner |
+|---|---|---|---|
+| `D:\git\opencode-model-router\src\router\config.ts` | 1.1 | — | — |
+| `D:\git\opencode-model-router\src\verify\exec.ts` | 1.2 | — | — |
+| `D:\git\opencode-model-router\src\verify\types.ts` | 1.2 | 2.1 | — |
+| `D:\git\opencode-model-router\src\verify\runner.ts` (new) | 1.3 | — | — |
+| `D:\git\opencode-model-router\src\verify\deterministic.ts` | 1.3 (allowlist constants only) | 2.1 | — |
+| `D:\git\opencode-model-router\src\verify\slot.ts` (new) | 1.4 | — | — |
+| `D:\git\opencode-model-router\src\verify\reference.ts` (new) | 1.5 | — | — |
+| `D:\git\opencode-model-router\src\verify\baseline.ts` | — | 2.1 | — |
+| `D:\git\opencode-model-router\src\verify\dispatch.ts` | — | 2.1 | — |
+| `D:\git\opencode-model-router\src\verify\wiring.ts` | — | 2.1, then 2.2 (sequential) | — |
+| `D:\git\opencode-model-router\src\verify\batch.ts` (new) | — | 2.2 | — |
+| `D:\git\opencode-model-router\src\index.ts` | — | 2.1 (gate signal, reference GC), then 2.3 (protocol text) — sequential | — |
+| `D:\git\opencode-model-router\docs\**`, `D:\git\opencode-model-router\README.md`, `D:\git\opencode-model-router\CHANGELOG.md` | — | 2.3 | 3.3 (CHANGELOG version header only) |
+| `D:\git\opencode-model-router\test\unit\config-verify-budget.test.ts` (new) | 1.1 | 2.3 (docs-consistency case only) | — |
+| `D:\git\opencode-model-router\test\unit\exec.test.ts` | 1.2 | — | — |
+| `D:\git\opencode-model-router\test\unit\runner.test.ts` (new) + `D:\git\opencode-model-router\test\fixtures\runner\**` (new) | 1.3 | — | — |
+| `D:\git\opencode-model-router\test\unit\slot.test.ts` (new) | 1.4 | — | — |
+| `D:\git\opencode-model-router\test\unit\reference.test.ts` (new) | 1.5 | — | — |
+| `D:\git\opencode-model-router\test\unit\baseline.test.ts`, `D:\git\opencode-model-router\test\unit\baseline-wiring.test.ts`, `D:\git\opencode-model-router\test\unit\tests-pass-pipeline.test.ts` (new) | — | 2.1 | — |
+| `D:\git\opencode-model-router\test\unit\batch.test.ts` (new), `D:\git\opencode-model-router\test\unit\batch-wiring.test.ts` (new) | — | 2.2 | — |
+| `D:\git\opencode-model-router\test\golden\**` | — | 2.3 | — |
+| `D:\git\opencode-model-router\test\integration\verify-resource-budget.test.ts` (new), `D:\git\opencode-model-router\test\fixtures\projects\**` (new), `D:\git\opencode-model-router\test\smoke\**` | — | — | 3.1 |
+| `D:\git\opencode-model-router\vitest.config.ts`, `D:\git\opencode-model-router\.github\workflows\test.yml` | — | — | 3.1 |
+| `D:\git\opencode-model-router\package.json`, `D:\git\opencode-model-router\package-lock.json` | — | — | 3.3 |
+| `D:\git\opencode-model-router\docs\qa\verification-resource-budget\phase-<id>.md` | each phase writes only its own file | same | same |
+
+---
+
+## 3. Waves, phases, tasks
+
+### Dependency graph
+
+```
+Phase 0.P ─► Wave 1: 1.1 ║ 1.2 ║ 1.3 ║ 1.4 ║ 1.5     (all parallel; 1.3 and 1.5 read 1.2's
+                                                      ExecSeam type from the base branch
+                                                      contract in §3.1.2 and are merged after 1.2)
+         ─► Wave 2: 2.1 ─► 2.2(integration) ─► 2.3
+                    2.2(batch.ts core) runs in parallel with 2.1
+         ─► Wave 3: 3.1 ─► 3.2 (global QA) ─► 3.3 (release)
+```
+
+Merge order into `vrb/wave-1`: 1.1, 1.2, 1.4, then 1.3, then 1.5. Parallel **work** is not affected: 1.3
+and 1.5 code against the ExecSeam contract written down in §3.1.2, so they need not wait for 1.2's
+merge. Only their merge waits.
+
+---
+
+### Phase 0.P — Execution pre-flight (once) `[tier:fast]`
+
+Not a delivery phase. It prepares a safe workspace.
+
+- [ ] **0.P.1** Sync the main checkout so the executing sessions run `1.14.0` (tree kill,
+      no read-only baseline). `D:\git\opencode-model-router` has a local edit to `tiers.json` that
+      is already upstream in `1.14.0`. Verify that with
+      `git -C D:\git\opencode-model-router diff origin/master -- tiers.json`: it must differ **only**
+      in the medium `description` line. Then run `git -C D:\git\opencode-model-router checkout -- tiers.json`
+      and `git -C D:\git\opencode-model-router pull --ff-only`. If the diff shows anything else, this
+      is a §0.1 critical item (user data): stop and ask.
+- [ ] **0.P.2** Ask nothing. Just note in the run log that opencode sessions must be restarted to
+      load `1.14.0`. A restart is not a blocker for executing this plan.
+- [ ] **0.P.3** Create the integration branch: `git -C D:\git\opencode-model-router branch vrb/wave-1 origin/master`
+      and push it.
+- [ ] **0.P.4** Record machine facts in the run log: OS, core count, Node version, and whether
+      `uv`/`pytest` are on PATH (for the pytest spikes).
+
+---
+
+### Wave 1 — Final components (parallel)
+
+Each phase ships a finished, fully tested module. Wave 2 wires them in without changing their
+contracts, except for defects that QA finds.
+
+#### Phase 1.1 — Configuration surface `[tier:medium]`
+
+**Goal:** every key in §1.4 is typed, validated, defaulted and documented in code, and the
+deprecated keys map correctly.
+
+**Pre-flight (in addition to §0.9)**
+- [ ] Read `D:\git\opencode-model-router\src\router\config.ts` `EnforcementConfig.verify` and the
+      `validateConfig` verify block (currently around the `testBaseline` checks) and the override
+      deep-merge (`deepMerge`). Confirm that deep-merge keeps sibling keys (a user override that sets
+      only `maxWorkers` must keep the defaults for the other keys).
+
+**Tasks**
+- **1.1.1** `[tier:medium]` Extend `EnforcementConfig.verify` in
+  `D:\git\opencode-model-router\src\router\config.ts` with the §1.4 keys, each with a JSDoc line
+  giving its default.
+  - 1.1.1.a Add validation in `validateConfig` with error messages in the existing
+    `tiers.json: enforcement.verify.<key> must be …` form. Integers are checked with
+    `Number.isInteger`; `testScope` against the literal union.
+  - 1.1.1.b Export a pure `resolveVerifyBudget(cfg): VerifyBudget` returning fully defaulted values.
+    It applies the deprecation mapping (`testBaseline: false` → `failureRecheck: false`). An explicit
+    `failureRecheck` wins over the deprecated key.
+  - 1.1.1.c Emit the deprecation warning once per process through the plugin logger seam that
+    config already uses. Do not use `console`.
+- **1.1.2** `[tier:medium]` Tests in `D:\git\opencode-model-router\test\unit\config-verify-budget.test.ts`.
+
+**New tests (coverage ≥ 90% lines and branches for the new code; edge cases required)**
+- Defaults when `verify` is absent, empty, or partially set; deep-merged overrides keep sibling defaults.
+- Every key rejects wrong types: `0` for the ≥1 keys, negative numbers, `NaN`, `Infinity`, `1.5`,
+  strings, `null` where not allowed.
+- `testScope` rejects `"all"` and `"Affected"` (case-sensitive).
+- `slotWaitMs: 0` and `batchWindowMs: 0` are valid and mean "no wait" and "no batching".
+- Deprecation: `testBaseline: false` → `failureRecheck: false`; `testBaseline: true` → no change;
+  explicit `failureRecheck: true` + `testBaseline: false` → `true`; the warning fires once across
+  repeated resolves.
+
+**Acceptance criteria**
+- `resolveVerifyBudget` is the **only** place defaults are applied, and it is pure and synchronous.
+- Existing config tests pass unchanged.
+
+**Definition of Done**
+- §0.9 items hold on the phase branch; tests above pass; `npm run typecheck` is clean; the heavy QA
+  report `D:\git\opencode-model-router\docs\qa\verification-resource-budget\phase-1.1.md` has zero open findings; commits are pushed.
+
+**QA review** `[tier:heavy]` CAP:none — reason: adversarial review must read the full config diff and all callers of `validateConfig`.
+Adversarial focus: the deep-merge interaction (can an override delete a default?), validation
+bypass through `null`/prototype keys (`__proto__`), deprecation precedence, and warning spam.
+
+---
+
+#### Phase 1.2 — Process controls (S4 priority, abort, argv spawn) `[tier:medium]`
+
+**Goal:** a single process layer that every verification command goes through. It kills the whole
+tree, runs at low priority, honours an abort signal, and can spawn argv (no shell) as well as a shell
+string.
+
+**Pre-flight (in addition to §0.9)**
+- [ ] **Spike A (Windows priority)** `[tier:fast]`: in a scratch dir under `%TEMP%`, verify
+      empirically which mechanism makes **grandchildren** of a spawned process run below normal:
+      (a) `os.setPriority(child.pid, os.constants.priority.PRIORITY_BELOW_NORMAL)` right after
+      `spawn`; (b) the `cmd /c start "" /B /WAIT /BELOWNORMAL …` wrapper (check that the exit code
+      propagates for `.cmd` targets like `npm.cmd`). Record the priority class of grandchildren
+      (`Get-CimInstance Win32_Process | select ProcessId,Priority`) and whether exit codes survive.
+      Pick the mechanism that is deterministic for grandchildren **and** keeps exit codes. If neither
+      does both, use (a) and document the startup race in the code comment.
+- [ ] **Spike B (POSIX)**: confirm `nice -n 10` (prepended to the argv) is inherited by
+      grandchildren and preserves the exit code. Use CI's ubuntu runner through a throwaway workflow
+      on the phase branch if no POSIX host is available; delete the workflow afterwards.
+
+**Tasks**
+- **1.2.1** `[tier:medium]` Extend `D:\git\opencode-model-router\src\verify\exec.ts`:
+  - 1.2.1.a `runShell(command, opts)` gains `lowPriority?: boolean` and `env?: Record<string,string>`.
+    Priority uses the mechanism chosen in the spikes.
+  - 1.2.1.b New `runArgv(file, args, opts)`: same options, same result shape and tree-kill
+    semantics, `shell: false`, arguments passed as an array. The two share one internal
+    implementation (no duplicated kill or timeout logic).
+  - 1.2.1.c An abort signal that is already aborted never spawns (keep the current behaviour); a
+    signal that aborts mid-run kills the tree.
+- **1.2.2** `[tier:medium]` In `D:\git\opencode-model-router\src\verify\types.ts`, widen `ExecSeam`
+  opts to `{ cwd?, timeoutMs?, signal?, lowPriority?, env? }` and add
+  `ArgvSeam = (file, args, opts) => Promise<ExecResult>`. **This is the contract 1.3 and 1.5 code
+  against (§3 graph).** Write it first and commit it as the phase's first commit, so it can be
+  quoted verbatim into 1.3/1.5 dispatches.
+- **1.2.3** `[tier:medium]` Tests in `D:\git\opencode-model-router\test\unit\exec.test.ts`, using
+  real processes (no mocks), extending the four existing cases.
+
+**New tests (edge cases required)**
+- Tree kill for `runArgv` on timeout and on abort (grandchild verified dead), on both platforms.
+- The low-priority grandchild is observed at below-normal priority (Windows: `Priority` ≤ 6; POSIX:
+  `ps -o ni` ≥ 10). Skip only with an explicit platform guard that has a reason string.
+- The exit code survives the priority wrapper, for success, failure (3) and a `.cmd` target on Windows.
+- `env` is merged over `process.env`, not replacing it (`PATH` is still present).
+- Paths with spaces, quotes, `&`, `$()`, `%VAR%` and unicode in **argv** reach the child byte-for-byte
+  (the child echoes `process.argv` as JSON), which proves no shell interpretation.
+- Output over `maxBuffer` is truncated without hanging.
+- A spawn error (non-existent executable) resolves `{code:1, timedOut:false}` with the error in
+  `stderr`, and never rejects.
+- Abort after natural exit is a no-op (no `taskkill` of a recycled PID: a `settled` guard).
+
+**Acceptance criteria**
+- No verification code path spawns a process except through `runShell`/`runArgv`
+  (`rg "child_process" D:\git\omr-p12\src` lists only `exec.ts` and `tree.ts`, and `tree.ts` only
+  runs git with a timeout).
+- A killed run reports `timedOut: true` and a non-zero code on both platforms.
+
+**Definition of Done** — as in 1.1; QA report `D:\git\opencode-model-router\docs\qa\verification-resource-budget\phase-1.2.md`.
+
+**QA review** `[tier:heavy]` CAP:none — reason: process-lifecycle review must read exec.ts, its tests and the spike logs together.
+Adversarial focus: PID reuse after exit, the priority race, zombie handles, Windows `.cmd` quoting,
+`detached` side effects on POSIX (a detached child that survives opencode exit), and a signal
+listener leak across many runs.
+
+---
+
+#### Phase 1.3 — Runner adapter (S1 scoping, S4 worker caps, identities) `[tier:heavy]` design + `[tier:medium]` implementation
+
+**Goal:** a pure-planning plus I/O-seamed module that turns `(checkCommand, cwd, changedFiles,
+budget)` into either an executable **scoped run spec** or an `unverifiable` reason. It also parses
+results into failing identities and can build a "re-run exactly these test files" spec for S2.
+
+**Pre-flight (in addition to §0.9)**
+- [ ] **Spike C (runner CLIs)** `[tier:fast]`: in throwaway fixture projects under `%TEMP%`, pin the
+      exact behaviour of the versions in use (vitest 4.x, jest 29/30, pytest 8/9):
+      `vitest related <files> --run --passWithNoTests --maxWorkers=N --reporter=json --outputFile=<f>`;
+      `vitest list` (can it list the tests related to given files **without running them**? This
+      decides the S5 attribution path);
+      `jest --findRelatedTests <files> --listTests` and
+      `jest --findRelatedTests <files> --passWithNoTests --maxWorkers=N --json --outputFile=<f>`;
+      `pytest <files> -q -p no:cacheprovider --junitxml=<f>`, with and without `-n auto` in
+      `addopts` (what does `PYTEST_XDIST_AUTO_NUM_WORKERS` do?).
+      Record the exit codes for: all passed, some failed, none found, collection error, and the JSON/XML shapes.
+- [ ] Gather `[tier:fast]`: `isCommandAllowed`, `FORBIDDEN_SHELL`, `INTERPRETERS` and
+      `resolveRepoCommand` from `D:\git\opencode-model-router\src\verify\deterministic.ts`, and
+      `observeTests` from `D:\git\opencode-model-router\src\verify\baseline.ts`, to paste into the
+      heavy design dispatch.
+
+**Tasks**
+- **1.3.1** `[tier:heavy]` Design note (committed as the header comment of
+  `D:\git\opencode-model-router\src\verify\runner.ts`): the spec type, the runner-detection decision
+  table, argument construction per runner, identity-extraction formats, and the S6 reasons. It
+  implements §1.5 decisions 1–6 and 10 exactly, and chooses the S5 attribution path from Spike C.
+- **1.3.2** `[tier:medium]` Implement `D:\git\opencode-model-router\src\verify\runner.ts`:
+  - 1.3.2.a `detectRunner(command, cwd, fs)`: direct invocations (`vitest`, `npx vitest`,
+    `pnpm exec vitest`, `jest`, `pytest`, `uv run pytest`) and package scripts (§1.5-4). The nearest
+    `package.json` is found by walking up from `cwd` to the git root.
+  - 1.3.2.b `resolveEntry(runner, cwd, fs)`: the runner's JS entry from
+    `node_modules/<pkg>/package.json` `bin` (walk up for hoisted and pnpm layouts), or the native
+    executable for pytest/uv. When it is missing → `unverifiable("runner not installed")`.
+  - 1.3.2.c `planScopedRun({command, cwd, changedFiles, budget})` → `ScopedSpec | Unverifiable`:
+    normalizes paths, drops files outside the git root, and handles deletions and renames (§1.5-5),
+    config-file triggers (§1.5-3) and the empty set (§1.5-6). It adds the `maxWorkers` flag and the
+    reporter output file under `os.tmpdir()`, and returns `{file, args, cwd, env, reportPath, runner}`.
+  - 1.3.2.d `planListRelated(...)`: only if Spike C proved a non-executing listing exists; otherwise
+    the function does not exist and 2.2 uses the per-request re-run fallback (§3 Phase 2.2).
+  - 1.3.2.e `planRerun(runner, testFiles, cwd, budget)` → spec that runs exactly those test files
+    (used by S2 and S5).
+  - 1.3.2.f `readResult(spec, execResult, fs)` → `{ failingIds: string[], failingFiles: string[],
+    collectionError: boolean, total: number }`. It reads the report file, falls back to
+    `observeTests`, and always deletes the report file.
+  - 1.3.2.g Lint scoping (§1.5-10): `planScopedLint(...)` for plain `eslint`.
+- **1.3.3** `[tier:medium]` In `D:\git\opencode-model-router\src\verify\deterministic.ts`, add
+  `pytest` to `DEFAULT_ALLOWLIST`, and the `uv` special case in `isCommandAllowed` (only
+  `uv run pytest …`). Keep all existing allowlist tests green.
+- **1.3.4** `[tier:medium]` Tests in `D:\git\opencode-model-router\test\unit\runner.test.ts`, with
+  static fixtures under `D:\git\opencode-model-router\test\fixtures\runner\` (package.json variants,
+  fake `node_modules` layouts, captured reporter outputs from Spike C). No real test runs in unit
+  tests: those happen in 3.1.
+
+**New tests (edge cases required)**
+- Detection for each direct form, and `npm test`/`pnpm test`/`yarn test`/`bun test` → the script,
+  for vitest and jest scripts with extra flags (`vitest run --coverage` → coverage flag dropped for
+  scoped runs).
+- Composite scripts (`vitest run && eslint .`, `npm run a; npm run b`, `cross-env X=1 vitest run`)
+  → decide explicitly. `cross-env` is supported **only if** the design note says so; otherwise it is
+  `unverifiable`.
+- Monorepo: `cwd` in a package, runner hoisted to the root; pnpm `.pnpm` store layout; runner missing → `unverifiable`.
+- Changed files: outside the git root (dropped); `..` traversal (dropped); absolute Windows paths with
+  a different drive letter case; paths with spaces and unicode; a deleted source that has
+  stem-matching tests; a deleted source with none (`unverifiable`); a rename; only non-code files
+  (docs) → affected set empty → pass note.
+- pytest: `conftest.py` changed → `unverifiable`; `src/pkg/mod.py` → `tests/test_mod.py` and `tests/pkg/mod_test.py`; `uv run pytest` allowed, `uv run python -c` refused.
+- `readResult`: JSON with failures, zero tests, a collection error, a truncated or missing report
+  file (falls back to text), a report file already deleted.
+- `maxWorkers` is injected exactly once, even if the user script already has one (the user's value
+  is replaced by the budget's, as the design note specifies).
+
+**Acceptance criteria**
+- `runner.ts` performs **no** process spawning: it returns specs and uses `fs` only through the seam.
+- Every S6 path returns a reason string that names what made scoping impossible.
+
+**Definition of Done** — as in 1.1; branch coverage of `runner.ts` ≥ 90%; QA report `D:\git\opencode-model-router\docs\qa\verification-resource-budget\phase-1.3.md`.
+
+**QA review** `[tier:heavy]` CAP:none — reason: security-sensitive command construction; the reviewer must read runner.ts, the allowlist change and every fixture.
+Adversarial focus: **command injection** through file names, script contents and package.json
+`bin` paths; allowlist bypass through `uv`; paths that escape the repo; wrong detection that silently
+runs a full suite; the reporter file being written inside the repo (it must be in the temp dir).
+
+---
+
+#### Phase 1.4 — Machine-wide verification slot (S3) `[tier:medium]`
+
+**Goal:** a cross-process counting semaphore that works across separate opencode processes on the
+same machine, recovers from crashes and never deadlocks.
+
+**Pre-flight (in addition to §0.9)**
+- [ ] Confirm that `fs.open(path, "wx")` is atomic on NTFS and ext4 for this use: two processes racing
+      100 times, exactly one wins per slot (spike script `[tier:fast]`).
+- [ ] Confirm that `process.kill(pid, 0)` distinguishes dead from alive and from EPERM on both platforms.
+
+**Tasks**
+- **1.4.1** `[tier:medium]` `D:\git\opencode-model-router\src\verify\slot.ts`:
+  `acquireSlot({ max, waitMs, signal, meta })` → `{ release(): Promise<void> } | { busy: true }`.
+  - 1.4.1.a Lock files live at `path.join(os.tmpdir(), "opencode-model-router", "verify-slots", "slot-<i>.lock")`
+    and contain JSON `{pid, hostname, startedAt, cwd, command}`.
+  - 1.4.1.b Stale detection: a dead PID, a hostname mismatch (shared temp dirs), or an age above
+    `maxHold` (= the largest configured command budget + 60 s). Stale files are removed with a
+    compare-before-delete (re-read the content and delete only if it is unchanged) to avoid deleting
+    a freshly re-acquired slot.
+  - 1.4.1.c Waiting uses exponential backoff with jitter (250 ms → 2 s), honours `signal`, and stops at `waitMs`.
+  - 1.4.1.d `release()` is idempotent. It deletes only its own file (content check). Slots are also
+    released on `process.on("exit")`, synchronously, as best effort.
+  - 1.4.1.e If the temp dir is unwritable, degrade to an in-process semaphore with the same API,
+    and log the degradation once through the logger seam.
+- **1.4.2** `[tier:medium]` Tests in `D:\git\opencode-model-router\test\unit\slot.test.ts`. They
+  include **real multi-process** cases that spawn child Node processes which acquire slots.
+
+**New tests (edge cases required)**
+- N processes × `max=1`: never two holders at once (each holder records its enter/exit timestamps
+  in a shared file; assert no overlap). With `max=2`, at most two.
+- A crashed holder (child killed with SIGKILL/`taskkill /F`) → its slot is reclaimed by the next
+  waiter within the backoff window.
+- A recycled PID (the file names a live but unrelated PID with a different `startedAt` beyond
+  `maxHold`) is reclaimed.
+- `waitMs=0` → an immediate `busy`. An abort while waiting → resolves `busy` promptly and leaks no timers.
+- Release twice; release after the file was already reclaimed as stale (it must not delete the new
+  owner's file).
+- An unwritable temp dir (point `TMPDIR`/`TEMP` at a read-only dir) → in-process fallback and one
+  log line.
+- A corrupt or empty lock file is treated as stale.
+
+**Acceptance criteria**
+- No busy-wait: CPU during a 10 s wait is negligible (assert fewer than N wake-ups).
+- Every exit path releases the slot (success, throw, abort).
+
+**Definition of Done** — as in 1.1; QA report `D:\git\opencode-model-router\docs\qa\verification-resource-budget\phase-1.4.md`.
+
+**QA review** `[tier:heavy]` CAP:none — reason: concurrency review must read slot.ts and every multi-process test.
+Adversarial focus: TOCTOU between the stale check and delete, a two-winner race, starvation,
+a deadlock when one process holds a slot and waits on another, clock changes, and antivirus file
+locks on Windows (EBUSY/EPERM on unlink must be retried, not treated as success).
+
+---
+
+#### Phase 1.5 — Dispatch reference and ephemeral worktree (S2 infrastructure) `[tier:heavy]` design + `[tier:medium]` implementation
+
+**Goal:** capture a cheap git reference of the tree as it was when a producer was dispatched, and
+later materialize an **exact** or explicitly **approximate** copy of it in which failing tests can
+be re-run safely. Cleanup must never touch real data.
+
+**Pre-flight (in addition to §0.9)**
+- [ ] **Spike D (junction safety)** `[tier:fast]`, critical: on Windows, create a junction
+      `worktree\node_modules` → `repo\node_modules`. Then verify that each removal method leaves the
+      **target** intact: `fs.rm(junction, {recursive:true, force:true})`, `fs.unlink`, `fs.rmdir`, and
+      `git worktree remove --force` with the junction still inside. Record which methods are safe.
+      Same check on POSIX for directory symlinks. **Any method that deletes target contents is
+      banned in code.** If `git worktree remove --force` follows junctions, links must be removed
+      before it runs.
+- [ ] **Spike E**: confirm that `git stash create` produces a commit with staged and unstaged tracked
+      changes, excludes untracked files, returns an empty string on a clean tree, and does not change
+      the working tree, index or stash list.
+- [ ] Gather `[tier:fast]`: `snapshotTree` from `D:\git\opencode-model-router\src\verify\tree.ts`
+      (how it hashes untracked files) and the `TreeSnapshot` type from
+      `D:\git\opencode-model-router\src\verify\dispatch.ts`.
+
+**Tasks**
+- **1.5.1** `[tier:heavy]` Design note (the header comment of
+  `D:\git\opencode-model-router\src\verify\reference.ts`): what the reference contains, what exact
+  vs approximate means (§1.5-7), the materialization steps, the link strategy for every ignored
+  `node_modules` directory in the repo (root and workspace packages), the cleanup order proven safe
+  by Spike D, and crash GC.
+- **1.5.2** `[tier:medium]` Implement `D:\git\opencode-model-router\src\verify\reference.ts`:
+  - 1.5.2.a `captureReference(cwd, signal)` → `{ root, commit, untracked: Map<relPath, sha256> } | undefined`,
+    using `git stash create` or `HEAD`. Git runs through `execFile` with args (no shell), with a timeout.
+  - 1.5.2.b `materialize(ref, currentTree, signal)` → `{ dir, exact: boolean, dispose() }`:
+    `git worktree add --detach <os.tmpdir()>/omr-ref-<pid>-<rand> <commit>`. It copies the untracked
+    files whose current hash matches the reference hash (`exact=false` if any file is missing or
+    changed), then links `node_modules` directories.
+  - 1.5.2.c `dispose()`: unlink the links first (only with the methods Spike D proved safe), then
+    `git worktree remove --force`, then remove the directory if it is still there. Idempotent.
+    Must never throw into the caller: failures are logged.
+  - 1.5.2.d `gcStaleReferences(root)`: remove `omr-ref-*` worktrees whose owner PID is dead or which
+    are older than 1 h; `git worktree prune`. Called at plugin start (wired in 2.1).
+- **1.5.3** `[tier:medium]` Tests in `D:\git\opencode-model-router\test\unit\reference.test.ts`, using
+  **real temporary git repositories** created in `os.tmpdir()` (no git mocks).
+
+**New tests (edge cases required)**
+- Clean tree → the reference is HEAD; dirty tracked → the stash commit contains the dirty content;
+  staged + unstaged mixed; the stash list is unchanged after capture.
+- Untracked files: unchanged → copied (exact); modified after dispatch → `exact=false`; deleted →
+  `exact=false`; a new untracked file after dispatch → not copied, and exact is unaffected.
+- `node_modules` at the root and in `packages/a/node_modules` are linked; after `dispose()`, **the
+  real `node_modules` directories and a sentinel file inside them still exist** (the key safety test,
+  on Windows with junctions and on POSIX with symlinks).
+- `dispose()` twice; `dispose()` after the directory was deleted externally; `dispose()` while a
+  process still holds a file open in the worktree (Windows EBUSY → retried, then logged).
+- GC: a stale worktree left by a killed PID is removed; a live owner's worktree is kept.
+- Capture on a repo with submodules → `undefined` (the same refusal as `snapshotTree`); outside a
+  git repo → `undefined`; an abort mid-capture leaves no partial state.
+- Paths with spaces and unicode in the repo path and the temp path.
+
+**Acceptance criteria**
+- The capture runs only git, finishes under `baselineTimeoutMs`, and does not modify the repo
+  (working tree, index, stash, refs), which the tests assert by `git status`/`git stash list`/`git for-each-ref` before and after.
+- Every cleanup method in the code is on Spike D's safe list.
+
+**Definition of Done** — as in 1.1; QA report `D:\git\opencode-model-router\docs\qa\verification-resource-budget\phase-1.5.md`.
+
+**QA review** `[tier:heavy]` CAP:none — reason: data-safety review must read reference.ts, the spike D log and every cleanup test.
+Adversarial focus: **any path that could delete real data** (junction following, a wrong directory
+passed to `rm`, GC removing a non-`omr-ref` worktree), a reference that claims `exact` when it is
+not, secrets copied into the temp dir (untracked `.env` files: copy only what already existed and
+is needed, and document it), and temp-dir exhaustion.
+
+---
+
+### Wave 2 — Integration: the final `testsPass` pipeline
+
+`vrb/wave-2` is branched from `vrb/wave-1` after all Wave 1 phases are merged and clean.
+
+#### Phase 2.1 — testsPass pipeline, gate abort, dispatch reference `[tier:heavy]` design + `[tier:medium]` implementation
+
+**Goal:** `testsPass` works as in §1.6: scoped (S1), under the slot (S3), with caps and the gate
+abort (S4), with a failure-only recheck at the reference (S2), and never a full suite unless
+`testScope: "full"` is set (S6). The dispatch-time test baseline code is **removed**.
+
+**Pre-flight (in addition to §0.9)**
+- [ ] All five Wave 1 QA reports are clean; `vrb/wave-2` contains them.
+- [ ] Gather `[tier:fast]`: the current `beginVerification`/`prepareVerification`/`execSeam`
+      (`D:\git\opencode-model-router\src\verify\wiring.ts`), the baseline store in
+      `createChangedFileStore` (`D:\git\opencode-model-router\src\verify\dispatch.ts`),
+      `runCommandCheck` (`D:\git\opencode-model-router\src\verify\deterministic.ts`), `compareTests`
+      (`D:\git\opencode-model-router\src\verify\baseline.ts`), and both gate call sites in
+      `D:\git\opencode-model-router\src\index.ts` (`delegate` tool: `accept(` wrapped in
+      `withTimeout(…, gateBudgetMs, "verification gate")`; native `task` in `tool.execute.after`).
+
+**Tasks**
+- **2.1.1** `[tier:heavy]` Design the pipeline and the verdict algebra (written as the header of
+  the new `testsPass` section in `D:\git\opencode-model-router\src\verify\deterministic.ts`). It must
+  include a truth table covering: {scoped result green / failures / collection error / timeout / slot
+  busy / S6 unverifiable} × {recheck exact-and-all-preexisting / exact-and-some-introduced /
+  approximate / unusable / disabled / timed out}, with the resulting `ok`, `unverifiable`, `reason`
+  and `note`. It preserves the §1.2 guarantees.
+- **2.1.2** `[tier:medium]` Replace the testsPass branch of `runCommandCheck` with the pipeline
+  (the batch hook is a direct call for now; 2.2 swaps in the coordinator behind the same function
+  signature).
+  - 2.1.2.a `DeterministicDeps` (`D:\git\opencode-model-router\src\verify\types.ts`) gains
+    `argv: ArgvSeam`, `changedFiles`, `reference`, `slot`, `budget`, `signal`. The old
+    `testBaseline` member is removed.
+  - 2.1.2.b `buildPasses`, `lintClean` and `run` also run under the slot, with low priority and the
+    signal; `lintClean` uses scoping (§1.5-10).
+  - 2.1.2.c `testScope: "full"` runs the resolved full command, and still uses S2–S4.
+- **2.1.3** `[tier:medium]` `D:\git\opencode-model-router\src\verify\dispatch.ts` +
+  `D:\git\opencode-model-router\src\verify\wiring.ts`: `beginVerification` captures a reference
+  (1.5) instead of running tests, only for DoDs with `testsPass`. Delete the test-baseline cache
+  (`cache`, `baselines`, the test half of `observeEdit` contamination) and `baseline()`. Keep the
+  changed-file tracking (`bySession`, `delta`) intact. `prepareVerification` returns the reference
+  and the changed files. The references follow the existing TTL sweep.
+- **2.1.4** `[tier:medium]` `D:\git\opencode-model-router\src\verify\baseline.ts`: replace
+  `compareTests` with `judgeScoped(scoped, recheck | undefined)` implementing the 2.1.1 table. Keep
+  `observeTests` as the text fallback that `runner.ts` uses.
+- **2.1.5** `[tier:medium]` `D:\git\opencode-model-router\src\index.ts`:
+  - 2.1.5.a Gate budget abort: create an `AbortController` per gate invocation, pass its signal into
+    the gate deps, and abort it when `withTimeout(… "verification gate")` rejects **and** in the
+    native `task` path when its own budget expires. The running command tree dies with the gate.
+  - 2.1.5.b Call `gcStaleReferences` once at plugin start, fire-and-forget, with logged failures.
+- **2.1.6** `[tier:medium]` Rewrite `D:\git\opencode-model-router\test\unit\baseline.test.ts` and
+  `D:\git\opencode-model-router\test\unit\baseline-wiring.test.ts` to the new model (no behaviour
+  from the removed cache is kept alive), and add
+  `D:\git\opencode-model-router\test\unit\tests-pass-pipeline.test.ts`.
+
+**New tests (edge cases required)**
+- Every row of the 2.1.1 truth table is a test case (table-driven).
+- A read-only dispatch → no reference, no command. An implementation dispatch → a reference is
+  captured and **zero** test commands run at dispatch (assert through the seams).
+- A green scoped run → pass, and **no** recheck is attempted.
+- A failure introduced by the producer (green at the reference) → rejected, naming only the new test.
+- A pre-existing failure (failing at an exact reference) → accepted with the "no worse than before"
+  note that states the suite is not green.
+- Mixed: one pre-existing and one introduced → rejected, naming only the introduced one.
+- Approximate reference + failure → `unverifiable`; with `strictUnverifiable` → rejected as unverifiable.
+- `failureRecheck: false` (and the deprecated `testBaseline: false`) → no reference is captured at
+  dispatch, a green scoped run passes, any scoped failure is `unverifiable`; assert that no
+  worktree is ever created.
+- Slot busy past `slotWaitMs` → `unverifiable` "verification slot busy"; the gate budget expiring
+  while waiting for the slot → the wait is cancelled, and no process is spawned afterwards.
+- Gate budget expiry during a scoped run → the tree is killed (assert through the argv seam
+  receiving an aborted signal).
+- `testScope: "full"` → the full command runs once, no dispatch-time run, S2 applies to its failures.
+- Escalation interplay: a rejected verdict still triggers the ladder exactly as before
+  (reuse the existing escalation assertions in the rewritten `baseline.test.ts`).
+
+**Acceptance criteria**
+- `rg "testBaseline|baselines\.|compareTests" D:\git\omr-p21\src` returns only the deprecated config
+  key handling in `config.ts`.
+- With default config, **no code path runs a test command at dispatch time**, and **no code path runs
+  a full suite** (proven by tests that assert the argv of every spawned spec).
+
+**Definition of Done** — as in 1.1; full `npm test` + typecheck green; coverage of changed `src\verify\*` files ≥ 90% lines/branches (measured with `npx vitest run --coverage --coverage.include=src/verify/**`); QA report `D:\git\opencode-model-router\docs\qa\verification-resource-budget\phase-2.1.md`.
+
+**QA review** `[tier:heavy]` CAP:none — reason: the verdict algebra is the guardrail itself; the reviewer must read the whole pipeline, both gate call sites and the truth-table tests.
+Adversarial focus: **false passes** (any path where an introduced failure is excused), a stale
+reference reused across retries (a failed attempt must never become its own reference, same rule as
+before), the attribution of changed files under concurrent subagents, leaked slots/worktrees on
+every exception path, and behaviour when the gate is aborted between the scoped run and the recheck.
+
+---
+
+#### Phase 2.2 — Batching coordinator (S5) `[tier:heavy]` design + `[tier:medium]` implementation
+
+**Goal:** concurrent `testsPass` checks for the same runner root become one scoped run, with correct
+per-request verdicts.
+
+**Parallelism:** tasks 2.2.1–2.2.2 (the new file `D:\git\opencode-model-router\src\verify\batch.ts`
+and its unit tests) run **in parallel with Phase 2.1**, coding against the 1.3 spec types that are
+already on `vrb/wave-2`. Task 2.2.3 (wiring) starts only after 2.1 is merged, because it writes
+`D:\git\opencode-model-router\src\verify\wiring.ts`.
+
+**Pre-flight (in addition to §0.9)**
+- [ ] Spike C's result on non-executing related-test listing is recorded; it selects attribution mode
+      A (listing) or B (per-request re-run of the failing files only).
+
+**Tasks**
+- **2.2.1** `[tier:heavy]` Design (the header of `batch.ts`):
+  - the batch key `(git root, runner, resolved entry, env signature)`;
+  - window semantics: it opens at the first request and closes at `batchWindowMs`, or earlier when a
+    configured maximum size is reached;
+  - requests that arrive while a batch is running join the **next** window;
+  - attribution:
+    - mode A: list the related tests per request and assign each failing file to every request whose
+      related set contains it;
+    - mode B: when the union run fails, re-run only the failing files once per request, scoped to
+      that request's affected set, all under one slot hold;
+  - how S2 is shared: one recheck for the union of the failing files, with results distributed;
+  - cancellation: one requester's abort does not cancel the batch unless all requesters have aborted.
+- **2.2.2** `[tier:medium]` Implement `D:\git\opencode-model-router\src\verify\batch.ts` with an
+  injected clock and seams, plus `D:\git\opencode-model-router\test\unit\batch.test.ts`.
+- **2.2.3** `[tier:medium]` Wire it into `D:\git\opencode-model-router\src\verify\wiring.ts`: one
+  coordinator per plugin instance, with an eviction sweep that shares the existing TTL sweep. Add
+  `D:\git\opencode-model-router\test\unit\batch-wiring.test.ts`.
+
+**New tests (edge cases required)**
+- 5 requests inside the window → exactly 1 scoped run over the union; 5 correct verdicts.
+- Requests for different roots or runners → separate batches that run in parallel only as far as the
+  slot allows (`maxConcurrentVerifications`).
+- `batchWindowMs: 0` → every request runs alone (the old behaviour, still scoped).
+- Union green → all pass. Union fails in a file related to only one request → only that request is
+  rejected; the others pass. A failing file related to two requests → both are judged through S2.
+- A pre-existing failure that is related to all requests → a single shared recheck; all pass with the note.
+- A requester aborts mid-batch → the others still get verdicts; all abort → the run is killed.
+- A request arriving while a batch runs → the next window, never merged into the running union.
+- Changed-file overlap between requests (the same file edited by two producers) → the union is
+  deduplicated.
+- A window timer under fake timers: no leaked timers after the coordinator is disposed.
+
+**Acceptance criteria**
+- In the wiring test with 5 concurrent `testsPass` gates, the argv seam sees ≤ 1 scoped run + ≤ 1
+  recheck per window.
+- Verdicts are identical to running each request alone (property test over random change sets and
+  failure assignments, using the fake runner seam).
+
+**Definition of Done** — as in 2.1; QA report `D:\git\opencode-model-router\docs\qa\verification-resource-budget\phase-2.2.md`.
+
+**QA review** `[tier:heavy]` CAP:none — reason: attribution correctness under concurrency; the reviewer must read batch.ts, its wiring and the property tests.
+Adversarial focus: misattribution that excuses a producer, starvation (a steady stream of requests
+that keeps a window open forever), memory growth of the coordinator, and interaction with the
+gate budget (a batch longer than one requester's budget).
+
+---
+
+#### Phase 2.3 — Protocol, documentation, ADR, changelog `[tier:medium]`
+
+**Goal:** everything a user or orchestrator reads describes the final behaviour exactly.
+
+**Pre-flight (in addition to §0.9)**
+- [ ] 2.1 and 2.2 are merged and their QA is clean (the docs describe merged behaviour only).
+
+**Tasks**
+- **2.3.1** `[tier:medium]` `D:\git\opencode-model-router\src\index.ts` protocol strings (the
+  acceptance-block guidance near `"check: <testsPass | buildPasses | …>"` and
+  `"Prefer deterministic checks …"`): state that `testsPass` means "the tests affected by the
+  producer's changes pass; the full suite is CI's job", and that dispatch acceptance blocks should
+  prefer `testsPass` over hand-written full-suite `run` commands. Regenerate the goldens under
+  `D:\git\opencode-model-router\test\golden\` and review the diff line by line (only the intended
+  text may change). Update the README's measured prompt-size figures if they move.
+- **2.3.2** `[tier:medium]` `D:\git\opencode-model-router\docs\CONFIG_REFERENCE.md`: add the §1.4
+  keys to the `verify` table; rewrite "Test and changed-file baselines" into
+  "Affected-test verification" (S1–S6, reference capture, recheck, slot, batching, the deprecations).
+- **2.3.3** `[tier:medium]` `D:\git\opencode-model-router\docs\VERIFICATION.md` and
+  `D:\git\opencode-model-router\docs\FLOW_DIAGRAMS.md`: the new flow (§1.6).
+- **2.3.4** `[tier:medium]` ADR `D:\git\opencode-model-router\docs\adr\0003-affected-test-verification.md`:
+  context (the incident, with its evidence), decision (S1–S6), consequences (what `testsPass` no
+  longer proves, and why CI is the full-suite gate), and the alternatives rejected (the dispatch-time
+  full baseline; running the full suite at low priority only).
+- **2.3.5** `[tier:medium]` `D:\git\opencode-model-router\CHANGELOG.md` `## [Unreleased]`: Added
+  (the keys, pytest), Changed (the `testsPass` semantics, the deprecations), Fixed (gate abort kills
+  the tree), written in the house style of the 1.14.0 entry.
+- **2.3.6** `[tier:medium]` `D:\git\opencode-model-router\docs\plans\README.md`: list this plan
+  under Active plans.
+
+**New tests**
+- The golden snapshots are updated and reviewed. `D:\git\opencode-model-router\test\unit\packaging.test.ts`
+  still passes (new `src` files ship; no test fixtures ship).
+- A docs consistency test in
+  `D:\git\opencode-model-router\test\unit\config-verify-budget.test.ts` (2.3 owns this file in Wave 2
+  per §2): every key in `resolveVerifyBudget`'s defaults appears in
+  `D:\git\opencode-model-router\docs\CONFIG_REFERENCE.md` with the same default.
+
+**Acceptance criteria**
+- No document still claims that dispatches "warm" a test cache or that `testsPass` runs the suite.
+  Check with `rg -n "warm|baseline capture|full suite" D:\git\omr-p23\docs D:\git\omr-p23\README.md` and review every hit.
+
+**Definition of Done** — as in 1.1; QA report `D:\git\opencode-model-router\docs\qa\verification-resource-budget\phase-2.3.md`.
+
+**QA review** `[tier:heavy]` — adversarial focus: docs that promise more than the code does
+(especially about what `unverifiable` means and about Windows), protocol text that would lead an
+orchestrator to write full-suite `run` checks, and golden diffs that include unintended text.
+
+---
+
+### Wave 3 — Prove it end to end, then release
+
+`vrb/wave-3` is branched from `vrb/wave-2` after all Wave 2 phases are merged and clean.
+
+#### Phase 3.1 — End-to-end fixtures, resource benchmark, CI `[tier:medium]` (+ `[tier:fast]` runs)
+
+**Goal:** prove on real runners, on Windows and Linux, that the guardrail holds and the resource
+bound holds.
+
+**Pre-flight (in addition to §0.9)**
+- [ ] Waves 1–2 are merged and clean; the full unit suite is green on `vrb/wave-3`.
+
+**Tasks**
+- **3.1.1** `[tier:medium]` Fixture projects under `D:\git\opencode-model-router\test\fixtures\projects\`:
+  `vitest-app` (≥ 40 test files, a module graph where each source has 1–3 related tests),
+  `jest-app` (≥ 20 test files) and `pytest-app` (≥ 20 test files, with a `conftest.py`). Each has one
+  deliberately pre-existing failing test that can be switched on with an env-free mechanism: a
+  separate file that the test setup copies in. Dependencies are installed by the test setup into a
+  temp copy, **never committed**; they are cached in CI.
+- **3.1.2** `[tier:medium]` `D:\git\opencode-model-router\test\integration\verify-resource-budget.test.ts`,
+  gated by `RUN_VERIFY_E2E=1`, which drives the real wiring (plugin factory + gate) against temp
+  git copies of the fixtures:
+  - 3.1.2.a Guardrail matrix per runner: introduced failure → rejected; pre-existing → accepted with
+    the note; pre-existing + introduced → rejected naming only the introduced; docs-only change →
+    pass note; `conftest.py` change → `unverifiable`.
+  - 3.1.2.b **Resource bound:** 5 concurrent implementation gates on `vitest-app` with the defaults.
+    A process sampler polls every 100 ms (Windows: `Get-CimInstance Win32_Process`; POSIX: `ps -eo pid,ppid,ni,args`)
+    and records the descendant processes of the test process. Assert:
+    - peak concurrent runner worker processes ≤ `maxWorkers` × `maxConcurrentVerifications`;
+    - no descendant runs above below-normal priority;
+    - no test command started at dispatch;
+    - no command ever ran the full file set (from the argv records);
+    - the total number of runs is ≤ 1 per batch window + rechecks.
+  - 3.1.2.c **Two plugin instances** (two child processes, simulating two opencode sessions) → the
+    slot limits them jointly.
+  - 3.1.2.d **No orphans:** force the gate budget to expire mid-run; 3 s later no descendant is alive.
+  - 3.1.2.e **Cleanup:** after the suite, no `omr-ref-*` worktrees remain, and the fixture's real
+    `node_modules` sentinel file still exists.
+- **3.1.3** `[tier:medium]` `D:\git\opencode-model-router\.github\workflows\test.yml`: add an `e2e`
+  job (`ubuntu-latest` and `windows-latest`, Node 22) that runs with `RUN_VERIFY_E2E=1` and has
+  `uv`/pytest set up. `D:\git\opencode-model-router\vitest.config.ts`: per-file coverage thresholds
+  of ≥ 90% lines and branches for `src/verify/{exec,runner,slot,reference,batch}.ts`, and keep the
+  existing per-directory gates.
+- **3.1.4** `[tier:medium]` Smoke: extend
+  `D:\git\opencode-model-router\test\smoke\layer2-gate.smoke.test.ts` so that a real-opencode
+  delegation with a `testsPass` acceptance block runs a scoped command (asserted from the plugin log).
+- **3.1.5** `[tier:fast]` Run the full unit suite, the e2e suite locally on Windows, and the smoke
+  keyless lane, then push and collect the CI results for every job; report.
+
+**New tests** — as listed in 3.1.2 and 3.1.4 (this phase *is* the system-level test phase).
+
+**Acceptance criteria** — the global criteria G1–G6 (§4.1) are demonstrated by passing tests on
+both OSes in CI.
+
+**Definition of Done** — as in 1.1; the CI `test`, `e2e`, `smoke-keyless`, CodeQL and GitGuardian
+checks are green; QA report `D:\git\opencode-model-router\docs\qa\verification-resource-budget\phase-3.1.md`.
+
+**QA review** `[tier:heavy]` CAP:none — reason: the reviewer must judge whether the e2e assertions actually prove G1–G6 or can pass vacuously.
+Adversarial focus: sampling that could miss short-lived workers (the poll interval vs worker
+lifetime; assert a minimum observed count so the sampler provably saw workers), tests that pass
+because nothing ran, flaky timing, and fixtures that differ from real repos (pnpm layout, monorepo).
+
+---
+
+#### Phase 3.2 — Global senior QA review `[tier:heavy]` CAP:none — reason: whole-change adversarial review across every file of the plan.
+
+**Pre-flight**
+- [ ] Every phase QA report shows zero open findings; CI on `vrb/wave-3` is green.
+- [ ] `[tier:fast]` produces the review packet: the full diff `git diff origin/master...vrb/wave-3`,
+      the file list, the e2e and bench output, the spike logs, and every phase QA report.
+
+**Task**
+- **3.2.1** `[tier:heavy]` Adversarial global review against §1.2, §1.5 and G1–G6. It is saved to
+  `D:\git\opencode-model-router\docs\qa\verification-resource-budget\global.md`. It must at least
+  attempt to:
+  - construct a false pass;
+  - construct a command injection;
+  - make cleanup delete real data;
+  - deadlock the slot;
+  - run a full suite with the default config;
+  - leave an orphan process.
+
+  Each attempt is recorded with its outcome.
+- **3.2.2** `[tier:medium]` Fix **every** finding (own commits), then re-run the §0.9 checks and the
+  e2e suite. **3.2.3** `[tier:heavy]` Re-review the fixes. Repeat until zero open findings (§0.8
+  applies to repeated failures).
+
+**Acceptance / DoD** — zero open findings in `global.md`; CI green after the fixes.
+
+---
+
+#### Phase 3.3 — Release `1.15.0` and local sync `[tier:medium]` (+ `[tier:fast]` verification)
+
+**Pre-flight**
+- [ ] Phase 3.2 closed with zero findings; `vrb/wave-3` is green in CI.
+- [ ] `npm view opencode-model-router version` is `1.14.0` (nobody published in between).
+
+**Tasks**
+- **3.3.1** `[tier:medium]` Open the PR `vrb/wave-3` → `master` titled
+  `feat(verify): affected-test verification under a machine-wide resource budget`. The body gives the
+  summary, S1–S6, the evidence, the G1–G6 proof links and the QA report links. It ends with the
+  repo's PR attribution line.
+- **3.3.2** `[tier:fast]` Watch the CI; on red, route per §0.8 (fix on the branch, never merge red).
+- **3.3.3** `[tier:medium]` Merge with a merge commit (the repo convention). On `master`: set
+  `D:\git\opencode-model-router\package.json` and `package-lock.json` to `1.15.0`, and rename
+  `## [Unreleased]` to `## [1.15.0] - <date>` in `D:\git\opencode-model-router\CHANGELOG.md`.
+  Commit `chore(release): 1.15.0`, push, tag `v1.15.0`, push the tag.
+- **3.3.4** `[tier:fast]` Watch the `Publish Package` workflow, then poll the registry until
+  `latest` is `1.15.0`. The publish log must show `+ opencode-model-router@1.15.0` and the
+  provenance statement.
+- **3.3.5** `[tier:fast]` Sync the main checkout (the plugin that the live sessions load):
+  `git -C D:\git\opencode-model-router pull --ff-only` (the tree must be clean first; if it is not,
+  this is a §0.1 critical item: stop and ask). Remove every `D:\git\omr-*` worktree and every
+  `vrb/*` branch, locally and on the remote. Then tell the human to restart the opencode sessions.
+
+**Acceptance / DoD** — `1.15.0` is `latest` on npm with provenance; `master` is tagged; the main
+checkout is at `v1.15.0`; no `omr-*` worktrees or `vrb/*` branches remain.
+
+---
+
+## 4. Global acceptance, Definition of Done, QA
+
+### 4.1 Global acceptance criteria
+
+- **G1 — No suite per delegation.** With the default config, no delegation (read-only or
+  implementation) runs a test command at dispatch, and no verification ever runs the full test set.
+  Proven by 3.1.2.b and the 2.1 argv assertions.
+- **G2 — The guardrail holds.** Introduced failures are rejected and named; pre-existing failures
+  (exact reference) are accepted with an explicit "suite not green" note; anything unprovable is
+  `unverifiable`. Proven by the 2.1 truth-table tests and the 3.1.2.a runner matrix.
+- **G3 — Bounded CPU/RAM.** Peak concurrent runner workers from verification ≤ `maxWorkers` ×
+  `maxConcurrentVerifications` (default 2 × 1) machine-wide, across opencode processes, all at
+  below-normal priority. Proven by 3.1.2.b and 3.1.2.c on Windows and Linux.
+- **G4 — Nothing outlives its budget.** A gate or recheck budget expiry kills the whole process
+  tree; no orphans after 3 s. Proven by 1.2 and 3.1.2.d.
+- **G5 — Safe cleanup.** No reference worktree survives a run or a crash (GC). No cleanup path
+  touches real `node_modules` or user files. Proven by 1.5 and 3.1.2.e.
+- **G6 — Compatibility.** Existing configs load unchanged; the deprecated keys work with a warning;
+  `testScope: "full"` restores full-suite semantics (still resource-bounded); `npm test`,
+  typecheck, smoke-keyless, CodeQL and GitGuardian are green on ubuntu/windows × Node 20/22/24.
+
+### 4.2 Global Definition of Done
+
+- [ ] All phases meet their DoD; every phase QA report and `global.md` show zero open findings.
+- [ ] G1–G6 are demonstrated by tests that run in CI on both OSes.
+- [ ] Coverage is ≥ 90% lines and branches for `src/verify/{exec,runner,slot,reference,batch}.ts`,
+      enforced in `D:\git\opencode-model-router\vitest.config.ts`.
+- [ ] Docs, ADR 0003, CHANGELOG and the protocol text describe the shipped behaviour exactly.
+- [ ] `1.15.0` is published with provenance; the main checkout is synced; no temporary worktrees or
+      branches remain.
+- [ ] Final report to the human: what shipped, the G1–G6 evidence (the CI links and measured peak
+      process counts), the known limits (runners without scoping → `unverifiable`), and the
+      reminder to restart the opencode sessions.
+
+### 4.3 Global QA
+
+Phase 3.2 is the global senior QA review: `[tier:heavy]`, adversarial, with every finding fixed and
+re-reviewed until clean. The global DoD cannot be ticked before it closes.
+
+---
+
+## 5. Risks and mitigations
+
+| Risk | Mitigation |
+|---|---|
+| Related-test detection misses a dependency (dynamic imports, config-driven tests), so an introduced failure goes unseen | Accepted by design: CI runs the full suite (S6). The ADR states it; `testScope: "full"` is the opt-in for repos that need it. The 3.1 fixtures include one dynamic-import case to document the behaviour. |
+| Reference worktree differs from the dispatch tree (ignored generated files, env) | The exact/approximate flag; collection errors at the reference → `unverifiable`, never an excuse (§1.5-7, §1.5-8). |
+| Windows junction cleanup deletes real `node_modules` | Spike D gate, a code-level ban on unsafe methods, sentinel-file tests on real junctions, and a heavy QA focus in 1.5 and 3.2. |
+| Cross-process lock left behind by a crash blocks verification | Stale detection by PID, hostname and age; compare-before-delete; the busy result after `slotWaitMs` is `unverifiable`, never a hang. |
+| Runner CLI differences across versions | Spike C pins the behaviour; the reporter-file parsing falls back to text; an unknown shape → `unverifiable`. |
+| The executing session's own plugin runs full suites during execution | Phase 0.P syncs to `1.14.0`; §0.5 forbids `check: testsPass` in dispatches until `1.15.0`. |
+
+## 6. Out of scope
+
+- Remote or containerized verification.
+- Caching test results across sessions.
+- Scoping for runners other than vitest, jest, pytest and eslint: they return `unverifiable` with a reason naming the runner.
+- Changing the escalation ladder, grader policy or DoD inference rules, beyond consuming the new verdicts.
