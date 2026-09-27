@@ -488,6 +488,7 @@
 //             - one slot acquisition per batch, never nested.
 // ===============================================================================================
 
+import { posix, win32 } from "node:path";
 import type { PluginLogger } from "../router/logger";
 import type { DispatchReference } from "./reference";
 import type { ChangedPath, RunResult, ScopedSpec, ScopingPlan } from "./runner";
@@ -591,29 +592,54 @@ export function createBatchCoordinator(options: BatchCoordinatorOptions = {}): B
 // Pure helpers (exported for table tests)
 // ---------------------------------------------------------------------------------------------
 
+function pathApi(platform: NodeJS.Platform): typeof posix {
+  return platform === "win32" ? win32 : posix;
+}
+
+/** Path-key folding: case-insensitive on win32 (B3, B6). */
+function fold(p: string, platform: NodeJS.Platform): string {
+  return platform === "win32" ? p.toLowerCase() : p;
+}
+
+/** Code-unit order, independent of the locale. */
+function byCodeUnit(a: string, b: string): number {
+  return a < b ? -1 : a > b ? 1 : 0;
+}
+
 /** B3: key-sorted JSON of a spec's env. */
 export function envSignature(env: Readonly<Record<string, string>>): string {
-  void env;
-  throw notImplemented("envSignature");
+  return JSON.stringify(
+    Object.keys(env)
+      .sort(byCodeUnit)
+      .map((k) => [k, env[k]]),
+  );
 }
 
 /** B3: spec.args without the elements equal to an input, with spec.reportPath replaced by "<report>". */
 export function argvTemplate(spec: ScopedSpec): readonly string[] {
-  void spec;
-  throw notImplemented("argvTemplate");
+  const inputs = new Set(spec.inputs);
+  const report = spec.reportPath;
+  return spec.args.filter((a) => !inputs.has(a)).map((a) => (report === "" ? a : a.split(report).join("<report>")));
 }
 
 /** B3: [gitRoot, runner, entry, file, cwd, envSignature, argvTemplate] as JSON, with paths case-folded on win32. */
 export function batchKey(spec: ScopedSpec, platform: NodeJS.Platform): string {
-  void spec;
-  void platform;
-  throw notImplemented("batchKey");
+  return JSON.stringify([
+    fold(spec.gitRoot, platform),
+    spec.runner,
+    fold(spec.entry, platform),
+    fold(spec.file, platform),
+    fold(spec.cwd, platform),
+    envSignature(spec.env),
+    argvTemplate(spec),
+  ]);
 }
 
 /** B8.2: root, commit, and the sorted untracked, tracked and captureReasons entries; capturedAt is excluded. */
 export function referenceKey(reference: DispatchReference): string {
-  void reference;
-  throw notImplemented("referenceKey");
+  const entries = (m: ReadonlyMap<string, string>) => [...m.entries()].sort((a, b) => byCodeUnit(a[0], b[0]) || byCodeUnit(a[1], b[1]));
+  const reasons = reference.captureReasons.map((r) => JSON.stringify([r.cause, r.path])).sort(byCodeUnit);
+  return JSON.stringify([reference.root, reference.commit, entries(reference.untracked), entries(reference.tracked), reasons]);
 }
 
 /** One member's change set, as unionChangedFiles reads it. */
@@ -628,9 +654,33 @@ export interface BatchMemberChanges {
  * deduplicated by the platform key of (path, previousPath) in first-seen order.
  */
 export function unionChangedFiles(members: readonly BatchMemberChanges[], platform: NodeJS.Platform): ChangedPath[] {
-  void members;
-  void platform;
-  throw notImplemented("unionChangedFiles");
+  const P = pathApi(platform);
+  const seen = new Set<string>();
+  const out: ChangedPath[] = [];
+  for (const m of members) {
+    for (const c of m.changedFiles) {
+      const path = P.resolve(m.cwd, c.path);
+      const previousPath = c.previousPath === undefined ? undefined : P.resolve(m.cwd, c.previousPath);
+      const key = JSON.stringify([fold(path, platform), previousPath === undefined ? null : fold(previousPath, platform)]);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push({
+        path,
+        ...(c.status !== undefined ? { status: c.status } : {}),
+        ...(previousPath !== undefined ? { previousPath } : {}),
+      });
+    }
+  }
+  return out;
+}
+
+/** runner.ts JS_TEST_RE: the G.8 test-file suffix rule. */
+const JS_TEST_RE = /\.(test|spec)\.[cm]?[jt]sx?$/;
+
+/** runner.ts isJsTestPath (G.8): a .test/.spec file or a file under __tests__. Either separator. */
+function isJsTestPath(p: string): boolean {
+  const segs = p.split(/[\\/]/);
+  return JS_TEST_RE.test(segs[segs.length - 1] ?? "") || segs.includes("__tests__");
 }
 
 /**
@@ -638,17 +688,38 @@ export function unionChangedFiles(members: readonly BatchMemberChanges[], platfo
  * lexicalPaths, inputsAreTests, or a JS test file among its inputs (runner.ts G.8 rule).
  */
 export function isGuardSensitive(spec: ScopedSpec, platform: NodeJS.Platform): boolean {
-  void spec;
+  // The G.8 rule reads both separators and is case-sensitive on every platform, as in runner.ts.
   void platform;
-  throw notImplemented("isGuardSensitive");
+  return spec.lexicalPaths === true || spec.inputsAreTests || spec.inputs.some(isJsTestPath);
 }
 
 /** The id-space file key: the path of `absolutePath` relative to `cwd`, with "/" separators (runner.ts I). */
 export function fileKeyOf(cwd: string, absolutePath: string, platform: NodeJS.Platform): string {
-  void cwd;
-  void absolutePath;
-  void platform;
-  throw notImplemented("fileKeyOf");
+  return pathApi(platform).relative(cwd, absolutePath).replace(/\\/g, "/");
+}
+
+/**
+ * 2.1-T5's fileKeyOfId, private until 2.2.3 can import it: the part of an id before " > ", else
+ * before "::", else the whole id.
+ */
+function idFileKey(id: string): string {
+  const gt = id.indexOf(" > ");
+  if (gt >= 0) return id.slice(0, gt);
+  const cc = id.indexOf("::");
+  return cc >= 0 ? id.slice(0, cc) : id;
+}
+
+/** The sum of `counts` over `keys`, matched with the platform's folding. */
+function countOver(counts: TestCounts, keys: Iterable<string>, platform: NodeJS.Platform): number {
+  const folded = new Map<string, number>();
+  for (const [k, n] of Object.entries(counts)) folded.set(fold(k, platform), (folded.get(fold(k, platform)) ?? 0) + n);
+  let n = 0;
+  for (const k of new Set([...keys].map((x) => fold(x, platform)))) n += folded.get(k) ?? 0;
+  return n;
+}
+
+function greenResult(total: number | undefined): RunResult {
+  return { failingIds: [], failingFiles: [], collectionError: false, total, complete: true, source: "report" };
 }
 
 /** Per-file test counts of one run (P1): id-space file key -> the number of tests listed. */
@@ -678,11 +749,50 @@ export function attributeUnion(
   member: ScopedSpec,
   platform: NodeJS.Platform,
 ): UnionAttribution {
-  void union;
-  void counts;
-  void member;
-  void platform;
-  throw notImplemented("attributeUnion");
+  // 7.1
+  if (!union.complete || union.collectionError || union.source !== "report") return { kind: "own-run", cause: "not-comparable" };
+  const inputKeys = member.inputs.map((f) => fileKeyOf(member.cwd, f, platform));
+
+  // 7.2b for pytest (and 7.3a when none of the union's failures is the member's): its own run is
+  // green with n tests, or trips the zero-test guard with n = 0.
+  const staticGreen = (): UnionAttribution => {
+    if (counts === undefined) return { kind: "own-run", cause: "zero-test-ambiguous" };
+    const n = countOver(counts, inputKeys, platform);
+    if (n > 0) return { kind: "derived", result: greenResult(n), exitCode: 0 };
+    return {
+      kind: "derived",
+      result: { ...greenResult(0), complete: false, note: `${member.runner} ran no tests although a test file was passed` },
+      exitCode: member.runner === "pytest" ? 5 : 0,
+    };
+  };
+
+  if (union.failingIds.length === 0) {
+    // 7.2a
+    if (!isGuardSensitive(member, platform)) return { kind: "derived", result: greenResult(union.total), exitCode: 0 };
+    // 7.2b
+    if (member.inputsAreTests) return staticGreen();
+    if (counts === undefined) return { kind: "own-run", cause: "zero-test-ambiguous" };
+    const n = countOver(
+      counts,
+      member.inputs.flatMap((f, i) => (isJsTestPath(f) ? [inputKeys[i]] : [])),
+      platform,
+    );
+    return n > 0 ? { kind: "derived", result: greenResult(n), exitCode: 0 } : { kind: "own-run", cause: "zero-test-ambiguous" };
+  }
+
+  // 7.3b
+  if (!member.inputsAreTests) return { kind: "own-run", cause: "mode-b" };
+  // 7.3a: static attribution by input file key.
+  const own = new Set(inputKeys.map((k) => fold(k, platform)));
+  const ids = union.failingIds.filter((id) => own.has(fold(idFileKey(id), platform)));
+  if (ids.length === 0) return staticGreen();
+  const files = union.failingFiles.filter((f) => own.has(fold(fileKeyOf(member.cwd, f, platform), platform)));
+  const total = counts === undefined ? union.total : countOver(counts, inputKeys, platform);
+  return {
+    kind: "derived",
+    result: { failingIds: ids, failingFiles: files, collectionError: false, total, complete: true, source: "report" },
+    exitCode: 1,
+  };
 }
 
 /**
@@ -690,10 +800,23 @@ export function attributeUnion(
  * reproduced by any request's own run: <ids>". Its failing ids and files are kept.
  */
 export function taintUnreproduced(result: RunResult, unreproduced: readonly string[]): RunResult {
-  void result;
-  void unreproduced;
-  throw notImplemented("taintUnreproduced");
+  if (unreproduced.length === 0) return result;
+  return {
+    ...result,
+    complete: false,
+    note: `batched run failure not reproduced by any request's own run: ${[...new Set(unreproduced)].sort(byCodeUnit).join(", ")}`,
+  };
 }
+
+/** B8.5: unusable causes that describe the reference, the same for every member of its group. */
+const REFERENCE_LEVEL_CAUSES: ReadonlySet<string> = new Set([
+  "no-reference",
+  "materialize-failed",
+  "reference-vanished",
+  "unreproduced-inputs",
+  "runner-unsupported",
+  "error",
+]);
 
 /**
  * B8.5: one member's RecheckOutcome, derived from a recheck shared by its reference group, or
@@ -707,12 +830,59 @@ export function deriveSharedRecheck(
   cwd: string,
   platform: NodeJS.Platform,
 ): RecheckOutcome | "split" {
-  void shared;
-  void counts;
-  void failingFiles;
-  void cwd;
-  void platform;
-  throw notImplemented("deriveSharedRecheck");
+  switch (shared.kind) {
+    case "approximate":
+    case "disabled":
+    case "timed-out":
+    case "skipped-deadline":
+      return shared;
+    case "unusable":
+      return REFERENCE_LEVEL_CAUSES.has(shared.cause) ? shared : "split";
+    case "exact":
+      break;
+  }
+  const mine = new Set(failingFiles.map((f) => fold(fileKeyOf(cwd, f, platform), platform)));
+  const ranFiles = shared.ranFiles.filter((k) => mine.has(fold(k, platform)));
+  const absentFiles = shared.absentFiles.filter((k) => mine.has(fold(k, platform)));
+  // Every file of the member must be accounted for, and ran files need a result: otherwise only
+  // the member's own recheck can answer.
+  const covered = new Set([...ranFiles, ...absentFiles].map((k) => fold(k, platform)));
+  if ([...mine].some((k) => !covered.has(k))) return "split";
+  if (ranFiles.length === 0) return { kind: "exact", result: undefined, ranFiles, absentFiles, notes: shared.notes };
+  const full = shared.result;
+  if (full === undefined) return "split";
+
+  const ranSet = new Set(ranFiles.map((k) => fold(k, platform)));
+  const failingIds = full.failingIds.filter((id) => ranSet.has(fold(idFileKey(id), platform)));
+  // The rerun's failingFiles are absolute paths in the reference worktree, whose cwd this module
+  // does not know: each is keyed by the longest shared ran-file key it ends with.
+  const allKeys = [...new Set(shared.ranFiles.map((k) => fold(k, platform)))].sort((a, b) => b.length - a.length);
+  const keyOfRerunFile = (f: string): string | undefined => {
+    const slashed = fold(f.replace(/\\/g, "/"), platform);
+    return allKeys.find((k) => slashed === k || slashed.endsWith(`/${k}`));
+  };
+  const failingFilesAtRef = full.failingFiles.filter((f) => {
+    const k = keyOfRerunFile(f);
+    return k !== undefined && ranSet.has(k);
+  });
+
+  let total: number | undefined;
+  if (counts !== undefined) {
+    total = countOver(counts, ranFiles, platform);
+    if (total === 0) {
+      return { kind: "unusable", cause: "incomplete", reason: "rerun ran no tests although every input is a test file" };
+    }
+  } else {
+    if (failingIds.length === 0) return "split";
+    total = full.total;
+  }
+  return {
+    kind: "exact",
+    result: { failingIds, failingFiles: failingFilesAtRef, collectionError: false, total, complete: true, source: "report" },
+    ranFiles,
+    absentFiles,
+    notes: shared.notes,
+  };
 }
 
 /** B9: the deadline of a batch or of a recheck group, over the members still attached. */
@@ -725,8 +895,52 @@ export interface BatchDeadline extends Deadline {
 
 /** B9. It has no timer of its own: it aborts when every attached member has aborted, or at dispose. */
 export function createBatchDeadline(members: readonly Deadline[]): BatchDeadline {
-  void members;
-  throw notImplemented("createBatchDeadline");
+  const controller = new AbortController();
+  const attached = new Map<Deadline, () => void>();
+  const budgetMs = members.reduce((m, d) => Math.max(m, d.budgetMs), 0);
+
+  const detachAll = () => {
+    for (const [d, listener] of attached) d.signal.removeEventListener("abort", listener);
+    attached.clear();
+  };
+  const abort = () => {
+    detachAll();
+    if (!controller.signal.aborted) controller.abort();
+  };
+  const check = () => {
+    for (const d of attached.keys()) if (!d.signal.aborted) return;
+    abort();
+  };
+
+  for (const d of members) {
+    if (attached.has(d)) continue;
+    const listener = () => check();
+    attached.set(d, listener);
+    d.signal.addEventListener("abort", listener, { once: true });
+  }
+  check();
+
+  const remaining = () => {
+    if (controller.signal.aborted) return 0;
+    let r = 0;
+    for (const d of attached.keys()) r = Math.max(r, d.remaining());
+    return r;
+  };
+
+  return {
+    budgetMs,
+    remaining,
+    bound: (ownBudgetMs: number) => Math.min(ownBudgetMs, remaining()),
+    signal: controller.signal,
+    release(member: Deadline) {
+      const listener = attached.get(member);
+      if (listener === undefined) return;
+      member.signal.removeEventListener("abort", listener);
+      attached.delete(member);
+      check();
+    },
+    dispose: abort,
+  };
 }
 
 function notImplemented(name: string): Error {
