@@ -1027,9 +1027,6 @@ function splitZ(stdout: string): string[] {
  * mixed, none, -text, or "" for a missing or non-regular file). Each record is
  * "i/%-5s w/%-5s attr/%-17s\t<path>" (git's ls-files.c); only the path follows the tab.
  */
-/** Pathspecs limiting `ls-files --eol` to paths with a conversion attribute (QA-1.5-17). */
-const EOL_ATTR_PATHSPECS = [":(attr:text)", ":(attr:text=auto)", ":(attr:eol=crlf)", ":(attr:eol=lf)"] as const;
-
 function parseEolList(stdout: string): Map<string, { i: string; w: string }> {
   const result = new Map<string, { i: string; w: string }>();
   for (const record of splitZ(stdout)) {
@@ -1081,11 +1078,21 @@ interface GitRun {
  * `git --no-optional-locks ...` (QA-1.5-2): read-only commands never refresh
  * the user's index, and so never compete with the producer for index.lock.
  */
+/** Overrides for the pathspec environment switches git would otherwise inherit (QA-1.5-18). */
+const PATHSPEC_ENV_RESET: Readonly<Record<string, string>> = {
+  GIT_LITERAL_PATHSPECS: "0",
+  GIT_GLOB_PATHSPECS: "0",
+  GIT_NOGLOB_PATHSPECS: "0",
+  GIT_ICASE_PATHSPECS: "0",
+};
+
 async function runGit(argv: ArgvSeam, args: readonly string[], run: GitRun): Promise<ExecResult | undefined> {
   if (run.timeoutMs <= 0 || run.signal?.aborted) return undefined;
   const opts: ExecOptions = { cwd: run.cwd, timeoutMs: run.timeoutMs };
   if (run.signal) opts.signal = run.signal;
-  if (run.env) opts.env = run.env;
+  // QA-1.5-18: pathspec env switches (literal/glob/noglob/icase) change what every pathspec
+  // means; git reads them as booleans, so "0" neutralises them whatever the plugin inherited.
+  opts.env = { ...PATHSPEC_ENV_RESET, ...run.env };
   try {
     const result = await argv("git", ["--no-optional-locks", ...args], opts);
     if (result.timedOut || run.signal?.aborted) return undefined;
@@ -1777,17 +1784,17 @@ export async function materialize(
       // The caller's signal, not the budget's: this is the last step, so a spent budget
       // leaves the reference approximate ("" reason) instead of failing it.
       const eolClasses = async (cwd: string) => {
-        // QA-1.5-17: only paths whose attributes can convert (git >= 2.13 attr magic); without
-        // attributes only core.autocrlf converts, and that already added the "" reason above.
-        const listed = await runGit(deps.argv, ["ls-files", "--eol", "-z", "--", ...EOL_ATTR_PATHSPECS], {
+        // QA-1.5-18: the full listing. No pathspec limit is sound: a clean file's live bytes come
+        // from its last checkout (old core.autocrlf, legacy `crlf`, later working-tree-encoding).
+        const listed = await runGit(deps.argv, ["ls-files", "--eol", "-z"], {
           cwd,
           timeoutMs: budget.remaining(),
           signal,
         });
         return listed && listed.code === 0 ? parseEolList(listed.stdout) : undefined;
       };
-      const liveEol = await eolClasses(root);
-      const refEol = liveEol ? await eolClasses(dir) : undefined;
+      // QA-1.5-17: both listings run concurrently to bound the cost.
+      const [liveEol, refEol] = await Promise.all([eolClasses(root), eolClasses(dir)]);
       if (signal.aborted) return await abandon("aborted", "aborted during the eol comparison");
       if (!liveEol || !refEol) {
         conversion(""); // not compared: budget spent or git failed

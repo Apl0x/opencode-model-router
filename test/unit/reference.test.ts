@@ -716,6 +716,61 @@ describe("materialize / dispose", { timeout: 60_000 }, () => {
     }
   });
 
+  // QA-1.5-18: a clean file's live bytes come from its last checkout, so conversions no
+  // attribute pathspec selects must still be caught by the full `ls-files --eol` listing.
+  const expectCleanConversion = async (expected: string[]) => {
+    expect(await git(repo, "status", "--porcelain")).toBe("");
+    const ref = await capture();
+    expect(ref.tracked.size).toBe(0);
+    const handle = await mat(ref);
+    try {
+      const conversions = handle.inexactReasons.filter((r) => r.cause === "checkout-conversion").map((r) => r.path);
+      expect(conversions).toEqual(expected);
+      expect(handle.exact).toBe(false);
+    } finally {
+      await handle.dispose();
+    }
+  };
+
+  it("QA-1.5-18: legacy `crlf` attribute on a clean LF file -> inexact for those paths", async () => {
+    await git(repo, "config", "core.eol", "crlf");
+    await fsp.writeFile(join(repo, ".gitattributes"), "*.txt crlf\n");
+    await git(repo, "add", ".gitattributes");
+    await git(repo, "commit", "-q", "-m", "legacy crlf");
+    await expectCleanConversion(["a.txt", "b.txt"]);
+  });
+
+  it("QA-1.5-18: working-tree-encoding added after checkout -> inexact for that path", async () => {
+    await fsp.writeFile(join(repo, ".gitattributes"), "a.txt working-tree-encoding=UTF-16LE-BOM\n");
+    await git(repo, "add", ".gitattributes");
+    await git(repo, "commit", "-q", "-m", "encoding");
+    expect(await fsp.readFile(join(repo, "a.txt"), "utf8")).toBe("a0\n");
+    await expectCleanConversion(["a.txt"]);
+  });
+
+  it("QA-1.5-18: a file last checked out under core.autocrlf=true, now false -> inexact for that path", async () => {
+    await fsp.rm(join(repo, "a.txt"));
+    await git(repo, "-c", "core.autocrlf=true", "checkout", "--", "a.txt");
+    expect(await fsp.readFile(join(repo, "a.txt"), "utf8")).toBe("a0\r\n");
+    await new Promise((r) => setTimeout(r, 1100)); // not racily clean
+    await git(repo, "-c", "core.autocrlf=true", "update-index", "--refresh"); // stat now matches; config says false
+    await expectCleanConversion(["a.txt"]);
+  });
+
+  it("QA-1.5-18: GIT_LITERAL_PATHSPECS=1 in the environment does not disable the eol check", async () => {
+    await fsp.writeFile(join(repo, ".gitattributes"), "*.txt text eol=crlf\n");
+    await git(repo, "add", ".gitattributes");
+    await git(repo, "commit", "-q", "-m", "eol");
+    const saved = process.env.GIT_LITERAL_PATHSPECS;
+    process.env.GIT_LITERAL_PATHSPECS = "1";
+    try {
+      await expectCleanConversion(["a.txt", "b.txt"]);
+    } finally {
+      if (saved === undefined) delete process.env.GIT_LITERAL_PATHSPECS;
+      else process.env.GIT_LITERAL_PATHSPECS = saved;
+    }
+  });
+
   it("QA-1.5-13: an eol comparison that cannot run makes the reference approximate, not failed", async () => {
     const failing: CaptureDeps["argv"] = async (file, args, opts) =>
       args.includes("--eol") ? { code: 128, stdout: "", stderr: "fatal: simulated", timedOut: false } : argv(file, args, opts);
