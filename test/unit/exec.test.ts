@@ -5,7 +5,7 @@ import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "no
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { DEFAULT_TIMEOUT_MS, KILL_GRACE_MS, deadlineOf, runArgv, runShell, setSweeperExecutableForTests } from "../../src/verify/exec";
+import { DEFAULT_TIMEOUT_MS, KILL_GRACE_MS, deadlineOf, runArgv, runShell, setSweeperExecutableForTests, trackingForTests } from "../../src/verify/exec";
 
 // Real processes, no mocks: the defect this guards against only exists in how
 // the OS tears a process tree down, which a fake child_process cannot model.
@@ -131,8 +131,8 @@ function priorityOf(pid: number): number {
   return Number(execFileSync("ps", ["-o", "ni=", "-p", String(pid)]).toString().trim());
 }
 
-async function waitForFile(path: string): Promise<void> {
-  for (let i = 0; i < 100; i++) {
+async function waitForFile(path: string, limitMs = 5000): Promise<void> {
+  for (let i = 0; i < limitMs / 50; i++) {
     try {
       readFileSync(path, "utf8");
       return;
@@ -584,6 +584,22 @@ describe("process lifecycle around the direct child's exit", () => {
   }, 60000);
 });
 
+describe("tracked-process bookkeeping (QA-1.2-23)", () => {
+  it("only lets the run that owns an entry untrack it, so a recycled id stays tracked", () => {
+    const { track, untrack, isTracked } = trackingForTests;
+    const pid = 2_000_000_123;
+    const oldRun = Symbol("old");
+    const newRun = Symbol("new");
+    track(pid, oldRun);
+    untrack(pid, oldRun);
+    track(pid, newRun);
+    untrack(pid, oldRun);
+    expect(isTracked(pid)).toBe(true);
+    untrack(pid, newRun);
+    expect(isTracked(pid)).toBe(false);
+  });
+});
+
 describe("lowPriority", () => {
   // Windows: BELOW_NORMAL base priority is 6 (normal 8). POSIX: `nice -n 10`.
   const lowered = (p: number) => (isWin ? p <= 6 : p >= 10);
@@ -593,33 +609,35 @@ describe("lowPriority", () => {
     const controller = new AbortController();
     const pending = runArgv(process.execPath, [f.script, f.pidFile], { cwd: f.dir, timeoutMs: 30000, lowPriority: true, signal: controller.signal });
     try {
-      await waitForFile(f.pidFile);
+      // Below-normal fixtures start late under normal-priority load (QA-1.2-22).
+      await waitForFile(f.pidFile, 30_000);
       expect(lowered(priorityOf(f.grandchild()))).toBe(true);
     } finally {
       controller.abort();
       await pending;
     }
     expect(await waitForExit(f.grandchild())).toBe(true);
-  }, 60000);
+  }, 90_000);
 
   it("runs grandchildren of runShell below normal priority", async () => {
     const f = forkingFixture();
     const controller = new AbortController();
     const pending = runShell(f.command, { cwd: f.dir, timeoutMs: 30000, lowPriority: true, signal: controller.signal });
     try {
-      await waitForFile(f.pidFile);
+      // Below-normal fixtures start late under normal-priority load (QA-1.2-22).
+      await waitForFile(f.pidFile, 30_000);
       expect(lowered(priorityOf(f.grandchild()))).toBe(true);
     } finally {
       controller.abort();
       await pending;
     }
     expect(await waitForExit(f.grandchild())).toBe(true);
-  }, 60000);
+  }, 90_000);
 
   it.each([0, 3])("keeps exit code %i through the priority wrapper", async (code) => {
     const script = `process.exit(${code})`;
-    expect((await runArgv(process.execPath, ["-e", script], { cwd: tmpdir(), timeoutMs: 20000, lowPriority: true })).code).toBe(code);
-    expect((await runShell(`${node} -e "${script}"`, { cwd: tmpdir(), timeoutMs: 20000, lowPriority: true })).code).toBe(code);
+    expect((await runArgv(process.execPath, ["-e", script], { cwd: tmpdir(), timeoutMs: 60_000, lowPriority: true })).code).toBe(code);
+    expect((await runShell(`${node} -e "${script}"`, { cwd: tmpdir(), timeoutMs: 60_000, lowPriority: true })).code).toBe(code);
   }, 20000);
 
   it.runIf(isWin)("keeps the exit code of a .cmd target run through runShell (Windows-only: .cmd is a Windows batch file)", async () => {

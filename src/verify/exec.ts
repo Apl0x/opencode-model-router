@@ -78,8 +78,15 @@ const SWEEP_ARM_MS = 200;
 const SWEEP_TIMEOUT_MS = 30_000;
 /** Windows: the most `taskkill /T` on a live direct child may take. */
 const TASKKILL_TIMEOUT_MS = 5000;
-/** Windows: the most the exit hook's single `taskkill /T` may delay opencode's exit. */
-const EXIT_TASKKILL_TIMEOUT_MS = 2000;
+/**
+ * Windows: the most the exit hook's single `taskkill /T` may delay opencode's
+ * exit, and only when a verification is in flight: with none, the hook spawns
+ * nothing, and an idle taskkill takes well under a second. Under normal-priority
+ * CPU saturation taskkill took up to 3.4 s, and a 2 s limit left part of a tree
+ * running (QA-1.2-21); this is the last chance to reach those trees. A load that
+ * slows taskkill past this limit can still leave part of a tree (a G4 known limit).
+ */
+const EXIT_TASKKILL_TIMEOUT_MS = 10_000;
 /** Printed by the sweeper once pinning is done; its absence means the sweep did not run. */
 const SWEEP_MARKER = "pinned";
 /** Windows: clock tolerance between Date.now() and the kernel's creation times. */
@@ -199,7 +206,8 @@ function run(file: string, args: string[], shell: boolean, opts: RunOptions, nic
       }
     }
     // After the priority call, which must follow the spawn as closely as possible.
-    if (pid) track(pid);
+    const trackToken = Symbol("run");
+    if (pid) track(pid, trackToken);
     // A StringDecoder per stream, so a multi-byte character split across two
     // chunks is not turned into U+FFFD.
     child.stdout?.setEncoding("utf8");
@@ -219,7 +227,7 @@ function run(file: string, args: string[], shell: boolean, opts: RunOptions, nic
       opts.signal?.removeEventListener("abort", kill);
       // Windows keeps the child tracked until its `exit`: one that outlived
       // the grace is exactly what the exit hook must still end.
-      if (!isWin && pid) untrack(pid);
+      if (!isWin && pid) untrack(pid, trackToken);
       // A sweep that is killing must finish, but must not keep opencode alive
       // (QA-1.2-19); one that is only armed is released.
       if (sweeper && sweepPending) sweeper.unref();
@@ -305,10 +313,10 @@ function run(file: string, args: string[], shell: boolean, opts: RunOptions, nic
       exitCode = code;
       exitedAt = Date.now();
       // Windows: libuv has closed the child's handle, so its PID may be recycled from here on.
-      if (isWin && pid) untrack(pid);
+      if (isWin && pid) untrack(pid, trackToken);
       if (!isWin && pid && !groupAlive(pid)) {
         groupGone = true;
-        untrack(pid);
+        untrack(pid, trackToken);
       }
       if (isWin && pid) {
         // Pipes still open shortly after exit mean a descendant holds them.
@@ -415,23 +423,37 @@ function killTree(child: ChildProcess): void {
 // - Windows (QA-1.2-18): the tree of each direct child that has not exited.
 //   libuv's kill-on-close job ends the direct child only. Until the child's
 //   `exit`, libuv holds its process handle, so its PID cannot be recycled.
-const tracked = new Set<number>();
+// Each entry is owned by the run that tracked it (QA-1.2-23): POSIX untracks a
+// group both at `exit` and at settle, and its id may be recycled in between by
+// a new run's group. That run overwrites the entry, and the old run's second
+// untrack must not delete it, so only the owner's token deletes an entry.
+// Not fixable without pidfd: if a group empties after `exit` and its id is
+// recycled by an unrelated group, the late kill or this hook can signal that
+// group (it needs a `setsid` escapee holding the pipes plus PID wrap-around).
+const tracked = new Map<number, symbol>();
 let exitHookInstalled = false;
 
-function track(pid: number): void {
-  tracked.add(pid);
+function track(pid: number, token: symbol): void {
+  tracked.set(pid, token);
   if (exitHookInstalled) return;
   exitHookInstalled = true;
   process.once("exit", killTrackedProcesses);
 }
 
-function untrack(pid: number): void {
-  tracked.delete(pid);
+function untrack(pid: number, token: symbol): void {
+  if (tracked.get(pid) === token) tracked.delete(pid);
 }
+
+/** The tracking helpers, for unit tests only (QA-1.2-23). */
+export const trackingForTests = {
+  track,
+  untrack,
+  isTracked: (pid: number): boolean => tracked.has(pid),
+};
 
 /** The `exit` hook: synchronous, as `exit` listeners must be. */
 function killTrackedProcesses(): void {
-  const pids = [...tracked];
+  const pids = [...tracked.keys()];
   tracked.clear();
   if (!isWin) {
     for (const pgid of pids) signalGroup(pgid, "SIGKILL");
