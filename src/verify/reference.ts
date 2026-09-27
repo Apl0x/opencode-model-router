@@ -610,10 +610,12 @@
 //      identical, so no call site changes. They are not exported, to avoid a
 //      second exported ArgvSeam; tests can type the seam as CaptureDeps["argv"].
 //      Truncation contract (QA-1.5-21): p12's runArgv caps each stream at its
-//      maxBuffer, keeps the child's exit code and appends `[stdout truncated
-//      at <n> chars]` to stderr. runGit turns such a result (or a `-z` output
-//      without its closing NUL) into a failed call, so a cut listing can only
-//      make a reference approximate or failed, never falsely exact.
+//      maxBuffer, keeps the child's exit code and appends the note line
+//      `[stdout truncated at <n> chars]` after git's stderr. runGit honours
+//      that note only in the trailing note block and only when stdout is n
+//      (or n-1) chars long (QA-1.5-23), and turns such a result (or a `-z`
+//      output without its closing NUL) into a failed call, so a cut listing
+//      can only make a reference approximate or failed, never falsely exact.
 //   D9 Hooks are disabled for `git worktree add` (core.hooksPath points at a
 //      random path in the tmp root that does not exist and lies outside the
 //      worktree, so the checkout cannot create it; QA-1.5-8).
@@ -1099,16 +1101,37 @@ const PATHSPEC_ENV_RESET: Readonly<Record<string, string>> = {
   GIT_ICASE_PATHSPECS: "0",
 };
 
-/** The note the p12 seam appends to stderr when it cut stdout at its maxBuffer (QA-1.5-21). */
-const STDOUT_TRUNCATED = /\[stdout truncated at \d+ chars\]/;
+/** One note line the p12 seam appends to stderr when it cut a stream at its maxBuffer (QA-1.5-21). */
+const TRUNCATION_NOTE = /^\[(stdout|stderr) truncated at (\d+) chars\]$/;
+
+/**
+ * Whether the seam cut stdout (QA-1.5-21, QA-1.5-23). p12's runArgv appends its
+ * notes as whole lines after git's own stderr, so only the trailing block of
+ * note lines counts: git messages quoting a path named like the note never
+ * match. The stdout note must also agree with the cap, i.e. stdout is n chars,
+ * or n-1 when the cut dropped half of a surrogate pair.
+ */
+function stdoutTruncated(result: ExecResult): boolean {
+  const lines = result.stderr.split("\n");
+  if (lines.at(-1) === "") lines.pop();
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const note = TRUNCATION_NOTE.exec(lines[i] ?? "");
+    if (!note) return false;
+    if (note[1] === "stdout") {
+      const limit = Number(note[2]);
+      return result.stdout.length === limit || result.stdout.length === limit - 1;
+    }
+  }
+  return false;
+}
 
 /**
  * One git run through the seam; undefined on timeout or abort. Every call is
  * `git --no-optional-locks ...` (QA-1.5-2): read-only commands never refresh
  * the user's index, and so never compete with the producer for index.lock.
  * A truncated stdout (QA-1.5-21) comes back as a failed call (code -1): the
- * seam's truncation note in stderr, or a non-empty `-z` output that does not
- * end in NUL. Every caller parses stdout only after `code === 0`.
+ * seam's trailing stdout note in stderr (stdoutTruncated), or a non-empty
+ * `-z` output that does not end in NUL. Every caller parses stdout only after `code === 0`.
  */
 async function runGit(argv: ArgvSeam, args: readonly string[], run: GitRun): Promise<ExecResult | undefined> {
   if (run.timeoutMs <= 0 || run.signal?.aborted) return undefined;
@@ -1122,7 +1145,7 @@ async function runGit(argv: ArgvSeam, args: readonly string[], run: GitRun): Pro
     if (result.timedOut || run.signal?.aborted) return undefined;
     // QA-1.5-21: the p12 seam keeps exit code 0 when it cuts stdout at maxBuffer.
     const cut =
-      STDOUT_TRUNCATED.test(result.stderr) ||
+      stdoutTruncated(result) ||
       (args.includes("-z") && result.stdout !== "" && !result.stdout.endsWith("\0"));
     if (cut && result.code === 0) {
       return { ...result, code: -1, stderr: `${result.stderr}\n[omr: git output truncated]` };

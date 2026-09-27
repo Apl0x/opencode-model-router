@@ -836,6 +836,26 @@ describe("materialize / dispose", { timeout: 60_000 }, () => {
     }
   });
 
+  it("QA-1.5-23: a repository file named like the truncation note does not disable capture or materialize", async () => {
+    const name = "[stdout truncated at 1 chars].txt";
+    await fsp.writeFile(join(repo, ".gitattributes"), "*.txt text eol=crlf\n");
+    await fsp.writeFile(join(repo, name), "x0\n");
+    await git(repo, "add", "-A");
+    await git(repo, "commit", "-q", "-m", "note-named file");
+    // Dirty with LF content: `stash create` warns on stderr, quoting the file name.
+    await fsp.writeFile(join(repo, name), "x1\n");
+    const ref = await capture();
+    expect(ref).toBeDefined();
+    // Dirtied again after capture: step 7's `diff --name-only` prints the same warning.
+    await fsp.writeFile(join(repo, name), "x2\n");
+    const handle = await mat(ref);
+    try {
+      expect(handle.inexactReasons.some((r) => r.path === name)).toBe(true);
+    } finally {
+      await handle.dispose();
+    }
+  });
+
   it("QA-1.5-6b: assume-unchanged / skip-worktree entries -> inexact index-flags", async () => {
     await git(repo, "update-index", "--assume-unchanged", "b.txt");
     await git(repo, "update-index", "--skip-worktree", "packages/a/index.js");
