@@ -712,3 +712,49 @@ Open non-deferred findings: QA-1.5-18 (Medium), QA-1.5-19 (Low), QA-1.5-20 (Low)
 - Resolution: a27c4be, 714079b — QA-1.5-20: `EOL_ATTR_PATHSPECS` is removed, so `parseEolList` has its JSDoc again. Section 2e, step 7b and OPEN RISKS now match the code.
 
 Verification: `npx vitest run --maxWorkers=2 test/unit/reference.test.ts` 51/51 passed; `npm run typecheck` clean.
+
+## QA re-review (round 5)
+
+Scope: the round-4 fixes (a27c4be, 714079b, ca300c3) and every defect that `git diff 667673e..ca300c3` introduces
+(`src/verify/reference.ts`, `test/unit/reference.test.ts`, this file). Unchanged code cleared in rounds 1-4 was not
+re-audited. Host: win32, Git 2.51.0.windows.1, Node, vitest 4.1.11.
+
+Method: a scratch copy of the repo in `%TEMP%\omr-qa15r5` (`node_modules` junction) ran the 4 new tests against three
+builds: `reference.ts` from 667673e (the 8e71e32 step 7b), HEAD with only the env reset removed, and HEAD. A
+scratch-only test ran `materialize` through the real production seam: `runArgv` and `types.ts` from `origin/vrb/p12`
+(a14ba68). Direct `git` runs checked the env semantics.
+
+### Resolutions: verification
+| Finding | Status | Evidence |
+|---|---|---|
+| QA-1.5-18 | **Verified** (a new, separate gap → QA-1.5-21) | Step 7b (`:1798-1809`) runs `ls-files --eol -z` with no pathspec at root and at dir. On the **667673e build all 4 new tests fail**: legacy `crlf` and `GIT_LITERAL_PATHSPECS=1` give `expected [] to deeply equal [ 'a.txt', 'b.txt' ]`; `working-tree-encoding` and the file last checked out under `core.autocrlf=true` give `expected [] to deeply equal [ 'a.txt' ]`. On HEAD all 4 pass. So these are real regression tests for B6, B9, B10 and B11. |
+| QA-1.5-18: env reset | **Verified**, safe. Untested → QA-1.5-22 | `opts.env = { ...PATHSPEC_ENV_RESET, ...run.env }` (`:1107`). The caller's keys win, but callers pass only `GIT_INDEX_FILE` (`:1362`, `:1748`) and `LC_ALL` (`:1613`). No caller can re-enable a switch, and no key a caller sets is overridden. The inherited process env loses to the reset, as intended. The p12 `mergeEnv` (`exec.ts:355-370`) merges over `process.env`, and on Windows it first deletes other casings of the same name, so a differently cased inherited name is replaced too. Direct git, `ls-files -- ':(attr:text)'`: `LITERAL=1` → empty; `LITERAL=0` → `a.txt`; `LITERAL=1,GLOB=1` → `fatal: global 'literal' pathspec setting is incompatible…`; all four `=0` → `a.txt`, with no incompatibility error. So `"0"` is the neutral value. Hooks and filters that git spawns inherit it, and `0` is git's default. The HEAD build **with the reset removed passes all 4 new tests**: since a27c4be no call passes pathspecs, so the reset is only a safeguard for later changes and no test covers it. |
+| QA-1.5-18: concurrency | **Verified** | `runGit` never rejects (a try/catch surrounds the awaited seam call) and `parseEolList` cannot throw. So `Promise.all` (`:1809`) always waits for both listings, and no git process is still running in `dir` when `abandon` or `dispose` runs; the seam resolves only after the process tree has exited. Both calls get the caller's `signal` and `timeoutMs = budget.remaining()`. An abort → `abandon("aborted")`; a timeout or failure of either → `""`. The existing "cannot run" test (both `--eol` calls fail) still yields exactly `[{checkout-conversion, ""}]`. Both listings are read-only (`--no-optional-locks`) and use separate index files, so they cannot contend for a lock. One behaviour change, not a defect: when the live listing fails, the dir listing is no longer skipped; it runs until done or until the remaining budget ends. |
+| QA-1.5-19 | **Accepted as OPEN RISK** | The error runs only toward inexact. The rule at `:1819` flags an edited, untracked-at-capture path only when the reference's checkout converts it (`i/` != `w/`), which can only add reasons, never remove them. The loss applies only to files edited between capture and materialize. Git for Windows' default `core.autocrlf=true` already adds the repository-wide `""` reason, so the extra cost falls on `* text=auto` repos with `autocrlf=false`. The fix really does need each path's `w/` class at capture time, and that cannot be recovered once the file has been edited. The OPEN RISKS text (`:642-648`) matches the code. Revisit in 2.1 if the unverifiable rate on win32 turns out to matter. |
+| QA-1.5-20 | **Verified**, but the same defect returns elsewhere → QA-1.5-22 | `parseEolList`'s JSDoc (`:1037-1041`) sits directly on the function again. Section 2e (`:88-98`), step 7b (`:300-308`) and OPEN RISKS (`:633-648`) describe the full listing and the QA-1.5-16/19 rule. |
+
+### New findings
+| ID | Severity | Evidence | Fix |
+|---|---|---|---|
+| QA-1.5-21 | Medium (exposed after the p12 merge; widened by a27c4be) | **The production seam silently truncates stdout, so a large repository gets `exact: true` with part of the tree never compared.** In `origin/vrb/p12`, `argvSeam = runArgv`, and runArgv caps each stream at `DEFAULT_MAX_BUFFER = 10 * 1024 * 1024` chars (`exec.ts:69`). Output past the cap is dropped, the child's own exit code (0 here) is kept, and only a note `[stdout truncated at <n> chars]` is appended to stderr (`exec.ts:215-245`). `ExecOptions`/`ArgvSeam` in `types.ts` carry no `maxBuffer`, so every seam call gets the default. `runGit` (`:1101-1116`) never checks for truncation, and `parseEolList` skips a cut record, or keys it under a partial path. Rows past the cut are missing from both listings, so step 7b never compares them. **Repro** (scratch test, real p12 `runArgv`, `*.txt text eol=crlf`, a.txt and b.txt clean LF): with the default seam, `exact: false` with reasons `a.txt` and `b.txt`, both `--eol` calls `code=0 stdout.length=305`. With `maxBuffer` cut mid-record before `a.txt` (138 chars), **`exact: true`, `inexactReasons: []`**, both calls `code=0 stdout.length=138 stderr="[stdout truncated at 138 chars]"`. At full scale a record is 39 header chars + path + NUL, so 10 M chars ≈ 90-120k tracked paths. In a monorepo of that size, a clean file past the cut that the checkout converts goes unreported, which is the §1.5-7 wrong-excuse direction. The problem has existed since 9790b41 for attributed repos (the 8e71e32 limit was already the full listing under `* text=auto`). a27c4be makes it unconditional. The same cause affects every other `runGit` listing (`diff --name-only` in step 7, `ls-files --others`, the capture listings), but those need far larger outputs. | In `runGit`, treat a truncated result as a failed call: return `undefined` when stderr matches `/\[stdout truncated at \d+ chars\]/`. For `-z` listings, also reject non-empty stdout that does not end in `\0`, which does not depend on the note's wording. The existing failure paths (`""` reason, `abandon("error")`) are already safe. Record the truncation contract in the D8 mirror comment. Add a unit test with a seam that truncates like p12 (the repro above). Fix it here, or at the latest as a blocker of the p12/p15 merge. |
+| QA-1.5-22 | Low (docs/tests; introduced by a27c4be) | (1) **The orphaned-JSDoc pattern of QA-1.5-20 is back, now on `runGit`:** its JSDoc (`:1088-1092`) is followed by the `PATHSPEC_ENV_RESET` JSDoc and constant (`:1093-1099`), so `runGit` (`:1101`) has no doc comment and the constant has two. (2) The round-4 resolution names `GIT_LITERAL_PATHSPECS=1` as the regression test for the env override. That test fails on 8e71e32, but it **passes with the override removed** (verified above), so nothing covers the reset. (3) Wording: `:1808` says concurrency "bound[s] the cost", but it only halves the wall-clock time; the bound comes from `budget.remaining()` plus the `""` fallback. Header line `:303` runs past the comment's wrap width. The round-4 resolution above says "adds the `"` reason" where it means `""`. | Move the `runGit` JSDoc down onto the function. Add a seam-spy assertion that every git call's `opts.env` carries the four `"0"` values, and that a caller key such as `GIT_INDEX_FILE` still arrives. Reword `:1808` and re-wrap `:303`. |
+
+### Checked with no finding
+- The 4 new tests are deterministic: 51/51 on the mandated run, and 4/4 on the reset-removed build.
+- The test seam's checks at `:306` and `:317` (`opts?.env?.GIT_INDEX_FILE ?? userIndex`) still work now that every call
+  passes an `env` object without `GIT_INDEX_FILE`.
+- Always passing `env` makes the p12 seam copy `process.env` on every call (`mergeEnv` returns `process.env` itself
+  only when there are no overrides). The cost is negligible.
+
+### Verification and cleanup
+- `npx vitest run --maxWorkers=2 test/unit/reference.test.ts` (ca300c3): **51/51 passed** (174.2 s).
+- Scratch `%TEMP%\omr-qa15r5`: the `node_modules` junction was unlinked first (the real `node_modules` was intact
+  afterwards), then the directory was deleted (`scratch exists: False`). TEMP has no `omr-ref-*` or
+  `omr-nohooks-*` dirs, and `git worktree list` shows only the pre-existing worktrees. Three
+  `omr refs ü テスト *` test bases in TEMP (created 01:12, 01:59 and 03:12) predate this round's first run (03:39) and
+  were left untouched.
+
+Open non-deferred findings: QA-1.5-21 (Medium), QA-1.5-22 (Low). Phase 1.5 QA is **not** clean.
+
+Deferred by plan (unchanged): QA-1.5-7; QA-1.5-10 and QA-1.5-4 (2.1 parts); the POSIX key safety test and the Bun
+POSIX smoke (3.1).
