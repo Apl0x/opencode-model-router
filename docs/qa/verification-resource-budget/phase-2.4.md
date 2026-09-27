@@ -349,6 +349,157 @@ compiles, and every body throws "not implemented" until 2.4.1b. Key decisions:
   in the same session and root. This can only remove a pass; it never creates a pass or a fail.
   It depends on gather item 5; if that precondition fails, the lineage API is deleted.
 
+## Implementation notes (2.4.2a–c)
+
+Commits on `vrb/p24`: merge `24008e5`, docs `aa571a9`, 2.4.2a `7eeb91a`, 2.4.2b `80598f5` and
+2.4.2c `d414687`. The tests are in `test/integration/deferred-verification.test.ts`. Every routing
+case runs on both paths through `describe.each(["task", "delegate"])`.
+
+### Wiring API (`src/verify/wiring.ts`)
+
+- `resolveDirectives(text)` calls `parseVerifyDirectives` with the config's `defaultVerify`,
+  `captureWaitMs` and `baselineTimeoutMs`, and sends unknown values to `logger.warn`. When the
+  config cannot be read, it returns `required` with a wait of 0, which is today's gate.
+- `dispatchDirectiveText(prompt, description)` returns the orchestrator's `prompt`, or its
+  `description` when the prompt is blank (the case the prompt-repair hook copies). It is never
+  given tool output or subagent text.
+- `startDispatch(store, id, cwd, dod, text, remember)` resolves the directives, then calls
+  `beginVerificationBounded(…, waitMs)`. `beginVerificationBounded` now takes an optional
+  `waitMs`, whose default is still `captureWaitMs`, so 2.1 callers and tests are unchanged.
+  - `remember: true` (native path) keeps `{ directives, dispatchedAt }` for the after hook. The
+    store holds at most 1 024 of them (FIFO), `sweepVerification` sweeps them at the idle TTL,
+    and `disposeVerification` clears them.
+- `takeDispatch(id, text)` returns the remembered start once. With nothing remembered, it
+  re-parses the same prompt and uses `dispatchedAt = now`. A later `dispatchedAt` can only widen
+  lineage (fewer passes).
+- `isDeferred(dod, directives)` holds when all three hold: mode is `deferred`, the DoD has a
+  `testsPass` check, and `require` is not `"never"`.
+- `finishDeferred(store, input)` implements R3/R10 and never rejects. In order:
+  1. It reads the reference promise with no signal and never awaits it.
+  2. It reads "captured at return" from a `WeakMap` of settled states filled in
+     `beginVerification`, so the check costs 0 ms.
+  3. Under a `DEFERRED_FINISH_MS` (2 s) deadline, it runs `observeChange`: the snapshot, the
+     commit diff (git only) and `delta`.
+  4. It runs static scoping (see the decisions below) and computes the risk with `assessRisk`,
+     passing the canonical tier and `root = snapshot.root`.
+  5. It starts the drift digests (`digestFiles`: fs reads, not awaited), then calls `register`
+     and builds the footer.
+  6. If the change set is unavailable (the snapshot is missing or late, or the commit diff
+     failed), it registers `"unavailable"` with `unattributedRisk()`, never `[]`.
+  7. If anything throws, it still returns an `unverified · no handle (not registered)` footer.
+- `observeChange` is `prepareVerification` without the reference await, and
+  `prepareVerification` is now `observeChange` + `await store.reference(id, signal)`.
+  - The only reorder: `delta` now runs before the reference await. `delta` reads only the
+    store's record and the producers' tool-observed files, and neither changes once the producer
+    has returned.
+- `applyLineage(res, ctx)` applies R11 to a required gate's result:
+  - outcome `fail` with `failures.introduced` → `recordRejection` with label
+    `dispatch <id>` and `landedAt = returnedAt`;
+  - otherwise, `failures.preexisting` matched by `findLineage` → the outcome becomes
+    `unverifiable` and `buildLineageCaveat` is appended to the caveats. The result stays accepted
+    unless `strictUnverifiable`.
+  - No `failures` (checker verdicts, a timed-out gate) or no `root` → no change, nothing recorded.
+- `pending`: one registry per plugin instance. Its TTL is `pendingTtlMs` and its abandonment
+  bound is `gateBudgetMs + VERIFYING_GRACE_MS`, both read at plugin start (a reload applies
+  after a restart). If the config is unreadable, the §1.4 defaults apply.
+
+### Plugin (`src/index.ts`)
+
+- **Native `task`.**
+  - `tool.execute.before` calls `startDispatch(…, remember: true)` on the **raw** orchestrator
+    prompt, before the dispatch header and the prompt repair.
+  - `tool.execute.after` calls `takeDispatch`. When the dispatch is deferred it calls
+    `finishDeferred`, appends the footer last with `appendRouterFooter`, clears the child's
+    store entry, and returns: no gate deadline, no `buildGateDeps`, no `accept`.
+  - Otherwise the 2.1 gate runs unchanged, followed by `applyLineage`, and then the existing
+    forcing note or accepted suffix.
+- **`delegate`.**
+  - The directives come from `args.task` (`startDispatch`, `remember: false`) on the first
+    attempt.
+  - A deferred attempt whose producer returned: `finishDeferred`, the per-attempt cleanup, and
+    `producerText + footer`. It gets no `nextAction`, no scorecard and no retry.
+  - A required attempt keeps the gate and the ladder, with `applyLineage` after each gate.
+  - `finally` does not clear `baselineID` when `finishDeferred` owns it.
+- **Lifecycle.**
+  - `pending.sweep()` is in the `createIdleTtlSweeper` list.
+  - `session.deleted` calls `pending.forgetSession(id)`.
+  - Plugin `dispose` calls `pending.dispose()` before `disposeVerification()`.
+
+### Decisions (QA may challenge)
+
+1. **What defers.** Only a DoD that has a `testsPass` check (R3: "else nothing is deferred"),
+   with verification enabled. Checker-only and other deterministic DoDs are gated exactly as
+   before, whatever the mode. When a DoD has `testsPass` and other checks, the **whole** gate is
+   deferred, and `router_verify` later runs the whole gate (§1.5-18: "the same path as a required
+   gate").
+2. **`VERIFY_WAIT` applies to every verified dispatch's capture wait**, not only `testsPass` ones.
+   It defaults to `captureWaitMs`, so a dispatch without the directive behaves as in 2.1.
+3. **Static scoping for risk.**
+   - `planStaticScoping` runs once per `testsPass` check, with the gate's command
+     (`resolveRepoCommand`) and cwd (`resolveBaseDir`). The first S6 result wins.
+   - A command outside the allowlist counts as S6 `unsupported-command` (the gate reports it
+     unverifiable).
+   - A plan that does not finish inside the 2 s bound counts as S6 `search-failed` with
+     `STATIC_SCOPING_UNFINISHED_REASON`. That raises the risk and never lowers it.
+4. **Dispatch record lifetime.**
+   - `finishDeferred` clears the dispatch record in its `finally`, chained on the reference
+     promise. So the record is gone only after the finish has read it **and** the capture has
+     settled.
+   - Clearing it earlier aborts the capture (`dispatch.ts:203`) and stops the §1.5-14
+     contamination tracking. A test with a capture that honours its abort signal catches that
+     regression on the delegate path.
+5. **A delegate producer that failed outright** (transport error or timeout) keeps today's
+   failed-attempt path, even in deferred mode. It produced nothing that could be verified later,
+   and that path runs no verification process. Only a returned result is deferred, and a deferred
+   result is never retried or escalated.
+6. **Tier canonicalisation** (lowercase + trim) happens at the registry boundary
+   (`finishDeferred` → `canonicalTier`) on both paths. The delegate ladder's own tier string
+   (`tierModel`, `agent`, ladder index) is left as it was.
+7. **Lineage on both paths.** R11 names the native path. `applyLineage` also runs after each
+   delegate gate, because a native re-dispatch of rejected delegate work is the same T11 case.
+   It can only remove passes. Within one delegate call it never matches its own attempts: every
+   `landedAt` is after that call's `dispatchedAt`.
+8. **Timeout lineage:** nothing is recorded (see gather item 5). Residual: ids proven introduced
+   before the gate budget ran out are lost to the ledger.
+
+### Test coverage (2.4.2)
+
+- **Wiring:**
+  - directive defaults and overrides;
+  - `VERIFY_WAIT` latency under fake timers: 20 s capture with a 5 s wait → 5 s; wait 0 → 0;
+    2 s capture with a 5 s wait → 2 s;
+  - `isDeferred`;
+  - `finishDeferred`: zero spawns, no scope opener, no testsPass hook; canonical tier;
+    captured versus in-flight reference; the record outlives the capture; unavailable →
+    unattributed; a slow snapshot is cut at 2 s; registration refused → footer without a
+    handle;
+  - `applyLineage`: record then downgrade; strict rejection; other session, other root and
+    `dispatchedAt` all fail to match; timed-out gate and unknown root are no-ops.
+- **Both paths:**
+  - default deferred: footer last, zero non-git spawns, no slot, one pending entry;
+  - a deferred result with a failing check is neither rejected nor retried;
+  - `VERIFY:required` → gate and escalation, no footer;
+  - `defaultVerify: "required"` → the same, and `VERIFY:deferred` still defers;
+  - a non-`testsPass` DoD is gated;
+  - a producer's `VERIFY:required` changes nothing;
+  - the lineage context is correct;
+  - `VERIFY_WAIT:5s` with a 20 s capture → the producer starts at 5 s, and the reference is still
+    captured later;
+  - `VERIFY_WAIT:0s` with a capture that never settles → immediate, and counted as no reference;
+  - canonical tier;
+  - `session.deleted` → forgotten;
+  - sweep and dispose are wired.
+
+### Follow-ups found in 2.4.2
+
+- The `delegate` tool description (`src/index.ts`) still says every result is "INDEPENDENTLY
+  VERIFIED … before it is returned". With deferred as the default, that is false for `testsPass`
+  DoDs. It is protocol text owned by 2.3 (plan 2.3.1: everything the orchestrator reads must
+  describe the final behaviour), so 2.3 must reword it.
+- Risk row 1 short-circuits: a delegation with no attributed change is `low` even when there is
+  no reference (risk.ts table). This is by design in 1.6; noted because the footer then shows no
+  "no reference" reason.
+
 ## Task breakdown
 
 Each task is ≤ ~20 tool calls. Commit and push each one when green. Run only scoped
@@ -357,9 +508,9 @@ Each task is ≤ ~20 tool calls. Commit and push each one when green. Run only s
 | Task | When | Scope |
 |---|---|---|
 | 2.4.1b | now | Implement pending.ts R2–R11 + `test/unit/pending.test.ts`. Cover the R6 scoping matrix, every R4 transition, join (N calls → one claim), single-use settle, reaping, TTL at read without a sweep, caps, eviction order and weight, `registry-full`, release on terminal settle, a rejected reference promise normalized, `forgetSession`, dispose resolving joiners, every R9 text verbatim, and the lineage matrix. |
-| 2.4.2a | after 2.1 + 2.2.3 merge | wiring.ts: parse directives from the orchestrator prompt only; `VERIFY_WAIT` bounds the capture wait; deferred-finish helper (snapshot → changed files or `"unavailable"`, static scoping, risk, digests, register, footer). |
-| 2.4.2b | after 2.4.2a | index.ts native `task`: mode routing; required path unchanged; deferred footer; `recordRejection` on required rejections; `pending.sweep` in `createIdleTtlSweeper`. |
-| 2.4.2c | after 2.4.2b | index.ts `delegate`: same routing; footer on the tool return; no ladder for deferred. |
+| 2.4.2a | **done** `7eeb91a` | wiring.ts: parse directives from the orchestrator prompt only; `VERIFY_WAIT` bounds the capture wait; deferred-finish helper (snapshot → changed files or `"unavailable"`, static scoping, risk, digests, register, footer). |
+| 2.4.2b | **done** `80598f5` | index.ts native `task`: mode routing; required path unchanged; deferred footer; `recordRejection` on required rejections; `pending.sweep` in `createIdleTtlSweeper`. |
+| 2.4.2c | **done** `d414687` | index.ts `delegate`: same routing; footer on the tool return; no ladder for deferred. |
 | 2.4.3a | after Spike F | wiring.ts `verifyHandles`: normalize, claim/join, one `Deadline`, one batch via the 2.2 coordinator, drift, per-handle verdict with forcing note and next tier, lineage caveat, settle in `finally`, no retry ever. |
 | 2.4.3b | after 2.4.3a | index.ts: register `router_verify` whenever verification is enabled (independent of `enableDelegateTool`); `test/unit/router-verify-tool.test.ts`. |
 | 2.4.4 | after 2.4.2 | System transform: `buildPendingListBlock(listUnverified(sid))`, appended only when defined. |
