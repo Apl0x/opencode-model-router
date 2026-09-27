@@ -515,3 +515,27 @@ taint" (QA-2.2-15). Control: B12 9/9.
 **critical** remains, QA-2.2-11, a false pass introduced by c041ad6's B7.5 exclusion. It must be
 fixed before 2.2.3. The rest are minor, nit or info, and under the owner's rule they are not
 fixed.
+
+### Resolutions (round 2)
+
+**QA-2.2-11** (critical)
+Resolution: `0e89ef1` — fixes (a) and (b), and the test part of (c). (a) `taintable` keeps every
+failing id of a complete union. It drops an id that names no input only when the union is
+incomplete, which is B7.5's premise. (b) `idFileKey` cuts an id at the earliest `" > "` or `"::"`,
+so `tests/test_x.py::test_cmp[1 > 0]` is keyed `tests/test_x.py`. It is batch.ts's only rule for
+getting a file from an id, used by 7.3a, `taintable` and B8.5. The judge stand-in in the test
+follows it too (2.1-T5 now states the same rule). (c) Three new tests. An `attributeUnion` row. A
+complete pytest union with an id that names no input taints both members. A regression through the
+real coordinator and the real `readResult` with `classname="tests.test_x" name="test_cmp[1 &gt; 0]"`.
+Solo and batched A are both `failingIds ["tests/test_x.py::test_cmp[1 > 0]"]` with
+`runner-unsupported`, so both are unverifiable. B passes. Stats are `unionRuns 1, ownRuns 0,
+taints 0`. B12's pytest name pool adds `test_cmp[1 > 0]` and `TestK::test_gt[a > b]`, and the
+report escapes them as pytest does. New tallies require > 10 cases with a failing `" > "` name and
+> 10 multi-member pytest unions with such an id. **Checked against the old batch.ts** (only
+`src/verify/batch.ts` stashed): 7 tests fail. They are the regression test, the (a) test, the new
+row, and 4 of 6 B12 chunks, each with "false pass" (e.g. seed 11158, `pytest -q`,
+`tests/test_x.py`, solo unverifiable). With the fix, `batch.test.ts` + `runner.test.ts` pass
+869/869, and `tsc --noEmit` is clean.
+
+**QA-2.2-12, QA-2.2-13, QA-2.2-14, QA-2.2-15, QA-2.2-16**: accepted per owner rule (post-round-2:
+only major/critical are fixed). QA-2.2-15 (2) is covered anyway by the `" > "` names above.
