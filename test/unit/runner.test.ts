@@ -1933,9 +1933,9 @@ describe("QA-1.3-3a/c: every xdist source is found, so the cap always lands", ()
     expect(await detect("pytest", files, POSIX_HOST, "/r/sub")).toMatchObject({ xdist: true, userWorkers: { count: 3 } });
   });
 
-  it("(c) the first accepted file in a directory wins, even an empty pytest.ini", async () => {
-    expect(await detect("pytest", pyRepo({ "/r/pytest.toml": "[pytest]\n", "/r/pytest.ini": "[pytest]\naddopts = -n 3\n" }))).toMatchObject({ xdist: false });
+  it("(c) the first accepted file in a directory wins, even an empty pytest.ini (every pytest line)", async () => {
     expect(await detect("pytest", pyRepo({ "/r/pytest.ini": "", "/r/tox.ini": "[pytest]\naddopts = -n 3\n" }))).toMatchObject({ xdist: false });
+    expect(await detect("pytest", pyRepo({ "/r/pytest.ini": "[pytest]\n", "/r/.pytest.ini": "[pytest]\naddopts = -n 3\n" }))).toMatchObject({ xdist: false });
   });
 
   it("(c) -c / --config-file: only that file, in its format", async () => {
@@ -2259,5 +2259,72 @@ describe("QA-1.3-19: the zero-test guard covers every runner; lexical mode stays
       expect(real.cwd).toBe(realpathSync.native(repo));
       expect(real.lexicalPaths).toBeUndefined();
     });
+  });
+});
+
+describe("QA-1.3-20: TOML spellings of addopts the parser does not read fail closed", () => {
+  it.each([
+    ["/r/pyproject.toml", 'tool.pytest.ini_options.addopts = "-n 3"\n'],
+    ["/r/pyproject.toml", '[tool]\npytest.ini_options.addopts = "-n 3"\n'],
+    ["/r/pyproject.toml", '[tool.pytest.ini_options]\n"addopts" = "-n 3"\n'],
+    ["/r/pyproject.toml", "[tool.pytest.ini_options]\n'addopts' = '-n 3'\n"],
+    ["/r/pyproject.toml", '[tool.pytest]\nini_options = { addopts = "-n 3" }\n'],
+    ["/r/pyproject.toml", '[tool]\npytest = { ini_options = { addopts = "-n 3" } }\n'],
+    ["/r/pyproject.toml", 'tool = { pytest = { addopts = ["-n", "3"] } }\n'],
+    ["/r/pyproject.toml", '[project]\nname = "x"\n[tool . "pytest"]\n"ini_options" . addopts = "-n 3"\n'],
+    ["/r/pyproject.toml", '[[tool.pytest.ini_options]]\naddopts = "-n 3"\n'],
+    ["/r/pytest.toml", '[pytest]\n"addopts" = ["-n", "3"]\n'],
+    ["/r/pytest.toml", 'pytest.addopts = ["-n", "3"]\n'],
+  ])("%s %j -> S6", async (f, text) => {
+    expectS6(await detectRunner("pytest", "/r", memFs(pyRepo({ [f]: text })), POSIX_HOST), "unsupported-argument", `unsupported pytest argument "addopts" in ${f}`);
+  });
+
+  it("other keys, other tables and the bare form still plan", async () => {
+    const text = [
+      'tool.black.line-length = 100',
+      '[tool.pytest.ini_options]',
+      '"testpaths" = ["tests"]',
+      'markers = { slow = "x" }',
+      'addopts = "-n 3"',
+      '[tool.other]',
+      'pytest.addopts = "-n 9"',
+      '"addopts" = "-n 9"',
+      'ini_options = { addopts = "-n 9" }',
+    ].join("\n");
+    expect(await detect("pytest", pyRepo({ "/r/pyproject.toml": text }))).toMatchObject({ xdist: true, userWorkers: { count: 3 } });
+  });
+});
+
+describe("QA-1.3-21: the config every pytest release line would read counts", () => {
+  const det = (files: Record<string, string>, command = "pytest") => detect(command, pyRepo(files));
+
+  it("pytest 8 skips pytest.toml, pytest 7.0 skips .pytest.ini: their pick is read too", async () => {
+    expect(await det({ "/r/pytest.toml": "[pytest]\n", "/r/pytest.ini": "[pytest]\naddopts = -n 3\n" })).toMatchObject({ xdist: true, userWorkers: { count: 3 } });
+    expect(await det({ "/r/.pytest.ini": "[pytest]\n", "/r/tox.ini": "[pytest]\naddopts = -n 3 --cov\n" })).toMatchObject({ xdist: true, covInConfig: true, userWorkers: { count: 3 } });
+    const s = spec(await planScopedRun(input({ command: "pytest", files: pyRepo({ "/r/pytest.toml": "[pytest]\n", "/r/pytest.ini": "[pytest]\naddopts = -n 3\n", "/r/tests/test_a.py": "" }), changedFiles: changed("tests/test_a.py") })));
+    expect(s.args.slice(s.args.indexOf("-n"), s.args.indexOf("-n") + 2)).toEqual(["-n", "2"]);
+  });
+
+  it("pytest 7/8 ignore the native [tool.pytest] table and keep walking; the lowest cap wins", async () => {
+    expect(await det({ "/r/pyproject.toml": '[tool.pytest]\naddopts = ["-n", "1"]\n', "/r/tox.ini": "[pytest]\naddopts = -n 3\n" })).toMatchObject({ xdist: true, userWorkers: { count: 1 } });
+    expect(await det({ "/r/pytest.toml": '[pytest]\naddopts = ["-n", "auto"]\n', "/r/pytest.ini": "[pytest]\naddopts = -n 3\n" })).toMatchObject({ userWorkers: { count: 3 } });
+    const d = await det({ "/r/pytest.toml": '[pytest]\naddopts = ["-n", "abc"]\n', "/r/pytest.ini": "[pytest]\naddopts = -n 3\n" });
+    expect(d).toMatchObject({ userWorkers: { count: 3 } });
+    expect(d.notes).toContain('invalid worker cap "abc" ignored');
+    expect(await det({ "/r/pytest.toml": '[pytest]\naddopts = ["-n", "2"]\n', "/r/pytest.ini": "[pytest]\naddopts = -n abc\n" })).toMatchObject({ userWorkers: { count: 2 } });
+  });
+
+  it("-p no:xdist in one line's config does not disable the -n another line reads", async () => {
+    expect(await det({ "/r/pytest.toml": '[pytest]\naddopts = ["-p", "no:xdist"]\n', "/r/pytest.ini": "[pytest]\naddopts = -n 3\n" })).toMatchObject({ xdist: true });
+    expect(await det({ "/r/pytest.ini": "[pytest]\naddopts = -n 3 -p no:xdist\n" })).toMatchObject({ xdist: false });
+    expect(await det({ "/r/pytest.toml": '[pytest]\naddopts = ["-p", "no:xdist", "-n", "3"]\n' })).toMatchObject({ xdist: true });
+    expect(await det({ "/r/pytest.ini": "[pytest]\naddopts = -p no:xdist\n" }, "pytest -n 3")).toMatchObject({ xdist: false });
+  });
+
+  it("a file only an older line reads can still be S6; -c toml is read both ways", async () => {
+    const bad = '[tool.pytest]\naddopts = ["-q"]\n[tool.pytest.ini_options]\naddopts = -n 3\n';
+    expectS6(await detectRunner("pytest", "/r", memFs(pyRepo({ "/r/pyproject.toml": bad })), POSIX_HOST), "unsupported-argument", 'unsupported pytest argument "addopts" in /r/pyproject.toml');
+    expect(await det({ "/r/cfg/x.toml": '[tool.pytest.ini_options]\naddopts = "-n 3"\n' }, "pytest -c cfg/x.toml")).toMatchObject({ xdist: true, userWorkers: { count: 3 } });
+    expectS6(await detectRunner("pytest -c cfg/x.toml", "/r", memFs(pyRepo({ "/r/cfg/x.toml": '[tool.pytest]\nini_options.addopts = "-n 3"\n' })), POSIX_HOST), "unsupported-argument");
   });
 });
