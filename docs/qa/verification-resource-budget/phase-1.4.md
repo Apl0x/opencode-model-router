@@ -1947,6 +1947,8 @@ These are the same as round 4, with the padded gap: b3 within 3 watch steps on b
   - `:665` exceeds its 100 ms on purpose and the new exit test does not depend on timing: leave
     both.
 
+Resolution: 3ebc8a1 — both claim tests use `claimHoldMaxMs: 1_000`; the drop-fence sleep is 1.7 s (past 1.5 × 1 s) and the second test waits up to 10 s. Each still proves the same thing. 62/62 unloaded (61.7 s) and under 14 busy loops (84.3 s).
+
 ### QA-1.4-36 — nit — One 5 s wait still runs under vitest's default 5 s timeout
 
 - **Where:** `slot.test.ts:310-319`, the `it.each` for an empty, corrupt or wrong-shape lock.
@@ -1955,6 +1957,8 @@ These are the same as round 4, with the padded gap: b3 within 3 watch steps on b
   - The QA-1.4-33 resolution says "every test that can wait 5 s or more has a 20 s timeout".
 - **Evidence:** load 1, `Error: Test timed out in 5000ms.` for "a wrong shape lock file is stale".
 - **Fix:** pass `20_000` as the `it.each` timeout.
+
+Resolution: 3ebc8a1 — the `it.each` gets 20 s. A grep for waits of 5 s or more found two more tests without a timeout (the QA-1.4-29 release test with its `waitUntil` of 4 s, and the test before it with a default 5 s `waitUntil`); both get 20 s.
 
 ### QA-1.4-37 — nit — The gap rule is described as 2 heartbeats; the padded rule restarts sooner
 
@@ -1978,6 +1982,8 @@ These are the same as round 4, with the padded gap: b3 within 3 watch steps on b
   - Optionally, move `:516-532` to `WATCHER_HEARTBEAT_MS` with calls 1.2 s or more apart, as
     QA-1.4-30 did for the others.
 
+Resolution: 3ebc8a1 — `slot.ts`, the notes and the test comments now state the limit as 2 heartbeats minus both looks' slacks: 2 × 5 s − 2 × 1 s = 8 s in production, 1.6 s and 320 ms in the tests. The residual is 8 s.
+
 ### QA-1.4-38 — nit — The QA-1.4-32 test leaves a background watch running for the rest of the file
 
 - **Where:**
@@ -1992,6 +1998,8 @@ These are the same as round 4, with the padded gap: b3 within 3 watch steps on b
   - In vitest it runs until `afterAll` removes the dir. It holds no process open (the timer is
     unref'd), but it is a 10 Hz loop for the rest of the file.
 - **Fix:** after `expect(existsSync(claim)).toBe(past)`, set `shift = 1_000_000` in both iterations.
+
+Resolution: 3ebc8a1 — after its assertion each iteration moves the seam clock past the watch's end, lets one poll see it, and asserts no further lock reads over the next 400 ms. Also: a new test pins QA-1.4-34 (looks 700 ms apart are reclaimed; 900 ms apart, inside 2 heartbeats of 500 ms but past the padded 800 ms, stay busy). Reverting the padding fails it.
 
 ### Deferred by plan (round 5)
 
