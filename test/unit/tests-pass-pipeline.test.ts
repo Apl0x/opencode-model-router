@@ -1,10 +1,12 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { join } from "node:path";
 import type { VerifyBudget } from "../../src/router/config";
-import type { RunnerFs, ScopedSpec } from "../../src/verify/runner";
+import type { DetectedRunner, ResolvedEntry, RunResult, RunnerFs, ScopedSpec } from "../../src/verify/runner";
+import type { DispatchReference, MaterializeResult, ReferenceFs, ReferenceStats } from "../../src/verify/reference";
 import type { acquireSlot } from "../../src/verify/slot";
-import type { ArgvSeam, Deadline, ExecSeam } from "../../src/verify/types";
+import type { ArgvSeam, Deadline, ExecSeam, RecheckOutcome, RecheckUnusableCause } from "../../src/verify/types";
 import {
+  type RecheckSeams,
   ABORTED_BEFORE_RUN,
   ABORTED_DURING_RUN,
   createScopeOpener,
@@ -388,5 +390,334 @@ describe("createScopeOpener", () => {
     await expect(s.scope.runLint({ ...SPEC, runner: "eslint" }, d)).resolves.toMatchObject({ kind: "error" });
     await expect(s.scope.close()).resolves.toBeUndefined();
     expect(s.argv).not.toHaveBeenCalled();
+  });
+});
+
+describe("scope.rechecker (T4)", () => {
+  const TMP = process.platform === "win32" ? "C:\\omr-tmp" : "/omr-tmp";
+  const ROOT = join(TMP, "repo");
+  const REF_DIR = join(TMP, "omr-ref-1-0123456789abcdef");
+  const HOST = { platform: process.platform, tmpdir: TMP };
+  const BUDGET: VerifyBudget = {
+    testScope: "affected",
+    maxWorkers: 2,
+    lowPriority: true,
+    maxConcurrentVerifications: 1,
+    defaultVerify: "required",
+    captureWaitMs: 5_000,
+    background: false,
+    pendingTtlMs: 600_000,
+    slotWaitMs: 60_000,
+    batchWindowMs: 250,
+    failureRecheck: true,
+    recheckTimeoutMs: 120_000,
+    baselineTimeoutMs: 60_000,
+    gateBudgetMs: 300_000,
+  };
+  const REFERENCE: DispatchReference = {
+    root: ROOT,
+    head: "a".repeat(40),
+    commit: "b".repeat(40),
+    untracked: new Map(),
+    tracked: new Map(),
+    captureReasons: [],
+    capturedAt: 0,
+  };
+  const RUNNER: DetectedRunner = {
+    kind: "vitest",
+    launcher: "npx",
+    source: { type: "command" },
+    gitRoot: ROOT,
+    runnerCwd: ROOT,
+    env: {},
+    keptArgs: ["run"],
+    pathScopes: [],
+    xdist: false,
+    covInConfig: false,
+    notes: [],
+  };
+  const ENTRY: ResolvedEntry = { file: "node", prefix: ["vitest.mjs"], entry: join(ROOT, "node_modules", "vitest", "vitest.mjs") };
+  const FAIL_A = join(ROOT, "test", "a.test.ts");
+  const FAIL_B = join(ROOT, "test", "b.test.ts");
+  const OUTSIDE = join(TMP, "elsewhere", "c.test.ts");
+  const toRefPath = (p: string): string | undefined =>
+    p.startsWith(ROOT + (process.platform === "win32" ? "\\" : "/")) || p === ROOT ? REF_DIR + p.slice(ROOT.length) : undefined;
+  const GOOD: RunResult = {
+    failingIds: ["test/a.test.ts > fails"],
+    failingFiles: [join(REF_DIR, "test", "a.test.ts")],
+    collectionError: false,
+    total: 3,
+    complete: true,
+    source: "report",
+  };
+
+  function deadline(left: number): Deadline & { abort(): void } {
+    const controller = new AbortController();
+    return {
+      budgetMs: left,
+      remaining: () => (controller.signal.aborted ? 0 : left),
+      bound: ms => Math.min(ms, controller.signal.aborted ? 0 : left),
+      signal: controller.signal,
+      abort: () => controller.abort(new Error("gate budget exhausted")),
+    };
+  }
+
+  const notUsed = (name: string) => async (): Promise<never> => { throw new Error(`unexpected ${name}`); };
+
+  interface Opts {
+    materialized?: { exact?: boolean; unreproduced?: string[] };
+    materializeResult?: MaterializeResult;
+    existing?: string[];
+    result?: RunResult;
+    argv?: ArgvSeam;
+    acquire?: typeof acquireSlot;
+    vanished?: boolean;
+    recheck?: Partial<RecheckSeams>;
+  }
+
+  function setup(opts: Opts = {}) {
+    const events: string[] = [];
+    let held = false;
+    const release = vi.fn(async (): Promise<void> => { events.push("release"); held = false; });
+    const acquire = vi.fn<typeof acquireSlot>(opts.acquire ?? (async () => { events.push("acquire"); held = true; return { release, lost: false }; }));
+    const argv = vi.fn<ArgvSeam>(opts.argv ?? (async () => { events.push("argv"); return { code: 1, stdout: "", stderr: "" }; }));
+    const exec = vi.fn<ExecSeam>(async () => ({ code: 0, stdout: "", stderr: "" }));
+    const existing = new Set(opts.existing ?? [join(REF_DIR, "test", "a.test.ts"), join(REF_DIR, "test", "b.test.ts")]);
+    const fs: RunnerFs = {
+      fileExists: async p => existing.has(p),
+      readFile: async (p: string) => { throw new Error(`ENOENT: ${p}`); },
+      unlink: async () => {},
+    };
+    const stats: ReferenceStats = { isFile: () => false, isDirectory: () => true, isSymbolicLink: () => false, size: 0, mode: 0o700, mtimeMs: 0 };
+    const refFs: ReferenceFs = {
+      lstat: async p => {
+        if (opts.vanished === true) throw new Error(`ENOENT: ${p}`);
+        return stats;
+      },
+      realpath: notUsed("realpath"),
+      readFile: notUsed("readFile"),
+      writeFile: notUsed("writeFile"),
+      mkdir: notUsed("mkdir"),
+      chmod: notUsed("chmod"),
+      readdir: notUsed("readdir"),
+      symlink: notUsed("symlink"),
+      unlink: notUsed("unlink"),
+      utimes: notUsed("utimes"),
+      rm: notUsed("rm"),
+    };
+    const dispose = vi.fn(async (): Promise<void> => { events.push("dispose"); });
+    const materializedWhileHeld: boolean[] = [];
+    const materialize = vi.fn<RecheckSeams["materialize"]>(async () => {
+      events.push("materialize");
+      materializedWhileHeld.push(held);
+      if (opts.materializeResult) return opts.materializeResult;
+      const exact = opts.materialized?.exact ?? true;
+      return {
+        ok: true,
+        reference: {
+          dir: REF_DIR,
+          exact,
+          inexactReasons: exact ? [] : [{ cause: "dependency-drift", path: "package-lock.json" }],
+          unreproduced: opts.materialized?.unreproduced ?? [],
+          links: [],
+          toRefPath,
+          dispose,
+        },
+      };
+    });
+    const gcStaleReferences = vi.fn<RecheckSeams["gcStaleReferences"]>(async () => {
+      events.push("gc");
+      return { removed: [], kept: [], failed: [] };
+    });
+    const detectRunner = vi.fn<RecheckSeams["detectRunner"]>(async () => RUNNER);
+    const resolveEntry = vi.fn<RecheckSeams["resolveEntry"]>(async () => ENTRY);
+    const planRerun = vi.fn<RecheckSeams["planRerun"]>(async (_runner, files, cwd) => ({
+      runner: "vitest",
+      mode: "rerun",
+      file: "node",
+      args: ["vitest.mjs", "run", ...files],
+      cwd,
+      env: { OMR: "1" },
+      reportPath: join(TMP, "report.json"),
+      gitRoot: REF_DIR,
+      entry: ENTRY.entry,
+      inputs: [...files],
+      inputsAreTests: true,
+      workers: 2,
+      notes: [],
+    }));
+    const readResult = vi.fn<RecheckSeams["readResult"]>(async () => { events.push("readResult"); return opts.result ?? GOOD; });
+    const warn = vi.fn();
+    const open = createScopeOpener({
+      argv, exec, fs, acquire, budget: BUDGET, checkTimeoutMs: 120_000, host: HOST, logger: { warn },
+      reference: { fs: refFs },
+      recheck: { materialize, gcStaleReferences, detectRunner, resolveEntry, planRerun, readResult, ...opts.recheck },
+    });
+    const scope = open({ cwd: ROOT, command: "npx vitest run" });
+    const recheck = scope.rechecker("npx vitest run", ROOT);
+    return {
+      scope, recheck, events, acquire, argv, release, dispose, materialize, materializedWhileHeld, gcStaleReferences,
+      detectRunner, resolveEntry, planRerun, readResult, warn,
+    };
+  }
+
+  it("skips below the recheck threshold without detecting, acquiring, materializing or spawning", async () => {
+    const s = setup();
+    const out = await s.recheck(REFERENCE, [FAIL_A], deadline(RECHECK_MIN_REMAINING_MS - 1));
+    expect(out).toEqual({ kind: "skipped-deadline", remainingMs: RECHECK_MIN_REMAINING_MS - 1 });
+    expect(s.detectRunner).not.toHaveBeenCalled();
+    expect(s.acquire).not.toHaveBeenCalled();
+    expect(s.materialize).not.toHaveBeenCalled();
+    expect(s.argv).not.toHaveBeenCalled();
+  });
+
+  it("reports pytest as runner-unsupported without materializing or rerunning", async () => {
+    const s = setup({ recheck: { detectRunner: async () => ({ ...RUNNER, kind: "pytest" }) } });
+    const out = await s.recheck(REFERENCE, [FAIL_A], deadline(200_000));
+    expect(out).toMatchObject({ kind: "unusable", cause: "runner-unsupported" });
+    expect(s.gcStaleReferences).not.toHaveBeenCalled();
+    expect(s.materialize).not.toHaveBeenCalled();
+    expect(s.argv).not.toHaveBeenCalled();
+  });
+
+  it("reports an S6 from detectRunner as rerun-unplannable", async () => {
+    const s = setup({ recheck: { detectRunner: async () => ({ unverifiable: true, code: "no-git-root", reason: "no git repository" }) } });
+    expect(await s.recheck(REFERENCE, [FAIL_A], deadline(200_000))).toMatchObject({ kind: "unusable", cause: "rerun-unplannable" });
+    expect(s.materialize).not.toHaveBeenCalled();
+  });
+
+  it("GCs, then materializes inside the hold, reruns only files present at the reference and disposes before release", async () => {
+    const s = setup({ existing: [join(REF_DIR, "test", "a.test.ts")] });
+    const d = deadline(200_000);
+    const out = await s.recheck(REFERENCE, [FAIL_A, FAIL_B, OUTSIDE], d);
+    expect(out).toEqual({ kind: "exact", result: GOOD, ranFiles: ["test/a.test.ts"], absentFiles: ["test/b.test.ts"], notes: [] });
+    expect(s.materializedWhileHeld).toEqual([true]);
+    expect(s.gcStaleReferences.mock.calls[0]?.[0]).toBe(ROOT);
+    expect(s.gcStaleReferences.mock.calls[0]?.[1].timeoutMs).toBeLessThanOrEqual(5_000);
+    expect(s.planRerun).toHaveBeenCalledWith(RUNNER, [join(REF_DIR, "test", "a.test.ts")], REF_DIR, { maxWorkers: 2 }, expect.objectContaining({ entry: ENTRY }));
+    expect(s.resolveEntry.mock.calls[0]?.[1]).toBe(ROOT);
+    const argvOpts = s.argv.mock.calls[0]?.[2];
+    expect(argvOpts).toMatchObject({ cwd: REF_DIR, lowPriority: true, env: { OMR: "1" } });
+    expect(argvOpts?.timeoutMs).toBeGreaterThan(0);
+    expect(argvOpts?.timeoutMs).toBeLessThanOrEqual(BUDGET.recheckTimeoutMs);
+    await s.scope.close();
+    expect(s.events).toEqual(["acquire", "gc", "materialize", "argv", "readResult", "dispose", "release"]);
+    expect(s.acquire).toHaveBeenCalledTimes(1);
+  });
+
+  it("shares the scope's hold with an earlier scoped run", async () => {
+    const s = setup();
+    const d = deadline(200_000);
+    await s.scope.runShell("npm run build", ROOT, d);
+    await s.recheck(REFERENCE, [FAIL_A], d);
+    expect(s.acquire).toHaveBeenCalledTimes(1);
+    await s.scope.close();
+  });
+
+  it("returns exact with no result when every failing file is absent at the reference", async () => {
+    const s = setup({ existing: [] });
+    const out = await s.recheck(REFERENCE, [FAIL_A, FAIL_B], deadline(200_000));
+    expect(out).toEqual({ kind: "exact", result: undefined, ranFiles: [], absentFiles: ["test/a.test.ts", "test/b.test.ts"], notes: [] });
+    expect(s.argv).not.toHaveBeenCalled();
+    expect(s.dispose).toHaveBeenCalledTimes(1);
+  });
+
+  it("returns approximate with the inexact reasons, reruns nothing and disposes", async () => {
+    const s = setup({ materialized: { exact: false } });
+    const out = await s.recheck(REFERENCE, [FAIL_A], deadline(200_000));
+    expect(out).toEqual({ kind: "approximate", inexactReasons: [{ cause: "dependency-drift", path: "package-lock.json" }] });
+    expect(s.argv).not.toHaveBeenCalled();
+    expect(s.dispose).toHaveBeenCalledTimes(1);
+  });
+
+  it("refuses a reference missing a non-inert ignored input, and reruns when only inert ones are missing", async () => {
+    const bad = setup({ materialized: { unreproduced: ["coverage/", ".env"] } });
+    const out = await bad.recheck(REFERENCE, [FAIL_A], deadline(200_000));
+    expect(out).toMatchObject({ kind: "unusable", cause: "unreproduced-inputs" });
+    expect(out.kind === "unusable" ? out.reason : "").toContain(".env");
+    expect(bad.argv).not.toHaveBeenCalled();
+    expect(bad.dispose).toHaveBeenCalledTimes(1);
+
+    const inert = setup({ materialized: { unreproduced: ["coverage/", "logs/debug.log"] } });
+    expect((await inert.recheck(REFERENCE, [FAIL_A], deadline(200_000))).kind).toBe("exact");
+    expect(inert.argv).toHaveBeenCalledTimes(1);
+  });
+
+  it.each<[string, MaterializeResult, RecheckUnusableCause]>([
+    ["commit-missing", { ok: false, reason: "commit-missing", detail: "no such commit" }, "reference-vanished"],
+    ["worktree-add-failed", { ok: false, reason: "worktree-add-failed", detail: "git failed" }, "materialize-failed"],
+    ["aborted", { ok: false, reason: "aborted", detail: "signal aborted" }, "materialize-failed"],
+  ])("maps a %s materialize failure to %s", async (_name, materializeResult, cause) => {
+    const s = setup({ materializeResult });
+    expect(await s.recheck(REFERENCE, [FAIL_A], deadline(200_000))).toMatchObject({ kind: "unusable", cause });
+    expect(s.argv).not.toHaveBeenCalled();
+    expect(s.dispose).not.toHaveBeenCalled();
+  });
+
+  it.each<[string, RunResult, RecheckUnusableCause]>([
+    ["incomplete", { ...GOOD, complete: false }, "incomplete"],
+    ["a collection error", { ...GOOD, collectionError: true }, "collection-error"],
+    ["zero tests", { ...GOOD, total: 0 }, "no-tests"],
+  ])("refuses a rerun with %s", async (_name, result, cause) => {
+    const s = setup({ result });
+    expect(await s.recheck(REFERENCE, [FAIL_A], deadline(200_000))).toMatchObject({ kind: "unusable", cause });
+    expect(s.dispose).toHaveBeenCalledTimes(1);
+  });
+
+  it("reports a reference dir that vanished during the rerun", async () => {
+    const s = setup({ vanished: true });
+    expect(await s.recheck(REFERENCE, [FAIL_A], deadline(200_000))).toMatchObject({ kind: "unusable", cause: "reference-vanished" });
+    expect(s.readResult).toHaveBeenCalledTimes(1);
+    expect(s.dispose).toHaveBeenCalledTimes(1);
+  });
+
+  it("reports a rerun timeout with its bound and still reads the result and disposes", async () => {
+    const s = setup({ argv: async () => ({ code: -1, stdout: "", stderr: "", timedOut: true }) });
+    const out = await s.recheck(REFERENCE, [FAIL_A], deadline(200_000));
+    expect(out.kind).toBe("timed-out");
+    expect(out.kind === "timed-out" ? out.boundMs : 0).toBeGreaterThan(0);
+    expect(s.readResult).toHaveBeenCalledTimes(1);
+    expect(s.dispose).toHaveBeenCalledTimes(1);
+  });
+
+  it("maps unplannable reruns: entry S6, planRerun S6 and NoAffected", async () => {
+    const s6 = { unverifiable: true as const, code: "node-not-found" as const, reason: "node not found" };
+    const a = setup({ recheck: { resolveEntry: async () => s6 } });
+    expect(await a.recheck(REFERENCE, [FAIL_A], deadline(200_000))).toMatchObject({ kind: "unusable", cause: "rerun-unplannable" });
+    const b = setup({ recheck: { planRerun: async () => s6 } });
+    expect(await b.recheck(REFERENCE, [FAIL_A], deadline(200_000))).toMatchObject({ kind: "unusable", cause: "rerun-unplannable" });
+    const c = setup({ recheck: { planRerun: async () => ({ noAffected: true, note: "nothing" }) } });
+    expect(await c.recheck(REFERENCE, [FAIL_A], deadline(200_000))).toMatchObject({ kind: "unusable", cause: "rerun-unplannable" });
+    for (const s of [a, b, c]) {
+      expect(s.argv).not.toHaveBeenCalled();
+      expect(s.dispose).toHaveBeenCalledTimes(1);
+    }
+  });
+
+  it("never rejects: spawn, readResult, slot and seam errors become unusable error", async () => {
+    const outcomes: RecheckOutcome[] = [];
+    const spawn = setup({ argv: async () => { throw new Error("spawn EACCES"); } });
+    outcomes.push(await spawn.recheck(REFERENCE, [FAIL_A], deadline(200_000)));
+    const read = setup({ recheck: { readResult: async () => { throw new Error("EIO"); } } });
+    outcomes.push(await read.recheck(REFERENCE, [FAIL_A], deadline(200_000)));
+    const busy = setup({ acquire: async () => ({ busy: true }) });
+    outcomes.push(await busy.recheck(REFERENCE, [FAIL_A], deadline(200_000)));
+    const thrown = setup({ recheck: { materialize: async () => { throw new Error("boom"); } } });
+    outcomes.push(await thrown.recheck(REFERENCE, [FAIL_A], deadline(200_000)));
+    for (const out of outcomes) expect(out).toMatchObject({ kind: "unusable", cause: "error" });
+    expect(busy.materialize).not.toHaveBeenCalled();
+    expect(spawn.dispose).toHaveBeenCalledTimes(1);
+    expect(read.dispose).toHaveBeenCalledTimes(1);
+  });
+
+  it("reports skipped-deadline when the deadline aborts before the rerun spawns", async () => {
+    const d = deadline(200_000);
+    const s = setup({ recheck: { planRerun: async (_r, files, cwd) => { d.abort(); return {
+      runner: "vitest", mode: "rerun", file: "node", args: [...files], cwd, env: {}, reportPath: join(TMP, "r.json"),
+      gitRoot: REF_DIR, entry: ENTRY.entry, inputs: [...files], inputsAreTests: true, workers: 2, notes: [],
+    }; } } });
+    expect((await s.recheck(REFERENCE, [FAIL_A], d)).kind).toBe("skipped-deadline");
+    expect(s.argv).not.toHaveBeenCalled();
+    expect(s.dispose).toHaveBeenCalledTimes(1);
   });
 });

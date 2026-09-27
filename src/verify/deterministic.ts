@@ -14,19 +14,23 @@ import type {
   ExecOptions,
   ExecSeam,
   OpenVerificationScope,
+  RecheckOutcome,
+  RecheckUnusableCause,
   Rechecker,
   ScopedExecutor,
   ScopedOutcome,
   VerificationScope,
 } from "./types";
-import type { LintSpec, RunnerFs, RunnerHost, RunResult } from "./runner";
+import type { DetectedRunner, LintSpec, RunnerFs, RunnerHost, RunResult } from "./runner";
+import type { DispatchReference, MaterializedReference, ReferenceDeps } from "./reference";
 import type { VerifyBudget } from "../router/config";
 import type { PluginLogger } from "../router/logger";
 import { scrubText } from "../guard/scrub";
 import { resolveAgainst } from "./paths";
-import { isAbsolute } from "node:path";
+import { isAbsolute, posix as pathPosix, win32 as pathWin32 } from "node:path";
 import { compareTests, observeTests } from "./baseline";
-import { readResult } from "./runner";
+import { detectRunner, isUnverifiable, planRerun, readResult, resolveEntry } from "./runner";
+import { DEFAULT_MATERIALIZE_TIMEOUT_MS, gcStaleReferences, materialize, nodeReferenceFs } from "./reference";
 import { acquireSlot, type SlotHandle } from "./slot";
 
 // ---------------------------------------------------------------------------
@@ -772,8 +776,31 @@ export interface ScopeOpenerDeps {
   checkTimeoutMs: number;
   host?: Partial<RunnerHost>;
   logger?: Pick<PluginLogger, "warn">;
-  /** Clock for slot-busy waitedMs; default Date.now. */
+  /** Clock for slot-busy waitedMs and the recheck sub-deadline; default Date.now. */
   now?: () => number;
+  /** Reference seams for the recheck (T4); argv defaults to `argv`, fs to node:fs/promises, logger to `logger`. */
+  reference?: Partial<ReferenceDeps>;
+  /** T4 seams; each defaults to the reference.ts / runner.ts function of the same name. */
+  recheck?: Partial<RecheckSeams>;
+}
+
+/** The injectable steps of the T4 Rechecker (2.1.2.3). */
+export interface RecheckSeams {
+  materialize: typeof materialize;
+  gcStaleReferences: typeof gcStaleReferences;
+  detectRunner: typeof detectRunner;
+  resolveEntry: typeof resolveEntry;
+  planRerun: typeof planRerun;
+  readResult: typeof readResult;
+}
+
+/** T4.c: GC's own bound inside the recheck sub-deadline. */
+const RECHECK_GC_MS = 5_000;
+/** How many non-inert `unreproduced` entries the T4.f reason names. */
+const MAX_NAMED_UNREPRODUCED = 5;
+
+function unusable(cause: RecheckUnusableCause, reason: string): RecheckOutcome {
+  return { kind: "unusable", cause, reason: scrubText(reason) };
 }
 
 type Blocked = Extract<ScopedOutcome, { kind: "slot-busy" | "aborted" | "error" }>;
@@ -811,6 +838,23 @@ export function createScopeOpener(deps: ScopeOpenerDeps): OpenCheckScope {
   const { argv, exec, fs, budget, checkTimeoutMs, host, logger } = deps;
   const acquire = deps.acquire ?? acquireSlot;
   const now = deps.now ?? Date.now;
+  const seams: RecheckSeams = {
+    materialize: deps.recheck?.materialize ?? materialize,
+    gcStaleReferences: deps.recheck?.gcStaleReferences ?? gcStaleReferences,
+    detectRunner: deps.recheck?.detectRunner ?? detectRunner,
+    resolveEntry: deps.recheck?.resolveEntry ?? resolveEntry,
+    planRerun: deps.recheck?.planRerun ?? planRerun,
+    readResult: deps.recheck?.readResult ?? readResult,
+  };
+  const refDeps: ReferenceDeps = {
+    ...deps.reference,
+    argv: deps.reference?.argv ?? argv,
+    fs: deps.reference?.fs ?? nodeReferenceFs,
+    ...(deps.reference?.logger === undefined && logger !== undefined ? { logger } : {}),
+  };
+  const P = (host?.platform ?? process.platform) === "win32" ? pathWin32 : pathPosix;
+  /** Id-space file key (T4): cwd-relative with "/" separators, as readResult builds ids. */
+  const fileKey = (cwd: string, abs: string): string => P.relative(cwd, abs).split(P.sep).join("/");
 
   return (meta): CheckScope => {
     let holdP: Promise<Hold> | undefined;
@@ -849,12 +893,16 @@ export function createScopeOpener(deps: ScopeOpenerDeps): OpenCheckScope {
       }
     };
 
-    const attempt = async (deadline: Deadline, launch: (opts: ExecOptions) => Promise<ExecResult>): Promise<Blocked | Spawned> => {
+    const attempt = async (
+      deadline: Deadline,
+      launch: (opts: ExecOptions) => Promise<ExecResult>,
+      ownMs: number = checkTimeoutMs,
+    ): Promise<Blocked | Spawned> => {
       if (closed) return { kind: "error", reason: "verification scope already closed" };
       holdP ??= acquireHold(deadline);
       const hold = await holdP;
       if (!hold.ok) return hold.outcome;
-      const boundMs = deadline.bound(checkTimeoutMs);
+      const boundMs = deadline.bound(ownMs);
       if (deadline.signal.aborted || boundMs <= 0) return { kind: "aborted", reason: ABORTED_BEFORE_RUN };
 
       // A per-run signal linked to the deadline: aborting it after a timeout or a failed spawn
@@ -920,17 +968,142 @@ export function createScopeOpener(deps: ScopeOpenerDeps): OpenCheckScope {
       }
     };
 
-    // 2.1.2.3 replaces this with the T4 Rechecker; until then a recheck is never usable (fail-closed).
-    const rechecker = (): Rechecker => async () => ({
-      kind: "unusable",
-      cause: "error",
-      reason: "the reference recheck is not available",
-    });
+    // T4.e-k at a materialized reference. The caller disposes it.
+    const rerunAt = async (
+      ref: MaterializedReference,
+      runner: DetectedRunner,
+      liveCwd: string,
+      failingFiles: readonly string[],
+      rd: Deadline,
+    ): Promise<RecheckOutcome> => {
+      if (!ref.exact) return { kind: "approximate", inexactReasons: ref.inexactReasons };
+      const platform = host?.platform ?? process.platform;
+      const hidden = ref.unreproduced.filter(e => !isInertUnreproduced(e, platform));
+      if (hidden.length > 0) {
+        const named = hidden.slice(0, MAX_NAMED_UNREPRODUCED).join(", ");
+        const more = hidden.length > MAX_NAMED_UNREPRODUCED ? ` and ${hidden.length - MAX_NAMED_UNREPRODUCED} more` : "";
+        return unusable("unreproduced-inputs", `the reference lacks ignored inputs tests may read: ${named}${more}`);
+      }
+
+      const rerunList: string[] = [];
+      const absentFiles: string[] = [];
+      for (const f of failingFiles) {
+        const r = ref.toRefPath(f);
+        if (r === undefined) continue; // outside the root: stays unclassified (T4.g)
+        if (await fs.fileExists(r)) rerunList.push(r);
+        else absentFiles.push(fileKey(runner.runnerCwd, f));
+      }
+      if (rerunList.length === 0) return { kind: "exact", result: undefined, ranFiles: [], absentFiles, notes: [] };
+
+      const entry = await seams.resolveEntry(runner, liveCwd, fs, host);
+      if (isUnverifiable(entry)) return unusable("rerun-unplannable", entry.reason);
+      const refCwd = ref.toRefPath(runner.runnerCwd);
+      if (refCwd === undefined) return unusable("rerun-unplannable", "the runner cwd is outside the reference root");
+      const spec = await seams.planRerun(runner, rerunList, refCwd, { maxWorkers: budget.maxWorkers }, {
+        fs,
+        entry,
+        ...(host !== undefined ? { host } : {}),
+      });
+      if (isUnverifiable(spec)) return unusable("rerun-unplannable", spec.reason);
+      if ("noAffected" in spec) return unusable("rerun-unplannable", `the rerun planned nothing: ${spec.note}`);
+
+      const a = await attempt(
+        rd,
+        opts => argv(spec.file, spec.args, { ...opts, cwd: spec.cwd, env: { ...spec.env } }),
+        budget.recheckTimeoutMs,
+      );
+      if (a.kind === "aborted") return { kind: "skipped-deadline", remainingMs: rd.remaining() };
+      if (a.kind === "slot-busy") return unusable("error", "the verification slot was not available for the recheck");
+      if (a.kind === "error") return unusable("error", a.reason);
+      let result: RunResult;
+      try {
+        // P6: on every path after a spawn attempt; it deletes the report file (QA-1.3-16).
+        result = await seams.readResult(spec, a.exec, fs, host);
+      } catch (err) {
+        return unusable("error", `reading the recheck result failed: ${errorText(err)}`);
+      }
+      if (a.threw !== undefined) return unusable("error", `the recheck failed to start: ${a.threw}`);
+      if (a.exec.timedOut === true) return { kind: "timed-out", boundMs: a.boundMs };
+      try {
+        await refDeps.fs.lstat(ref.dir);
+      } catch (err) {
+        return unusable("reference-vanished", `the reference worktree vanished during the rerun: ${errorText(err)}`);
+      }
+      if (!result.complete) return unusable("incomplete", result.note ?? "the rerun at the reference reported an incomplete result");
+      if (result.collectionError) return unusable("collection-error", "the rerun at the reference failed to collect its tests");
+      if (result.total === 0) return unusable("no-tests", "the rerun at the reference ran no tests");
+      return {
+        kind: "exact",
+        result,
+        ranFiles: rerunList.map(r => fileKey(spec.cwd, r)),
+        absentFiles,
+        notes: [...a.notes, ...(result.note !== undefined ? [result.note] : [])],
+      };
+    };
+
+    // T4.a-l. The hook decides "disabled" and "none" before calling this.
+    const recheck = async (
+      command: string,
+      liveCwd: string,
+      reference: DispatchReference,
+      failingFiles: readonly string[],
+      deadline: Deadline,
+    ): Promise<RecheckOutcome> => {
+      const remainingMs = deadline.remaining();
+      if (remainingMs < RECHECK_MIN_REMAINING_MS) return { kind: "skipped-deadline", remainingMs };
+      const runner = await seams.detectRunner(command, liveCwd, fs, host);
+      if (isUnverifiable(runner)) return unusable("rerun-unplannable", runner.reason);
+      if (runner.kind === "pytest") {
+        return unusable("runner-unsupported", "pytest cannot be pinned to the reference: an editable install imports the live sources");
+      }
+      if (closed) return unusable("error", "verification scope already closed");
+      holdP ??= acquireHold(deadline);
+      const hold = await holdP;
+      if (!hold.ok) {
+        return unusable("error", hold.outcome.kind === "error" ? hold.outcome.reason : "the verification slot was not available for the recheck");
+      }
+
+      const rd = deriveDeadline(deadline, budget.recheckTimeoutMs, { now });
+      try {
+        // QA-1.5-10: GC, then materialize, both inside the hold.
+        const gc = await seams.gcStaleReferences(reference.root, { ...refDeps, timeoutMs: rd.bound(RECHECK_GC_MS) });
+        if (gc.removed.length > 0 || gc.failed.length > 0) {
+          logger?.warn(`reference GC removed ${gc.removed.length}, failed ${gc.failed.length}`);
+        }
+        if (rd.signal.aborted || rd.remaining() === 0) return { kind: "skipped-deadline", remainingMs: rd.remaining() };
+        const m = await seams.materialize(reference, undefined, rd.signal, {
+          ...refDeps,
+          timeoutMs: rd.bound(DEFAULT_MATERIALIZE_TIMEOUT_MS),
+        });
+        if (!m.ok) {
+          return m.reason === "commit-missing"
+            ? unusable("reference-vanished", `the reference commit is gone: ${m.detail}`)
+            : unusable("materialize-failed", `materialize ${m.reason}: ${m.detail}`);
+        }
+        const ref = m.reference;
+        try {
+          return await rerunAt(ref, runner, liveCwd, failingFiles, rd);
+        } finally {
+          // T4.l: the rerun tree has exited here; close() waits for this before releasing the slot.
+          track(ref.dispose().catch((err: unknown) => logger?.warn(`reference dispose failed: ${errorText(err)}`)));
+        }
+      } finally {
+        rd.dispose();
+      }
+    };
+
+    const rechecker = (command: string, liveCwd: string): Rechecker => (reference, failingFiles, deadline) =>
+      track(
+        recheck(command, liveCwd, reference, failingFiles, deadline).catch(
+          (err: unknown): RecheckOutcome => unusable("error", `the reference recheck errored: ${errorText(err)}`),
+        ),
+      );
 
     const close = (): Promise<void> => {
       closing ??= (async (): Promise<void> => {
         closed = true;
-        await Promise.allSettled([...inflight]);
+        // Loop: a recheck settling here tracks its reference disposal (T4.l, P9).
+        while (inflight.size > 0) await Promise.allSettled([...inflight]);
         if (holdP === undefined) return;
         const hold = await holdP;
         if (!hold.ok) return;
