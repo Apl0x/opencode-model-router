@@ -653,6 +653,35 @@ Reviewer: heavy QA, adversarial re-review of the fix round, `git diff 5e393dc..2
 | QA-1.2-15 | nit | `exec.ts:463-476` and `:478-497` | **Sweeper failures are silent.** Four causes all resolve as "nothing killed", and the result cannot tell them apart from "nothing to kill":<br>• the sweeper's stderr is `ignore`d;<br>• `error` and `close` both call `end()`;<br>• `report()` passes only `killedPids()`;<br>• the 5 s limit does the same.<br>Evidence:<br>• In the QA-1.2-14 run where the limit ended the sweeper, the result carried only the force-closed note.<br>• Under Constrained Language Mode (simulated with `$ExecutionContext.SessionState.LanguageMode = 'ConstrainedLanguage'` in `powershell.exe`), each construct the script needs fails: `[Diagnostics.Process]::GetProcessById` and `[Console]::Out.WriteLine` ("A invocação de método tem suporte apenas nos tipos principais deste modo de linguagem", pt-BR host: method invocation is supported only on core types), and the `[DateTimeOffset]` cast ("Esse modo de linguagem dá suporte apenas para os tipos principais": this language mode supports only core types). `Pin` swallows the error, so on an AppLocker/WDAC machine the QA-1.2-1 fix is inert with no trace. | 1. Have the script print a sentinel after pinning, for example `pinned <n>`.<br>2. Have `kill()` append `[orphan sweep unavailable: <spawn error \| exit <code> \| timed out after <n> ms \| no sentinel>]` to the notes when the sentinel is missing or the limit fires.<br>3. State the FullLanguage requirement in the `armSweeper` doc comment.<br>4. Test it by pointing the sweeper at a script that exits 1 before the sentinel, through a test-only override of the PowerShell path, and assert the note. |
 | QA-1.2-16 | nit | `exec.ts:289`, `test/unit/exec.test.ts` | **The 120 s default is untested.** `rg DEFAULT_TIMEOUT_MS test src` matches only `src/verify/exec.ts` (`:45`, `:59`, `:289`). Every `runShell`/`runArgv` call in the test file passes `timeoutMs`, so neither arm of `t === undefined` (no signal → 120000; signal only → no timer) runs. This counts against §4.2's ≥ 90 % branch target for `exec.ts`. | Add two tests with `vi.spyOn(globalThis, "setTimeout")`. With no `timeoutMs` and no `signal`, a quick `runArgv` arms a timer of `DEFAULT_TIMEOUT_MS`. With only a `signal`, it arms no deadline timer. Alternatively, export `deadlineOf` and test it pure. |
 
+### Round-2 resolutions
+
+- **QA-1.2-14 — Resolution: 98ae488.** `SWEEP_TIMEOUT_MS` is now 30000 ms and bounds only a
+  hung sweeper; the run is already settled by the 2 s grace, so a slow sweep under load turns
+  "never" into "late". The limit timer is `unref`'d, so it never keeps opencode alive, and the
+  sweeper stays a non-detached child that dies with opencode (libuv job). The live-child
+  `taskkill /T` keeps its own 5000 ms limit (`TASKKILL_TIMEOUT_MS`). The optional
+  `PRIORITY_HIGH` was not applied: it lowered the median but not the tail in the QA experiment.
+  The load dependence stays in the G4/risk wording below (3.2) and the 3.1.2.d load run (3.1).
+- **QA-1.2-15 — Resolution: 98ae488.** The script exits 3 unless it runs in FullLanguage mode and
+  prints `pinned <n>` after pinning. When a kill was requested and the marker is missing, the
+  result's stderr gets `[orphan sweep unavailable: <spawn error: … | exit <code> | killed by
+  <signal> | timed out after 30000 ms | no marker>]`, provided the run has not settled yet; a
+  failure after the grace settled the run has no result to carry it, which is documented in the
+  `armSweeper` comment together with the FullLanguage requirement. Tests: a test-only
+  `setSweeperExecutableForTests` points the sweeper at a missing executable (spawn error) and at
+  `node` (exits non-zero before the marker); both assert the note.
+- **QA-1.2-16 — Resolution: 98ae488.** `deadlineOf` is exported and tested pure (no options →
+  `DEFAULT_TIMEOUT_MS`, `NaN` → default, signal only → none), and a `vi.spyOn(globalThis,
+  "setTimeout")` test asserts a real run arms a 120000 ms timer without options and none with only
+  a signal.
+- `npx vitest run --maxWorkers=2 test/unit/exec.test.ts`: 35 passed, 2 skipped (POSIX-only);
+  `npm run typecheck` clean.
+
+**Known-limit example (G4 limit (a), deferred to 3.2).** During the phase 1.5 work an MSYS
+`sleep.exe` started by a git filter escaped `taskkill /T`: it was not reachable from the live
+tree at the kill. This is the same "descendant whose parent died before the kill" case and is covered by the
+same G4 wording.
+
 ### Residual limit: decision and plan wording (for 3.2 to apply)
 
 **Decision: the residual is acceptable**, as long as the wording below replaces the absolute claim
