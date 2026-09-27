@@ -69,7 +69,8 @@ mtime = fresh" rule are gone. So is round 1's per-process observation map.
     staleness needs a span ≥ `staleMs` + 2 s (or the wall age) and a witness ≥ 2 heartbeats + 2 s;
     a claim is inert at span ≥ `staleMs` + 2 s and witness ≥ 2 × `claimHoldMaxMs` + 2 s.
   - `first` is the view's first sighting of the key. `last` is its latest look. `from` is the first
-    look after the latest gap of more than 2 heartbeats between two looks. `span = now − first`
+    look after the latest gap between two looks of more than 2 heartbeats minus both looks' slacks
+    (8 s in production: 2 × 5 s − 2 × 1 s). `span = now − first`
     and `witnessed = now − from`. A stamp from the future (another boot's clock) restarts the view.
   - At most 4 views are kept; the oldest goes first.
   - The host is part of the name, so hosts sharing a dir never mix clocks.
@@ -110,10 +111,10 @@ mtime = fresh" rule are gone. So is round 1's per-process observation map.
   - So a process that calls with `waitMs: 0` once a minute still reclaims a lock whose owner is not
     provably dead.
   - Short-lived processes that each look once succeed through the sidecar when their looks are less
-    than 2 heartbeats apart. If the looks are further apart, the reclaim falls to the next caller
+    than 2 heartbeats minus both slacks (8 s in production) apart. If the looks are further apart, the reclaim falls to the next caller
     that waits, or lives, for 2 heartbeats.
-- **Residual (QA-1.4-21, accepted; documented in the header):** looks more than 2 heartbeats apart
-  cannot tell a dead holder from a frozen machine. So a lock whose owner is not provably dead (a
+- **Residual (QA-1.4-21, accepted; documented in the header):** looks more than 8 s apart (2 heartbeats
+  minus both slacks) cannot tell a dead holder from a frozen machine. So a lock whose owner is not provably dead (a
   reused PID, another host, a hung holder) is reclaimed only by a caller that waits, or stays alive,
   for 2 heartbeats after its look (10 s plus the 2 s slack), or by callers that look often enough
   together. Until then every caller is told busy. A same-host holder with a dead PID is still

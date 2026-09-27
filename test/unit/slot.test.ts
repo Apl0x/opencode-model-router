@@ -316,7 +316,7 @@ describe("slot: stale detection", () => {
     const t0 = Date.now();
     held(await acquireSlot({ max: 1, waitMs: 5_000, meta }, deps));
     expect(Date.now() - t0).toBeGreaterThanOrEqual(250);
-  });
+  }, 20_000);
 });
 
 describe("slot: clock changes and suspend/resume (QA-1.4-1, QA-1.4-8)", () => {
@@ -496,7 +496,7 @@ describe("slot: shared observations outlive a call and a process (QA-1.4-21)", (
     // A hung holder: live PID on this host (or a reused one), fresh mtime, no more heartbeats.
     writeLock(p, { pid: process.pid, token: "hung" });
     const planted = Date.now();
-    const deps = { heartbeatMs: 1_000, staleMs: 3_000 }; // the looks must be less than 2 heartbeats (2 s) apart
+    const deps = { heartbeatMs: 1_000, staleMs: 3_000 }; // the looks must be less than 2 heartbeats minus both looks' slacks (2 x 1 s - 2 x 200 ms = 1.6 s) apart
     const out: Array<{ r: string; at: number }> = [];
     for (let i = 0; i < 5; i++) {
       await sleep(Math.max(0, planted + i * 900 - Date.now()));
@@ -513,12 +513,12 @@ describe("slot: shared observations outlive a call and a process (QA-1.4-21)", (
     expect(existsSync(p)).toBe(false); // the child that took it released it at exit
   }, 20_000);
 
-  it("one process calling with waitMs 0 less often than every 2 heartbeats still reclaims it: the background watch confirms", async () => {
+  it("one process calling with waitMs 0 less often than the padded gap limit (2 heartbeats minus both slacks) still reclaims it: the background watch confirms", async () => {
     const dir = freshDir();
     const p = join(dir, "slot-0.lock");
     writeLock(p, { pid: process.pid, token: "hung" });
     const t0 = Date.now();
-    const deps = fast(dir, { heartbeatMs: 200, staleMs: 1_000 }); // a gap over 400 ms restarts the witness
+    const deps = fast(dir, { heartbeatMs: 200, staleMs: 1_000 }); // a gap over 2 x 200 ms - 2 x 40 ms slack = 320 ms restarts the witness
     let r: SlotResult = { busy: true };
     let calls = 0;
     while ("busy" in r && Date.now() - t0 < 8_000) {
@@ -650,7 +650,8 @@ describe("slot: claims replace the time-leased reap lock (QA-1.4-2, QA-1.4-11)",
     // Its mtime says 60 s old: that no longer shortens anything.
     writeLock(claim, { pid: process.ppid, token: "live-claimer", command: "reap" }, 60_000);
     // One heartbeat for every look: a view's padded gap rule (QA-1.4-34) needs its writers' slacks to fit in 2 heartbeats.
-    const deps = fast(dir, { claimHoldMaxMs: 100, heartbeatMs: WATCHER_HEARTBEAT_MS });
+    // claimHoldMaxMs 1 s: a claimed delete must fit in it even in a loaded worker (QA-1.4-35).
+    const deps = fast(dir, { claimHoldMaxMs: 1_000, heartbeatMs: WATCHER_HEARTBEAT_MS });
     const t0 = Date.now();
     expect(await acquireSlot({ max: 1, waitMs: 0, meta }, deps)).toEqual({ busy: true });
     expect(await acquireSlot({ max: 1, waitMs: 0, meta }, { ...deps, now: () => Date.now() + 10_500 })).toEqual({ busy: true });
@@ -694,15 +695,16 @@ describe("slot: claims replace the time-leased reap lock (QA-1.4-2, QA-1.4-11)",
       if (scanner && path.includes(".reap-")) throw Object.assign(new Error("scanner"), { code: "EBUSY" });
       return realRead(path);
     };
-    const deps = fast(dir, { read, claimHoldMaxMs: 100, unlinkRetries: 2, heartbeatMs: WATCHER_HEARTBEAT_MS });
+    // claimHoldMaxMs 1 s (drop fence 1.5 s): a claimed delete must fit in it even in a loaded worker (QA-1.4-35).
+    const deps = fast(dir, { read, claimHoldMaxMs: 1_000, unlinkRetries: 2, heartbeatMs: WATCHER_HEARTBEAT_MS });
     expect(await acquireSlot({ max: 1, waitMs: 0, meta }, deps)).toEqual({ busy: true });
     expect(tokenAt(p)).toBe("dead-holder");
     expect(existsSync(reapClaimPath(p, "dead-holder"))).toBe(true); // ours, but never confirmed
     // Its owner drops it at a readable look within 1.5 x claimHoldMaxMs (QA-1.4-29); after that it is any claim.
-    await sleep(200);
+    await sleep(1_700);
     scanner = false;
     const t0 = Date.now();
-    held(await acquireSlot({ max: 1, waitMs: 5_000, meta }, deps));
+    held(await acquireSlot({ max: 1, waitMs: 10_000, meta }, deps));
     expect(Date.now() - t0).toBeGreaterThanOrEqual(900); // inert after staleMs (1 s) from its first readable sighting
     expect(claimsIn(dir)).toEqual([]);
   }, 20_000);
@@ -813,7 +815,7 @@ describe("slot: release never fails the caller (QA-1.4-4, QA-1.4-6, QA-1.4-17)",
     locked = false;
     await waitUntil(() => !existsSync(p));
     held(await acquireSlot({ max: 1, waitMs: 0, meta }, fast(dir)));
-  });
+  }, 20_000);
 
   it("the owner's release drops its own claim that a scanner kept it from confirming, at the next readable look, so the slot is free at once (QA-1.4-29)", async () => {
     const dir = freshDir();
@@ -832,7 +834,7 @@ describe("slot: release never fails the caller (QA-1.4-4, QA-1.4-6, QA-1.4-17)",
     await waitUntil(() => !existsSync(p) && claimsIn(dir).length === 0, 4_000);
     expect(Date.now() - t0).toBeLessThan(4_000);
     held(await acquireSlot({ max: 1, waitMs: 0, meta }, fast(dir)));
-  });
+  }, 20_000);
 
   it("a heartbeat tick in flight when release starts never touches the file afterwards", async () => {
     const dir = freshDir();
@@ -890,8 +892,10 @@ describe("slot: release never fails the caller (QA-1.4-4, QA-1.4-6, QA-1.4-17)",
       const p = join(dir, "slot-0.lock");
       writeLock(p, { pid: await deadPid(), token: "dead-holder" });
       let shift = 0;
+      let lockReads = 0;
       const mono = () => performance.now() + shift;
       const read = async (path: string) => {
+        if (path === p) lockReads++;
         if (path.includes(".reap-")) throw Object.assign(new Error("scanner"), { code: "EBUSY" });
         return realRead(path);
       };
@@ -903,8 +907,42 @@ describe("slot: release never fails the caller (QA-1.4-4, QA-1.4-6, QA-1.4-17)",
       shift = past ? 1_000_000 : -1_000_000;
       releaseAllSlotsSync();
       expect(existsSync(claim)).toBe(past);
-      if (past) rmSync(claim);
+      // End the background watch (QA-1.4-38): move the seam clock past its end, let one poll see it, then no more reads.
+      shift = 1_000_000;
+      await sleep(300);
+      lockReads = 0;
+      await sleep(400);
+      expect(lockReads).toBe(0);
+      if (existsSync(claim)) rmSync(claim);
     }
+  }, 20_000);
+
+  it("a look within 2 heartbeats but past the padded gap limit (2 heartbeats minus both slacks) restarts the witness (QA-1.4-34)", async () => {
+    // heartbeat 500 ms: maxGap 1 s, each look's slack 100 ms, so the padded limit is 800 ms.
+    const run = async (step: number) => {
+      const dir = freshDir();
+      const p = join(dir, "slot-0.lock");
+      writeLock(p, { pid: process.pid, token: "hung" }); // a live PID: not provably dead
+      let shift = 0;
+      const deps = fast(dir, { heartbeatMs: WATCHER_HEARTBEAT_MS, staleMs: 1_000, now: () => Date.now() + shift, mono: () => performance.now() + shift });
+      const out: string[] = [];
+      for (let i = 0; i < 8; i++) {
+        shift = i * step;
+        const r = await acquireSlot({ max: 1, waitMs: 0, meta }, deps);
+        out.push("busy" in r ? "BUSY" : "HELD");
+        if (!("busy" in r)) {
+          await r.release();
+          break;
+        }
+      }
+      shift += 1_000_000; // past any background watch's end
+      await sleep(300);
+      return out;
+    };
+    const within = await run(700); // inside the padded limit: the looks accumulate
+    expect(within.at(-1), JSON.stringify(within)).toBe("HELD");
+    const beyond = await run(900); // inside 2 heartbeats, past the padded limit: every look restarts
+    expect(beyond.every((x) => x === "BUSY"), JSON.stringify(beyond)).toBe(true);
   }, 20_000);
 });
 
