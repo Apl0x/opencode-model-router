@@ -6,7 +6,9 @@ import { accept, type Artefact } from "../../src/verify/gate";
 import { buildGradingPrompt } from "../../src/verify/checker";
 import { validateConfig } from "../../src/router/config";
 import { nextAction, newLadderState } from "../../src/escalate/ladder";
-import type { ExecResult } from "../../src/verify/types";
+import type { ExecResult, RecheckOutcome, ScopedOutcome } from "../../src/verify/types";
+import { judgeScoped, formatIds } from "../../src/verify/baseline";
+import type { RunResult } from "../../src/verify/runner";
 
 const cwd = resolve("baseline-workspace");
 const green: ExecResult = { code: 0, stdout: "", stderr: "" };
@@ -215,4 +217,157 @@ it("validateConfig validates both baseline settings without requiring either", (
   for (const testBaseline of [true, false]) expect(validateConfig({ ...cfg, enforcement: { verify: { testBaseline, baselineTimeoutMs: 1 } } }).enforcement?.verify?.testBaseline).toBe(testBaseline);
   expect(() => validateConfig({ ...cfg, enforcement: { verify: { testBaseline: "yes" } } })).toThrow("testBaseline must be a boolean");
   for (const baselineTimeoutMs of [0, -1, 1.5, "100", Infinity]) expect(() => validateConfig({ ...cfg, enforcement: { verify: { baselineTimeoutMs } } })).toThrow("baselineTimeoutMs must be an integer");
+});
+
+describe("judgeScoped verdict algebra (deterministic.ts T5-T7)", () => {
+  const ID = "a.test.ts > t1";
+  const OBS = `; observed failures: ${ID}`;
+  const rr = (failingIds: string[], o: Partial<RunResult> = {}): RunResult => ({
+    failingIds, failingFiles: failingIds.map(id => `/repo/${id.split(" > ")[0]}`), collectionError: false,
+    total: 3, complete: true, source: "text", ...o,
+  });
+  const ran = (result: RunResult, exitCode = 1): ScopedOutcome => ({ kind: "ran", result, exitCode, notes: [] });
+  const exact = (refIds: string[], o: Partial<Extract<RecheckOutcome, { kind: "exact" }>> = {}): RecheckOutcome => ({
+    kind: "exact", result: rr(refIds, { total: 5 }), ranFiles: ["a.test.ts"], absentFiles: [], notes: [], ...o,
+  });
+  const cols: Record<string, RecheckOutcome | undefined> = {
+    "--": undefined,
+    "X+": exact([ID]),
+    "X-": exact([]),
+    "X?": exact(["a.test.ts > other"]),
+    A: { kind: "approximate", inexactReasons: [{ cause: "untracked-modified", path: "src/x.ts" }, { cause: "untracked-deleted", path: "" }] },
+    U: { kind: "unusable", cause: "no-reference", reason: "the dispatch was not tracked" },
+    D: { kind: "disabled" },
+    T: { kind: "timed-out", boundMs: 4000 },
+    S: { kind: "skipped-deadline", remainingMs: 8000 },
+  };
+  const rows: Record<string, ScopedOutcome> = {
+    R2: ran(rr([ID])),
+    R2i: ran(rr([ID], { complete: false, note: "report truncated" })),
+    R3: ran(rr([ID], { complete: false, collectionError: true })),
+  };
+  const col = (inventoryNote: string): Record<string, [boolean, boolean, string]> => ({
+    "X-": [false, false, `testsPass: introduced failures: ${ID}${OBS}`],
+    "X?": [false, true, `testsPass: cannot prove failures predate dispatch: ${ID}${OBS}`],
+    A: [false, true, `testsPass: cannot attribute failures: the dispatch reference is approximate (untracked-modified src/x.ts, untracked-deleted)${OBS}`],
+    U: [false, true, `testsPass: no reference: pre-existing failures cannot be told apart (the dispatch was not tracked)${OBS}`],
+    D: [false, true, `testsPass: cannot attribute failures: failureRecheck is off, pre-existing failures cannot be told apart${OBS}`],
+    T: [false, true, `testsPass: cannot attribute failures: the reference rerun timed out after 4000ms${OBS}`],
+    S: [false, true, `testsPass: gate budget exhausted before recheck${OBS}`],
+    "X+": [false, true, `testsPass: the scoped failure inventory is incomplete (${inventoryNote}); known failures predate dispatch, others may not${OBS}`],
+  });
+  const u9: [boolean, boolean, string] = [false, true, `testsPass: cannot attribute failures: no failing test file identified, recheck not attempted${OBS}`];
+  const table: Record<string, Record<string, [boolean, boolean, string]>> = {
+    R2: { ...col(""), "--": u9, "X+": [true, false, ""] },
+    R2i: { ...col("report truncated"), "--": u9 },
+    R3: { ...col("collection error"), "--": [false, true, `testsPass: collection error without failing test files: no details${OBS}`] },
+  };
+  const cells = Object.entries(table).flatMap(([row, byCol]) => Object.entries(byCol).map(([c, want]) => [row, c, ...want] as const));
+
+  it.each(cells)("%s x %s -> ok=%s unverifiable=%s", (row, c, ok, unv, reason) => {
+    const j = judgeScoped(rows[row], cols[c]);
+    expect(j.ok).toBe(ok);
+    expect(j.unverifiable).toBe(unv);
+    if (ok) {
+      expect(j.reason).toBeUndefined();
+      expect(j.note).toBe(`testsPass: no worse than before; pre-existing failures: ${ID}; suite is NOT green (affected tests checked against the exact dispatch reference)`);
+      expect(j.failures).toEqual({ introduced: [], preexisting: [ID], unknown: [] });
+    } else {
+      expect(j.reason).toBe(reason);
+    }
+    if (c.startsWith("X")) expect(j.failures).toBeDefined();
+    else expect(j.failures).toBeUndefined();
+  });
+
+  it("u4 names the cause of a non-reference unusable recheck", () => {
+    expect(judgeScoped(rows.R2, { kind: "unusable", cause: "materialize-failed", reason: "worktree add failed" }).reason)
+      .toBe(`testsPass: cannot attribute failures: reference unusable (materialize-failed): worktree add failed${OBS}`);
+  });
+
+  it("R0 no-affected passes with the NoAffected note verbatim, ignoring any recheck", () => {
+    for (const recheck of Object.values(cols)) {
+      expect(judgeScoped({ kind: "no-affected", note: "no changed files, no affected tests" }, recheck))
+        .toEqual({ ok: true, unverifiable: false, note: "no changed files, no affected tests" });
+    }
+  });
+
+  it("R1 green passes with e1, plus n1 when no test ran, ignoring any recheck", () => {
+    for (const recheck of Object.values(cols)) {
+      expect(judgeScoped(ran(rr([]), 0), recheck))
+        .toEqual({ ok: true, unverifiable: false, evidence: "testsPass: affected tests passed (full, 3 tests)" });
+    }
+    expect(judgeScoped(ran(rr([], { total: 0 }), 0), undefined)).toEqual({
+      ok: true, unverifiable: false, evidence: "testsPass: affected tests passed (full, 0 tests)", note: "testsPass: no affected tests ran",
+    });
+  });
+
+  it("R4 incomplete without failing ids is u12 whatever the recheck", () => {
+    for (const recheck of Object.values(cols)) {
+      expect(judgeScoped(ran(rr([], { complete: false, note: "no report written" }), 2), recheck))
+        .toEqual({ ok: false, unverifiable: true, reason: "testsPass: the scoped result is incomplete: no report written (exit 2)" });
+    }
+  });
+
+  it.each([
+    ["R5 timed out", { kind: "timed-out", boundMs: 5000 }, "testsPass timed out after 5000ms"],
+    ["R5 aborted", { kind: "aborted", reason: "gate budget exhausted during the scoped run" }, "testsPass: gate budget exhausted during the scoped run"],
+    ["R6 slot busy", { kind: "slot-busy", waitedMs: 60000, deadlineCut: false }, "verification slot busy (waited 60000ms)"],
+    ["R6 deadline cut", { kind: "slot-busy", waitedMs: 5000, deadlineCut: true }, "gate budget exhausted waiting for the verification slot"],
+    ["R7 S6", { kind: "unverifiable", code: "node-not-found", reason: "no node on PATH" }, "testsPass: scoping impossible (node-not-found): no node on PATH"],
+    ["R8 error", { kind: "error", reason: "spawn EPERM" }, "testsPass check errored: spawn EPERM"],
+  ] as [string, ScopedOutcome, string][])("%s is unverifiable whatever the recheck", (_name, scoped, reason) => {
+    for (const recheck of Object.values(cols)) {
+      expect(judgeScoped(scoped, recheck)).toEqual({ ok: false, unverifiable: true, reason });
+    }
+  });
+
+  describe("T5 classification edge cases", () => {
+    it("an id whose file is absent at the reference is introduced", () => {
+      const j = judgeScoped(ran(rr(["new.test.ts > t"])), exact([], { result: undefined, ranFiles: [], absentFiles: ["new.test.ts"] }));
+      expect(j).toMatchObject({ ok: false, unverifiable: false, failures: { introduced: ["new.test.ts > t"], preexisting: [], unknown: [] } });
+    });
+
+    it("a file that was not rerun leaves its ids unknown", () => {
+      const j = judgeScoped(ran(rr(["b.test.ts > t"])), exact([ID]));
+      expect(j).toMatchObject({ ok: false, unverifiable: true, failures: { unknown: ["b.test.ts > t"] } });
+    });
+
+    it("report source classifies id-level: another failing id in the same file does not hide a new one", () => {
+      const j = judgeScoped(ran(rr([ID], { source: "report" })), exact(["a.test.ts > other"]));
+      expect(j).toMatchObject({ ok: false, unverifiable: false, reason: `testsPass: introduced failures: ${ID}${OBS}` });
+    });
+
+    it("text source classifies file-level only when the file passed at the reference", () => {
+      expect(judgeScoped(ran(rr([ID])), exact(["a.test.ts > other"])).failures).toEqual({ introduced: [], preexisting: [], unknown: [ID] });
+      expect(judgeScoped(ran(rr([ID])), exact([])).failures).toEqual({ introduced: [ID], preexisting: [], unknown: [] });
+    });
+
+    it("pytest ids key on the part before ::", () => {
+      const id = "tests/test_x.py::TestA::test_b";
+      const j = judgeScoped(ran(rr([id], { source: "report" })), exact([id], { ranFiles: ["tests/test_x.py"] }));
+      expect(j).toMatchObject({ ok: true, failures: { preexisting: [id] } });
+    });
+
+    it("a bare-file id is never pre-existing: introduced when its file ran or is absent", () => {
+      const bare = "a.test.ts";
+      const scoped = ran(rr([bare], { collectionError: true, complete: false }));
+      expect(judgeScoped(scoped, exact([bare])).failures).toEqual({ introduced: [bare], preexisting: [], unknown: [] });
+      expect(judgeScoped(scoped, exact([], { result: undefined, ranFiles: [], absentFiles: [bare] })).ok).toBe(false);
+    });
+
+    it("r1 names only the introduced ids and notes the pre-existing ones", () => {
+      const j = judgeScoped(ran(rr([ID, "a.test.ts > t2"], { source: "report" })), exact([ID]));
+      expect(j).toMatchObject({
+        ok: false, unverifiable: false,
+        reason: `testsPass: introduced failures: a.test.ts > t2; observed failures: ${ID}, a.test.ts > t2`,
+        note: `testsPass: also failing at the dispatch reference: ${ID}`,
+      });
+    });
+  });
+
+  it("<ids> lists at most 10 ids, then the remainder count", () => {
+    const ids = Array.from({ length: 12 }, (_, i) => `t${String(i).padStart(2, "0")}`);
+    expect(formatIds(ids)).toBe(`${ids.slice(0, 10).join(", ")} (+2 more)`);
+    expect(formatIds(ids.slice(0, 10))).toBe(ids.slice(0, 10).join(", "));
+  });
 });
