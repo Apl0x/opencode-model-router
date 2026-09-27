@@ -762,3 +762,55 @@ Open non-deferred findings: QA-1.5-21 (Medium), QA-1.5-22 (Low). Phase 1.5 QA is
 
 Deferred by plan (unchanged): QA-1.5-7; QA-1.5-10 and QA-1.5-4 (2.1 parts); the POSIX key safety test and the Bun
 POSIX smoke (3.1).
+
+## QA re-review (round 6)
+
+Scope: the round-5 fixes (dd16de4, 6b0c924, e3c7e76) and every defect that `git diff 7b43ef8..e3c7e76` introduces
+(`src/verify/reference.ts`, `test/unit/reference.test.ts`, this file). Unchanged code cleared in rounds 1-5 was not
+re-audited. Host: win32, Git 2.51.0.windows.1, Node 24.21.0, Bun 1.3.14, vitest 4.1.11.
+
+Method: a clone of vrb/p15 in `%TEMP%\omr-qa15r6` (`node_modules` junction) ran mutation builds of `reference.ts`
+against the new tests. Bun scratch scripts wired `captureReference` / `materialize` / `gcStaleReferences` to the
+**real p12 `runArgv`**: `exec.ts` and `types.ts` were taken from `vrb/p12` at 2529f85 with `git cat-file blob`.
+Their blob ids (`edb353c`, `e5b2e2f`) matched the source, and nothing in omr-p12 was modified. The scripts ran
+against two builds of `reference.ts`: HEAD (e3c7e76) and 7b43ef8. `maxBuffer` was passed through a wrapper,
+because `ExecOptions` at 2529f85 still has no `maxBuffer`.
+
+### Resolutions: verification
+| Finding | Status | Evidence |
+|---|---|---|
+| QA-1.5-21 | **Verified** (side effects → QA-1.5-23, QA-1.5-24) | **Coverage:** the only seam call in the module is `argv("git", …)` inside `runGit` (`:1121`). All 15 git call sites go through `runGit`. **Marker:** p12 2529f85 `run()`/`finish` pushes `` `[stdout truncated at ${limit} chars]` `` and appends each note on its own line after git's stderr. `STDOUT_TRUNCATED` (`:1103`) matches that text. In every capped real run below, `note: true`. **Callers of code -1:** capture's `git` helper (`:1348-1352`), `stash create` (`:1383`) and `rev-parse --git-path` (`:1461`) return undefined, so there is no reference. `cat-file` → `commit-missing`, `worktree add` / `ls-files --ignored` / `diff` / `ls-files --others` → `abandon`, `config core.autocrlf` → no reason (only `code === 0` is read). `--eol` → the `""` fallback. `unlock`/`remove` → left registered. GC's `worktree list` / `rev-parse --git-common-dir` → return early. None throws. None reads stdout of a failed call. **-z with legitimate output:** repo with `color.ui=always`, `color.diff=always`, a skip-worktree entry, a dirty tracked file, an untracked file, an ignored `node_modules/` and drift after capture. All 8 `-z` calls (`ls-files -v`, `diff-tree`, `ls-files --others` ×2, `ls-files --ignored --directory`, `diff --name-only`, `ls-files --eol` ×2) ended in NUL, and no call became -1. **End to end, real p12 `runArgv`** (`*.txt text eol=crlf`, a.txt/b.txt clean LF): default cap → `a.txt`, `b.txt` on both builds. `--eol` capped at the record boundary before a.txt (54, ends in NUL, note) and mid-record (59): HEAD `[{checkout-conversion, ""}]`, **7b43ef8 `exact: true`, `[]`**. Every materialize call capped at 0/20/60/120: HEAD `worktree-add-failed`, `worktree-add-failed`, `""`, `""`. 7b43ef8 gives `EISDIR` (a cut `rev-parse --git-path index` = the repo root), **`exact: true` at 20 and 60**, and at 120 only `a.txt` (b.txt past the cut hidden). Capture capped at 10/40: undefined on both builds. **GC:** a crashed owner (a separate process materialized under dead pid 999991 and exited without dispose) plus an unregistered dead-pid orphan, `isAlive: () => false`, `worktree list` capped at the end of its first entry (140/676 chars). HEAD: `removed: []`, both dirs kept, `reference GC skipped: git worktree list failed`. The uncapped GC then removed both. 7b43ef8: the capped GC removed **the registered dir through the orphan path** (`git: false`), leaving its admin entry for a later GC. **Mutations** (clone, `-t QA-1.5-21`): without the note check, `expected [ 'note', true ] to deeply equal [ 'note', false ]`. Without the `-z` check, `expected [ 'no trailing NUL', true ] …`. With the condition changed to `code === 1`, the `note` variant fails. The 7b43ef8 `reference.ts` with the HEAD test fails with exactly the message quoted in the resolution. |
+| QA-1.5-22 | **Verified** | (1) JSDoc: `PATHSPEC_ENV_RESET` (`:1094`), `STDOUT_TRUNCATED` (`:1102`) and `runGit` (`:1105-1112`) each carry exactly one doc comment, directly above their own declaration. (2) The env spy test is meaningful. With the reset removed (`opts.env = { ...run.env }`) it fails: `expected {} to match object { GIT_LITERAL_PATHSPECS: '0', …(3) }`. With the caller env dropped (`{ ...PATHSPEC_ENV_RESET }`) it fails: `expected false to be true` (no `GIT_INDEX_FILE`). On 7b43ef8 (reset present) it passes, as it should. (3) `:1827-1829` now says the concurrency halves the wall time and names `budget.remaining()` plus `""` as the bound. `:303-304` is within width. The round-4 resolution reads `""`. |
+
+### New findings
+| ID | Severity | Evidence | Fix |
+|---|---|---|---|
+| QA-1.5-23 | Low (fail-closed; introduced by dd16de4) | **Git's own stderr can contain the marker, so a successful call is reported as truncated.** `STDOUT_TRUNCATED` is unanchored (`:1103`) and is tested against the whole stderr (`:1125`), which includes git's messages quoting repository paths. **Repro** (real p12 `runArgv`): `*.txt text eol=crlf`, a committed file `[stdout truncated at 1 chars].txt`, edited with LF content. `stash create` exits 0 with the stderr `warning: in the working copy of '[stdout truncated at 1 chars].txt', LF will be replaced by CRLF the next time Git touches it`. HEAD: `captureReference` → **undefined**. 7b43ef8: a reference is captured, and `materialize` returns both files as `checkout-conversion`. `diff --name-only` in step 7 prints the same warning, so a file dirtied after capture would make `materialize` fail with `abandon("error")`. Errors go only toward "no reference", never toward a wrong excuse. But a file name in the repository can turn off the reference, and nothing records that the call was misread. | Match p12's framing, not a substring. The notes are appended as whole lines after git's stderr, so anchor to the trailing note block, e.g. `/(?:^\|\n)\[stdout truncated at (\d+) chars\]\n(?:\[[^\n]*\]\n)*$/`. Also require `stdout.length` to be `n` or `n-1` (p12 drops half of a surrogate pair). Add a test with the file name above under `eol=crlf` that expects a reference. |
+| QA-1.5-24 | Low (docs; introduced by dd16de4) | **The new scale limit is not documented, and the resolution describes a path the default cap rarely reaches.** The resolution says a cut `--eol` listing takes the `""` fallback. But capture's `ls-files --stage` (`:1357`, not `-z`) is longer per entry than `--eol` for the same paths: 51 + path chars (SHA-1; 75 + path under SHA-256) against 40 + path. So at the default 10 M-char cap, capture fails first, and **no reference exists at all** for a repository beyond ~95-150k tracked paths (path length 60-20). Before dd16de4 such a repository got a reference whose submodule check read only part of the listing. The new behaviour is the correct fail-closed one, but OPEN RISKS and section 3 say nothing about it. The `""` outcome applies only to an index that grew after capture or to long `attr/` fields. | Record the limit in OPEN RISKS and section 3 step 6 (no reference when a capture listing exceeds the seam's cap; approximate when only `--eol` does). Correct the QA-1.5-21 resolution text. If 2.1 needs large monorepos, pass a per-call `maxBuffer` through the seam for the listing calls. |
+
+### Checked with no finding
+- A cut `worktree list` at dispose: `registeredEntry` returns undefined (`:1226`). `removeReferenceDir` then skips the
+  unlock and runs `worktree remove --force` (`:1298-1321`). Git refuses our locked entry, so the admin entry stays
+  registered and a warning is logged. In the all-calls-capped runs this left 4 locked entries whose dirs were gone.
+  A later uncapped `gcStaleReferences` removed all 4 (dir gone + own reason, QA-1.5-15). This handling predates
+  dd16de4 and is recoverable, and at the 10 M default a cut `worktree list` is not realistic.
+- A fractional `maxBuffer` would print as e.g. `1.5` and escape `\d+`. This is unreachable: `ExecOptions` / `ArgvSeam`
+  at 2529f85 carry no `maxBuffer`, so runArgv always prints the integer default, and the `-z` check covers the
+  `-z` listings anyway.
+- Nits, not findings: the added `\n[omr: git output truncated]` follows a p12 stderr that already ends in `\n`,
+  which leaves a blank line in the logged detail. The D8 comment splits the marker text across two lines (`:613-614`).
+- Wording of the round-5 resolution lines: accurate, apart from the QA-1.5-24 point.
+
+### Verification and cleanup
+- `npx vitest run --maxWorkers=2 test/unit/reference.test.ts` (e3c7e76): **53/53 passed** (115.5 s). `npm run
+  typecheck`: no diagnostics.
+- Scratch `%TEMP%\omr-qa15r6`: the `node_modules` junction was unlinked first (it was the only reparse point, and the
+  real `node_modules` was intact afterwards), then the directory was deleted (`scratch exists: False`). TEMP has
+  no `omr-ref-*` or `omr-nohooks-*` dirs, `git worktree list` shows only the 10 pre-existing worktrees, and
+  no QA process is left running. The running `bun.exe` processes are opencode hosts that were already running
+  before this round started.
+
+Open non-deferred findings: QA-1.5-23 (Low), QA-1.5-24 (Low). Phase 1.5 QA is **not** clean.
+
+Deferred by plan (unchanged): QA-1.5-7; QA-1.5-10 and QA-1.5-4 (2.1 parts); the POSIX key safety test and the Bun
+POSIX smoke (3.1). Accepted open risk: QA-1.5-19.
