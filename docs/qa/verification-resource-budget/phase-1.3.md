@@ -951,3 +951,112 @@ Cleanup: the 27 junctions under `%TEMP%\omr-qa13r5` (`node_modules` links into `
 `rmdir` first, and the check found 0 reparse points left. Then the directory was deleted; the link targets are intact. No `bun --bun run`
 probe was needed this round. The final check found 0 `omr-verify-*` files and 0 `bun-node-*` directories in `%TEMP%`, and no process
 referring to `omr-qa13r5`. The Spike C fixtures were not modified (`git status` clean in the jest project).
+
+### Resolutions (round 5)
+
+Gates after the last fix: `npx vitest run --maxWorkers=2 --coverage --coverage.include=src/verify/runner.ts test/unit/runner.test.ts test/unit/deterministic.test.ts`
+gave `Test Files 2 passed (2)`, `Tests 724 passed (724)`, and runner.ts coverage of 99.4% statements (2014/2026), 97.82% branches (1797/1837),
+100% functions (212/212) and 99.87% lines (1597/1599). `npm run typecheck` was clean. runner.ts still imports no `child_process`.
+Contract changes are additive: no exported type changed (`ChangedPath`, `StaticScoping`, `DetectedRunner` and `S6Code` are as before), and
+no S6 code was added. `unsupported-argument` gains four reason templates (M.1): `unsupported pytest config for the scoped inputs: <file|none>
+instead of <file|none>`, `unsupported pytest rootdir: the pytest releases pick <a> or <b>`, `unsupported pytest rootdir: pytest expands
+variables in <dir>`, and `unsupported <vitest|jest> config: <path> does not parse as JSON`. Behaviour changes a consumer can see: a pytest
+spec now carries `--rootdir=<dir>` (and `-c <config>` when every release reads the same accepted one) after `--maxfail=0`; for vitest and
+jest, more than SEARCH_LIMIT gone modules or inputs whose paths alone overflow the command line are S6 before any config is read, so such a
+change reports `too-many-searches`/`argv-too-long` even when it also touches a config; planStaticScoping now reports `argv-too-long` for such
+changes (both runners) where it used to report `scopable`.
+Real-runner checks: runner.ts at 6449655 ("before") and at afabb45 ("after") were bundled with `bun build --target node` and driven under
+node v24.21.0 and bun 1.3.14 from `%TEMP%\omr-fix13r5`. The planners got the real fs (native realpath, bigint stat) and a search seam
+backed by `git ls-files` / `git grep`; each fixture was a fresh directory with its own `git init` and commit, and the changed file was then
+broken. Specs were spawned with `spawnSync(file, args, {shell: false})` and every run went through `readResult`. Runners: pytest 9.1.1 +
+xdist 3.8.0 (the Spike C venv, through `host.pathEnv`), jest 30.5.2 (Spike C `node_modules`, by junction), vitest 4.1.11
+(`D:\git\omr-p13\node_modules`, by junction). "User's own" is the check command run by itself in the fixture; `pin=` lists a pytest
+spec's arguments between `--maxfail=0` and `--`. The determine_setup model was
+checked against the source of pytest 7.0.0, 7.4.4, 8.0.0, 8.1.0 (wheels unpacked, not installed) and 9.1.1: every release takes the -c file's
+directory as the rootdir, only 8.1+ has the table-less pyproject.toml rule, and a `--rootdir` skips the setup.py rule and the fallback in all
+of them; the conftest cutoff is the inifile's directory, else the rootdir (8.0+; 7.x: the inifile's directory or none).
+
+- QA-1.3-43 Resolution: 64799b1 — The spec is pinned to the config the user's run reads. determine_setup is modelled per release
+  (PYTEST_SETUPS: pytest 9, 8.1-8.4, 8.0/7.x, 7.0), including the 8.1+ rule that a table-less pyproject.toml becomes the inifile and the
+  rootdir. At spec time the user's run is looked up again (runnerCwd and the path arguments; a rerun moves both into its tree), the xdist,
+  cap, cov and python_files evidence comes from what it reads, and the spec adds `--rootdir=<the user's rootdir>` unless the command or
+  PYTEST_ADDOPTS gives one (the releases must agree on it, else S6), and `-c <config>` when every release reads the same accepted config;
+  then the inifile, the ini values, the rootdir and the conftest cutoff all match on every release. A -c/--config-file from the command or
+  PYTEST_ADDOPTS is already seen by the spawn, so nothing is added. The no-config case, checked as asked: pinning `--rootdir` alone does
+  not stop pytest's own locate_config from the inputs' ancestor, so where no single file can be pinned (the releases read different
+  files, a table-less pyproject.toml, or none) the spawn's lookup from the inputs' ancestor must give every release the inifile the user's
+  run has, none included, else S6 `unsupported pytest config for the scoped inputs: <file> instead of <file|none>`. This keeps pytest.toml
+  (pytest 9 only) scopable. A rootdir with `$` (or `%` on win32) is S6, since pytest applies `os.path.expandvars` to `--rootdir`. A
+  DetectedRunner without pytestFacts has its kept `-c`/`--rootdir` read back, so neither is doubled. Real pytest 9.1.1, changed file broken:
+  (a) monorepo, root `pyproject.toml` table, `packages/foo/pyproject.toml` `addopts = "-m 'not integration'"`, `pytest packages`: before
+  `exit=0 total=1 failingIds=[] complete=true` (a pass); after `pin=["-c","pyproject.toml","--rootdir=."] exit=1 total=2
+  failingIds=["packages/foo/tests/test_x.py::test_db"] complete=true`; user's own `exit=1 FAILED packages/foo/tests/test_x.py::test_db …
+  1 failed, 1 passed`. (b) root `pytest.ini` plus `tests/unit/pytest.ini` `addopts = -m "not slow"`, `pytest`: before a pass; after
+  `pin=["-c","pytest.ini","--rootdir=."] exit=1 total=2 failingIds=["tests/unit/test_s.py::test_slow"] complete=true`; user's own `exit=1
+  … 1 failed, 1 passed`. No root config, only `tests/unit/pytest.ini` with the same addopts: before a pass; after `S6
+  unsupported-argument: unsupported pytest config for the scoped inputs: …\tests\unit\pytest.ini instead of none`; user's own `exit=1`
+  (plain `pytest` never reads that file). Root table-less `pyproject.toml`: after `pin=["--rootdir=."] exit=1
+  failingIds=["tests/test_a.py::test_up"] complete=true`, as the user's own. Root `pytest.ini` `addopts = -n 3` with the worker probe:
+  after `pin=["-c","pytest.ini","--rootdir=.","-n","2"] exit=0` (user's own `WORKERS=3`). Identical under node and bun. Unit tests: (a),
+  (b), the rerun tree, no config, a table-less pyproject.toml, pytest.toml, the honoured -c/--rootdir (command, PYTEST_ADDOPTS, kept
+  arguments), the rootdir disagreement, `$`/`%` rootdirs, and the fs-root rootdir.
+  The QA-1.3-40 modelling is kept for the user's run only: with `--rootdir` pinned the spawn never falls back, so the spec-time walks over
+  the inputs' directories are gone. That changes two round-4 results, both towards the user's run. QA-1.3-40 (a) `pytest tests/a tests/b`:
+  the user's run falls back to `tests/a/pytest.ini` with rootdir `tests/a`, so the spec now pins both; pytest writes `classname=""` for
+  `tests/b/check_math.py` outside that rootdir, and the run reads `exit=1 failingIds=["::test_up"] complete=false` (was `complete=true`),
+  never a pass; user's own `exit=1`. QA-1.3-40 (b) plain `pytest`: the user's run does not fall back and reads no config, so the spec now
+  gets `--rootdir=.` and no `-n` (was `-n 2` from `tests/a/pytest.ini`); after `exit=0 total=2`, as the user's own `2 passed`. The QA-1.3-40
+  unit tests were rewritten to these semantics (path arguments for the fallback, the user's order, setup.py, `--rootdir`, empty
+  `--rootdir=`, a table-less pyproject.toml that now splits the releases' rootdirs -> S6, and a bad fallback config).
+- QA-1.3-44 Resolution: d1eec4f — jsConfigFacts also reads the vitest (`vitest.config.*`, `vite.config.*`) or jest (`jest.config.*`,
+  package.json) configs in every directory from each changed JS/TS module that is not a test file, existing or gone, up to gitRoot, with
+  that directory as a base; vitest's literal `root` values (inline projects) are bases too, against the config's directory and runnerCwd.
+  The directories are deduplicated (each walk stops at the first directory already listed). To keep the reads bounded, the S6s a large
+  change reaches without them come first: more than SEARCH_LIMIT gone modules, or existing inputs whose quoted paths alone exceed
+  MAX_ARGV_CHARS. `planStaticScoping` with real fs, 250 changed modules in 250 directories (vitest): node 77-101 ms before, 177-191 ms after;
+  bun 146-390 ms before, 217-284 ms after (fileExists 265 -> 3265 under node). 400 such modules: before `scopable` in 122-142 ms (node) and
+  196-204 ms (bun); after `S6 argv-too-long` in 120-133 ms and 143-153 ms, with 401 fileExists and no config probe. Section P no longer says
+  a vitest setup file under another name is "correct at full cost": under `projects`, `vitest related` runs 0 tests for it; the residual is
+  a non-literal reference or a project config outside the file's own directory chain (`../../shared/boot.js`). Real runners, changed
+  `packages/a/testing/boot.js` made to throw: jest (root `projects: ['<rootDir>/packages/a']`, `packages/a/jest.config.js`
+  `setupFilesAfterEnv: ['<rootDir>/testing/boot.js']`) and vitest (root `test: { projects: ['packages/a'] }`,
+  `packages/a/vitest.config.mjs` `setupFiles: ['./testing/boot.js']`): before `inputs=["packages/a/testing/boot.js"] exit=0 total=0
+  failingIds=[] complete=true` (a pass) for both; after `S6 config-changed: config file changed: packages/a/testing/boot.js` for both.
+  User's own: jest `exit=1 ● Test suite failed to run … setup broke`; vitest `exit=1 Test Files 1 failed (1) … Error: setup broke`. A
+  plain vitest source change still runs its related test (`exit=1 failingIds=["test/math.test.js > add"]`, before and after). Unit tests:
+  both layouts, a deleted setup file, an inline project's `root`, which changed files add directories, and the cheap S6s reading no config.
+- QA-1.3-45 Resolution: d1eec4f — (a) the last jest `--rootDir`/`--root-dir` in keptArgs, resolved against runnerCwd, is a base for every
+  config's references and a `<rootDir>` (jest-config's setFromArgv puts it over the config's rootDir). (b) configLiterals scans a key's
+  value as a whole expression, up to the next `,` or `;` at depth 0 or the bracket that closes the enclosing object, and takes every
+  string literal in it, so `require.resolve('./x')`, `path.resolve(__dirname, 'x')`, a ternary's branches and nested arrays count; a
+  template with `${`, a comment and an unterminated string are handled as before. The budget of QA-1.3-42 counts the new bases before any
+  root literal is resolved. Real jest 30.5.2, bootstrap made to throw: `jest --rootDir src` with `setupFilesAfterEnv:
+  ['<rootDir>/testing/bootstrap.js']`, and `globalSetup: require.resolve('./src/testing/bootstrap.js')`: before `inputs=
+  ["src/testing/bootstrap.js"] exit=0 total=0 complete=true` for both; after `S6 config-changed: config file changed:
+  src/testing/bootstrap.js` for both. User's own: `exit=1 ● Test suite failed to run … setup broke` and `exit=1 Jest: Got error running
+  globalSetup - …\src\testing\bootstrap.js, reason: setup broke`. Unit tests: three `--rootDir` spellings, five value shapes, and where a
+  value ends.
+- QA-1.3-46 Resolution: afabb45 — JSON configs go through strip-json-comments' rules (the version jest-config uses: `//` and block
+  comments outside strings become whitespace, an escaped quote does not end a string, an unterminated comment runs to the end) before
+  JSON.parse. A `.json` config that still does not parse is S6 `unsupported <runner> config: <path> does not parse as JSON`, since jest
+  fails the user's run on it; an unparseable package.json is skipped, as jest's own lookup (`getPackageJsonJestKey`) skips it. Real jest
+  30.5.2: `jest.config.json` `{ // local setup` + `"setup\u0046ilesAfterEnv": ["./src/testing/bootstrap.js"] }`, bootstrap made to throw:
+  before `exit=0 total=0 complete=true`; after `S6 config-changed: config file changed: src/testing/bootstrap.js`; user's own `exit=1 ● Test
+  suite failed to run … setup broke`. `jest.config.json` `{ "testEnvironment": "node", }` with a source change: before `exit=1
+  complete=false note=runner exited 1 without a usable report`; after `S6 unsupported-argument: unsupported jest config: …\jest.config.json
+  does not parse as JSON`; user's own `exit=1 JSONError: Expected double-quoted property name in JSON …`. The round-4 unit test that kept
+  the literal scan for an unparseable jest.config.json now expects this S6; new tests cover line, block, trailing and unterminated
+  comments, markers inside strings, escaped quotes, and package.json.
+- QA-1.3-47 Resolution: 64799b1 — With the rootdir pinned (QA-1.3-43) the spec-time lookup no longer walks from each input directory; the
+  user's fallback walks stop below the ancestor, which the first walk covered; and a lower bound of the pytest argv (without `-n N`,
+  `--no-cov` and the pin) is checked before the lookup in planScopedRun, planStaticScoping (over the test inputs it knows) and planRerun.
+  2000 directories, one test file each, no config anywhere, real fs: `planScopedRun` node 1668-1753 ms -> 714-920 ms and bun 4353-4597 ms
+  -> 767-803 ms; `planStaticScoping` node 1761-2122 ms -> 699-1612 ms and bun 4598-5817 ms -> 782-834 ms; fileExists 16074 -> 2074 (the
+  2000 existence checks of the changed files remain). Both planners now return `S6 argv-too-long: too many inputs for one command line:
+  2000 files` (planStaticScoping used to return `scopable`). A unit test plans 2000 inputs in 2000 directories: planScopedRun makes fewer
+  than 2100 fs checks, and planScopedRun, planStaticScoping and planRerun all return that S6.
+
+Cleanup: the fixture junctions under `%TEMP%\omr-fix13r5` (`node_modules` links into `D:\git\omr-p13` and the Spike C jest project) were
+removed with `rmdir` first and the check found 0 reparse points left; then the directory, with the unpacked pytest wheels, was deleted. The
+link targets are intact and the Spike C fixtures were not modified. The final check found 0 `omr-verify-*` files and 0 `bun-node-*`
+directories in `%TEMP%`, and no process referring to `omr-fix13r5`.
