@@ -10,67 +10,123 @@
  * own token is there (a creator stalled between the create and the write may
  * have been reaped as an empty file).
  *
- * Staleness. The holder refreshes the file's mtime every `heartbeatMs` (5 s,
+ * Clock. Every duration is measured on `mono`, the machine-wide monotonic clock
+ * `process.hrtime`: CLOCK_MONOTONIC on Linux and mach/CLOCK_UPTIME_RAW on macOS
+ * (both stop while the system is suspended), QueryPerformanceCounter on Windows.
+ * Each reads the same value in every process of the host (checked on Windows 11:
+ * processes started one after another read consecutive values, equal to
+ * `os.uptime()`). Whether QPC counts a Windows sleep is not documented, and Modern
+ * Standby pauses desktop processes while every clock runs, so no rule assumes
+ * that the clock stops while the processes are frozen (see "witnessed"). The wall
+ * clock is only compared with file mtimes.
+ *
+ * Shared observation. Staleness needs a file to be seen unchanged over time, and
+ * one call may be too short for that (`slotWaitMs: 0`). So every look is
+ * recorded in a sidecar `slot-<i>.lock.seen-<hash(file, identity, host)>` holding
+ * `{key, first, from, last}` on `mono`. `key` is identity@mtime, `first` the first
+ * sighting of that key, `last` the latest look by any process, and `from` the
+ * first look after the latest gap of more than 2 heartbeats between two looks.
+ * So `span = now - first` is how long the file has been unchanged, and
+ * `witnessed = now - from` how long it has been watched without a gap. A new
+ * key, another boot (the Linux boot id, or the boot instant `wall - mono` moved by
+ * more than a minute) or a stamp from the future restarts the record. The host is
+ * part of the name, so hosts sharing a dir never mix clocks. A stamp that
+ * survives a reboot can only be for a file whose holder died with the reboot
+ * (tokens are never reused). Sidecar I/O is advisory: a failure only loses
+ * evidence, which delays a reclaim and never causes one.
+ *
+ * Staleness. The holder refreshes its file's mtime every `heartbeatMs` (5 s,
  * unref'd timer). A lock is stale when
  *   (a) its host is this host and its PID is dead (immediately), or
- *   (b) its heartbeat is older than `staleMs` (30 s) by the wall clock, AND this
- *       process has seen the same (token, mtime) for at least 2 heartbeats of its
- *       own monotonic clock (`performance.now()`), with no gap longer than 2
- *       heartbeats between two observations.
- * A suspend/resume or a clock step makes a live holder's file look old, but the
- * holder heartbeats within one interval after it runs again, which changes the
- * mtime and restarts the observation; a gap in the observations (the observer
- * slept) restarts it too. A lock seen unchanged for `staleMs` of monotonic time
- * is stale whatever its mtime says (an mtime in the future after the clock
- * stepped back). A foreign host is never judged by PID. A corrupt/empty lock uses
- * rule (b) with the short `corruptGraceMs` for both the age and the observation,
- * because a creator writes the JSON right after the exclusive create.
+ *   (b) it is old (its heartbeat is older than `staleMs`, 30 s, by the wall
+ *       clock, or its span is at least `staleMs`) AND it has been witnessed
+ *       unchanged for 2 heartbeats.
+ * A suspend, a freeze or a clock step makes a live holder's file look old. But
+ * the holder heartbeats within one interval once it runs again, which changes the
+ * key, and a gap in the looks (everyone was frozen, or nobody looked) restarts
+ * the witness, so the holder always gets 2 heartbeats of running time first. A
+ * foreign host is never judged by PID. A corrupt/empty lock uses the short
+ * `corruptGraceMs` for both the age and the witness, because a creator writes the
+ * JSON right after the exclusive create.
+ *
+ * Watch. A call that gives up at its deadline while a lock is old but not yet
+ * witnessed long enough keeps looking at it in the background, every heartbeat
+ * (unref'd timer), until the lock is reaped or changes, or for at most
+ * `staleMs + 2 x (heartbeatMs + claimHoldMaxMs)`. So a process calling with
+ * `waitMs: 0` once a minute still reclaims a lock whose owner is not provably
+ * dead (a reused PID, another host, a hung holder). Short-lived processes that
+ * each look once do it through the sidecar when their looks are less than 2
+ * heartbeats apart; looks further apart than that cannot tell a dead holder from
+ * a frozen machine, and leave the reclaim to the next caller that waits or lives
+ * for 2 heartbeats.
  *
  * Deletion. Every delete of a lock file whose identity is K (its token; for a
  * corrupt file its mtime and size) runs under the claim file
- * `slot-<i>.lock.reap-<hash(K)>`, created with `wx`. That includes the owner's
- * own release and the exit hook. The claim holder re-reads the file before every
- * unlink attempt and deletes it only while it is still K. K is never reused and
- * only a K-claim holder deletes K's file, so the file cannot be deleted and
- * re-created between the re-read and the unlink (no ABA, no time lease).
- * A claim holds `{pid, hostname, token}` and is removed by its owner. A crashed
- * claimer's claim is removed the same way, under the claim for *its* token, when
- * its owner is provably dead (same host, dead PID) or when it is older than
- * `staleMs` and has been seen unchanged for 2 x `claimHoldMaxMs`. A claimer never
- * deletes anything after holding its claim for `claimHoldMaxMs` of its monotonic
- * clock (self-fencing), so the second rule never removes the claim of a claimer
- * that still acts. Transient antivirus/indexer errors (EBUSY/EPERM/EACCES) are
- * retried, and a failed delete is never reported as success.
+ * `slot-<i>.lock.reap-<hash(K)>`, created with `wx` and holding `{pid, hostname,
+ * token, target, victim: K}`. That includes the owner's own release and the exit
+ * hook. A claimer holds its claim only after a readable re-read shows its own
+ * token; an unconfirmed claim is never used and is left to the rules below. The
+ * claim holder re-reads the target before every unlink attempt and deletes it
+ * only while it is still K. K is never reused and only a K-claim holder deletes
+ * K's file, so the file cannot be deleted and re-created between the re-read and
+ * the unlink (no ABA). A claim is removed by its owner. A crashed claimer's claim
+ * is removed the same way, under the claim for *its* token, when its owner is
+ * provably dead (same host, dead PID) or when it is inert: span >= `staleMs` AND
+ * witnessed >= 2 x `claimHoldMaxMs`. The wall clock plays no part, because claims
+ * are never refreshed. A claimer deletes its target only within `claimHoldMaxMs`
+ * (5 s) of `mono`, counted from just before it created the claim and checked
+ * again right before each unlink, and drops its own claim only within 1.5 x that
+ * (7.5 s). So a claimer acts on a claim judged inert only if it freezes for more
+ * than 25 s (target) or 22.5 s (drop) between that last check and the unlink
+ * syscall; when every process was frozen together, the witness gives it 10 s of
+ * running time after the thaw. Transient antivirus/indexer errors
+ * (EBUSY/EPERM/EACCES) are retried, and a failed delete is never reported as
+ * success.
  *
  * Fairness. A caller that waits files a ticket `wait-<startedAt>-<uuid>.ticket`
- * (`{pid, hostname, token}`), refreshes it on every wake-up and tries the slots
- * only while fewer than `max` live tickets are older than its own: strict FIFO for
- * max=1, and for max>1 the `max` oldest waiters compete. A caller that does not
- * wait defers while `max` live tickets exist, so a releaser that re-acquires at
- * once queues behind the waiters. A ticket is dead when its PID is dead (same
- * host), when it is older than `staleMs`, or when it has been seen unchanged for
- * `staleMs` of monotonic time. Tickets only order the attempts: exclusion never
- * depends on them, and a ticket I/O failure lets the caller try.
+ * (`{pid, hostname, token}`), refreshes it every heartbeat (unref'd timer) and on
+ * every wake-up, and tries the slots only while fewer than `max` live tickets are
+ * older than its own. That is strict FIFO for max=1; for max>1 the `max` oldest
+ * waiters compete. A caller that does not wait defers while `max` live tickets
+ * exist, so a releaser that re-acquires at once queues behind the waiters. A
+ * ticket is dead when its PID is dead (same host), or when it has not been
+ * refreshed for 2 heartbeats (by its mtime, or seen unchanged that long by this
+ * process). A live PID proves nothing, because PIDs are reused. A live waiter
+ * misjudged dead re-creates its ticket under its old name at its next refresh.
+ * Tickets only order the attempts: exclusion never depends on them, and a ticket
+ * I/O failure lets the caller try.
+ *
+ * Housekeeping. At most every 10 minutes per dir, a caller deletes orphaned files
+ * older than 1 hour. Probes, observation sidecars and the legacy `.reap` and
+ * `.reap.dead-*` files go by path, since they are unique or advisory. Claims go
+ * under the claim protocol when their target no longer holds their victim or when
+ * they are empty/corrupt. A claim without `target`/`victim` is left alone.
  *
  * Loss. When the heartbeat finds the holder's file gone or owned by another token,
  * the handle's `lost` becomes true, `onLost` is called and a warning is logged,
  * once. A failing `utimes` is retried like an unlink.
  *
+ * Errors. `acquireSlot` never rejects. If the slot dir has disappeared (a temp
+ * cleaner), it is re-created once and the attempt repeated; if that fails, the
+ * dir verdict is dropped. Any other unexpected file-system error (EMFILE, ENOSPC,
+ * EIO, ...) resolves `{busy:true}` with one warning per dir and code, and drops
+ * the dir verdict, so the next call probes again. A slot is never granted
+ * without its lock file, so exclusion holds.
+ *
  * Residual risk: every check-then-act on a file system has a window between the
- * last check and the syscall. A process frozen exactly there (SIGSTOP, a debugger)
- * for longer than the stale rules allow can still act late. A holder that stops
- * heartbeating for 2 intervals while its lock looks older than `staleMs` is
- * reaped; that is the plan's heartbeat contract.
+ * last check and the syscall; its bounds are above. A single process frozen there
+ * (SIGSTOP, a debugger) for longer can still act late. A holder that stops
+ * heartbeating for 2 intervals while its lock looks old is reaped; that is the
+ * plan's heartbeat contract, and the holder is told through `lost`.
  *
  * If the temp dir is unwritable the module degrades to an in-process semaphore
  * with the same API and logs that once per slot dir. No process is spawned here.
  */
 import { createHash, randomUUID } from "node:crypto";
 import { closeSync, openSync, readFileSync, unlinkSync, writeSync } from "node:fs";
-import { mkdir, open, readdir, unlink, utimes, writeFile, type FileHandle } from "node:fs/promises";
+import { mkdir, open, readdir, readFile, stat, unlink, utimes, writeFile, type FileHandle } from "node:fs/promises";
 import { hostname as osHostname, tmpdir } from "node:os";
-import { join } from "node:path";
-import { performance } from "node:perf_hooks";
+import { basename, join } from "node:path";
 import type { PluginLogger } from "../router/logger";
 
 export interface SlotMeta {
@@ -113,7 +169,10 @@ export interface SlotDeps {
   logger?: Pick<PluginLogger, "warn">;
   /** Wall clock (ms). Compared with file mtimes and written into new files, nothing else. */
   now?: () => number;
-  /** Monotonic clock (ms). Wait deadlines, observation windows and claim fencing. */
+  /**
+   * Machine-wide monotonic clock (ms): wait deadlines, shared observations and
+   * claim fencing. The default reads `process.hrtime`, the same in every process.
+   */
   mono?: () => number;
   random?: () => number;
   hostname?: string;
@@ -146,8 +205,20 @@ export const SLOT_DEFAULTS = {
   unlinkRetryMs: 50,
 } as const;
 
+/** Housekeeping: files older than this (wall clock) may be collected when orphaned. */
+const ORPHAN_AGE_MS = 3_600_000;
+/** Housekeeping runs at most this often per dir and process (monotonic). */
+const HOUSEKEEPING_EVERY_MS = 600_000;
+/** How far the boot instant (`wall - mono`) may move before a stamp counts as another boot's. */
+const BOOT_SLACK_MS = 60_000;
+
 export function defaultSlotDir(): string {
   return join(tmpdir(), "opencode-model-router", "verify-slots");
+}
+
+/** Machine-wide monotonic milliseconds: `process.hrtime` reads the same clock in every process (see the header). */
+function machineMonoMs(): number {
+  return Number(process.hrtime.bigint() / 1_000n) / 1_000;
 }
 
 interface LockInfo {
@@ -157,6 +228,9 @@ interface LockInfo {
   startedAt: number;
   cwd: string;
   command: string;
+  /** Claims only: the basename of the file this claim deletes, and that file's identity. */
+  target?: string;
+  victim?: string;
 }
 
 type LockState =
@@ -178,6 +252,11 @@ const TRANSIENT = new Set(["EBUSY", "EPERM", "EACCES"]);
 const UNWRITABLE = new Set(["EACCES", "EPERM", "EBUSY", "EROFS", "ENOTDIR", "ENOENT", "EEXIST"]);
 const FINAL_UNWRITABLE = new Set(["EROFS", "ENOTDIR", "EEXIST"]);
 
+function isTransient(e: unknown): boolean {
+  const code = errCode(e);
+  return code !== undefined && TRANSIENT.has(code);
+}
+
 /** Failures of the logger itself (a throwing logger must not break slot bookkeeping). */
 export let loggerFailures = 0;
 
@@ -187,6 +266,16 @@ function warn(cfg: Cfg, msg: string, data: Record<string, unknown>): void {
   } catch {
     loggerFailures++;
   }
+}
+
+const ioWarned = new Set<string>();
+
+/** Advisory files (observations, housekeeping): a failure only loses evidence. Said once per dir and kind. */
+function ioTrouble(cfg: Cfg, what: string, path: string, e: unknown): void {
+  const k = `${cfg.dir}\n${what}`;
+  if (ioWarned.has(k)) return;
+  ioWarned.add(k);
+  warn(cfg, `verification slot: ${what} I/O failed`, { path, code: errCode(e) ?? String(e) });
 }
 
 export function isPidAlive(pid: number): boolean {
@@ -215,7 +304,7 @@ function resolveCfg(deps: SlotDeps = {}): Cfg {
   return {
     dir: deps.dir ?? defaultSlotDir(),
     now: deps.now ?? Date.now,
-    mono: deps.mono ?? (() => performance.now()),
+    mono: deps.mono ?? machineMonoMs,
     random: deps.random ?? Math.random,
     hostname: deps.hostname ?? osHostname(),
     pid: deps.pid ?? process.pid,
@@ -249,6 +338,8 @@ function parseLock(text: string): LockInfo | undefined {
       startedAt: typeof o.startedAt === "number" ? o.startedAt : 0,
       cwd: typeof o.cwd === "string" ? o.cwd : "",
       command: typeof o.command === "string" ? o.command : "",
+      ...(typeof o.target === "string" ? { target: o.target } : {}),
+      ...(typeof o.victim === "string" ? { victim: o.victim } : {}),
     };
   } catch (e) {
     if (e instanceof SyntaxError) return undefined;
@@ -282,28 +373,122 @@ function observedKey(s: Present): string {
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
-// ---- staleness ----------------------------------------------------------------
+function hash32(s: string): string {
+  return createHash("sha256").update(s).digest("hex").slice(0, 32);
+}
 
-interface Observation {
+/** The claim file under which the file with identity `id` (in slot `slotPath`'s family) is deleted. */
+export function reapClaimPath(slotPath: string, id: string): string {
+  return `${slotPath}.reap-${hash32(id)}`;
+}
+
+/** The shared observation sidecar of `target` (identity `id`) as seen from host `host`. */
+function seenPath(slotPath: string, target: string, id: string, host: string): string {
+  return `${slotPath}.seen-${hash32(`${basename(target)}\n${id}\n${host}`)}`;
+}
+
+// ---- shared observation and staleness ----------------------------------------
+
+let bootIdCache: string | undefined;
+
+/** The Linux boot id; "" where there is none (the boot-instant check then stands alone). */
+function bootId(): string {
+  if (bootIdCache === undefined) {
+    bootIdCache = "";
+    if (process.platform === "linux") {
+      try {
+        bootIdCache = readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim();
+      } catch (e) {
+        // No procfs (a sandbox): every process of the host fails alike, so "" still
+        // matches between them, and the boot-instant check remains.
+        if (errCode(e) === undefined) throw e;
+      }
+    }
+  }
+  return bootIdCache;
+}
+
+interface SeenRecord {
   key: string;
+  boot: string;
+  /** `wall - mono` when the record was started: moves at a reboot or a wall-clock step. */
+  bootAt: number;
   first: number;
+  from: number;
   last: number;
 }
-/** Per process: since when (monotonic) each file has been seen with the same key, without gaps. */
-const observations = new Map<string, Observation>();
 
-/** Record that `path` is seen with `key` now. Returns for how long it has been seen unchanged. */
-function observe(path: string, key: string, cfg: Cfg): number {
-  const t = cfg.mono();
-  const maxGap = 2 * cfg.heartbeatMs;
-  const o = observations.get(path);
-  if (!o || o.key !== key || t - o.last > maxGap || t < o.last) {
-    if (observations.size > 256) for (const [p, x] of observations) if (t - x.last > maxGap) observations.delete(p);
-    observations.set(path, { key, first: t, last: t });
-    return 0;
+function parseSeen(text: string): SeenRecord | undefined {
+  try {
+    const v: unknown = JSON.parse(text);
+    if (typeof v !== "object" || v === null) return undefined;
+    const { key, boot, bootAt, first, from, last } = v as Record<string, unknown>;
+    if (typeof key !== "string" || typeof boot !== "string") return undefined;
+    if (typeof bootAt !== "number" || typeof first !== "number" || typeof from !== "number" || typeof last !== "number") return undefined;
+    return { key, boot, bootAt, first, from, last };
+  } catch (e) {
+    // A torn read of a concurrent write: no evidence, the record restarts.
+    if (e instanceof SyntaxError) return undefined;
+    throw e;
   }
-  o.last = t;
-  return t - o.first;
+}
+
+interface Look {
+  /** How long the file has had its current key (mono), since the first sighting by any process. */
+  span: number;
+  /** How long it has been watched without a gap of more than 2 heartbeats. */
+  witnessed: number;
+}
+const NO_LOOK: Look = { span: 0, witnessed: 0 };
+
+/**
+ * Record a look at `target` (state `s`, read at `at`, taken before the read) in
+ * its shared sidecar, and return what all looks so far establish.
+ */
+async function observe(slotPath: string, target: string, s: Present, at: number, cfg: Cfg): Promise<Look> {
+  const file = seenPath(slotPath, target, identity(s), cfg.hostname);
+  let prev: SeenRecord | undefined;
+  try {
+    prev = parseSeen(await readFile(file, "utf8"));
+  } catch (e) {
+    if (errCode(e) !== "ENOENT") {
+      if (!isTransient(e)) ioTrouble(cfg, "observation", file, e);
+      return NO_LOOK;
+    }
+  }
+  const key = observedKey(s);
+  const boot = bootId();
+  const bootAt = cfg.now() - at;
+  const maxGap = 2 * cfg.heartbeatMs;
+  let rec: SeenRecord;
+  if (
+    prev !== undefined &&
+    prev.key === key &&
+    prev.boot === boot &&
+    Math.abs(prev.bootAt - bootAt) <= BOOT_SLACK_MS &&
+    at >= prev.last - maxGap // a stamp far in the future: another boot's clock
+  ) {
+    rec = { ...prev, from: at - prev.last > maxGap ? at : prev.from, last: Math.max(prev.last, at) };
+  } else {
+    rec = { key, boot, bootAt, first: at, from: at, last: at };
+  }
+  try {
+    await writeFile(file, JSON.stringify(rec));
+  } catch (e) {
+    // The verdict of this look stands; only later looks lose it.
+    if (errCode(e) !== "ENOENT" && !isTransient(e)) ioTrouble(cfg, "observation", file, e);
+  }
+  return { span: Math.max(0, at - rec.first), witnessed: Math.max(0, at - rec.from) };
+}
+
+/** Delete the sidecar of a file that is gone. Advisory: a leftover is collected by housekeeping. */
+async function dropSeen(slotPath: string, target: string, id: string, cfg: Cfg): Promise<void> {
+  const file = seenPath(slotPath, target, id, cfg.hostname);
+  try {
+    await cfg.unlink(file);
+  } catch (e) {
+    if (errCode(e) !== "ENOENT" && !isTransient(e)) ioTrouble(cfg, "observation", file, e);
+  }
 }
 
 /** Same host and the PID is gone: provably dead, no confirmation needed. */
@@ -311,31 +496,39 @@ function ownerDead(s: Present, cfg: Cfg): boolean {
   return s.kind === "ok" && s.info.hostname === cfg.hostname && !cfg.isPidAlive(s.info.pid);
 }
 
-/** Old by the wall clock (or by the observation alone), and seen unchanged for `confirmMs`. */
-function observedStale(path: string, s: Present, cfg: Cfg, ageMs: number, confirmMs: number): boolean {
-  const span = observe(path, observedKey(s), cfg);
-  return span >= confirmMs && (cfg.now() - s.mtimeMs > ageMs || span >= ageMs);
+/** stale: reap it; aged: old but not witnessed long enough yet; fresh: leave it. */
+type Verdict = "stale" | "aged" | "fresh";
+
+async function lockVerdict(slotPath: string, s: Present, at: number, cfg: Cfg): Promise<Verdict> {
+  if (ownerDead(s, cfg)) return "stale";
+  const corrupt = s.kind === "corrupt";
+  const oldMs = corrupt ? cfg.corruptGraceMs : cfg.staleMs;
+  const confirmMs = corrupt ? cfg.corruptGraceMs : 2 * cfg.heartbeatMs;
+  const look = await observe(slotPath, slotPath, s, at, cfg);
+  if (!(cfg.now() - s.mtimeMs > oldMs || look.span >= oldMs)) return "fresh";
+  return look.witnessed >= confirmMs ? "stale" : "aged";
 }
 
-function lockStale(path: string, s: Present, cfg: Cfg): boolean {
-  if (s.kind === "corrupt") return observedStale(path, s, cfg, cfg.corruptGraceMs, cfg.corruptGraceMs);
-  return ownerDead(s, cfg) || observedStale(path, s, cfg, cfg.staleMs, 2 * cfg.heartbeatMs);
-}
-
-function claimStale(path: string, s: Present, cfg: Cfg): boolean {
-  if (s.kind === "corrupt") return observedStale(path, s, cfg, cfg.corruptGraceMs, cfg.corruptGraceMs);
-  return ownerDead(s, cfg) || observedStale(path, s, cfg, cfg.staleMs, 2 * cfg.claimHoldMaxMs);
+/** A claim is inert by observation only (claims are never refreshed, so a wall age says nothing). */
+async function claimInert(slotPath: string, claim: string, s: Present, at: number, cfg: Cfg): Promise<boolean> {
+  if (ownerDead(s, cfg)) return true;
+  const corrupt = s.kind === "corrupt";
+  const oldMs = corrupt ? cfg.corruptGraceMs : cfg.staleMs;
+  const confirmMs = corrupt ? cfg.corruptGraceMs : 2 * cfg.claimHoldMaxMs;
+  const look = await observe(slotPath, claim, s, at, cfg);
+  return look.span >= oldMs && look.witnessed >= confirmMs;
 }
 
 // ---- exclusive create and claimed delete --------------------------------------
 
 /**
- * Create `path` exclusively with `info`, then re-read it: true only when it
- * still holds `info.token`. An unreadable re-read (a scanner) counts as ours:
- * nobody else can have created the file, and a reaper needs it to be seen
- * unchanged for a while first.
+ * Create `path` exclusively with `info`, then re-read it (an unreadable re-read,
+ * a scanner, is retried on the unlink schedule): true only when it holds
+ * `info.token`. A re-read that stays unreadable counts as ours only when
+ * `trustUnreadable` (a slot lock, whose heartbeat re-checks the token within one
+ * interval), never for a claim, which nothing re-checks.
  */
-async function createOwned(path: string, info: LockInfo, cfg: Cfg): Promise<boolean> {
+async function createOwned(path: string, info: LockInfo, cfg: Cfg, trustUnreadable: boolean): Promise<boolean> {
   let fh: FileHandle;
   try {
     fh = await open(path, "wx");
@@ -349,36 +542,38 @@ async function createOwned(path: string, info: LockInfo, cfg: Cfg): Promise<bool
   } finally {
     await fh.close();
   }
-  const s = await readLock(path, cfg);
-  return s.kind === "unreadable" || (s.kind === "ok" && s.info.token === info.token);
+  for (let i = 0; ; i++) {
+    const s = await readLock(path, cfg);
+    if (s.kind !== "unreadable") return s.kind === "ok" && s.info.token === info.token;
+    if (i >= cfg.unlinkRetries) return trustUnreadable;
+    await sleep(cfg.unlinkRetryMs * 2 ** i);
+  }
 }
 
 /** Claims currently held by this process (claim path -> claim token), for the exit hook. */
 const activeClaims = new Map<string, string>();
 const MAX_CLAIM_DEPTH = 3;
 
-/** The claim file under which the file with identity `id` (in slot `slotPath`'s family) is deleted. */
-export function reapClaimPath(slotPath: string, id: string): string {
-  return `${slotPath}.reap-${createHash("sha256").update(id).digest("hex").slice(0, 32)}`;
-}
-
 type Removal = "removed" | "gone" | "changed" | "contended" | "failed";
 
 /**
  * Unlink `target` while `stillVictim` holds, re-reading it before every attempt.
- * Gives up (without deleting) at the monotonic `deadline`.
+ * Gives up (without deleting) at the monotonic `deadline`, which is checked
+ * again after the re-read, right before the unlink.
  */
 async function unlinkWhile(target: string, deadline: number, cfg: Cfg, stillVictim: (s: Present) => boolean): Promise<Removal> {
   let last = "";
+  const late = (): Removal => {
+    warn(cfg, "verification slot: claim held too long, delete abandoned", { path: target, code: last });
+    return "failed";
+  };
   for (let i = 0; ; i++) {
-    if (cfg.mono() > deadline) {
-      warn(cfg, "verification slot: claim held too long, delete abandoned", { path: target, code: last });
-      return "failed";
-    }
+    if (cfg.mono() > deadline) return late();
     const cur = await readLock(target, cfg);
     if (cur.kind === "missing") return "gone";
     if (cur.kind === "unreadable") last = cur.code;
     else if (!stillVictim(cur)) return "changed";
+    else if (cfg.mono() > deadline) return late();
     else {
       try {
         await cfg.unlink(target);
@@ -412,16 +607,37 @@ async function removeUnderClaim(
   const claim = reapClaimPath(slotPath, id);
   for (let round = 0; round < 2; round++) {
     const token = randomUUID();
-    const info: LockInfo = { pid: cfg.pid, hostname: cfg.hostname, token, startedAt: cfg.now(), cwd: "", command: "reap" };
-    if (await createOwned(claim, info, cfg)) {
-      const since = cfg.mono();
+    const info: LockInfo = {
+      pid: cfg.pid,
+      hostname: cfg.hostname,
+      token,
+      startedAt: cfg.now(),
+      cwd: "",
+      command: "reap",
+      target: basename(target),
+      victim: id,
+    };
+    // The fence starts before the create: other processes may see the claim from then on.
+    const since = cfg.mono();
+    let mine: boolean;
+    try {
+      mine = await createOwned(claim, info, cfg, false);
+    } catch (e) {
+      if (errCode(e) === "ENOENT") return "gone"; // no dir: the target went with it
+      throw e;
+    }
+    if (mine) {
       activeClaims.set(claim, token);
+      let r: Removal = "failed";
       try {
-        return await unlinkWhile(target, since + cfg.claimHoldMaxMs, cfg, stillVictim);
+        r = await unlinkWhile(target, since + cfg.claimHoldMaxMs, cfg, stillVictim);
+        return r;
       } finally {
         activeClaims.delete(claim);
-        // Dropping the claim is safe until another process could judge it stale (2 x claimHoldMaxMs).
-        await unlinkWhile(claim, since + 1.5 * cfg.claimHoldMaxMs, cfg, (c) => c.kind === "ok" && c.info.token === token);
+        // Dropping the claim is safe well before anyone could judge it inert (staleMs).
+        const drop = await unlinkWhile(claim, since + 1.5 * cfg.claimHoldMaxMs, cfg, (c) => c.kind === "ok" && c.info.token === token);
+        if (drop === "removed") await dropSeen(slotPath, claim, token, cfg);
+        if (r === "removed" || r === "gone") await dropSeen(slotPath, target, id, cfg);
       }
     }
     if (depth >= MAX_CLAIM_DEPTH || !(await reclaimClaim(slotPath, claim, cfg, depth + 1))) return "contended";
@@ -431,14 +647,19 @@ async function removeUnderClaim(
 
 /** Remove a claim whose owner is dead or that is inert. True when the claim path is free. */
 async function reclaimClaim(slotPath: string, claim: string, cfg: Cfg, depth: number): Promise<boolean> {
+  const at = cfg.mono();
   const s = await readLock(claim, cfg);
   if (s.kind === "missing") return true;
-  if (s.kind === "unreadable" || !claimStale(claim, s, cfg)) return false;
+  if (s.kind === "unreadable" || !(await claimInert(slotPath, claim, s, at, cfg))) return false;
   const key = observedKey(s);
   const r = await removeUnderClaim(slotPath, claim, identity(s), (c) => observedKey(c) === key, cfg, depth);
-  if (r !== "removed" && r !== "gone") return false;
-  observations.delete(claim);
-  return true;
+  return r === "removed" || r === "gone";
+}
+
+/** Reap the slot lock `path`, seen as `cur`, under its claim. */
+function reap(path: string, cur: Present, cfg: Cfg): Promise<Removal> {
+  const key = observedKey(cur);
+  return removeUnderClaim(path, path, identity(cur), (c) => observedKey(c) === key, cfg);
 }
 
 // ---- held slots, released synchronously on process exit ----------------------
@@ -484,7 +705,8 @@ function releaseOneSync(h: Held): void {
   }
   try {
     try {
-      writeSync(fd, JSON.stringify({ pid: h.pid, hostname: h.hostname, token, startedAt: Date.now(), cwd: "", command: "exit" }));
+      const info: LockInfo = { pid: h.pid, hostname: h.hostname, token, startedAt: Date.now(), cwd: "", command: "exit", target: basename(h.path), victim: h.token };
+      writeSync(fd, JSON.stringify(info));
     } finally {
       closeSync(fd);
     }
@@ -607,7 +829,7 @@ async function unlinkRetry(path: string, cfg: Cfg): Promise<boolean> {
   }
 }
 
-/** Per slot dir, for the life of the process: file slots and local slots never mix for one dir. */
+/** Per slot dir: file slots and local slots never mix for one dir. Dropped on unexpected errors. */
 const dirVerdicts = new Map<string, Promise<boolean>>();
 
 function dirWritable(cfg: Cfg): Promise<boolean> {
@@ -649,12 +871,105 @@ async function probeDir(cfg: Cfg): Promise<boolean> {
   }
 }
 
+/** The dir vanished at use time (a temp cleaner): re-create it once. On failure the verdict is dropped. */
+async function recreateDir(cfg: Cfg): Promise<boolean> {
+  try {
+    await mkdir(cfg.dir, { recursive: true });
+    return true;
+  } catch (e) {
+    dirVerdicts.delete(cfg.dir);
+    warn(cfg, "verification slot: could not re-create the slot dir", { dir: cfg.dir, code: errCode(e) ?? String(e) });
+    return false;
+  }
+}
+
+const fsWarned = new Set<string>();
+
+/** An unexpected file-system error: never a rejection, never a slot. Busy, one warning per dir and code. */
+function fsFailure(cfg: Cfg, e: unknown): SlotResult {
+  dirVerdicts.delete(cfg.dir);
+  const code = errCode(e) ?? String(e);
+  const k = `${cfg.dir}\n${code}`;
+  if (!fsWarned.has(k)) {
+    fsWarned.add(k);
+    warn(cfg, "verification slot: file-system error, reporting busy", { dir: cfg.dir, code });
+  }
+  return { busy: true };
+}
+
+// ---- housekeeping -------------------------------------------------------------
+
+const PROBE_NAME = /^\.probe-[0-9a-f-]{36}$/;
+const SEEN_NAME = /^slot-\d+\.lock\.seen-[0-9a-f]{32}$/;
+const LEGACY_NAME = /^slot-\d+\.lock\.reap(\.dead-.*)?$/;
+const CLAIM_NAME = /^(slot-\d+\.lock)\.reap-[0-9a-f]{32}$/;
+/** What a claim may target: a slot lock or another claim of its family. */
+const TARGET_NAME = /^slot-\d+\.lock(\.reap-[0-9a-f]{32})?$/;
+const housekeptAt = new Map<string, number>();
+
+async function olderThanOrphanAge(path: string, cfg: Cfg): Promise<boolean> {
+  try {
+    return cfg.now() - (await stat(path)).mtimeMs > ORPHAN_AGE_MS;
+  } catch (e) {
+    if (errCode(e) === "ENOENT") return false;
+    throw e;
+  }
+}
+
+/** One file of the dir listing: collected when orphaned and older than 1 hour. */
+async function collectOne(name: string, cfg: Cfg): Promise<void> {
+  const path = join(cfg.dir, name);
+  if (PROBE_NAME.test(name) || SEEN_NAME.test(name) || LEGACY_NAME.test(name)) {
+    // Unique (probes) or advisory (sidecars, legacy files the protocol ignores): by path.
+    if (!(await olderThanOrphanAge(path, cfg))) return;
+    try {
+      await cfg.unlink(path);
+    } catch (e) {
+      if (errCode(e) !== "ENOENT") throw e;
+    }
+    return;
+  }
+  const m = CLAIM_NAME.exec(name);
+  if (!m?.[1] || !(await olderThanOrphanAge(path, cfg))) return;
+  const s = await readLock(path, cfg);
+  if (s.kind === "missing" || s.kind === "unreadable") return;
+  if (s.kind === "ok") {
+    const { target, victim } = s.info;
+    if (target === undefined || victim === undefined || !TARGET_NAME.test(target)) return; // nothing says what it guards
+    const t = await readLock(join(cfg.dir, target), cfg);
+    // Still guarding its victim: that is the reaping path's business, not housekeeping's.
+    if (t.kind === "unreadable" || (t.kind !== "missing" && identity(t) === victim)) return;
+  }
+  // The victim is gone for good (identities are never reused), or the claim is empty/corrupt
+  // (never held: a claimer holds only after reading its token back). Removed under the protocol.
+  const key = observedKey(s);
+  await removeUnderClaim(join(cfg.dir, m[1]), path, identity(s), (c) => observedKey(c) === key, cfg);
+}
+
+async function housekeep(names: string[], cfg: Cfg): Promise<void> {
+  const t = cfg.mono();
+  const lastRun = housekeptAt.get(cfg.dir);
+  if (lastRun !== undefined && t >= lastRun && t - lastRun < HOUSEKEEPING_EVERY_MS) return;
+  housekeptAt.set(cfg.dir, t);
+  for (const name of names) {
+    try {
+      await collectOne(name, cfg);
+    } catch (e) {
+      if (!isTransient(e)) ioTrouble(cfg, "housekeeping", join(cfg.dir, name), e);
+    }
+  }
+}
+
 // ---- fairness: FIFO waiter tickets ------------------------------------------
 
 interface Ticket {
   path: string;
   name: string;
   body: string;
+  /** Set once the wait is over: nothing may re-create the ticket after that. */
+  dropped: boolean;
+  /** The refresh in flight, if any (the heartbeat timer and the wake-ups share it). */
+  refreshing?: Promise<void>;
 }
 const TICKET_NAME = /^wait-\d{15}-[0-9a-f-]{36}\.ticket$/;
 /** Tickets of the waits in progress in this process, for the exit hook. */
@@ -669,10 +984,17 @@ function ticketTrouble(cfg: Cfg, path: string, e: unknown): void {
 }
 
 async function writeTicket(t: Ticket, cfg: Cfg): Promise<void> {
-  try {
-    await writeFile(t.path, t.body, { flag: "wx" });
-  } catch (e) {
-    if (errCode(e) !== "EEXIST") ticketTrouble(cfg, t.path, e);
+  for (let retried = false; ; retried = true) {
+    try {
+      await writeFile(t.path, t.body, { flag: "wx" });
+      return;
+    } catch (e) {
+      const code = errCode(e);
+      if (code === "EEXIST") return;
+      if (code === "ENOENT" && !retried && (await recreateDir(cfg))) continue;
+      ticketTrouble(cfg, t.path, e);
+      return;
+    }
   }
 }
 
@@ -680,51 +1002,77 @@ async function createTicket(cfg: Cfg): Promise<Ticket> {
   const startedAt = Math.max(0, Math.floor(cfg.now()));
   const name = `wait-${String(startedAt).padStart(15, "0")}-${randomUUID()}.ticket`;
   const info: LockInfo = { pid: cfg.pid, hostname: cfg.hostname, token: randomUUID(), startedAt, cwd: "", command: "wait" };
-  const t: Ticket = { path: join(cfg.dir, name), name, body: JSON.stringify(info) };
+  const t: Ticket = { path: join(cfg.dir, name), name, body: JSON.stringify(info), dropped: false };
   hookExit();
   tickets.add(t.path);
   await writeTicket(t, cfg);
   return t;
 }
 
-/** Refreshed on every wake-up. A ticket deleted by someone who judged it dead comes back under its old name (same place). */
-async function refreshTicket(t: Ticket, cfg: Cfg): Promise<void> {
-  try {
-    await cfg.utimes(t.path, new Date(cfg.now()));
-  } catch (e) {
-    if (errCode(e) === "ENOENT") await writeTicket(t, cfg);
-    else ticketTrouble(cfg, t.path, e);
-  }
+/**
+ * Refresh the ticket's mtime: every heartbeat and on every wake-up. A ticket
+ * deleted by someone who judged it dead comes back under its old name (same place).
+ */
+function refreshTicket(t: Ticket, cfg: Cfg): Promise<void> {
+  t.refreshing ??= (async () => {
+    try {
+      await cfg.utimes(t.path, new Date(cfg.now()));
+    } catch (e) {
+      if (errCode(e) !== "ENOENT") ticketTrouble(cfg, t.path, e);
+      else if (!t.dropped) await writeTicket(t, cfg);
+    }
+  })().finally(() => {
+    t.refreshing = undefined;
+  });
+  return t.refreshing;
 }
 
 async function dropTicket(t: Ticket, cfg: Cfg): Promise<void> {
+  t.dropped = true;
   tickets.delete(t.path);
+  if (t.refreshing) await t.refreshing;
   await unlinkRetry(t.path, cfg);
 }
 
+/** Per process: since when (mono) each ticket has been seen with the same key. Tickets are advisory. */
+const ticketSeen = new Map<string, { key: string; first: number }>();
+
+function ticketUnchangedMs(path: string, key: string, cfg: Cfg): number {
+  const t = cfg.mono();
+  const o = ticketSeen.get(path);
+  if (o && o.key === key && t >= o.first) return t - o.first;
+  if (ticketSeen.size > 256) ticketSeen.clear();
+  ticketSeen.set(path, { key, first: t });
+  return 0;
+}
+
+/** Live while refreshed within 2 heartbeats, by its mtime and by this process's looks; a dead same-host PID ends it at once. */
 function ticketLive(path: string, s: LockState, cfg: Cfg): boolean {
   if (s.kind === "missing") return false;
   if (s.kind === "unreadable") return true;
-  // Seen unchanged for staleMs of monotonic time: dead whatever its mtime says (clock stepped back).
-  if (observe(path, observedKey(s), cfg) >= cfg.staleMs) return false;
-  const age = cfg.now() - s.mtimeMs;
-  if (s.kind === "corrupt") return age <= cfg.corruptGraceMs;
-  return !ownerDead(s, cfg) && age <= cfg.staleMs;
+  if (ownerDead(s, cfg)) return false;
+  const ttl = s.kind === "corrupt" ? cfg.corruptGraceMs : 2 * cfg.heartbeatMs;
+  // The second test catches an mtime that looks fresh because the clock stepped back.
+  return cfg.now() - s.mtimeMs <= ttl && ticketUnchangedMs(path, observedKey(s), cfg) < ttl;
 }
 
 /**
  * FIFO: true when fewer than `max` live tickets are older than `own` (than any
  * ticket, for a caller that does not wait). Dead tickets are deleted; their names
- * are unique, so a delete by path cannot hit another ticket.
+ * are unique, so a delete by path cannot hit another ticket. The same listing
+ * drives the housekeeping.
  */
 async function eligible(own: Ticket | undefined, max: number, cfg: Cfg): Promise<boolean> {
   let names: string[];
   try {
     names = await readdir(cfg.dir);
   } catch (e) {
-    ticketTrouble(cfg, cfg.dir, e);
+    const code = errCode(e);
+    // No dir (a temp cleaner) means no tickets either; the attempt re-creates it.
+    if (code !== "ENOENT" && code !== "ENOTDIR") ticketTrouble(cfg, cfg.dir, e);
     return true;
   }
+  await housekeep(names, cfg);
   let ahead = 0;
   for (const name of names.filter((n) => TICKET_NAME.test(n)).sort()) {
     if (own && name >= own.name) break;
@@ -739,7 +1087,7 @@ async function eligible(own: Ticket | undefined, max: number, cfg: Cfg): Promise
     if (ticketLive(path, s, cfg)) {
       if (++ahead >= max) return false;
     } else if (s.kind !== "missing") {
-      observations.delete(path);
+      ticketSeen.delete(path);
       try {
         await cfg.unlink(path);
       } catch (e) {
@@ -756,23 +1104,66 @@ function slotPathOf(dir: string, i: number): string {
   return join(dir, `slot-${i}.lock`);
 }
 
-async function tryAcquireOnce(opts: SlotOptions, cfg: Cfg): Promise<SlotHandle | undefined> {
+/** One pass over the slots. `aged` collects the locks that are old but not yet confirmed stale. */
+async function tryAcquireOnce(opts: SlotOptions, cfg: Cfg, aged: Set<string>): Promise<SlotHandle | undefined> {
   for (let i = 0; i < opts.max; i++) {
     const path = slotPathOf(cfg.dir, i);
     for (let attempt = 0; attempt < 3; attempt++) {
       const token = randomUUID();
       const info: LockInfo = { pid: cfg.pid, hostname: cfg.hostname, token, startedAt: cfg.now(), cwd: opts.meta.cwd, command: opts.meta.command };
-      if (await createOwned(path, info, cfg)) return makeFileHandle(path, token, opts, cfg);
+      if (await createOwned(path, info, cfg, true)) return makeFileHandle(path, token, opts, cfg);
+      const at = cfg.mono();
       const cur = await readLock(path, cfg);
       if (cur.kind === "missing") continue; // released meanwhile: create again
-      if (cur.kind === "unreadable" || !lockStale(path, cur, cfg)) break;
-      const key = observedKey(cur);
-      const r = await removeUnderClaim(path, path, identity(cur), (c) => observedKey(c) === key, cfg);
-      if (r !== "removed" && r !== "gone") break;
-      observations.delete(path);
+      if (cur.kind === "unreadable") break;
+      const v = await lockVerdict(path, cur, at, cfg);
+      if (v !== "stale") {
+        if (v === "aged") aged.add(path);
+        break;
+      }
+      const r = await reap(path, cur, cfg);
+      if (r !== "removed" && r !== "gone") {
+        if (r === "contended") aged.add(path);
+        break;
+      }
     }
   }
   return undefined;
+}
+
+/** Slot paths this process keeps watching after a call gave up on them (see the header). */
+const watched = new Set<string>();
+
+/** One background look: reap the lock if it is stale. True while it is still worth watching. */
+async function watchPass(path: string, cfg: Cfg): Promise<boolean> {
+  const at = cfg.mono();
+  const cur = await readLock(path, cfg);
+  if (cur.kind === "missing") return false;
+  if (cur.kind === "unreadable") return true;
+  const v = await lockVerdict(path, cur, at, cfg);
+  if (v !== "stale") return v === "aged";
+  return (await reap(path, cur, cfg)) === "contended";
+}
+
+function watchAged(path: string, cfg: Cfg): void {
+  if (watched.has(path)) return;
+  watched.add(path);
+  const until = cfg.mono() + cfg.staleMs + 2 * (cfg.heartbeatMs + cfg.claimHoldMaxMs);
+  const schedule = (): void => {
+    const t = setTimeout(() => {
+      void watchPass(path, cfg)
+        .catch((e: unknown) => {
+          warn(cfg, "verification slot: background reclaim failed", { path, code: errCode(e) ?? String(e) });
+          return false;
+        })
+        .then((again) => {
+          if (again && cfg.mono() < until) schedule();
+          else watched.delete(path);
+        });
+    }, cfg.heartbeatMs);
+    t.unref();
+  };
+  schedule();
 }
 
 function makeFileHandle(path: string, token: string, opts: SlotOptions, cfg: Cfg): SlotHandle {
@@ -908,33 +1299,36 @@ export function nextBackoffMs(attempt: number, random: number, minMs: number, ma
   return Math.max(1, Math.round(Math.min(maxMs, base * (1 + random * 0.5))));
 }
 
-/**
- * Acquire one of `max` machine-wide verification slots, waiting up to `waitMs`
- * with exponential backoff and jitter. Resolves `{busy:true}` on timeout or
- * abort; never rejects for contention.
- */
-export async function acquireSlot(opts: SlotOptions, deps?: SlotDeps): Promise<SlotResult> {
-  const cfg = resolveCfg(deps);
-  if (opts.signal?.aborted) return { busy: true };
-  const max = Math.max(1, Math.floor(opts.max));
-  const o = { ...opts, max };
-  if (!(await dirWritable(cfg))) {
-    if (!degradedLogged.has(cfg.dir)) {
-      degradedLogged.add(cfg.dir);
-      warn(cfg, "verification slot: temp dir unwritable, using an in-process semaphore", { dir: cfg.dir });
-    }
-    return acquireLocal(o, cfg);
-  }
-  const deadline = cfg.mono() + Math.max(0, opts.waitMs);
-  const ticket = opts.waitMs > 0 ? await createTicket(cfg) : undefined;
+/** The file-slot wait loop. Unexpected errors propagate to `acquireSlot`, which turns them into busy. */
+async function acquireFile(o: SlotOptions, cfg: Cfg): Promise<SlotResult> {
+  const deadline = cfg.mono() + Math.max(0, o.waitMs);
+  const ticket = o.waitMs > 0 ? await createTicket(cfg) : undefined;
+  let ticketBeat: NodeJS.Timeout | undefined;
+  let aged = new Set<string>();
+  let recreated = false;
   try {
+    if (ticket) {
+      // Tickets are heartbeated while waiting, so a long attempt never lets them expire.
+      ticketBeat = setInterval(() => void refreshTicket(ticket, cfg), cfg.heartbeatMs);
+      ticketBeat.unref();
+    }
     for (let k = 0; ; k++) {
       cfg.onAttempt?.();
       if (ticket && k > 0) await refreshTicket(ticket, cfg);
-      if (await eligible(ticket, max, cfg)) {
-        const h = await tryAcquireOnce(o, cfg);
+      if (await eligible(ticket, o.max, cfg)) {
+        aged = new Set();
+        let h: SlotHandle | undefined;
+        try {
+          h = await tryAcquireOnce(o, cfg, aged);
+        } catch (e) {
+          // The dir vanished (a temp cleaner): re-create it once and try again.
+          if (errCode(e) !== "ENOENT" || recreated) throw e;
+          recreated = true;
+          if (!(await recreateDir(cfg))) throw e;
+          h = await tryAcquireOnce(o, cfg, aged);
+        }
         if (h) {
-          if (opts.signal?.aborted) {
+          if (o.signal?.aborted) {
             await h.release();
             return { busy: true };
           }
@@ -942,7 +1336,12 @@ export async function acquireSlot(opts: SlotOptions, deps?: SlotDeps): Promise<S
         }
       }
       const remaining = deadline - cfg.mono();
-      if (remaining <= 0 || opts.signal?.aborted) return { busy: true };
+      if (o.signal?.aborted) return { busy: true };
+      if (remaining <= 0) {
+        // Out of time with an old lock not yet confirmed: keep looking in the background.
+        for (const path of aged) watchAged(path, cfg);
+        return { busy: true };
+      }
       // Observations need a wake-up at least every 2 heartbeats to stay unbroken;
       // the last wait is cut to the deadline.
       const delay = Math.min(remaining, cfg.heartbeatMs, nextBackoffMs(k, cfg.random(), cfg.backoffMinMs, cfg.backoffMaxMs));
@@ -952,15 +1351,46 @@ export async function acquireSlot(opts: SlotOptions, deps?: SlotDeps): Promise<S
           resolve(true);
         };
         const t = setTimeout(() => {
-          opts.signal?.removeEventListener("abort", onAbort);
+          o.signal?.removeEventListener("abort", onAbort);
           resolve(false);
         }, delay);
-        opts.signal?.addEventListener("abort", onAbort, { once: true });
+        o.signal?.addEventListener("abort", onAbort, { once: true });
       });
       if (aborted) return { busy: true };
     }
   } finally {
+    clearInterval(ticketBeat);
     if (ticket) await dropTicket(ticket, cfg);
+  }
+}
+
+/**
+ * Acquire one of `max` machine-wide verification slots, waiting up to `waitMs`
+ * with exponential backoff and jitter. Resolves `{busy:true}` on timeout or
+ * abort, and on an unexpected file-system error (logged); never rejects.
+ */
+export async function acquireSlot(opts: SlotOptions, deps?: SlotDeps): Promise<SlotResult> {
+  const cfg = resolveCfg(deps);
+  if (opts.signal?.aborted) return { busy: true };
+  const max = Math.max(1, Math.floor(opts.max));
+  const o = { ...opts, max };
+  let writable: boolean;
+  try {
+    writable = await dirWritable(cfg);
+  } catch (e) {
+    return fsFailure(cfg, e);
+  }
+  if (!writable) {
+    if (!degradedLogged.has(cfg.dir)) {
+      degradedLogged.add(cfg.dir);
+      warn(cfg, "verification slot: temp dir unwritable, using an in-process semaphore", { dir: cfg.dir });
+    }
+    return acquireLocal(o, cfg);
+  }
+  try {
+    return await acquireFile(o, cfg);
+  } catch (e) {
+    return fsFailure(cfg, e);
   }
 }
 

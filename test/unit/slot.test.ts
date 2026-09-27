@@ -3,8 +3,10 @@ import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { appendFileSync, chmodSync, existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { open as fsOpen, unlink as fsUnlink, utimes as fsUtimes } from "node:fs/promises";
+import { createRequire } from "node:module";
 import { hostname, tmpdir, userInfo } from "node:os";
 import { join, resolve } from "node:path";
+import { pathToFileURL } from "node:url";
 import {
   acquireSlot,
   exitReleaseFailures,
@@ -31,12 +33,45 @@ const handles: SlotHandle[] = [];
 let slotJs = "";
 
 beforeAll(async () => {
-  // The real slot.ts, transpiled with the oxc transformer that vitest's vite already ships.
-  const { transformWithOxc } = await import("vite");
-  const out = await transformWithOxc(readFileSync(SLOT_TS, "utf8"), SLOT_TS, { lang: "ts" });
   slotJs = join(freshDir(), "slot.mjs");
-  writeFileSync(slotJs, out.code);
+  writeFileSync(slotJs, await buildSlotJs(SLOT_TS));
 });
+
+function fnOf(mod: unknown, name: string): ((...args: unknown[]) => unknown) | undefined {
+  if (typeof mod !== "object" || mod === null) return undefined;
+  const f: unknown = (mod as Record<string, unknown>)[name];
+  return typeof f === "function" ? (f as (...args: unknown[]) => unknown) : undefined;
+}
+function codeOf(out: unknown): string {
+  const code: unknown = typeof out === "object" && out !== null ? (out as Record<string, unknown>).code : undefined;
+  if (typeof code !== "string") throw new Error("transform returned no code");
+  return code;
+}
+/**
+ * The real slot.ts as plain JS (QA-1.4-23; no direct `vite` devDependency needed):
+ * 1. vite, resolved from vitest's own location (vitest always depends on it, also
+ *    under a strict pnpm layout): `transformWithOxc` (vite 8), else
+ *    `transformWithEsbuild` (vite 6 and 7);
+ * 2. else Node's built-in `module.stripTypeScriptTypes` (Node 22.13+).
+ */
+async function buildSlotJs(file: string): Promise<string> {
+  const src = readFileSync(file, "utf8");
+  const tried: string[] = [];
+  try {
+    const fromVitest = createRequire(createRequire(import.meta.url).resolve("vitest/package.json"));
+    const vite: unknown = await import(pathToFileURL(fromVitest.resolve("vite")).href);
+    const oxc = fnOf(vite, "transformWithOxc");
+    if (oxc) return codeOf(await oxc(src, file, { lang: "ts" }));
+    const esbuild = fnOf(vite, "transformWithEsbuild");
+    if (esbuild) return codeOf(await esbuild(src, file, { loader: "ts" }));
+    tried.push("vite has neither transformWithOxc nor transformWithEsbuild");
+  } catch (e) {
+    tried.push(`vite: ${String(e)}`);
+  }
+  const strip = fnOf(await import("node:module"), "stripTypeScriptTypes");
+  if (strip) return String(strip(src));
+  throw new Error(`cannot build slot.ts for the child processes: ${tried.join("; ")}`);
+}
 
 function freshDir(): string {
   const d = mkdtempSync(join(tmpdir(), "omr-slot-"));
@@ -327,6 +362,64 @@ describe("slot: clock changes and suspend/resume (QA-1.4-1, QA-1.4-8)", () => {
   });
 });
 
+describe("slot: shared observations outlive a call and a process (QA-1.4-21)", () => {
+  it("fresh processes that each look once with waitMs 0 reclaim a lock whose owner is not provably dead, once unchanged for staleMs", async () => {
+    const dir = freshDir();
+    const p = join(dir, "slot-0.lock");
+    // A hung holder: live PID on this host (or a reused one), fresh mtime, no more heartbeats.
+    writeLock(p, { pid: process.pid, token: "hung" });
+    const planted = Date.now();
+    const deps = { heartbeatMs: 1_000, staleMs: 3_000 }; // the looks must be less than 2 heartbeats (2 s) apart
+    const out: Array<{ r: string; at: number }> = [];
+    for (let i = 0; i < 5; i++) {
+      await sleep(Math.max(0, planted + i * 900 - Date.now()));
+      const at = Date.now() - planted;
+      const h = runHolder({ dir, max: 1, waitMs: 0, mode: "exit", deps });
+      const r = await h.waitFor(/^(HELD|BUSY)$/);
+      await h.exit;
+      out.push({ r, at });
+    }
+    const first = out.findIndex((x) => x.r === "HELD");
+    // Looks before staleMs (children 0-2 start by 1.8 s) are busy; one of the last two takes it.
+    expect(first, JSON.stringify(out)).toBeGreaterThanOrEqual(3);
+    expect(out.slice(0, first).every((x) => x.r === "BUSY"), JSON.stringify(out)).toBe(true);
+    expect(existsSync(p)).toBe(false); // the child that took it released it at exit
+  }, 20_000);
+
+  it("one process calling with waitMs 0 less often than every 2 heartbeats still reclaims it: the background watch confirms", async () => {
+    const dir = freshDir();
+    const p = join(dir, "slot-0.lock");
+    writeLock(p, { pid: process.pid, token: "hung" });
+    const t0 = Date.now();
+    const deps = fast(dir, { heartbeatMs: 200, staleMs: 1_000 }); // a gap over 400 ms restarts the witness
+    let r: SlotResult = { busy: true };
+    let calls = 0;
+    while ("busy" in r && Date.now() - t0 < 8_000) {
+      if (calls++ > 0) await sleep(600); // every call comes after a gap: calls alone never confirm
+      r = await acquireSlot({ max: 1, waitMs: 0, meta }, deps);
+    }
+    held(r);
+    expect(Date.now() - t0).toBeGreaterThanOrEqual(1_000);
+    expect(calls).toBeGreaterThanOrEqual(3);
+    expect(tokenAt(p)).not.toBe("hung");
+  }, 15_000);
+
+  it("after a gap in the looks (all processes frozen while every clock ran), an old lock must be witnessed for 2 heartbeats again (QA-1.4-1)", async () => {
+    const dir = freshDir();
+    const p = join(dir, "slot-0.lock");
+    writeLock(p, { pid: process.pid, token: "frozen-holder" }, 60_000);
+    let skew = 0;
+    const deps = fast(dir, { heartbeatMs: 500, staleMs: 1_000, now: () => Date.now() + skew, mono: () => performance.now() + skew });
+    expect(await acquireSlot({ max: 1, waitMs: 0, meta }, deps)).toEqual({ busy: true });
+    skew += 60_000; // a 60 s Modern Standby: the holder could not run, the wall clock and QPC did
+    expect(await acquireSlot({ max: 1, waitMs: 0, meta }, deps)).toEqual({ busy: true });
+    expect(tokenAt(p)).toBe("frozen-holder");
+    const t0 = Date.now();
+    held(await acquireSlot({ max: 1, waitMs: 5_000, meta }, deps));
+    expect(Date.now() - t0).toBeGreaterThanOrEqual(900);
+  });
+});
+
 describe("slot: release", () => {
   it("release is idempotent and stops the heartbeat: the released handle's own lock is never touched again (QA-1.4-10)", async () => {
     const dir = freshDir();
@@ -422,19 +515,63 @@ describe("slot: claims replace the time-leased reap lock (QA-1.4-2, QA-1.4-11)",
     expect(claimsIn(dir)).toEqual([]);
   });
 
-  it("a live claimer's claim survives one look and a stepped clock; it is removed only once inert", async () => {
+  it("a live claimer's claim survives one look and a stepped clock; it is inert only once seen unchanged for staleMs, whatever its wall age (QA-1.4-20)", async () => {
     const dir = freshDir();
     const p = join(dir, "slot-0.lock");
     writeLock(p, { pid: await deadPid(), token: "dead-holder" });
     const claim = reapClaimPath(p, "dead-holder");
+    // Its mtime says 60 s old: that no longer shortens anything.
     writeLock(claim, { pid: process.ppid, token: "live-claimer", command: "reap" }, 60_000);
+    const t0 = Date.now();
     expect(await acquireSlot({ max: 1, waitMs: 0, meta }, { dir })).toEqual({ busy: true });
     expect(await acquireSlot({ max: 1, waitMs: 0, meta }, { dir, now: () => Date.now() + 10_500 })).toEqual({ busy: true });
     expect(existsSync(claim)).toBe(true);
-    // Inert: older than staleMs and seen unchanged for 2 x claimHoldMaxMs (2 x 100 ms here).
-    const t0 = Date.now();
+    // Inert: unchanged for staleMs (1 s here) since its first sighting above, witnessed for 2 x claimHoldMaxMs.
     held(await acquireSlot({ max: 1, waitMs: 3_000, meta }, fast(dir, { claimHoldMaxMs: 100 })));
-    expect(Date.now() - t0).toBeGreaterThanOrEqual(190);
+    expect(Date.now() - t0).toBeGreaterThanOrEqual(950);
+    expect(claimsIn(dir)).toEqual([]);
+  });
+
+  it("the claim-hold deadline is re-checked after the re-read, right before the unlink (QA-1.4-20)", async () => {
+    const dir = freshDir();
+    const p = join(dir, "slot-0.lock");
+    writeLock(p, { pid: await deadPid(), token: "dead-holder" });
+    let unlinks = 0;
+    const unlink = async (path: string) => {
+      if (path === p) unlinks++;
+      await fsUnlink(path);
+    };
+    // The re-read under the claim outlasts claimHoldMaxMs (100 ms): the reaper must not delete after it.
+    const read = async (path: string) => {
+      const snap = await realRead(path);
+      if (path === p && claimsIn(dir).length > 0) await sleep(120);
+      return snap;
+    };
+    const warns: string[] = [];
+    const deps = fast(dir, { claimHoldMaxMs: 100, read, unlink, logger: { warn: (m) => warns.push(m) } });
+    expect(await acquireSlot({ max: 1, waitMs: 0, meta }, deps)).toEqual({ busy: true });
+    expect(unlinks).toBe(0);
+    expect(tokenAt(p)).toBe("dead-holder");
+    expect(warns.some((w) => w.includes("claim held too long"))).toBe(true);
+  });
+
+  it("a claim is held only after a readable re-read shows its token; an unconfirmed one deletes nothing and is left to the inert rule (QA-1.4-26)", async () => {
+    const dir = freshDir();
+    const p = join(dir, "slot-0.lock");
+    writeLock(p, { pid: await deadPid(), token: "dead-holder" });
+    let scanner = true;
+    const read = async (path: string) => {
+      if (scanner && path.includes(".reap-")) throw Object.assign(new Error("scanner"), { code: "EBUSY" });
+      return realRead(path);
+    };
+    const deps = fast(dir, { read, claimHoldMaxMs: 100, unlinkRetries: 2 });
+    expect(await acquireSlot({ max: 1, waitMs: 0, meta }, deps)).toEqual({ busy: true });
+    expect(tokenAt(p)).toBe("dead-holder");
+    expect(existsSync(reapClaimPath(p, "dead-holder"))).toBe(true); // ours, but never confirmed
+    scanner = false;
+    const t0 = Date.now();
+    held(await acquireSlot({ max: 1, waitMs: 5_000, meta }, deps));
+    expect(Date.now() - t0).toBeGreaterThanOrEqual(900); // inert after staleMs (1 s) from its first readable sighting
     expect(claimsIn(dir)).toEqual([]);
   });
 
@@ -620,7 +757,7 @@ describe("slot: fairness between processes (QA-1.4-9)", () => {
     expect(maxOverlap(intervals(log))).toBe(1);
   }, 30_000);
 
-  it("a live older ticket makes a non-waiting caller defer even with a free slot; dead or aged tickets do not", async () => {
+  it("a live older ticket makes a non-waiting caller defer even with a free slot; dead tickets, or ones not refreshed for 2 heartbeats, do not (QA-1.4-24)", async () => {
     const dir = freshDir();
     const ticket = (over: Record<string, unknown>) => {
       const p = join(dir, `wait-${String(1).padStart(15, "0")}-${randomUUID()}.ticket`);
@@ -630,7 +767,8 @@ describe("slot: fairness between processes (QA-1.4-9)", () => {
     const live = ticket({ pid: process.ppid, token: "w-live" });
     expect(await acquireSlot({ max: 1, waitMs: 0, meta }, fast(dir))).toEqual({ busy: true });
     await held(await acquireSlot({ max: 2, waitMs: 0, meta }, fast(dir))).release(); // 1 ticket ahead < max 2
-    setAge(live, 5_000); // older than staleMs (1 s): dead
+    // Not refreshed for 2 heartbeats (200 ms here) though younger than staleMs (1 s): dead, whatever its (live) PID.
+    setAge(live, 300);
     await held(await acquireSlot({ max: 1, waitMs: 0, meta }, fast(dir))).release();
     expect(existsSync(live)).toBe(false);
     const dead = ticket({ pid: await deadPid(), token: "w-dead" });
@@ -638,6 +776,31 @@ describe("slot: fairness between processes (QA-1.4-9)", () => {
     expect(existsSync(dead)).toBe(false);
     expect(readdirSync(dir).filter((n) => n.endsWith(".ticket"))).toEqual([]);
   });
+
+  it("a waiter heartbeats its ticket while a slow attempt runs, so the others keep deferring to it (QA-1.4-24)", async () => {
+    const dir = freshDir();
+    const p = join(dir, "slot-0.lock");
+    const holder = held(await acquireSlot({ max: 1, waitMs: 0, meta }, fast(dir, { heartbeatMs: 200 })));
+    // Ticket TTL = 2 heartbeats = 400 ms, while each of the waiter's attempts takes over 1 s.
+    const slow = async (path: string) => {
+      if (path === p) await sleep(1_000);
+      return realRead(path);
+    };
+    const waiting = acquireSlot({ max: 1, waitMs: 10_000, meta }, fast(dir, { heartbeatMs: 200, read: slow }));
+    await waitUntil(() => readdirSync(dir).some((n) => n.endsWith(".ticket")));
+    let ticketDeletes = 0;
+    const unlink = async (path: string) => {
+      if (path.endsWith(".ticket")) ticketDeletes++;
+      await fsUnlink(path);
+    };
+    for (let i = 0; i < 8; i++) {
+      expect(await acquireSlot({ max: 1, waitMs: 0, meta }, fast(dir, { heartbeatMs: 200, unlink }))).toEqual({ busy: true });
+      await sleep(150);
+    }
+    expect(ticketDeletes).toBe(0);
+    await holder.release();
+    held(await waiting);
+  }, 20_000);
 });
 
 describe("slot: the holder learns that it lost the slot (QA-1.4-7)", () => {
@@ -805,5 +968,86 @@ describe("slot: unwritable temp dir", () => {
         expect(r.status, `${r.stdout}${r.stderr}`).toBe(0);
       } else chmodSync(ro, 0o755);
     }
+  });
+});
+
+describe("slot: file-system errors never reject (QA-1.4-22)", () => {
+  it("a slot dir removed by a temp cleaner is re-created at use time, silently, on every path", async () => {
+    const dir = join(freshDir(), "verify-slots");
+    const warns: string[] = [];
+    const deps = fast(dir, { logger: { warn: (m) => warns.push(m) } });
+    await held(await acquireSlot({ max: 1, waitMs: 0, meta }, deps)).release();
+    rmSync(dir, { recursive: true, force: true });
+    await held(await acquireSlot({ max: 1, waitMs: 0, meta }, deps)).release();
+    rmSync(dir, { recursive: true, force: true });
+    await held(await acquireSlot({ max: 1, waitMs: 500, meta }, deps)).release(); // the ticket path re-creates it too
+    rmSync(dir, { recursive: true, force: true });
+    expect(await withSlot({ max: 1, waitMs: 0, meta }, async () => 7, deps)).toEqual({ value: 7 });
+    expect(warns).toEqual([]);
+  });
+
+  it("an unexpected error (EIO) resolves busy with one warning; a dir that cannot be re-created is probed again", async () => {
+    const dir = freshDir();
+    const p = join(dir, "slot-0.lock");
+    writeLock(p, { pid: process.ppid, token: "other" });
+    const read = async (path: string) => {
+      if (path === p) throw Object.assign(new Error("io"), { code: "EIO" });
+      return realRead(path);
+    };
+    const warns: string[] = [];
+    const deps = fast(dir, { read, logger: { warn: (m) => warns.push(m) } });
+    expect(await acquireSlot({ max: 1, waitMs: 0, meta }, deps)).toEqual({ busy: true });
+    expect(await acquireSlot({ max: 1, waitMs: 300, meta }, deps)).toEqual({ busy: true });
+    expect(warns.filter((w) => w.includes("file-system error"))).toHaveLength(1);
+
+    // A file where the dir was: mkdir cannot re-create it. Busy now, and the next call probes
+    // again and falls back like an unwritable dir.
+    const gone = join(freshDir(), "verify-slots");
+    const warns2: string[] = [];
+    const deps2 = fast(gone, { logger: { warn: (m) => warns2.push(m) } });
+    await held(await acquireSlot({ max: 1, waitMs: 0, meta }, deps2)).release();
+    rmSync(gone, { recursive: true, force: true });
+    writeFileSync(gone, "");
+    expect(await acquireSlot({ max: 1, waitMs: 0, meta }, deps2)).toEqual({ busy: true });
+    held(await acquireSlot({ max: 1, waitMs: 0, meta }, deps2));
+    expect(warns2.filter((w) => w.includes("in-process"))).toHaveLength(1);
+  });
+});
+
+describe("slot: housekeeping (QA-1.4-25)", () => {
+  it("removes orphaned probe, observation, legacy and claim files older than 1 h, and nothing that is young or still guards a victim", async () => {
+    const dir = freshDir();
+    const p0 = join(dir, "slot-0.lock");
+    const p1 = join(dir, "slot-1.lock");
+    const aged = (path: string, body: string) => {
+      writeFileSync(path, body);
+      setAge(path, 2 * 3_600_000);
+      return path;
+    };
+    const claimBody = (over: Record<string, unknown>) =>
+      JSON.stringify({ pid: process.ppid, hostname: hostname(), token: randomUUID(), startedAt: 0, cwd: "", command: "reap", ...over });
+    const gone = [
+      aged(join(dir, `.probe-${randomUUID()}`), ""),
+      aged(`${p0}.seen-${"a".repeat(32)}`, "{}"),
+      aged(`${p0}.reap`, "legacy"),
+      aged(`${p0}.reap.dead-0`, "tombstone"),
+      aged(reapClaimPath(p0, "gone-token"), claimBody({ target: "slot-0.lock", victim: "gone-token" })), // its victim is gone
+      aged(reapClaimPath(p0, "corrupt:1:0"), ""), // empty: never held by anyone
+    ];
+    writeLock(p1, { pid: process.ppid, token: "v1" });
+    const kept = [
+      aged(reapClaimPath(p1, "v1"), claimBody({ target: "slot-1.lock", victim: "v1" })), // still guards v1
+      aged(reapClaimPath(p0, "old-format"), claimBody({})), // says nothing about what it guards
+      join(dir, `.probe-${randomUUID()}`),
+      reapClaimPath(p0, "young"),
+    ];
+    writeFileSync(kept[2]!, "");
+    writeFileSync(kept[3]!, claimBody({ target: "slot-0.lock", victim: "young" }));
+    const warns: string[] = [];
+    held(await acquireSlot({ max: 1, waitMs: 0, meta }, fast(dir, { logger: { warn: (m) => warns.push(m) } })));
+    expect(gone.filter((f) => existsSync(f))).toEqual([]);
+    expect(kept.filter((f) => !existsSync(f))).toEqual([]);
+    expect(existsSync(p1)).toBe(true);
+    expect(warns).toEqual([]);
   });
 });
