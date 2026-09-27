@@ -6,7 +6,8 @@ import { tmpdir } from "node:os";
 import { awaitBounded, createVerificationWiring, DISPOSED_MEMO_MAX, TEST_SEARCH_TIMEOUT_MS } from "../../src/verify/wiring";
 import { resolveVerifyBudget } from "../../src/router/config";
 import type { Deadline } from "../../src/verify/types";
-import { createChangedFileStore, type TreeSnapshot } from "../../src/verify/dispatch";
+import { createHash } from "node:crypto";
+import { ABSENT_DIGEST, createChangedFileStore, type TreeSnapshot } from "../../src/verify/dispatch";
 import { accept } from "../../src/verify/gate";
 import { REFERENCE_NONE } from "../../src/verify/baseline";
 import type { RouterConfig } from "../../src/router/config";
@@ -26,7 +27,7 @@ const state = vi.hoisted(() => ({
   /** What gcStaleReferences resolves with; gcArgv makes it spawn one git through its argv seam first. */
   gcRemoved: [] as string[], gcArgv: false,
   /** Replaces the snapshotTree mock when set. */
-  snapshotImpl: undefined as ((cwd: string, signal: AbortSignal) => Promise<TreeSnapshot | undefined>) | undefined,
+  snapshotImpl: undefined as ((cwd: string, signal: AbortSignal, options?: import("../../src/verify/tree").SnapshotOptions) => Promise<TreeSnapshot | undefined>) | undefined,
   /** Replaces the runArgv result when set (the call is still recorded). */
   argvImpl: undefined as ((file: string, args: readonly string[], opts: ExecOpts) => Promise<ExecOut>) | undefined,
   execOpts: [] as ExecOpts[],
@@ -40,7 +41,10 @@ const state = vi.hoisted(() => ({
 type ExecOpts = { cwd?: string; timeoutMs?: number; signal?: AbortSignal; lowPriority?: boolean; env?: Record<string, string | undefined> };
 type ExecOut = { code: number; stdout: string; stderr: string; timedOut: boolean };
 type ArgvFn = (file: string, args: readonly string[], opts?: ExecOpts) => Promise<ExecOut>;
-vi.mock("../../src/verify/tree", () => ({ snapshotTree: async (cwd: string, signal: AbortSignal) => (state.snapshotImpl ? state.snapshotImpl(cwd, signal) : state.snapshot) }));
+vi.mock("../../src/verify/tree", () => ({
+  snapshotTree: async (cwd: string, signal: AbortSignal, options?: import("../../src/verify/tree").SnapshotOptions) =>
+    (state.snapshotImpl ? state.snapshotImpl(cwd, signal, options) : state.snapshot),
+}));
 // G6: no process may run at dispatch time; any shell or argv spawn is recorded and fails the assertion.
 vi.mock("../../src/verify/exec", () => ({
   runShell: async (command: string, opts: ExecOpts) => { state.commands.push(command); state.execOpts.push(opts); return { code: 0, stdout: "", stderr: "", timedOut: false }; },
@@ -83,7 +87,8 @@ const cwd = resolve("baseline-wiring-project");
 const dod: DoD = { kind: "deterministic", source: "explicit", criteria: [], deliverable: null, checks: [{ kind: "testsPass", command: "pnpm test" }] };
 const REF: DispatchReference = { root: cwd, head: "HEAD", commit: "HEAD", untracked: new Map(), tracked: new Map(), captureReasons: [], capturedAt: 0 };
 beforeEach(() => Object.assign(state, {
-  snapshot: { cwd, head: "HEAD", fingerprint: "before", dirty: true, files: [{ path: resolve(cwd, "old.ts"), status: " M" }] },
+  // Like snapshotTree, it digests its listed paths (QA-2.1-2).
+  snapshot: { cwd, head: "HEAD", fingerprint: "before", dirty: true, files: [{ path: resolve(cwd, "old.ts"), status: " M" }], digests: new Map([[resolve(cwd, "old.ts"), "file:old"]]) },
   commands: [], captures: [], captureResult: REF, held: false, finish: undefined,
   captureDelayMs: undefined, captureThrows: false, gcCalls: [], gcRejects: false,
   gcRemoved: [], gcArgv: false, snapshotImpl: undefined, argvImpl: undefined, execOpts: [], captureArgv: undefined, hookDeps: undefined, scopeDeps: undefined,
@@ -133,6 +138,112 @@ describe("tree snapshot against a real git repository", () => {
       const snapshot = await snapshotTree(join(repo, "sub"), new AbortController().signal);
       expect(snapshot?.root).toBe(realpathSync.native(repo));
       expect(snapshot?.cwd).toBe(realpathSync.native(join(repo, "sub")));
+    });
+  });
+});
+
+describe("shell edits to files already dirty at dispatch, against a real git repository (QA-2.1-2)", () => {
+  const real = () => vi.importActual<typeof import("../../src/verify/tree")>("../../src/verify/tree");
+  const sha = (text: string) => `file:${createHash("sha256").update(text).digest("hex")}`;
+  const key = (p: string) => resolve(p).toLowerCase();
+  const WIP = "// WIP\nexport const add = (x, y) => x + y;\n";
+  /** The QA repro's repository: src/a.js and src/b.js committed, then src/a.js dirty (work in progress). */
+  const withRepo = async (body: (repo: string, git: (...args: string[]) => void) => Promise<void>) => {
+    const repo = realpathSync.native(mkdtempSync(join(tmpdir(), "omr-qa212-")));
+    const git = (...args: string[]) => { execFileSync("git", args, { cwd: repo, windowsHide: true }); };
+    try {
+      git("init", "-q");
+      git("config", "user.email", "t@example.invalid"); git("config", "user.name", "t");
+      git("config", "commit.gpgsign", "false"); git("config", "core.autocrlf", "false");
+      mkdirSync(join(repo, "src")); mkdirSync(join(repo, "test"));
+      writeFileSync(join(repo, "src", "a.js"), "export const add = (x, y) => x + y;\n");
+      writeFileSync(join(repo, "src", "b.js"), "export const mul = (x, y) => x * y;\n");
+      writeFileSync(join(repo, "test", "a.test.js"), "import { add } from '../src/a.js';\n");
+      git("add", "-A"); git("commit", "-q", "-m", "init");
+      writeFileSync(join(repo, "src", "a.js"), WIP);
+      await body(repo, git);
+    } finally {
+      rmSync(repo, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+    }
+  };
+  /** The real wiring and store over the real snapshotTree (the capture stays mocked: git-only, no test run). */
+  const wiringAt = async (repo: string) => {
+    const { snapshotTree } = await real();
+    state.snapshotImpl = snapshotTree;
+    const cfg: RouterConfig = { ...harness().cfg, enforcement: { verify: { baselineTimeoutMs: 30_000 } } };
+    return { wiring: createVerificationWiring({ client: {}, directory: repo, getConfig: () => cfg, logger: { warn: () => {} } }), store: createChangedFileStore() };
+  };
+  const paths = (files: readonly { path: string }[]) => files.map(f => key(f.path)).sort();
+
+  it("the dispatch snapshot digests every dirty or untracked path within the bounds; a gate digests the given paths", async () => {
+    const { snapshotTree, MAX_DIGEST_FILES, MAX_DIGEST_BYTES } = await real();
+    expect([MAX_DIGEST_FILES, MAX_DIGEST_BYTES]).toEqual([500, 64 * 1024 * 1024]);
+    await withRepo(async repo => {
+      writeFileSync(join(repo, "notes.txt"), "untracked");
+      const signal = new AbortController().signal;
+      const snapshot = await snapshotTree(repo, signal);
+      const digests = snapshot?.digests;
+      expect(digests === "unavailable" || digests === undefined ? digests : [...digests].map(([p, d]) => [key(p), d]).sort())
+        .toEqual([[key(join(repo, "notes.txt")), sha("untracked")], [key(join(repo, "src", "a.js")), sha(WIP)]]);
+      expect((await snapshotTree(repo, signal, { maxDigestFiles: 1 }))?.digests).toBe("unavailable");
+      expect((await snapshotTree(repo, signal, { maxDigestBytes: WIP.length }))?.digests).toBe("unavailable");
+      const gone = join(repo, "src", "gone.js");
+      const gate = await snapshotTree(repo, signal, { digestPaths: [join(repo, "src", "b.js"), gone] });
+      expect(gate?.digests).toEqual(new Map([[join(repo, "src", "b.js"), sha("export const mul = (x, y) => x * y;\n")], [gone, ABSENT_DIGEST]]));
+    });
+  });
+
+  it("a sed-style edit to the dirty file is in the gate's change set (the QA repro, scenario B)", async () => {
+    await withRepo(async repo => {
+      const { wiring, store } = await wiringAt(repo);
+      await wiring.beginVerification(store, "q1", undefined, dod);
+      // No producer edit yet: nothing changed, and the already-dirty file is not the producer's.
+      expect(await wiring.prepareVerification(store, "q1", "q1")).toMatchObject({ changedFiles: [], changeBaseline: "available" });
+      writeFileSync(join(repo, "src", "a.js"), "// WIP\nexport const add = (x, y) => x - y;\n"); // `sed -i`: no tool record
+      const prepared = await wiring.prepareVerification(store, "q1", "q1");
+      expect(prepared.changeBaseline).toBe("available");
+      expect(prepared.changedFiles).toEqual([expect.objectContaining({ status: " M" })]);
+      expect(paths(prepared.changedFiles)).toEqual([key(join(repo, "src", "a.js"))]);
+    });
+  });
+
+  it("git checkout, git rm and deleting an untracked file are in the change set; untouched dirty files are not", async () => {
+    await withRepo(async (repo, git) => {
+      writeFileSync(join(repo, "src", "b.js"), "// WIP too\nexport const mul = (x, y) => x * y;\n");
+      writeFileSync(join(repo, "src", "scratch.js"), "export {};\n");
+      writeFileSync(join(repo, "src", "keep.js"), "export {};\n");
+      const { wiring, store } = await wiringAt(repo);
+      await wiring.beginVerification(store, "d", undefined, dod);
+      git("checkout", "--", "src/a.js");
+      git("rm", "-q", "-f", "src/b.js");
+      rmSync(join(repo, "src", "scratch.js"));
+      const prepared = await wiring.prepareVerification(store, "d", "d");
+      expect(prepared.changeBaseline).toBe("available");
+      expect(paths(prepared.changedFiles)).toEqual(["a.js", "b.js", "scratch.js"].map(n => key(join(repo, "src", n))).sort());
+      const status = new Map(prepared.changedFiles.map(f => [key(f.path), f.status]));
+      expect(status.get(key(join(repo, "src", "a.js")))).toBe(" M");
+      expect(status.get(key(join(repo, "src", "b.js")))).toBe("D ");
+      expect(status.get(key(join(repo, "src", "scratch.js")))).toBe(" D");
+    });
+  });
+
+  it("over MAX_DIGEST_FILES dirty paths: an unchanged tree stays available, a changed one makes the result unverifiable", async () => {
+    await withRepo(async repo => {
+      mkdirSync(join(repo, "gen"));
+      for (let i = 0; i <= 500; i++) writeFileSync(join(repo, "gen", `f${i}.txt`), `${i}`);
+      const { wiring, store } = await wiringAt(repo);
+      await wiring.beginVerification(store, "d", undefined, dod);
+      expect(store.baselineSnapshot("d")?.digests).toBe("unavailable");
+      expect((await wiring.prepareVerification(store, "d", "d")).changeBaseline).toBe("available");
+      writeFileSync(join(repo, "src", "a.js"), "// WIP\nexport const add = (x, y) => x - y;\n");
+      const prepared = await wiring.prepareVerification(store, "d", "d");
+      expect(prepared.changeBaseline).toBe("unavailable");
+      const deps = wiring.buildGateDeps(undefined, undefined, prepared);
+      expect(deps.deterministic.changedFiles).toBe("unavailable");
+      const r = await accept({ dod }, { ...prepared, finalReturnText: "done", declaredOutputs: [], producerSessionID: "d", producerTier: "medium" }, deps);
+      expect(r.verdict.outcome).toBe("unverifiable");
+      expect(r.verdict.pass).toBe(false);
+      expect(state.commands).toEqual([]);
     });
   });
 });

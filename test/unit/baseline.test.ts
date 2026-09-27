@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { resolve } from "node:path";
 import { observeTests, REFERENCE_NONE } from "../../src/verify/baseline";
-import { createChangedFileStore, buildAcceptedSuffix, type TreeSnapshot, type DispatchCaptureDeps } from "../../src/verify/dispatch";
+import { ABSENT_DIGEST, createChangedFileStore, buildAcceptedSuffix, type TreeSnapshot, type DispatchCaptureDeps } from "../../src/verify/dispatch";
 import { accept, type Artefact } from "../../src/verify/gate";
 import { buildGradingPrompt } from "../../src/verify/checker";
 import { validateConfig } from "../../src/router/config";
@@ -250,6 +250,49 @@ describe("dispatch reference capture in the changed-file store", () => {
     expect(third.changedFiles).toContainEqual({ path: a, status: " M" });
     expect(third.changedFiles).toContainEqual({ path: b, status: "written" });
     expect(third.changedFiles).toContainEqual({ path: c, status: "modified" });
+  });
+  describe("paths already dirty or untracked at dispatch (QA-2.1-2)", () => {
+    const [a, b, c, d, u] = ["a.js", "b.js", "c.js", "d.js", "notes.txt"].map(n => resolve(cwd, n));
+    const before = tree({
+      dirty: true, fingerprint: "f1",
+      files: [{ path: a, status: " M" }, { path: b, status: " M" }, { path: c, status: " M" }, { path: d, status: " M" }, { path: u, status: "??" }],
+      digests: new Map([[a, "file:a1"], [b, "file:b1"], [c, "file:c1"], [d, "file:d1"], [u, "file:u1"]]),
+    });
+    const gate = async (current: TreeSnapshot, dispatch: TreeSnapshot = before) => {
+      const h = harness(); h.setTree(dispatch); await h.start("d");
+      return h.store.delta("d", "d", current);
+    };
+    it("adds a changed digest (sed), a restore (git checkout), a deletion (git rm, rm) and an undigested path; never an unchanged one", async () => {
+      const current = tree({
+        dirty: true, fingerprint: "f2",
+        files: [{ path: a, status: " M" }, { path: c, status: " M" }, { path: d, status: "D " }],
+        // b: restored to HEAD (no longer listed); u: deleted; c: unchanged; a: edited; d: git rm.
+        digests: new Map([[a, "file:a2"], [b, "file:b0"], [c, "file:c1"], [d, ABSENT_DIGEST], [u, ABSENT_DIGEST]]),
+      });
+      const delta = await gate(current);
+      expect(delta.changeBaseline).toBe("available");
+      expect(delta.changedFiles).toEqual(expect.arrayContaining([
+        { path: a, status: " M" }, { path: b, status: " M" }, { path: d, status: "D " }, { path: u, status: " D" },
+      ]));
+      expect(delta.changedFiles.map(f => f.path)).not.toContain(c);
+      expect(delta.changedFiles).toHaveLength(4);
+      // Same digests: only a path that left the listing (b) or that the gate did not digest (u) is added.
+      const partial = await gate({ ...current, digests: new Map([[a, "file:a1"], [b, "file:b1"], [c, "file:c1"], [d, "file:d1"]]) });
+      expect(partial.changedFiles.map(f => f.path).sort()).toEqual([b, u].sort());
+    });
+    it("without per-file digests a changed fingerprint makes the change set unavailable; an unchanged one does not", async () => {
+      const edited = tree({ ...before, fingerprint: "f2" });
+      for (const [dispatch, current] of [
+        [{ ...before, digests: "unavailable" as const }, edited],
+        [before, { ...edited, digests: "unavailable" as const }],
+        [{ ...before, digests: undefined }, edited],
+        [before, { ...edited, digests: undefined }],
+      ]) {
+        expect((await gate(current, dispatch)).changeBaseline).toBe("unavailable");
+      }
+      const same = await gate({ ...before, digests: "unavailable" }, { ...before, digests: "unavailable" });
+      expect(same).toEqual({ changedFiles: [], changeBaseline: "available" });
+    });
   });
   it("tool-observed paths take the snapshot's status letters and rename source", async () => {
     const h = harness(); await h.start("dispatch");

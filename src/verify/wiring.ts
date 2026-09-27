@@ -83,8 +83,10 @@ export function extractAssistantText(res: any): string {
 /** P0 (deterministic.ts header, T2): what a gate needs from its dispatch. */
 export interface PreparedVerification {
   /**
-   * The producer's changed files: tool-observed paths plus paths the current snapshot added since
-   * dispatch, each with the snapshot's status letters and rename source when the snapshot lists it.
+   * The producer's changed files: the tool-observed paths of every attempt judged against this
+   * dispatch (QA-2.1-1), the paths the current snapshot added since dispatch, and the paths dirty
+   * or untracked at dispatch whose content digest changed or which left the listing (QA-2.1-2);
+   * each with the snapshot's status letters and rename source when the snapshot lists it.
    */
   changedFiles: ChangedFile[];
   changeBaseline: "available" | "unavailable";
@@ -494,8 +496,12 @@ export function createVerificationWiring(deps: {
       let snapshot: TreeSnapshot | undefined;
       try {
         const bound = deadline ? deadline.bound(GRADE_SNAPSHOT_TIMEOUT_MS) : GRADE_SNAPSHOT_TIMEOUT_MS;
+        // QA-2.1-2: digest exactly the paths the dispatch snapshot digested (<= MAX_DIGEST_FILES),
+        // so delta can tell which already-dirty file a shell edit changed.
+        const digests = store.baselineSnapshot(id)?.digests;
+        const options = digests === undefined ? {} : { digestPaths: digests === "unavailable" ? [] : [...digests.keys()] };
         snapshot = bound > 0 && !controller.signal.aborted
-          ? await withTimeout(snapshotTree(base, controller.signal), bound, "grade fingerprint")
+          ? await withTimeout(snapshotTree(base, controller.signal, options), bound, "grade fingerprint")
           : undefined;
       } catch {
         snapshot = undefined; // Explicit unavailable disclaimer, never a raw tree.

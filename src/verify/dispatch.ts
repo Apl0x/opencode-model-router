@@ -24,7 +24,19 @@ export interface TreeSnapshot {
   fingerprint: string;
   dirty: boolean;
   files: ChangedFile[];
+  /**
+   * QA-2.1-2: a content identity per digested path (absolute, as in `files`): FILE_DIGEST_PREFIX +
+   * sha256, LINK_DIGEST_PREFIX + target, or ABSENT_DIGEST. A dispatch snapshot digests its listed
+   * (dirty or untracked) paths; a gate snapshot digests the dispatch snapshot's paths.
+   * "unavailable" (over the digest bounds, or unreadable) and absent both mean no per-file proof.
+   */
+  digests?: ReadonlyMap<string, string> | "unavailable";
 }
+
+/** QA-2.1-2: the digest of a path that does not exist. */
+export const ABSENT_DIGEST = "absent";
+export const FILE_DIGEST_PREFIX = "file:";
+export const LINK_DIGEST_PREFIX = "link:";
 
 /** What beginDispatch runs in the background for one dispatch (never a test command, G6). */
 export interface DispatchCaptureDeps {
@@ -265,12 +277,36 @@ export function createChangedFileStore(options: ChangedFileStoreOptions = {}) {
         // lists the path, its status letters and previousPath win.
         files.set(key, (base ? listed.get(key) : undefined) ?? { path: absolute, status });
       }
-      const available = !!snapshot && !!current;
-      if (available) {
+      let available = !!snapshot && !!current;
+      if (snapshot && current) {
         const before = new Set(snapshot.files.map(f => pathKey(f.path)));
         for (const file of current.files) if (!before.has(pathKey(file.path))) files.set(pathKey(file.path), file);
+        // QA-2.1-2: a path already dirty or untracked at dispatch is never "new" above, and a shell
+        // edit to it (sed, a formatter, git checkout, git rm) records nothing. An unchanged
+        // fingerprint proves no such edit; otherwise each dispatch-listed path whose content
+        // identity changed, or which left the listing, is part of the change.
+        if (snapshot.fingerprint !== current.fingerprint) {
+          const was = snapshot.digests;
+          const now = current.digests;
+          if (was === undefined || was === "unavailable" || now === undefined || now === "unavailable") {
+            available = false; // No per-file proof: the change set cannot be trusted (§1.5-6 S6).
+          } else {
+            const nowByKey = new Map([...now].map(([path, digest]) => [pathKey(path), digest] as const));
+            for (const [path, digest] of was) {
+              const key = pathKey(path);
+              const after = nowByKey.get(key);
+              if (after === digest && listed.has(key)) continue;
+              // An undigested path cannot be proven unchanged: it is included (wider scope).
+              files.set(key, listed.get(key) ?? files.get(key) ?? { path, status: after === ABSENT_DIGEST ? " D" : " M" });
+            }
+          }
+        }
       }
       return { changedFiles: [...files.values()], changeBaseline: available ? "available" : "unavailable" };
+    },
+    /** The dispatch-time snapshot (QA-2.1-2: the gate digests its listed paths); undefined until settled. */
+    baselineSnapshot(id: string): TreeSnapshot | undefined {
+      return dispatches.get(id)?.snapshot;
     },
     record(sessionID: string, tool: string, args: unknown): void {
       touch(sessionID);
