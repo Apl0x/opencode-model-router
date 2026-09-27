@@ -116,9 +116,75 @@ describe("assessRisk", () => {
     });
   });
 
+  it("QA-1.6-9: absolute paths are classified repo-relative", () => {
+    const posix = "/home/u/docs/app";
+    const win = "D:\\work\\docs\\app";
+    expect(run({ root: posix, changedFiles: [{ path: `${posix}/test/a.test.ts`, status: " D" }] }).level).toBe("high");
+    expect(run({ root: win, changedFiles: [{ path: `${win}\\src\\core.ts`, status: " D" }] }).level).toBe("medium");
+    expect(run({ root: "d:/work/docs/app", changedFiles: [{ path: `${win}\\src\\core.ts`, status: "D " }] }).reasons).toContain(
+      REASONS.deletedOrRenamed,
+    );
+    const pkg = run({ root: posix, reference: false, changedFiles: [{ path: `${posix}/package.json`, status: " M" }] });
+    expect(pkg.level).toBe("high");
+    expect(run({ root: "/tmp/test/app", changedFiles: [{ path: "/tmp/test/app/src/a.ts", status: " M" }] })).toEqual({
+      level: "low",
+      reasons: [REASONS.small],
+    });
+    expect(run({ root: win, changedFiles: [{ path: `${win}\\docs\\guide.md`, status: " M" }] }).reasons).toEqual([REASONS.docsOnly]);
+    // absolute without a usable root is never documentation
+    expect(run({ changedFiles: [{ path: "/home/u/docs/a.md" }] }).reasons).not.toContain(REASONS.docsOnly);
+    expect(run({ root: "/other", changedFiles: [{ path: "/home/u/docs/a.md" }] }).reasons).not.toContain(REASONS.docsOnly);
+  });
+
+  it("QA-1.6-10: docs exclude config/test paths and non-doc types", () => {
+    for (const path of ["requirements.txt", "requirements-dev.txt", "CMakeLists.txt", "docs/package.json", "docs/conf.py", "docs/vite.config.ts", "notes.txt", "test/fixtures/a.md"]) {
+      expect(run({ changedFiles: [{ path, status: "M" }] }).reasons, path).not.toContain(REASONS.docsOnly);
+    }
+    for (const path of ["docs/a.txt", "docs/img/x.svg", "guide.adoc", "LICENSE.txt", "pkg/README.mdx"]) {
+      expect(run({ changedFiles: [{ path, status: "M" }] }).reasons, path).toEqual([REASONS.docsOnly]);
+    }
+  });
+
+  it("QA-1.6-11: snapshots count as tests; extended config list", () => {
+    for (const path of ["src/__snapshots__/a.test.ts.snap", "x/a.snap"]) {
+      expect(run({ changedFiles: [{ path, status: "M" }] })).toEqual({ level: "medium", reasons: [REASONS.small, REASONS.testModified] });
+    }
+    for (const path of [
+      "vite.config.ts", "vitest.config.mts", "vitest.workspace.ts", "jest.config.cjs", "vitest.setup.ts", "src/setupTests.js",
+      "pytest.ini", "tox.ini", "setup.cfg", "setup.py", "pyproject.toml", "conftest.py", ".gitlab-ci.yml", "Makefile",
+      "CMakeLists.txt", "requirements.txt", "requirements-dev.txt",
+    ]) {
+      expect(run({ changedFiles: [{ path, status: "M" }] }).reasons, path).toContain(REASONS.configChanged);
+    }
+  });
+
+  it("QA-1.6-12: D or R in either porcelain column counts", () => {
+    expect(run({ changedFiles: [{ path: "test/a.test.ts", status: "MD" }] }).level).toBe("high");
+    expect(run({ changedFiles: [{ path: "src/a.ts", status: "AD" }] }).reasons).toContain(REASONS.deletedOrRenamed);
+    expect(run({ changedFiles: [{ path: "src/a.ts", status: "RM" }] }).reasons).toContain(REASONS.deletedOrRenamed);
+    expect(run({ changedFiles: [{ path: "src/a.ts", status: " M" }] }).reasons).toEqual([REASONS.small]);
+    expect(run({ changedFiles: [{ path: "src/a.ts", status: "MM" }] }).reasons).toEqual([REASONS.small]);
+  });
+
+  it("QA-1.6-13: a test renamed to a non-test path counts as deleted", () => {
+    for (const path of ["src/a.ts", "src/a.test.ts.bak"]) {
+      const r = run({ changedFiles: [{ path, previousPath: "src/a.test.ts", status: "R " }] });
+      expect(r.level).toBe("high");
+      expect(r.reasons).toContain(REASONS.testDeleted);
+    }
+    expect(run({ changedFiles: [{ path: "src/b.test.ts", previousPath: "src/a.test.ts" }] }).reasons).toContain(REASONS.testModified);
+  });
+
+  it("QA-1.6-15: duplicate paths are counted once", () => {
+    const dup = Array.from({ length: 6 }, () => ({ path: "src/a.ts", status: "M" }));
+    expect(run({ changedFiles: dup })).toEqual({ level: "low", reasons: [REASONS.small] });
+    const win = Array.from({ length: 6 }, (_, i) => ({ path: i % 2 ? "C:\\r\\src\\A.ts" : "c:/r/src/a.ts" }));
+    expect(run({ root: "C:\\r", changedFiles: win }).reasons).toContain(REASONS.small);
+  });
+
   it("risk.ts imports nothing with side effects", () => {
     const src = readFileSync(new URL("../../src/verify/risk.ts", import.meta.url), "utf8");
-    expect(src).not.toMatch(/child_process|from "(node:)?fs|http|net"/);
+    expect(src).not.toMatch(/child_process|from ["'](node:)?(fs|http|https|net)["']|\brequire\(|\bimport\(|\bprocess\./);
     expect(src.match(/^import .*$/gm)).toEqual(['import type { ChangedPath, StaticScoping } from "./runner";']);
   });
 });

@@ -4,23 +4,39 @@
  * Pure and synchronous: no process, no fs, no network. The caller runs the static planner
  * (`planStaticScoping`) and passes its result in as `scopingPlan`.
  *
+ * Paths: classification is done on repo-relative paths (QA-1.6-9). Pass the git root as `root`;
+ * absolute paths under it are made relative (after `\` → `/`, case-insensitively for drive-letter
+ * roots). An absolute path that cannot be made relative is classified conservatively: it never
+ * counts as documentation. Paths are deduplicated (normalised, case-folded for drive-letter paths)
+ * before counting (QA-1.6-15).
+ *
+ * Status: two-character porcelain XY codes count as deleted/renamed when D/R appears in EITHER
+ * column (`MD`, `AD`, ` D`, `RM`); other forms (`D`, `deleted`, `R100`) match on the first letter.
+ *
+ * Callers must not pass `[]` when attribution failed (e.g. `snapshotTree` returned undefined):
+ * `[]` means "nothing changed" and is rated low (QA-1.6-14; the unknown case is 2.4's).
+ *
  * Fixed table (evaluated in this order; the level is the maximum of every matching row, then the
  * adjustment rows apply once):
  *
  * | #  | Condition                                                         | Level / effect         |
  * |----|-------------------------------------------------------------------|------------------------|
  * | 1  | no changed files                                                  | low, stop              |
- * | 2  | every changed file is documentation (docs/**, *.md, *.mdx, *.rst, *.txt) | low, stop       |
+ * | 2  | every changed file is documentation (see isDocPath)               | low, stop              |
  * | 3  | 1–5 changed files                                                 | low                    |
  * | 4  | 6–15 changed files                                                | medium                 |
  * | 5  | 16 or more changed files                                          | high                   |
- * | 6  | a test file was deleted                                           | high                   |
- * | 7  | a test file was modified (added, changed or renamed)              | medium                 |
+ * | 6  | a test file was deleted, or renamed to a non-test path            | high                   |
+ * | 7  | a test file (incl. snapshots) was modified (added, changed, renamed) | medium              |
  * | 8  | a non-test file was deleted or any file was renamed               | medium                 |
- * | 9  | config / lock / CI file changed (package.json, lockfiles, tsconfig*.json, vitest|jest.config.*, conftest.py, pyproject.toml, .github/**) | medium |
+ * | 9  | config / lock / CI / test-setup file changed (see isConfigPath)   | medium                 |
  * | 10 | scoping impossible (Unverifiable, S6)                             | medium                 |
  * | 11 | producer tier "fast"                                              | medium                 |
  * | 12 | no reference captured                                             | +1 step (max high)     |
+ *
+ * Documentation (row 2): not a test or config path, and either a `.md/.mdx/.rst/.adoc` file
+ * anywhere, `LICENSE.txt`/`CHANGELOG.txt`, or a doc/asset file type
+ * (`md mdx rst txt adoc png jpg jpeg gif svg webp`) under a `docs/` directory.
  *
  * Rows 1–2 short-circuit: nothing else is evaluated. A `NoAffected` scoping plan adds the
  * informational reason REASONS.noAffected without changing the level. Reasons are stable strings
@@ -37,6 +53,8 @@ export interface RiskInput {
   readonly reference: boolean;
   readonly producerTier: ProducerTier;
   readonly scopingPlan: StaticScoping;
+  /** Git root; absolute changed paths are made relative to it before classification. */
+  readonly root?: string;
 }
 
 export interface RiskAssessment {
@@ -74,16 +92,44 @@ function base(p: string): string {
   return n.slice(n.lastIndexOf("/") + 1);
 }
 
+const DRIVE = /^[a-z]:\//i;
+
+function isAbsolute(n: string): boolean {
+  return n.startsWith("/") || DRIVE.test(n);
+}
+
+/** Repo-relative form, or null when the path is absolute and not under `root`. */
+function relativize(p: string, root: string | undefined): string | null {
+  const n = norm(p).replace(/^(\.\/)+/, "");
+  if (!isAbsolute(n)) return n;
+  if (root === undefined) return null;
+  const r = norm(root).replace(/\/+$/, "");
+  const fold = DRIVE.test(r);
+  const nc = fold ? n.toLowerCase() : n;
+  const rc = fold ? r.toLowerCase() : r;
+  return nc.startsWith(`${rc}/`) ? n.slice(r.length + 1) : null;
+}
+
+const DOC_ANYWHERE = /\.(md|mdx|rst|adoc)$/i;
+const DOC_UNDER_DOCS = /\.(md|mdx|rst|txt|adoc|png|jpe?g|gif|svg|webp)$/i;
+
 export function isDocPath(p: string): boolean {
   const n = norm(p);
-  return /(^|\/)docs\//i.test(n) || /\.(md|mdx|rst|txt)$/i.test(n);
+  if (isTestPath(n) || isConfigPath(n)) return false;
+  const b = base(n);
+  return (
+    DOC_ANYWHERE.test(b) ||
+    /^(LICENSE|CHANGELOG)\.txt$/i.test(b) ||
+    (/(^|\/)docs\//i.test(n) && DOC_UNDER_DOCS.test(b))
+  );
 }
 
 export function isTestPath(p: string): boolean {
   const n = norm(p);
   const b = base(n);
   return (
-    /(^|\/)(test|tests|__tests__)\//.test(n) ||
+    /(^|\/)(test|tests|__tests__|__snapshots__)\//.test(n) ||
+    /\.snap$/.test(b) ||
     /\.(test|spec)\.[cm]?[jt]sx?$/.test(b) ||
     /^test_.*\.py$/.test(b) ||
     /_test\.py$/.test(b)
@@ -106,25 +152,54 @@ export function isConfigPath(p: string): boolean {
     b === "uv.lock" ||
     b === "Pipfile.lock" ||
     /^tsconfig.*\.json$/.test(b) ||
-    /^(vitest|jest)\.config\./.test(b) ||
+    /^(vite|vitest|jest)\.config\./.test(b) ||
+    /^vitest\.workspace\./.test(b) ||
+    /setup[^/]*\.[cm]?[jt]sx?$/i.test(b) ||
     b === "conftest.py" ||
-    b === "pyproject.toml"
+    b === "pyproject.toml" ||
+    b === "pytest.ini" ||
+    b === "tox.ini" ||
+    b === "setup.cfg" ||
+    b === "setup.py" ||
+    b === ".gitlab-ci.yml" ||
+    b === "Makefile" ||
+    b === "CMakeLists.txt" ||
+    /^(requirements|constraints).*\.txt$/.test(b)
   );
 }
 
-function isDeleted(f: ChangedPath): boolean {
-  return f.status !== undefined && /^d/i.test(f.status.trim());
+const PORCELAIN = /^[ .MTADRCU?!]{2}$/;
+
+function statusHas(status: string | undefined, letter: "D" | "R"): boolean {
+  if (status === undefined) return false;
+  if (PORCELAIN.test(status)) return status.includes(letter);
+  return status.trim().charAt(0).toUpperCase() === letter;
 }
 
-function isRenamed(f: ChangedPath): boolean {
-  return f.previousPath !== undefined || (f.status !== undefined && /^r/i.test(f.status.trim()));
+interface Classified {
+  readonly path: string | null;
+  readonly previousPath: string | null | undefined;
+  readonly deleted: boolean;
+  readonly renamed: boolean;
 }
 
 export function assessRisk(input: RiskInput): RiskAssessment {
-  const { changedFiles, reference, producerTier, scopingPlan } = input;
+  const { changedFiles, reference, producerTier, scopingPlan, root } = input;
 
   if (changedFiles.length === 0) return { level: "low", reasons: [REASONS.empty] };
-  if (changedFiles.every((f) => isDocPath(f.path) && (f.previousPath === undefined || isDocPath(f.previousPath)))) {
+
+  const files: Classified[] = changedFiles.map((f) => ({
+    path: relativize(f.path, root),
+    previousPath: f.previousPath === undefined ? undefined : relativize(f.previousPath, root),
+    deleted: statusHas(f.status, "D"),
+    renamed: f.previousPath !== undefined || statusHas(f.status, "R"),
+  }));
+  // Unresolvable absolute paths fall back to their full normalised form (conservative: may
+  // over-match test/config patterns, never counts as documentation).
+  const cls = (rel: string | null, raw: string): string => rel ?? norm(raw);
+  const doc = (rel: string | null | undefined): boolean => rel === undefined || (rel !== null && isDocPath(rel));
+
+  if (files.every((f) => doc(f.path) && doc(f.previousPath))) {
     return { level: "low", reasons: [REASONS.docsOnly] };
   }
 
@@ -135,21 +210,34 @@ export function assessRisk(input: RiskInput): RiskAssessment {
     reasons.push(reason);
   };
 
-  const n = changedFiles.length;
+  const keys = new Set(
+    changedFiles.map((f, i) => {
+      const k = cls(files[i]!.path, f.path);
+      return DRIVE.test(norm(f.path)) || (root !== undefined && DRIVE.test(norm(root))) ? k.toLowerCase() : k;
+    }),
+  );
+  const n = keys.size;
   if (n <= SMALL_CHANGE_MAX) hit("low", REASONS.small);
   else if (n <= MEDIUM_CHANGE_MAX) hit("medium", REASONS.mediumCount);
   else hit("high", REASONS.largeCount);
 
-  const touchesTest = (f: ChangedPath): boolean =>
-    isTestPath(f.path) || (f.previousPath !== undefined && isTestPath(f.previousPath));
+  const paths = changedFiles.map((f, i) => {
+    const c = files[i]!;
+    const prev = f.previousPath === undefined ? undefined : cls(c.previousPath ?? null, f.previousPath);
+    return { ...c, cur: cls(c.path, f.path), prev };
+  });
+  const touchesTest = (f: (typeof paths)[number]): boolean =>
+    isTestPath(f.cur) || (f.prev !== undefined && isTestPath(f.prev));
+  const testGone = (f: (typeof paths)[number]): boolean =>
+    (f.deleted && touchesTest(f)) || (f.prev !== undefined && isTestPath(f.prev) && !isTestPath(f.cur));
 
-  if (changedFiles.some((f) => isDeleted(f) && touchesTest(f))) hit("high", REASONS.testDeleted);
-  else if (changedFiles.some(touchesTest)) hit("medium", REASONS.testModified);
+  if (paths.some(testGone)) hit("high", REASONS.testDeleted);
+  else if (paths.some(touchesTest)) hit("medium", REASONS.testModified);
 
-  if (changedFiles.some((f) => (isDeleted(f) && !touchesTest(f)) || isRenamed(f))) {
+  if (paths.some((f) => (f.deleted && !touchesTest(f)) || f.renamed)) {
     hit("medium", REASONS.deletedOrRenamed);
   }
-  if (changedFiles.some((f) => isConfigPath(f.path) || (f.previousPath !== undefined && isConfigPath(f.previousPath)))) {
+  if (paths.some((f) => isConfigPath(f.cur) || (f.prev !== undefined && isConfigPath(f.prev)))) {
     hit("medium", REASONS.configChanged);
   }
 
