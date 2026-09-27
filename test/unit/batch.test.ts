@@ -17,6 +17,7 @@ import {
   unionChangedFiles,
 } from "../../src/verify/batch";
 import type { BatchPlanInput, BatchPlanner, BatchRuntime } from "../../src/verify/batch";
+import { judgeScoped } from "../../src/verify/baseline";
 import type { DispatchReference } from "../../src/verify/reference";
 import { readResult } from "../../src/verify/runner";
 import type { RunResult, RunnerKind, ScopedSpec, ScopingPlan } from "../../src/verify/runner";
@@ -2339,6 +2340,21 @@ function judgeStandIn(run: TestsPassRun): Verdict {
   return { verdict, introduced: introduced.sort(), preexisting: preexisting.sort(), unknown: unknown.sort() };
 }
 
+/**
+ * 2.2.3: 2.1's real judgeScoped (baseline.ts, T5/T6) in the stand-in's shape: ok -> pass, else
+ * unverifiable or fail, with the classification sets sorted (empty when nothing was classified).
+ */
+function judgeReal(run: TestsPassRun): Verdict {
+  const j = judgeScoped(run.scoped, run.recheck);
+  const sorted = (xs: readonly string[] | undefined) => [...(xs ?? [])].sort();
+  return {
+    verdict: j.ok ? "pass" : j.unverifiable ? "unverifiable" : "fail",
+    introduced: sorted(j.failures?.introduced),
+    preexisting: sorted(j.failures?.preexisting),
+    unknown: sorted(j.failures?.unknown),
+  };
+}
+
 /** 2.1's one-request path over the same seams: plan, one scope, one run, one recheck of the failing files. */
 async function directOver(rt: BatchRuntime, request: TestsPassRequest): Promise<TestsPassRun> {
   const plan = await rt.plan({ command: request.command, cwd: request.cwd, changedFiles: request.changedFiles }, request.deadline);
@@ -2702,14 +2718,25 @@ describe("createBatchCoordinator: B12 batched verdicts equal solo verdicts", () 
     vi.useRealTimers();
   });
 
-  async function runCase(seed: number): Promise<void> {
+  /**
+   * One seeded case. `judge` is the stand-in oracle, or (2.2.3) 2.1's real judgeScoped: with the
+   * real judge, every solo and batched run is also judged by the stand-in, and both must agree.
+   */
+  async function runCase(seed: number, judge: (run: TestsPassRun) => Verdict = judgeStandIn): Promise<void> {
     const pc = genCase(seed);
     const w = pc.world;
+    const agree = (run: TestsPassRun, what: string): void => {
+      if (judge !== judgeStandIn) expect(judgeStandIn(run), `seed ${seed}: the stand-in disagrees with judgeScoped (${what})`).toEqual(judge(run));
+    };
 
     // Solo: every request alone, through 2.1's one-request path.
     const solo = propertySeams(pc, false);
     const soloVerdicts: Verdict[] = [];
-    for (const cr of pc.requests) soloVerdicts.push(judgeStandIn(await directOver({ ...solo.runtime, failureRecheck: cr.failureRecheck }, toRequest(cr))));
+    for (const cr of pc.requests) {
+      const run = await directOver({ ...solo.runtime, failureRecheck: cr.failureRecheck }, toRequest(cr));
+      agree(run, `solo ${JSON.stringify(cr)}`);
+      soloVerdicts.push(judge(run));
+    }
     expect(solo.calls.closes.length, `seed ${seed}: solo scopes closed`).toBe(solo.calls.opens.length);
 
     // Batched: every request in one window, each through its own gate's hook.
@@ -2791,7 +2818,8 @@ describe("createBatchCoordinator: B12 batched verdicts equal solo verdicts", () 
     if (answered > batched.calls.rechecks.length) propertyTally.reusedRechecks++;
 
     runs.forEach((run, i) => {
-      const got = judgeStandIn(run);
+      agree(run, `batched ${where(i)}`);
+      const got = judge(run);
       propertyTally[got.verdict]++;
       const soloVerdict = soloVerdicts[i];
       const cr = pc.requests[i];
@@ -2813,6 +2841,13 @@ describe("createBatchCoordinator: B12 batched verdicts equal solo verdicts", () 
   for (let start = 0; start < PROPERTY_CASES; start += PROPERTY_CHUNK) {
     it(`seeds ${start}..${start + PROPERTY_CHUNK - 1}`, async () => {
       for (let i = start; i < start + PROPERTY_CHUNK; i++) await runCase(PROPERTY_SEED + i);
+    }, 30_000);
+  }
+
+  // 2.2.3.b: the same property judged by 2.1's real judgeScoped (B12: "both must agree").
+  for (let start = 0; start < PROPERTY_CASES; start += PROPERTY_CHUNK) {
+    it(`seeds ${start}..${start + PROPERTY_CHUNK - 1}, judged by 2.1's judgeScoped`, async () => {
+      for (let i = start; i < start + PROPERTY_CHUNK; i++) await runCase(PROPERTY_SEED + i, judgeReal);
     }, 30_000);
   }
 
