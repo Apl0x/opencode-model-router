@@ -606,6 +606,15 @@ export const BATCH_MAX_REQUESTS = 8;
 export const BATCH_STALE_GRACE_MS = 60_000;
 
 /**
+ * W3 and B5.2a (QA-2.2-17): the margin a member keeps on top of its recheck threshold and the
+ * key's run estimate. It covers union planning and scheduling, the overhead the batch adds.
+ */
+export const BATCH_RESERVE_MARGIN_MS = 1_000;
+
+/** B11: at most this many batch keys keep a measured run duration (the oldest is dropped). */
+const DURATION_KEYS_MAX = 64;
+
+/**
  * Stable ScopedOutcome "aborted" reasons (B2, B9). They reach the orchestrator through 2.1-T7 u13.
  * beforeRun and run are 2.1's ABORTED_BEFORE_RUN and ABORTED_DURING_RUN, verbatim (QA-2.2-9).
  */
@@ -685,6 +694,11 @@ export interface BatchCoordinatorOptions {
   readonly timers?: BatchTimers;
   /** A logger whose warn throws is dropped for the coordinator's life (B-G5, QA-2.2-10). */
   readonly logger?: Pick<PluginLogger, "warn">;
+  /**
+   * W7 (QA-2.2-17 a). Default true: a window closes as soon as nothing else is in flight in the
+   * coordinator. false keeps only the timed close, for tests of the W1-W6 mechanics.
+   */
+  readonly idleClose?: boolean;
 }
 
 /** Live state and cumulative counters, for tests and QA (B11, B13). */
@@ -745,8 +759,12 @@ interface Member {
   readonly failureRecheck: boolean;
   /** QA-2.2-8: the submitting gate's runtime.currentTree, forwarded to the member's recheck. */
   readonly currentTree: TreeSnapshot | undefined;
+  /** W3 (QA-2.2-17): the submitting gate's runtime.recheckMinRemainingMs, for its reserve. */
+  readonly recheckMinRemainingMs: number;
   /** Arrival order: the tie-break of every deadline ordering. */
   readonly seq: number;
+  /** B5.2a (QA-2.2-17 c): it runs its own spec, and its recheck, before the union and outside it. */
+  solo: boolean;
   phase: MemberPhase;
   settled: boolean;
   window: BatchWindow | undefined;
@@ -765,8 +783,8 @@ interface BatchWindow {
   readonly key: string;
   /** The opener's runtime (W1, D6). */
   readonly runtime: BatchRuntime;
-  /** Fixed at opening (W1, W2). */
-  readonly closeAt: number;
+  /** Set at opening (W1). It never moves later (W2); a member's reserve can move it earlier (W3). */
+  closeAt: number;
   readonly members: Member[];
   timer: unknown;
   closed: boolean;
@@ -866,15 +884,20 @@ export function createBatchCoordinator(options: BatchCoordinatorOptions = {}): B
   const platform = options.platform ?? process.platform;
   const now = options.now ?? (() => Date.now());
   const timers = options.timers ?? defaultTimers;
+  const idleClose = options.idleClose ?? true;
   let logger = options.logger;
 
   const windows = new Map<string, BatchWindow>();
   const running = new Set<Batch>();
   const closing = new Set<Promise<void>>();
+  /** QA-2.2-17: the last measured scoped-run duration of each batch key (bounded, B11). */
+  const durations = new Map<string, number>();
   const counters = { unionRuns: 0, ownRuns: 0, rechecks: 0, splits: 0, taints: 0 };
   let disposed = false;
   let pending = 0;
   let arrivals = 0;
+  /** W7: requests between arrival and their window (or their planning outcome). */
+  let planning = 0;
 
   /**
    * B-G5 (QA-2.2-10): logging never throws into the coordinator. A logger that throws is dropped
@@ -956,6 +979,63 @@ export function createBatchCoordinator(options: BatchCoordinatorOptions = {}): B
     }
   }
 
+  /** QA-2.2-17: the key's last measured scoped-run duration, 0 before the first. */
+  function estimate(key: string): number {
+    return durations.get(key) ?? 0;
+  }
+
+  /** Records a run's duration and applies the new estimate to the key's open window (W3). */
+  function noteDuration(key: string, ms: number): void {
+    durations.delete(key);
+    durations.set(key, Math.max(0, ms));
+    if (durations.size > DURATION_KEYS_MAX) {
+      const oldest = durations.keys().next();
+      if (oldest.done !== true) durations.delete(oldest.value);
+    }
+    const w = windows.get(key);
+    if (w !== undefined) fitWindow(w);
+  }
+
+  /**
+   * W3 (QA-2.2-17 b): what a member keeps besides its runs: its recheck threshold when it can
+   * recheck at all (failureRecheck on and a captured reference), plus BATCH_RESERVE_MARGIN_MS.
+   */
+  function floorOf(m: Member): number {
+    const rechecks = m.failureRecheck && m.request.reference.kind === "captured";
+    return (rechecks ? m.recheckMinRemainingMs : 0) + BATCH_RESERVE_MARGIN_MS;
+  }
+
+  /**
+   * W3 (QA-2.2-17 b): the window closes no later than the moment any member would be left with
+   * less than its floor plus one run of the key's estimate, which is what the direct path needs
+   * for its run and its recheck. The close time only ever moves earlier (W2).
+   */
+  function fitWindow(w: BatchWindow): void {
+    if (w.closed) return;
+    const t = now();
+    const e = estimate(w.key);
+    let closeAt = w.closeAt;
+    for (const m of w.members) if (!m.settled) closeAt = Math.min(closeAt, t + m.request.deadline.remaining() - floorOf(m) - e);
+    if (closeAt <= t) {
+      closeWindow(w);
+      return;
+    }
+    if (closeAt >= w.closeAt) return;
+    w.closeAt = closeAt;
+    timers.clearTimeout(w.timer);
+    w.timer = timers.setTimeout(() => closeWindow(w), closeAt - t);
+  }
+
+  /**
+   * W7 (QA-2.2-17 a, QA-2.2-18): when no request is planning and no batch is running, nothing
+   * can join an open window and the slot is free, so every open window closes now. A lone request
+   * therefore never waits; requests that arrive while a batch runs gather in the next window.
+   */
+  function closeIdle(): void {
+    if (!idleClose || planning > 0 || running.size > 0) return;
+    for (const w of [...windows.values()]) closeWindow(w);
+  }
+
   function join(runtime: BatchRuntime, request: TestsPassRequest, spec: ScopedSpec): Promise<TestsPassRun> {
     const key = batchKey(spec, platform);
     return new Promise<TestsPassRun>((resolve) => {
@@ -964,7 +1044,9 @@ export function createBatchCoordinator(options: BatchCoordinatorOptions = {}): B
         spec,
         failureRecheck: runtime.failureRecheck,
         currentTree: runtime.currentTree,
+        recheckMinRemainingMs: runtime.recheckMinRemainingMs,
         seq: arrivals++,
+        solo: false,
         phase: "window",
         settled: false,
         window: undefined,
@@ -987,8 +1069,10 @@ export function createBatchCoordinator(options: BatchCoordinatorOptions = {}): B
       w.members.push(member);
       pending++;
       request.deadline.signal.addEventListener("abort", member.onAbort, { once: true });
-      // W2 (size) and W3 (a joiner that could not outlive the wait).
-      if (w.members.length >= maxBatchSize || request.deadline.remaining() <= w.closeAt - now()) closeWindow(w);
+      // W2 (size), W3 (the members' reserves) and W7 (nothing else in flight).
+      if (w.members.length >= maxBatchSize) closeWindow(w);
+      else fitWindow(w);
+      closeIdle();
     });
   }
 
@@ -1040,6 +1124,8 @@ export function createBatchCoordinator(options: BatchCoordinatorOptions = {}): B
       b.group?.dispose();
       b.deadline.dispose();
       void closeScope(b);
+      // W7: this batch no longer keeps the next windows waiting.
+      closeIdle();
     }
   }
 
@@ -1049,16 +1135,27 @@ export function createBatchCoordinator(options: BatchCoordinatorOptions = {}): B
     if (b.members.length === 1) {
       queueOwn([first]);
     } else {
-      // Step 2.
-      const planned = await planUnion(b);
-      if (b.deadline.signal.aborted) return;
-      if (typeof planned === "string") {
-        // Step 6.
-        counters.splits++;
-        warn("verify batch: split into own runs", { members: b.members.length, cause: planned });
-        queueOwn(live(b));
+      // Step 2a (QA-2.2-17 c): a member whose budget cannot cover the batched schedule runs alone.
+      const solo = soloForDeadline(b);
+      const pooled = b.members.filter((m) => !solo.has(m));
+      if (pooled.length <= 1) {
+        split(b, "the members' budgets cannot cover a batched run");
       } else {
-        unionSpec = planned;
+        // Step 2.
+        const planned = await planUnion(b, pooled);
+        if (b.deadline.signal.aborted) return;
+        if (typeof planned === "string") {
+          split(b, planned);
+        } else {
+          unionSpec = planned;
+          if (solo.size > 0) {
+            warn("verify batch: members short of budget run alone before the batched run", { members: b.members.length, alone: solo.size });
+            for (const m of solo) {
+              m.solo = true;
+              if (!m.settled) m.phase = "own-wait";
+            }
+          }
+        }
       }
     }
     // Everyone is gone, or the coordinator was disposed: open nothing.
@@ -1068,10 +1165,13 @@ export function createBatchCoordinator(options: BatchCoordinatorOptions = {}): B
     const scope = b.runtime.openScope({ cwd: first.request.cwd, command: first.request.command });
     b.scope = scope;
 
+    // Step 2a: the solo members' own runs and rechecks come first, earliest deadline first.
+    await drain(b, scope, true);
+
     // Step 4.
     if (unionSpec !== undefined) {
       counters.unionRuns++;
-      const union = await execute(scope, unionSpec, b.deadline);
+      const union = await execute(b.key, scope, unionSpec, b.deadline);
       switch (union.kind) {
         case "ran":
           attribute(b, union);
@@ -1085,13 +1185,25 @@ export function createBatchCoordinator(options: BatchCoordinatorOptions = {}): B
       }
     }
 
-    // Steps 5, 7 and 8 (QA-2.2-3): one queue under the hold, one command at a time, earliest
-    // deadline first. A member's recheck runs as soon as its outcome is final, before the own runs
-    // of members with more time left; nothing waits for a step it does not need.
+    // Steps 5, 7 and 8 (QA-2.2-3).
+    await drain(b, scope, false);
+  }
+
+  /**
+   * B5.5 (QA-2.2-3): one queue under the hold, one command at a time, earliest deadline first. A
+   * member's recheck runs as soon as its outcome is final, before the own runs of members with
+   * more time left; nothing waits for a step it does not need. The solo phase (B5.2a) runs only
+   * the solo members, whose outcomes are final at once: no union failure can taint them.
+   */
+  async function drain(b: Batch, scope: BatchScope, soloPhase: boolean): Promise<void> {
     for (;;) {
-      advance(b);
+      if (soloPhase) {
+        for (const m of live(b)) if (m.solo && m.phase === "held") release(b, m);
+      } else {
+        advance(b);
+      }
       const next = live(b)
-        .filter((m) => m.phase === "own-wait" || m.phase === "recheck-wait")
+        .filter((m) => (!soloPhase || m.solo) && (m.phase === "own-wait" || m.phase === "recheck-wait"))
         .sort(byDeadline)[0];
       if (next === undefined) return;
       if (next.phase === "own-wait") await runOwn(b, scope, next);
@@ -1103,15 +1215,44 @@ export function createBatchCoordinator(options: BatchCoordinatorOptions = {}): B
     for (const m of members) m.phase = "own-wait";
   }
 
-  /** B6 and the step-2 consistency checks. Returns the union spec, or the cause of a split. */
-  async function planUnion(b: Batch): Promise<ScopedSpec | string> {
+  /** Step 6: every member runs its own spec, and there is no union run. */
+  function split(b: Batch, cause: string): void {
+    counters.splits++;
+    warn("verify batch: split into own runs", { members: b.members.length, cause });
+    queueOwn(live(b));
+  }
+
+  /**
+   * B5.2a (QA-2.2-17 c). The members whose budget cannot cover the worst case of the batched
+   * schedule before their recheck: the union run, every pooled member's own run (mode B; a member
+   * can be held until the last of them, B5.7), one recheck for each pooled member ahead of it in
+   * deadline order, and the own run and recheck of every solo member, which come first. Each run
+   * and recheck is estimated at the key's last measured duration; before the first measurement
+   * the estimate is 0 and only the floor counts (W3). Moving a member to solo changes the others'
+   * sums, so the check repeats until nothing moves: at most once per member.
+   */
+  function soloForDeadline(b: Batch): Set<Member> {
+    const e = estimate(b.key);
+    const order = live(b).sort(byDeadline);
+    const solo = new Set<Member>();
+    for (;;) {
+      const pooled = order.filter((m) => !solo.has(m));
+      const ahead = 2 * e * solo.size;
+      const short = pooled.find((m, i) => m.request.deadline.remaining() < floorOf(m) + ahead + e * (1 + pooled.length + i));
+      if (short === undefined) return solo;
+      solo.add(short);
+    }
+  }
+
+  /** B6 and the step-2 consistency checks over the pooled members. Returns the union spec, or the cause of a split. */
+  async function planUnion(b: Batch, pooled: readonly Member[]): Promise<ScopedSpec | string> {
     const changes: BatchMemberChanges[] = [];
-    for (const m of b.members) {
+    for (const m of pooled) {
       const changedFiles = m.request.changedFiles;
       if (changedFiles === "unavailable") return "a member's change set is unavailable";
       changes.push({ cwd: m.request.cwd, changedFiles });
     }
-    const first = b.members[0];
+    const first = pooled[0];
     let plan: ScopingPlan;
     try {
       plan = await b.runtime.plan(
@@ -1124,7 +1265,7 @@ export function createBatchCoordinator(options: BatchCoordinatorOptions = {}): B
     if ("noAffected" in plan) return "the union plan found nothing to run";
     if ("unverifiable" in plan) return `the union cannot be scoped (${plan.code})`;
     if (batchKey(plan, platform) !== b.key) return "the union plan runs a different command";
-    const want = new Set(b.members.flatMap((m) => m.spec.inputs.map((f) => fold(f, platform))));
+    const want = new Set(pooled.flatMap((m) => m.spec.inputs.map((f) => fold(f, platform))));
     const got = new Set(plan.inputs.map((f) => fold(f, platform)));
     if (want.size !== got.size || [...want].some((k) => !got.has(k))) return "the union plan's inputs differ from the members' inputs";
     return plan;
@@ -1137,9 +1278,11 @@ export function createBatchCoordinator(options: BatchCoordinatorOptions = {}): B
    * ids derived for a member that already left still count as reproduced.
    */
   function attribute(b: Batch, union: RanOutcome): void {
-    const n = b.members.length;
+    // B5.2a: the solo members are not in the union, and are settled by now.
+    const pooled = b.members.filter((m) => !m.solo);
+    const n = pooled.length;
     b.unionIds = taintable(union);
-    for (const m of b.members) {
+    for (const m of pooled) {
       const a = attributeUnion(union.result, union.result.testsByFile, m.spec, platform);
       if (a.kind === "own-run") {
         if (!m.settled) m.phase = "own-wait";
@@ -1199,7 +1342,7 @@ export function createBatchCoordinator(options: BatchCoordinatorOptions = {}): B
     warn("verify batch: a batched run failure was not reproduced by any request's own run", { ids: unreproduced });
     for (const m of live(b)) {
       const s = m.scoped;
-      if (s?.kind === "ran") m.scoped = { ...s, result: taintUnreproduced(s.result, unreproduced) };
+      if (!m.solo && s?.kind === "ran") m.scoped = { ...s, result: taintUnreproduced(s.result, unreproduced) };
     }
   }
 
@@ -1247,10 +1390,12 @@ export function createBatchCoordinator(options: BatchCoordinatorOptions = {}): B
     m.phase = "own-run";
     counters.ownRuns++;
     const link = linkDeadline(m.request.deadline, b.deadline.signal);
-    const out = await execute(scope, m.spec, link.deadline);
+    const out = await execute(b.key, scope, m.spec, link.deadline);
     link.unlink();
-    // B7.5: a finished run is evidence even when its member has already left.
-    if (out.kind === "ran") for (const id of out.result.failingIds) b.reproduced.add(id);
+    // B7.5: a finished run is evidence even when its member has already left. A solo member's run
+    // (B5.2a) is not: it ran outside the union, so it cannot tell which pooled member a union
+    // failure belongs to.
+    if (out.kind === "ran" && !m.solo) for (const id of out.result.failingIds) b.reproduced.add(id);
     if (m.settled) return;
     m.scoped = out;
     if (out.kind !== "ran") settle(m, { scoped: out, recheck: undefined });
@@ -1385,12 +1530,20 @@ export function createBatchCoordinator(options: BatchCoordinatorOptions = {}): B
 
   // -- seams (B-G5: a throwing seam becomes a fail-closed outcome) ------------------------------
 
-  async function execute(scope: BatchScope, spec: ScopedSpec, deadline: Deadline): Promise<ScopedOutcome> {
+  /**
+   * A run under the batch's hold. A run that ran, or ran out of time, measures the key's estimate
+   * (QA-2.2-17). The first run of a scope includes its slot wait, which only overstates it.
+   */
+  async function execute(key: string, scope: BatchScope, spec: ScopedSpec, deadline: Deadline): Promise<ScopedOutcome> {
+    const started = now();
+    let out: ScopedOutcome;
     try {
-      return await scope.execute(spec, deadline);
+      out = await scope.execute(spec, deadline);
     } catch (e) {
       return { kind: "error", reason: `scoped run failed: ${message(e)}` };
     }
+    if (out.kind === "ran" || out.kind === "timed-out") noteDuration(key, now() - started);
+    return out;
   }
 
   async function recheck(
@@ -1438,6 +1591,8 @@ export function createBatchCoordinator(options: BatchCoordinatorOptions = {}): B
       members: b.members.length,
     });
     void closeScope(b);
+    // W7: a hung batch no longer keeps the next windows waiting.
+    closeIdle();
   }
 
   // -- arrival (B2) ----------------------------------------------------------------------------
@@ -1447,16 +1602,30 @@ export function createBatchCoordinator(options: BatchCoordinatorOptions = {}): B
     if (request.testScope === "full" || !(runtime.batchWindowMs > 0)) return await runtime.direct(request);
     // QA-2.2-9: planning comes first, as in 2.1's direct hook, so an exhausted deadline still gets
     // the planning outcome (NoAffected, S6) the direct path gives, and aborted only for a spec.
+    // W7: a request in planning may join an open window, so it keeps the windows open.
+    planning++;
     let plan: ScopingPlan;
     try {
       plan = await runtime.plan({ command: request.command, cwd: request.cwd, changedFiles: request.changedFiles }, request.deadline);
     } catch (e) {
+      planning--;
+      closeIdle();
       return errorRun(`scoped run planning failed: ${message(e)}`);
     }
-    if ("noAffected" in plan) return { scoped: { kind: "no-affected", note: plan.note }, recheck: undefined };
-    if ("unverifiable" in plan) return { scoped: { kind: "unverifiable", code: plan.code, reason: plan.reason }, recheck: undefined };
+    planning--;
+    if ("noAffected" in plan) {
+      closeIdle();
+      return { scoped: { kind: "no-affected", note: plan.note }, recheck: undefined };
+    }
+    if ("unverifiable" in plan) {
+      closeIdle();
+      return { scoped: { kind: "unverifiable", code: plan.code, reason: plan.reason }, recheck: undefined };
+    }
     if (disposed) return abortedRun(BATCH_REASONS.disposed);
-    if (request.deadline.signal.aborted) return abortedRun(BATCH_REASONS.beforeRun);
+    if (request.deadline.signal.aborted) {
+      closeIdle();
+      return abortedRun(BATCH_REASONS.beforeRun);
+    }
     return join(runtime, request, plan);
   }
 

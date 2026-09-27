@@ -2,11 +2,12 @@ import { posix, win32 } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   BATCH_REASONS,
+  BATCH_RESERVE_MARGIN_MS,
   BATCH_STALE_GRACE_MS,
   argvTemplate,
   attributeUnion,
   batchKey,
-  createBatchCoordinator,
+  createBatchCoordinator as createCoordinator,
   createBatchDeadline,
   deriveSharedRecheck,
   envSignature,
@@ -16,7 +17,7 @@ import {
   taintUnreproduced,
   unionChangedFiles,
 } from "../../src/verify/batch";
-import type { BatchPlanInput, BatchPlanner, BatchRuntime } from "../../src/verify/batch";
+import type { BatchCoordinator, BatchCoordinatorOptions, BatchPlanInput, BatchPlanner, BatchRuntime } from "../../src/verify/batch";
 import { judgeScoped } from "../../src/verify/baseline";
 import type { DispatchReference } from "../../src/verify/reference";
 import { readResult } from "../../src/verify/runner";
@@ -32,6 +33,15 @@ import type {
 } from "../../src/verify/types";
 
 const REPORT = "/tmp/omr-verify-00000000-0000-0000-0000-000000000000.json";
+
+/**
+ * The tests of the W1-W6 mechanics, B5-B11 and the B12 property open windows that only a timer,
+ * the size cap or a reserve closes: W7's idle close (QA-2.2-17 a) would close each one as soon as
+ * its last request joined. W7 has its own tests below, which use createCoordinator itself.
+ */
+function createBatchCoordinator(options: BatchCoordinatorOptions = {}): BatchCoordinator {
+  return createCoordinator({ idleClose: false, ...options });
+}
 
 function spec(over: Partial<ScopedSpec> = {}): ScopedSpec {
   const inputs = over.inputs ?? ["/r/app/src/a.ts"];
@@ -1108,7 +1118,9 @@ describe("createBatchCoordinator: windows and the union run", () => {
     await outs[3];
     expect(calls.executes.map((e) => e.spec.inputs.length)).toEqual([3, 1]);
 
-    // W3: 60 ms left in the window, and a joiner with exactly 60 ms left.
+    // W3: 60 ms left in the window, and a joiner with exactly 60 ms left: far below its floor, so
+    // the window closes at once. QA-2.2-17 (c): that joiner cannot cover a batched run either, so
+    // the batch splits and it runs first, alone.
     const w3 = harness();
     const c3 = createBatchCoordinator({ platform: "linux" });
     const hook3 = c3.hook(w3.runtime);
@@ -1116,10 +1128,177 @@ describe("createBatchCoordinator: windows and the union run", () => {
     await vi.advanceTimersByTimeAsync(40);
     const short = hook3(req(["src/b.ts"], { deadline: liveDeadline(60) }));
     await flush();
-    expect(w3.calls.executes.map((e) => e.spec.inputs)).toEqual([[at("src/a.ts"), at("src/b.ts")]]);
+    expect(w3.calls.executes.map((e) => e.spec.inputs)).toEqual([[at("src/b.ts")], [at("src/a.ts")]]);
+    expect(c3.stats()).toMatchObject({ unionRuns: 0, ownRuns: 2, splits: 1 });
     expect(vi.getTimerCount()).toBe(0);
     await Promise.all([long, short]);
     await Promise.all([c.dispose(), c3.dispose()]);
+  });
+
+  it("QA-2.2-17 (b), W3: a member's floor moves the close time earlier, never later, and keeps one timer", async () => {
+    const { calls, runtime } = harness(MODEL, { runtime: { batchWindowMs: 10_000 } });
+    const c = createBatchCoordinator({ platform: "linux" });
+    const hook = c.hook(runtime);
+    const long = hook(req(["src/a.ts"]));
+    await vi.advanceTimersByTimeAsync(1_000);
+    // Floor = recheck threshold 1 s (captured reference) + the margin; 3 s more than that: it may
+    // wait 3 s, where the window alone would keep it 9 s more.
+    const tight = req(["src/b.ts"], { deadline: liveDeadline(1_000 + BATCH_RESERVE_MARGIN_MS + 3_000) });
+    const pt = hook(tight);
+    await flush();
+    expect(vi.getTimerCount()).toBe(1);
+    await vi.advanceTimersByTimeAsync(2_999);
+    expect(calls.executes).toHaveLength(0);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(calls.executes.map((e) => e.spec.inputs)).toEqual([[at("src/a.ts"), at("src/b.ts")]]);
+    // At the close, b still has its whole floor: the window spent nothing from its reserve.
+    expect(tight.deadline.remaining()).toBe(1_000 + BATCH_RESERVE_MARGIN_MS);
+    await Promise.all([long, pt]);
+
+    // No reference: the floor is only the margin, so the same budget waits the whole window.
+    const loose = harness(MODEL, { runtime: { batchWindowMs: 3_000 } });
+    const c2 = createBatchCoordinator({ platform: "linux" });
+    const outs = [
+      c2.hook(loose.runtime)(req(["src/a.ts"])),
+      c2.hook(loose.runtime)(req(["src/b.ts"], { reference: { kind: "none", reason: "none" }, deadline: liveDeadline(6_000) })),
+    ];
+    await vi.advanceTimersByTimeAsync(2_999);
+    expect(loose.calls.executes).toHaveLength(0);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(loose.calls.executes).toHaveLength(1);
+    await Promise.all(outs);
+    await Promise.all([c.dispose(), c2.dispose()]);
+  });
+
+  it("QA-2.2-17 (a), QA-2.2-18, W7: a lone request never waits; arrivals during a running batch gather until it ends", async () => {
+    const gate = deferred<void>();
+    const { calls, runtime } = harness(MODEL, {
+      execute: async (spec, _deadline, n) => {
+        if (n === 0) await gate.promise;
+        return ranModel(MODEL, spec);
+      },
+      runtime: { batchWindowMs: 10_000 },
+    });
+    const c = createCoordinator({ platform: "linux" });
+    const hook = c.hook(runtime);
+    const lone = hook(req(["src/a.ts"]));
+    await flush();
+    // No window wait: nothing else is in flight, so the window closed as the request joined.
+    expect(calls.executes.map((e) => e.spec.inputs)).toEqual([[at("src/a.ts")]]);
+    expect(c.stats()).toMatchObject({ openWindows: 0, runningBatches: 1 });
+    // Two requests arrive while that batch runs: they gather in one window ...
+    const later = [hook(req(["src/b.ts"])), hook(req(["src/c.ts"]))];
+    await flush();
+    expect(c.stats()).toMatchObject({ openWindows: 1, runningBatches: 1, pendingRequests: 3 });
+    // ... which closes as soon as the running batch ends, long before its 10 s timer.
+    gate.resolve();
+    await flush();
+    expect(calls.executes.map((e) => e.spec.inputs)).toEqual([[at("src/a.ts")], [at("src/b.ts"), at("src/c.ts")]]);
+    expect((await Promise.all([lone, ...later])).map((r) => ran(r).exitCode)).toEqual([0, 0, 0]);
+    expect(vi.getTimerCount()).toBe(0);
+    await c.dispose();
+  });
+
+  it("W7: a request still planning keeps a window open; its planning outcome closes it", async () => {
+    const held = deferred<void>();
+    const { calls, runtime } = harness(MODEL, {
+      plan: async (input) => {
+        if (input.changedFiles !== "unavailable" && input.changedFiles.length === 0) await held.promise;
+        return planModel(input);
+      },
+      runtime: { batchWindowMs: 10_000 },
+    });
+    const c = createCoordinator({ platform: "linux" });
+    const hook = c.hook(runtime);
+    const a = hook(req(["src/a.ts"]));
+    const none = hook(req([]));
+    await flush();
+    expect(c.stats()).toMatchObject({ openWindows: 1, pendingRequests: 1 });
+    expect(calls.executes).toHaveLength(0);
+    held.resolve();
+    expect(await none).toEqual({ scoped: { kind: "no-affected", note: "no affected tests" }, recheck: undefined });
+    await flush();
+    expect(calls.executes.map((e) => e.spec.inputs)).toEqual([[at("src/a.ts")]]);
+    expect(ran(await a).exitCode).toBe(0);
+    expect(vi.getTimerCount()).toBe(0);
+    await c.dispose();
+  });
+
+  it("QA-2.2-17 (c), B5.2a: with a measured run time, a member that cannot cover the batched schedule runs alone first", async () => {
+    const RUN_MS = 1_000;
+    const tick = () => new Promise<void>((resolve) => setTimeout(resolve, RUN_MS));
+    const { calls, runtime } = harness(MODEL, {
+      execute: async (spec) => {
+        await tick();
+        return ranModel(MODEL, spec);
+      },
+    });
+    const c = createCoordinator({ platform: "linux" });
+    const hook = c.hook(runtime);
+    // A first run measures the key's estimate: 1 s.
+    const warm = hook(req(["src/h.ts"]));
+    await vi.advanceTimersByTimeAsync(RUN_MS);
+    expect(ran(await warm).exitCode).toBe(0);
+    // Floor 2 s (1 s threshold + margin). s needs 2 s + 4 runs (union, 3 own runs) = 6 s: 5 s is short.
+    const s = req(["src/s.ts"], { deadline: liveDeadline(5_000) });
+    const outs = [hook(req(["src/a.ts"])), hook(s), hook(req(["src/b.ts"]))];
+    await flush();
+    expect(calls.executes.map((e) => e.spec.inputs)).toEqual([[at("src/h.ts")], [at("src/s.ts")]]);
+    // s's own run ends before the union starts.
+    await vi.advanceTimersByTimeAsync(RUN_MS);
+    expect(calls.executes.map((e) => e.spec.inputs).slice(2)).toEqual([[at("src/a.ts"), at("src/b.ts")]]);
+    await vi.advanceTimersByTimeAsync(RUN_MS);
+    const runs = await Promise.all(outs);
+    expect(ran(runs[1] as TestsPassRun).notes).toEqual(["planned 1 input(s)"]);
+    expect(ran(runs[0] as TestsPassRun).notes).toEqual(["planned 1 input(s)", "batched: 1 run for 2 requests"]);
+    expect(c.stats()).toMatchObject({ unionRuns: 1, ownRuns: 2, splits: 0 });
+    // Before any measurement the estimate is 0: the same budget stays in the union (a residual).
+    const cold = harness(MODEL);
+    const c2 = createCoordinator({ platform: "linux" });
+    const coldRuns = await Promise.all([
+      c2.hook(cold.runtime)(req(["src/a.ts"])),
+      c2.hook(cold.runtime)(req(["src/s.ts"], { deadline: liveDeadline(5_000) })),
+    ]);
+    expect(cold.calls.executes.map((e) => e.spec.inputs.length)).toEqual([2]);
+    expect(coldRuns.map((r) => ran(r).exitCode)).toEqual([0, 0]);
+    await Promise.all([c.dispose(), c2.dispose()]);
+  });
+
+  it("B5.2a, B-G2: a solo member's run never explains a union failure the pooled members' own runs do not reproduce", async () => {
+    const RUN_MS = 1_000;
+    const tick = () => new Promise<void>((resolve) => setTimeout(resolve, RUN_MS));
+    const flaky = "test/g.test.ts > x";
+    const failing: Model = { ...MODEL, failing: { "test/g.test.ts": ["x"] } };
+    const { calls, runtime } = harness(MODEL, {
+      execute: async (spec, _deadline, n) => {
+        await tick();
+        // n = 2 is the union of a and b, with a failure no pooled member's own run shows.
+        if (n === 2) {
+          const r = runModel(MODEL, spec);
+          return { kind: "ran", result: { ...r, failingIds: [flaky], failingFiles: [at("test/g.test.ts")] }, exitCode: 1, spec, notes: spec.notes };
+        }
+        return ranModel(failing, spec);
+      },
+    });
+    const c = createCoordinator({ platform: "linux" });
+    const hook = c.hook(runtime);
+    const warm = hook(req(["src/h.ts"]));
+    await vi.advanceTimersByTimeAsync(RUN_MS);
+    await warm;
+    const none = { kind: "none", reason: "none" } as const;
+    const outs = [
+      hook(req(["src/a.ts"], { reference: none })),
+      hook(req(["src/g.ts"], { reference: none, deadline: liveDeadline(3_000) })),
+      hook(req(["src/b.ts"], { reference: none })),
+    ];
+    await vi.advanceTimersByTimeAsync(5 * RUN_MS);
+    const runs = await Promise.all(outs);
+    expect(calls.executes.map((e) => e.spec.inputs.length)).toEqual([1, 1, 2, 1, 1]);
+    // s ran alone and failed x itself; a and b are tainted, never passed on the strength of s's run.
+    expect(ran(runs[1] as TestsPassRun).result.failingIds).toEqual([flaky]);
+    for (const r of [runs[0], runs[2]]) expect(ran(r as TestsPassRun).result.complete).toBe(false);
+    expect(c.stats().taints).toBe(1);
+    await c.dispose();
   });
 
   it("a maximum size that is not a safe integer >= 1 means no batching", async () => {
@@ -1171,7 +1350,8 @@ describe("createBatchCoordinator: windows and the union run", () => {
     });
     const c = createBatchCoordinator({ platform: "linux" });
     const hook = c.hook(runtime);
-    const a = req(["src/a.ts"], { deadline: liveDeadline(1_000) });
+    // a's budget covers its floor (W3: recheck threshold + margin), so it waits in the window.
+    const a = req(["src/a.ts"], { deadline: liveDeadline(3_000) });
     const b = req(["src/b.ts"], { deadline: liveDeadline(9_000) });
     const pa = hook(a);
     const pb = hook(b);
@@ -1179,12 +1359,12 @@ describe("createBatchCoordinator: windows and the union run", () => {
     const union = calls.executes[0];
     expect(union?.deadline.remaining()).toBe(8_900);
 
-    await vi.advanceTimersByTimeAsync(900);
+    await vi.advanceTimersByTimeAsync(2_900);
     expect(a.deadline.remaining()).toBe(0);
     a.deadline.abort();
     expect(await pa).toEqual(aborted(BATCH_REASONS.run));
     expect(union?.deadline.signal.aborted).toBe(false);
-    expect(union?.deadline.remaining()).toBe(8_000);
+    expect(union?.deadline.remaining()).toBe(6_000);
 
     gate.resolve();
     expect(ran(await pb)).toMatchObject({ exitCode: 0, spec: { inputs: [at("src/b.ts")] } });
@@ -1747,8 +1927,17 @@ describe("createBatchCoordinator: attribution and rechecks", () => {
 
   it("a member below the recheck threshold gets skipped-deadline and leaves its group", async () => {
     const model: Model = { ...sharedFile("test/common.test.ts"), failing: { "test/common.test.ts": ["old"] }, atRef: { "test/common.test.ts": ["old"] } };
-    const { calls, runtime } = harness(model);
-    const { runs } = await batch(runtime, [req(["src/a.ts"], { deadline: liveDeadline(1_050) }), req(["src/b.ts"])]);
+    // a arrives with enough for its floor (W3, B5.2a); the union run then uses up all but 950 ms.
+    let left = 2_500;
+    const short: TestDeadline = { ...liveDeadline(2_500), remaining: () => left, bound: (ms) => Math.min(ms, left) };
+    const { calls, runtime } = harness(model, {
+      execute: (spec, _deadline, n) => {
+        if (n === 0) left = 950;
+        return ranModel(model, spec);
+      },
+    });
+    const { runs } = await batch(runtime, [req(["src/a.ts"], { deadline: short }), req(["src/b.ts"])]);
+    expect(calls.executes[0]?.spec.inputs).toHaveLength(2);
     expect(runs[0]?.recheck).toEqual({ kind: "skipped-deadline", remainingMs: 950 });
     expect(runs[1]?.recheck?.kind).toBe("exact");
     expect(calls.rechecks).toHaveLength(1);
