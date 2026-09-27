@@ -25,12 +25,41 @@ const CASES: { name: FixtureName; testDir: string; pattern: RegExp; min: number 
   { name: "pytest-app", testDir: "tests", pattern: /^test_.*\.py$/, min: 20 },
 ];
 
+/**
+ * ANSI escape sequences (CSI, including SGR colours). vitest colours its summary whenever `CI` is
+ * set, even into a pipe (CI round 1: `\x1b[2m      Tests \x1b[22m \x1b[1m\x1b[31m1 failed`), so the
+ * summary is only parseable once they are stripped.
+ */
+const ANSI_RE = /\u001b\[[0-?]*[ -/]*[@-~]/g;
+
+/** The failed-test count from a runner's summary line, or undefined when there is none. */
 function countFailed(output: string): number | undefined {
-  // vitest "Tests  1 failed | 125 passed", jest "Tests:       1 failed, 63 passed",
-  // pytest "1 failed, 63 passed in 0.2s". Loose on purpose.
-  const m = /Tests:?\s+(\d+) failed/.exec(output) ?? /=+ (\d+) failed/.exec(output);
+  // vitest "      Tests  1 failed | 125 passed (126)", jest "Tests:       1 failed, 63 passed, 64 total",
+  // pytest "==== 1 failed, 63 passed in 0.2s ====". One summary line each, matched per line.
+  const text = output.replace(ANSI_RE, "").replace(/\r\n?/g, "\n");
+  const m = /^[ \t]*Tests:?[ \t]+(\d+) failed\b/m.exec(text) ?? /^=+ (\d+) failed\b/m.exec(text);
   return m ? Number(m[1]) : undefined;
 }
+
+// Always runs (no install): the parser against the summaries the runners really print.
+describe("e2e fixtures self-check: failed-count parser", () => {
+  it("reads vitest's coloured CI summary (CI round 1), CRLF included", () => {
+    const ci = "\u001b[2m Test Files \u001b[22m \u001b[1m\u001b[31m1 failed\u001b[39m\u001b[22m\u001b[2m | \u001b[22m\u001b[1m\u001b[32m42 passed\u001b[39m\u001b[22m\u001b[90m (43)\u001b[39m\r\n"
+      + "\u001b[2m      Tests \u001b[22m \u001b[1m\u001b[31m1 failed\u001b[39m\u001b[22m\u001b[2m | \u001b[22m\u001b[1m\u001b[32m126 passed\u001b[39m\u001b[22m\u001b[90m (127)\u001b[39m\r\n";
+    expect(countFailed(ci)).toBe(1);
+  });
+
+  it("reads the plain vitest, jest and pytest summaries", () => {
+    expect(countFailed(" Test Files  1 failed | 42 passed (43)\n      Tests  1 failed | 126 passed (127)\n")).toBe(1);
+    expect(countFailed("Tests:       1 failed, 63 passed, 64 total\n")).toBe(1);
+    expect(countFailed("=========== 1 failed, 63 passed in 0.52s ===========\n")).toBe(1);
+  });
+
+  it("is undefined without a summary, and ignores a test named like one", () => {
+    expect(countFailed("")).toBeUndefined();
+    expect(countFailed("  × Tests 2 failed somewhere\n      Tests  3 passed (3)\n")).toBeUndefined();
+  });
+});
 
 const suite = e2eEnabled() ? describe : describe.skip;
 
