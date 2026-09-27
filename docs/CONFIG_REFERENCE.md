@@ -270,8 +270,11 @@ through its long path. Whether the host actually passes short paths is still to 
 confirmed by the Phase 3.1 live check.
 
 **Deprecations.** `testBaseline` is deprecated (`false` maps to
-`failureRecheck: false`; a one-time warning is logged). `gateBudgetMs` is no
-longer shipped in the bundled `tiers.json`; its in-code default applies.
+`failureRecheck: false`; a one-time warning is logged).
+
+**Bundled defaults.** The bundled `tiers.json` no longer sets `gateBudgetMs`. The
+key is still supported, not deprecated; its in-code default of 90 s (90000 ms)
+applies.
 
 ### Grader changed-file set
 

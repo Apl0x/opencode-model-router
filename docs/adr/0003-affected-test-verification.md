@@ -150,7 +150,9 @@ Each dispatch carries `VERIFY:required` or `VERIFY:deferred` (default: `defaultV
   - `lowPriority` is applied just after spawn; a descendant spawned before that call (a narrow
     race) runs at normal priority.
 - **Deprecations.** `enforcement.verify.testBaseline` logs a once-per-process warning and maps onto
-  `failureRecheck`. The `gateBudgetMs` key is removed from `tiers.json`.
+  `failureRecheck`.
+- **Bundled defaults.** The bundled `tiers.json` no longer sets `gateBudgetMs`. The key is still
+  supported, not deprecated; its in-code default of 90 s (90000 ms) applies.
 
 ## Alternatives rejected
 
