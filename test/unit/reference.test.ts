@@ -532,6 +532,54 @@ describe("materialize / dispose", { timeout: 60_000 }, () => {
     expect(await fsp.readFile(join(repo, "packages", "a", "index.js"), "utf8")).toBe("module.exports = 1;\n");
   });
 
+  it("QA-1.5-6a: core.autocrlf=true or input -> inexact checkout-conversion", async () => {
+    for (const value of ["true", "input"]) {
+      await git(repo, "config", "core.autocrlf", value);
+      const handle = await mat(await capture());
+      try {
+        if (value === "true") expect(await fsp.readFile(join(handle.dir, "a.txt"), "utf8")).toBe("a0\r\n");
+        expect(handle.exact).toBe(false);
+        expect(handle.inexactReasons).toContainEqual({ cause: "checkout-conversion", path: "" });
+      } finally {
+        await handle.dispose();
+      }
+    }
+  });
+
+  it("QA-1.5-6a: a dirty file whose checkout differs from the live bytes (eol attribute) -> inexact for that path", async () => {
+    await fsp.writeFile(join(repo, ".gitattributes"), "*.txt text eol=crlf\n");
+    await git(repo, "add", ".gitattributes");
+    await git(repo, "commit", "-q", "-m", "eol");
+    await fsp.writeFile(join(repo, "a.txt"), "x\ny\n");
+    const ref = await capture();
+    expect([...ref.tracked.keys()]).toEqual(["a.txt"]);
+    const handle = await mat(ref);
+    try {
+      expect(await fsp.readFile(join(handle.dir, "a.txt"), "utf8")).toBe("x\r\ny\r\n");
+      expect(handle.exact).toBe(false);
+      expect(handle.inexactReasons).toContainEqual({ cause: "checkout-conversion", path: "a.txt" });
+    } finally {
+      await handle.dispose();
+    }
+  });
+
+  it("QA-1.5-6b: assume-unchanged / skip-worktree entries -> inexact index-flags", async () => {
+    await git(repo, "update-index", "--assume-unchanged", "b.txt");
+    await git(repo, "update-index", "--skip-worktree", "packages/a/index.js");
+    await fsp.writeFile(join(repo, "b.txt"), "b-local\n");
+    await fsp.writeFile(join(repo, "packages", "a", "index.js"), "module.exports = 'local';\n");
+    const ref = await capture();
+    expect(ref.captureReasons).toEqual([{ cause: "index-flags", path: "b.txt" }]);
+    const handle = await mat(ref);
+    try {
+      expect(await fsp.readFile(join(handle.dir, "b.txt"), "utf8")).toBe("b0\n"); // the gap the reason reports
+      expect(handle.exact).toBe(false);
+      expect(handle.inexactReasons).toContainEqual({ cause: "index-flags", path: "b.txt" });
+    } finally {
+      await handle.dispose();
+    }
+  });
+
   it("commit-missing -> ok:false", async () => {
     const ref = await capture();
     const result = await materialize({ ...ref, commit: "0".repeat(40) }, undefined, new AbortController().signal, deps());

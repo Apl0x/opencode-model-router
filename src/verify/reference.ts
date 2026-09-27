@@ -43,6 +43,10 @@
 //               never reproduced. This module computes the per-file hashes
 //               itself: snapshotTree (tree.ts) keeps only one aggregate hash
 //               over all untracked files (spike gather notes).
+//   tracked     Map<relPath, sha256 hex> of the LIVE bytes of every tracked
+//               path that differs between head and commit and is a regular
+//               file at capture (section 2e). Empty when commit = head.
+//   captureReasons  InexactReasons found at capture (section 2f).
 //   capturedAt  now() when the capture resolved.
 //   Ignored content (node_modules, dist, .env, ...) is NOT part of the
 //   reference. At materialize, node_modules directories are linked from the
@@ -70,6 +74,22 @@
 //       load CURRENT code at the reference, so exact is false. Detection: for
 //       each linked node_modules, readdir its top level plus one level under
 //       each `@scope` directory, lstat each entry, and realpath every link.
+//   (e) The checkout reproduces the live bytes (QA-1.5-6a). The stash commit
+//       stores normalized blobs, and checkout converts them again, so the
+//       reference can differ from the live tree byte for byte: with
+//       core.autocrlf=true live "x\n" became "x\r\n"; with input, a dirty
+//       CRLF file became LF; `text`/`eol`/`filter` attributes do the same.
+//       Two checks: core.autocrlf set to anything but false (true, input,
+//       yes, on, 1) at materialize adds "checkout-conversion" with path ""
+//       (it also affects files git reports as clean); and every entry of
+//       `tracked` must hash equal to the checked-out file, otherwise
+//       "checkout-conversion" with that path.
+//   (f) No index entry is assume-unchanged or skip-worktree at capture
+//       (QA-1.5-6b). Git skips such entries, so neither stash create nor the
+//       drift diff sees a local edit to them (live "v2-local" became "v1" at
+//       the reference, exact: true). `git ls-files -v` tags them with a
+//       lowercase letter or `S`; the first such path (sorted) adds one
+//       "index-flags" reason, recorded in captureReasons.
 //   Each violation adds one InexactReason; exact === (inexactReasons.length ===
 //   0). An approximate reference never excuses a failure: the recheck (2.x)
 //   turns a reference-side failure of an approximate reference into
@@ -101,7 +121,9 @@
 //      undefined.
 //   2. `git ls-files --stage` (cwd: root). Any line starting "160000 " (a
 //      gitlink, i.e. a submodule) returns undefined. This is the same refusal
-//      snapshotTree makes (tree.ts).
+//      snapshotTree makes (tree.ts). Then `git ls-files -v -z`: the first
+//      assume-unchanged or skip-worktree path adds "index-flags" to
+//      captureReasons (section 2f).
 //   3. `git rev-parse --verify HEAD^{commit}` -> head. Failure (e.g. an unborn
 //      branch) returns undefined.
 //   4. `git stash create` on a PRIVATE INDEX (QA-1.5-1/2) -> trimmed stdout.
@@ -134,6 +156,13 @@
 //      Measured by QA on this host: the same tree as a plain `stash create`,
 //      and 0/120 producer `git add` failures against a capture loop, versus
 //      27/120 when stash create shared the user's index.
+//      Then, when commit != head: `git diff-tree -r -z --name-only
+//      --no-renames <head> <commit>` lists the dirty tracked paths. Each is
+//      checked against the RELPATH rules (a violation returns undefined),
+//      lstat'ed, and, if it is a regular file, read and hashed into
+//      `tracked` (section 2e). A deleted path or a non-file is skipped. The
+//      MAX_UNTRACKED_FILES / MAX_UNTRACKED_BYTES caps apply to this set on
+//      its own, as to the untracked set; exceeding them returns undefined.
 //   5. `git ls-files --others --exclude-standard --full-name -z` (cwd: root).
 //      For each path, in sorted order: apply the RELPATH rules (section 10),
 //      then lstat. A regular file is read (with the signal) and hashed with
@@ -198,6 +227,11 @@
 //      still run, within the budget. Failure returns ok:false
 //      "worktree-add-failed". Once the worktree exists, its HEAD pins the
 //      commit against gc (Spike E).
+//   3b. Byte-exactness (section 2e/2f): start from ref.captureReasons; run
+//      `git config --get core.autocrlf` (cwd: root); then, for each
+//      [rel, hash] of ref.tracked in sorted order, lstat and hash dir/rel.
+//      A missing file, a non-file, a hash mismatch or an unsafe rel adds
+//      "checkout-conversion" for rel.
 //   4. Copy untracked files, for each [rel, hash] in ref.untracked, in sorted
 //      order:
 //      - rel fails the RELPATH rules -> inexact "untracked-unsafe-path".
@@ -465,8 +499,9 @@
 //      `git stash create` itself is kept because the plan's S2 row (§1.3)
 //      names it.
 //   D3 exact=false has more causes than §1.5-7: untracked symlinks, dependency
-//      drift and workspace-link drift (section 2, b to d). These only make the
-//      check stricter, and approximate still never excuses.
+//      drift, workspace-link drift, checkout conversion and index flags
+//      (section 2, b to f). These only make the check stricter, and
+//      approximate still never excuses.
 //   D4 materialize returns { ok: true, reference } | { ok: false, reason,
 //      detail } instead of the plan's { dir, exact, dispose() }, so a verdict
 //      can say why the reference is unavailable. The handle adds
@@ -509,6 +544,14 @@
 //   - node_modules content generated from repository files (e.g. a Prisma
 //     client) reflects the live tree; check (c) only catches manifest and
 //     lockfile drift.
+//   - Checkout conversion of files git reports as CLEAN is detected only
+//     through core.autocrlf (section 2e). Under a `text`/`eol`/`filter`
+//     attribute with core.autocrlf=false, a clean file whose live bytes are
+//     not what checkout would write (e.g. saved with LF under
+//     `text eol=crlf`, which git normalizes and so does not report) still
+//     differs at the reference while exact stays true. Hashing every tracked
+//     file at capture would close this, at a cost the capture budget cannot
+//     bound. Dirty files are always compared.
 //   - An ignored file that tests need (.env, generated code) is absent at the
 //     reference. The recheck must classify the resulting failure as a setup
 //     failure (§1.5-8). `unreproduced` supports that decision but cannot make
@@ -624,6 +667,10 @@ export interface DispatchReference {
   readonly commit: string;
   /** Untracked, not ignored files at dispatch: git relPath (forward slashes) -> sha256 hex, or UNTRACKED_SYMLINK. */
   readonly untracked: ReadonlyMap<string, string>;
+  /** Tracked paths that differ between head and commit and were regular files: relPath -> sha256 of the live bytes (section 2e). */
+  readonly tracked: ReadonlyMap<string, string>;
+  /** Found at capture; every reference built from this capture is approximate for them (section 2f). */
+  readonly captureReasons: readonly InexactReason[];
   /** now() when the capture resolved. */
   readonly capturedAt: number;
 }
@@ -636,11 +683,13 @@ export type InexactCause =
   | "untracked-symlink"
   | "untracked-unsafe-path"
   | "dependency-drift"
-  | "workspace-link-drift";
+  | "workspace-link-drift"
+  | "index-flags"
+  | "checkout-conversion";
 
 export interface InexactReason {
   readonly cause: InexactCause;
-  /** Root-relative git path (forward slashes) the cause refers to. */
+  /** Root-relative git path (forward slashes) the cause refers to; "" for a repository-wide cause. */
   readonly path: string;
 }
 
@@ -1113,6 +1162,16 @@ async function captureInner(cwd: string, signal: AbortSignal, deps: CaptureDeps)
   const root = p.resolve(stripNewline(top.stdout));
   const stage = await git(["ls-files", "--stage"], root);
   if (!stage || /^160000 /m.test(stage.stdout)) return undefined;
+  // Section 2f (QA-1.5-6): neither stash create nor the drift diff sees an edit to an
+  // assume-unchanged (lowercase tag) or skip-worktree (`S`) entry.
+  const tagged = await git(["ls-files", "-v", "-z"], root);
+  if (!tagged) return undefined;
+  const captureReasons: InexactReason[] = [];
+  const flagged = splitZ(tagged.stdout)
+    .filter((record) => /^(?:[a-z]|S) /.test(record))
+    .map((record) => record.slice(record.indexOf(" ") + 1))
+    .sort(byCodeUnit);
+  if (flagged.length > 0) captureReasons.push({ cause: "index-flags", path: flagged[0] ?? "" });
   const headOut = await git(["rev-parse", "--verify", "HEAD^{commit}"], root);
   if (!headOut) return undefined;
   const head = headOut.stdout.trim();
@@ -1135,6 +1194,26 @@ async function captureInner(cwd: string, signal: AbortSignal, deps: CaptureDeps)
   else if (/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(stashOut)) commit = stashOut;
   else return undefined;
 
+  // Section 2e (QA-1.5-6): live bytes of every dirty tracked file, to be compared with the
+  // bytes the checkout produces (EOL conversion, text/eol/filter attributes).
+  const tracked = new Map<string, string>();
+  if (commit !== head) {
+    const dirty = await git(["diff-tree", "-r", "-z", "--name-only", "--no-renames", head, commit], root);
+    if (!dirty) return undefined;
+    const dirtyPaths = splitZ(dirty.stdout).sort();
+    if (dirtyPaths.length > MAX_UNTRACKED_FILES) return undefined;
+    let dirtyBytes = 0;
+    for (const rel of dirtyPaths) {
+      if (budget.spent() || !isSafeRelPath(rel, platform)) return undefined;
+      const absolute = p.join(root, rel);
+      const stats = await lstatOrMissing(deps.fs, absolute);
+      if (!stats || stats.isSymbolicLink() || !stats.isFile()) continue; // deleted or not a file: nothing to compare
+      dirtyBytes += stats.size;
+      if (dirtyBytes > MAX_UNTRACKED_BYTES) return undefined;
+      tracked.set(rel, sha256(await deps.fs.readFile(absolute, { signal: budget.signal })));
+    }
+  }
+
   const listed = await git(["ls-files", "--others", "--exclude-standard", "--full-name", "-z"], root);
   if (!listed) return undefined;
   const paths = splitZ(listed.stdout).sort();
@@ -1156,7 +1235,7 @@ async function captureInner(cwd: string, signal: AbortSignal, deps: CaptureDeps)
     }
   }
   if (budget.spent()) return undefined;
-  return { root, head, commit, untracked, capturedAt: Date.now() };
+  return { root, head, commit, untracked, tracked, captureReasons, capturedAt: Date.now() };
 }
 
 interface PrivateIndexEnv {
@@ -1353,8 +1432,27 @@ export async function materialize(
     if (budget.spent()) return await abandon("aborted", "aborted during git worktree add");
     if (!added || added.code !== 0) return await abandon("worktree-add-failed", added?.stderr.trim() ?? "");
 
+    // 3b. Byte-exactness of the checkout (section 2e/2f, QA-1.5-6).
+    const reasons: InexactReason[] = [...ref.captureReasons];
+    const autocrlf = await git(["config", "--get", "core.autocrlf"]);
+    if (budget.spent()) return await abandon("aborted", "aborted while reading core.autocrlf");
+    if (autocrlf && autocrlf.code === 0 && !/^(?:false|no|off|0|)$/i.test(autocrlf.stdout.trim())) {
+      reasons.push({ cause: "checkout-conversion", path: "" });
+    }
+    for (const [rel, hash] of [...ref.tracked].sort(([a], [b]) => byCodeUnit(a, b))) {
+      if (budget.spent()) return await abandon("aborted", "aborted while comparing tracked files");
+      if (!isSafeRelPath(rel, platform)) {
+        reasons.push({ cause: "checkout-conversion", path: rel });
+        continue;
+      }
+      const checkedOut = p.join(dir, rel);
+      const stats = await lstatOrMissing(fs, checkedOut);
+      const same = stats !== undefined && stats.isFile() && !stats.isSymbolicLink() &&
+        sha256(await fs.readFile(checkedOut, { signal: budget.signal })) === hash;
+      if (!same) reasons.push({ cause: "checkout-conversion", path: rel });
+    }
+
     // 4. Untracked files: the hashed buffer is the written buffer.
-    const reasons: InexactReason[] = [];
     const changed = new Set<string>();
     const inexact = (cause: InexactCause, path: string) => {
       reasons.push({ cause, path });
