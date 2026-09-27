@@ -174,6 +174,7 @@ not in any test, because every test gives the store a complete change set.
 | QA-2.1-8 | info | **Duplicate change-set entries under a Windows 8.3 short-name directory.** `pathKey` does not canonicalise short names. A tool-observed path under `C:\Users\MARQUI~1\…` and the realpath'd snapshot path of the same file are two entries; the repro printed `\src\b.js` and `C:\Users\Marquinho\…\src\b.js` for one file. The snapshot's status and `previousPath` then do not override the tool entry (`dispatch.ts:221-228`). This fails safe (wider scope), but a deletion seen through the short spelling keeps status `modified`. | Key by the realpath of the dispatch cwd (or a root-relative path), or canonicalise tool paths through native `realpath` of their parent. |
 | QA-2.1-9 | info | **A live `node_modules` that is itself a junction is not usable at the reference.** Repro scenario A, attempt 1: the recheck returned `reference unusable (rerun-unplannable): runner not installed: vitest` (unverifiable; fails closed). The cause was not isolated; most likely materialize does not link a `node_modules` that is itself a link. | None required unless linked-`node_modules` layouts are supported; if so, follow the link when materialize links `node_modules`. |
 | QA-2.1-10 | nit | **`INERT_UNREPRODUCED` matches the last path segment anywhere** (`deterministic.ts:752-774`). An ignored `test/fixtures/logs/` directory, or an ignored `*.log` fixture that a test reads, therefore counts as inert. T4.f asks for evidence that tests cannot read an inert entry. | Anchor the directory patterns (e.g. `coverage/` and `.nyc_output/` at a package root), or exclude paths under test directories. Low priority. |
+| QA-2.1-11 | major | **Plugin start holds the project directory** (found by the orchestrator's full capped suite run, after `9bb0ece`). `startReferenceGc` ran `gcStaleReferences(directory, …)` as the plugin factory returned, and its `git worktree list` child had the project directory as cwd. On Windows a process's cwd holds the directory, so 7 integration tests that remove their plugin directory right after start failed with `EBUSY: resource busy or locked, rmdir '<temp>/model-router-…'`: `test/integration/fable-effort-preset.test.ts` (2) and `test/integration/prompt-style-mixed.test.ts` (5). | Defer the GC on an unref'd timer and cancel it on plugin dispose. `git -C` is not enough: git changes into the directory itself. |
 
 **Handoffs checked with no finding:**
 - QA-1.3-16 and -17 (mutants killed).
@@ -191,3 +192,70 @@ not in any test, because every test gives the store a complete change set.
 - Every deadline, timer and listener is disposed or removed on each path read.
 
 **Status: NOT CLEAN.** QA-2.1-1 and -2 are critical false passes on the default config.
+
+## Round 1 resolutions
+
+Critical and major findings. Each regression test fails on the pre-fix code.
+
+- QA-2.1-1 Resolution: 78451f3 — each producer session gated against a dispatch joins its lineage
+  (`DispatchRecord.producers`), and `delta` unions the tool-observed files of the whole lineage
+  (`DispatchRecord.observed`). A retry's session is folded in before the ladder's per-attempt
+  `clear()`, so attempt 3 still sees attempts 1 and 2. Tests: a store retry test in
+  `baseline.test.ts` (attempts 1-3, an unrelated session excluded, sticky `written`), and a wiring
+  test in `baseline-wiring.test.ts` where the retry gate's testsPass request carries attempt 1's
+  already-dirty file.
+- QA-2.1-2 Resolution: 1dacb5a — `TreeSnapshot.digests`: the dispatch snapshot records a content
+  digest (sha256, link target, or absent) for each dirty or untracked path. It reads files only
+  (sizes summed from `lstat` before any read), inside the existing snapshot bound
+  (`baselineTimeoutMs`, and `captureWaitMs` for the dispatch wait), and spawns nothing. Over
+  `MAX_DIGEST_FILES` (500) paths or `MAX_DIGEST_BYTES` (64 MiB), or on anything unreadable, the
+  digests are `"unavailable"`. `prepareVerification` digests the dispatch snapshot's paths at the
+  gate. When the tree fingerprint changed, `delta` adds each dispatch-listed path whose digest
+  changed, that left the listing, or that the gate could not digest. With no digests on either
+  side, a changed fingerprint makes the change set `"unavailable"`, so testsPass is unverifiable
+  (S6). An unchanged fingerprint adds nothing. Tests: store cases in `baseline.test.ts` (sed,
+  `git checkout`, `git rm`, `rm`, undigested, unchanged; four unavailable combinations) and
+  real-git tests in `baseline-wiring.test.ts`: digests and bounds; the QA repro scenario B
+  (`sed`-style write to the dirty `src/a.js`); `git checkout` / `git rm -f` / an untracked
+  deletion; 501 dirty paths, where the unchanged tree stays available and an edit makes the gate
+  unverifiable with no process spawned. `repro-retry.ts` now reports scenario A attempt 2 and
+  scenario B as unverifiable, not pass, with `src/a.js` in the change set. They are unverifiable
+  rather than fail only because of QA-2.1-9.
+- QA-2.1-3 Resolution: 7793655 — `closeWithinDeadline(scope, deadline, logger)`: the hook awaits
+  `close()` only while the gate deadline lasts (its abort, or its remaining time). Within budget
+  the close is still awaited, so scopes never nest. After that, the close keeps running in the
+  background and its rejection is logged. `close()` is unchanged: the slot is released only after
+  the tracked disposals and the killed tree settle. A spent deadline bars later scopes of the gate
+  from acquiring (`acquireHold`). The listener and timer are always cleared. Command checks
+  (`obtainExec`) still await their own close, which has no dispose. T2 P9 was reworded. Tests in
+  `tests-pass-pipeline.test.ts`:
+  - with fake timers, a close that never settles is awaited until 999 ms and returns at 1000 ms;
+  - a spent deadline does not wait, and a rejecting close is logged;
+  - the index.ts shape (`createDeadline` + `withTimeout(accept)` + `onFailure`) with a close that
+    never settles yields `fail` with the introduced id, within budget. The old code gave an
+    accepted `unverifiable` here.
+- QA-2.1-11 Resolution: 9881621 — `startReferenceGc(delayMs = REFERENCE_GC_START_DELAY_MS)` (45 s)
+  schedules the GC on an unref'd timer and reads its config when the timer fires. It returns a
+  cancel function; the plugin's `dispose` calls it, clearing a pending timer and aborting the git
+  calls of a GC in flight through a linked signal. Tests:
+  - `reference-gc-start.test.ts` (fake timers): nothing at start, one GC at the delay, a rejection
+    logged, the project dir removable right after start, and dispose cancels;
+  - `baseline-wiring.test.ts`: the delay, the unref, cancel before the delay and cancel in flight.
+
+  `npx vitest run --maxWorkers=2 test/integration/fable-effort-preset.test.ts
+  test/integration/prompt-style-mixed.test.ts test/integration/reference-gc-start.test.ts` passed
+  3 times in a row (3 files, 12 tests each run).
+
+Runs after the fixes:
+- the nine scoped files (`tests-pass-pipeline`, `baseline`, `baseline-wiring`, `deterministic`,
+  `wiring`, `tree`, `delegate-timeout`, `reference-gc-start`, `layer2-wiring`): 9 files, 327
+  passed;
+- `npm run typecheck`: clean.
+
+QA-2.1-4 to -10 (minor, info and nit) are not addressed in this round.
+
+Residual for round 2 (not a fix in this round): the QA-2.1-2 digests cover paths that were dirty or
+untracked at dispatch. A producer that edits a file clean at dispatch through the shell and then
+commits it leaves nothing in `git status`, so that file is still unattributed. `delta` does not
+compare `head`. Candidates are a `git diff --name-status <dispatch head> HEAD` at the gate, or
+"unavailable" when `head` moved.
