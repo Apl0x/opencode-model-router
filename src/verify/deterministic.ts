@@ -4,7 +4,7 @@
 // seams. ./paths is pure path math (node:path only) and keeps that contract.
 
 import type { Check, DoD } from "./dod";
-import type { Verdict, DeterministicDeps, MutexRegistry, ExecResult } from "./types";
+import type { Verdict, DeterministicDeps, MutexRegistry, ExecResult, Deadline } from "./types";
 import { scrubText } from "../guard/scrub";
 import { resolveAgainst } from "./paths";
 import { isAbsolute } from "node:path";
@@ -587,6 +587,135 @@ export function resolveRepoCommand(
 //   - Concurrent agents editing the same files: attribution is per session (ADR 0002 D3); a
 //     reference cannot separate two producers' changes to one file.
 // ===============================================================================================
+
+export { fileKeyOfId } from "./baseline";
+
+/** T3: below this many milliseconds left, the Rechecker skips (u7) without materializing or spawning. */
+export const RECHECK_MIN_REMAINING_MS = 10_000;
+
+/** A Deadline plus its owner's controls (T3, plan 2.1.5.a). */
+export interface OwnedDeadline extends Deadline {
+  /** Aborts `signal` now (the owner's withTimeout rejected). Idempotent. */
+  abort(reason?: string): void;
+  /** Clears the expiry timer; no timer outlives the gate. Idempotent. */
+  dispose(): void;
+}
+
+export interface DeadlineOptions {
+  /** Injected clock in ms; default Date.now. */
+  now?: () => number;
+}
+
+/** setTimeout clamps delays above this to 1 ms, so longer waits are chained. */
+const MAX_TIMER_MS = 2_147_483_647;
+
+function clampMs(ms: number): number {
+  return Number.isNaN(ms) ? 0 : Math.max(0, ms);
+}
+
+function makeDeadline(
+  budgetMs: number,
+  now: () => number,
+  parent: Deadline | undefined,
+  defaultReason: string,
+): OwnedDeadline {
+  const budget = clampMs(budgetMs);
+  const endsAt = now() + budget;
+  const controller = new AbortController();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const ownLeft = (): number => Math.max(0, endsAt - now());
+  const clear = (): void => {
+    if (timer !== undefined) clearTimeout(timer);
+    timer = undefined;
+  };
+  const onParentAbort = (): void => abort("parent deadline aborted");
+  const abort = (reason?: string): void => {
+    clear();
+    parent?.signal.removeEventListener("abort", onParentAbort);
+    if (!controller.signal.aborted) controller.abort(new Error(reason ?? defaultReason));
+  };
+  const schedule = (): void => {
+    const left = ownLeft();
+    if (left === Infinity) return;
+    if (left <= 0) {
+      abort(defaultReason);
+      return;
+    }
+    timer = setTimeout(schedule, Math.min(left, MAX_TIMER_MS));
+    timer.unref?.();
+  };
+  const remaining = (): number => {
+    if (controller.signal.aborted) return 0;
+    return parent ? Math.min(ownLeft(), parent.remaining()) : ownLeft();
+  };
+  if (parent?.signal.aborted) {
+    abort("parent deadline aborted");
+  } else {
+    parent?.signal.addEventListener("abort", onParentAbort, { once: true });
+    schedule();
+  }
+  return {
+    budgetMs: budget,
+    remaining,
+    bound: (ownBudgetMs: number): number => Math.min(clampMs(ownBudgetMs), remaining()),
+    signal: controller.signal,
+    abort,
+    dispose: (): void => {
+      clear();
+      parent?.signal.removeEventListener("abort", onParentAbort);
+    },
+  };
+}
+
+/**
+ * One deadline per gate invocation or router_verify call (T3). Its signal aborts at expiry (the
+ * timer is unref'd) or on abort(); dispose() clears the timer.
+ */
+export function createDeadline(budgetMs: number, opts: DeadlineOptions = {}): OwnedDeadline {
+  return makeDeadline(budgetMs, opts.now ?? Date.now, undefined, "gate budget exhausted");
+}
+
+/**
+ * A sub-deadline of `ownMs` that never outlives `parent` (T3 recheck sub-deadline): remaining() is
+ * min(own, parent), and its signal aborts at its own expiry or when the parent aborts.
+ */
+export function deriveDeadline(parent: Deadline, ownMs: number, opts: DeadlineOptions = {}): OwnedDeadline {
+  return makeDeadline(Math.min(clampMs(ownMs), parent.remaining()), opts.now ?? Date.now, parent, "recheck budget exhausted");
+}
+
+/**
+ * T4.f: `unreproduced` entries tests cannot read. Matched on the entry's last segment (a directory
+ * ends in "/"), case-insensitive on win32. Additions need evidence that tests cannot read them.
+ */
+export const INERT_UNREPRODUCED: readonly string[] = [
+  "coverage/", ".nyc_output/", "logs/", ".idea/", ".vscode/", ".pytest_cache/", "__pycache__/",
+  ".mypy_cache/", ".ruff_cache/",
+  "*.log", ".DS_Store", "Thumbs.db", "desktop.ini", ".eslintcache", "*.pyc",
+];
+
+export function isInertUnreproduced(entry: string, platform: string): boolean {
+  const normalized = entry.replace(/\\/g, "/");
+  const isDir = normalized.endsWith("/");
+  const segments = normalized.split("/").filter(s => s !== "");
+  const last = segments[segments.length - 1];
+  if (last === undefined) return false;
+  const fold = (s: string): string => (platform === "win32" ? s.toLowerCase() : s);
+  const name = fold(last);
+  for (const raw of INERT_UNREPRODUCED) {
+    const pattern = fold(raw);
+    if (pattern.endsWith("/")) {
+      if (isDir && `${name}/` === pattern) return true;
+    } else if (!isDir) {
+      if (pattern.startsWith("*.")) {
+        const ext = pattern.slice(1);
+        if (name.length > ext.length && name.endsWith(ext)) return true;
+      } else if (name === pattern) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
 
 async function runCommandCheck(
   check: Check,

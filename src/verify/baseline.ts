@@ -54,6 +54,17 @@ export function observeTests(result: ExecResult): TestObservation {
   };
 }
 
+/**
+ * The id-space file key of a RunResult id (deterministic.ts header, T5): the part before the first
+ * " > ", else before the first "::", else the whole (bare-file) id; "/" separators.
+ */
+export function fileKeyOfId(id: string): string {
+  const vitest = id.indexOf(" > ");
+  const pytest = id.indexOf("::");
+  const file = vitest >= 0 ? id.slice(0, vitest) : pytest >= 0 ? id.slice(0, pytest) : id;
+  return file.replace(/\\/g, "/");
+}
+
 export function compareTests(after: TestObservation, baseline?: TestBaseline): {
   ok: boolean; unverifiable?: boolean; reason?: string; evidence?: string; note?: string;
 } {
