@@ -155,6 +155,40 @@ plus the "no orphans after" margin) and whether the promise had resolved.
   plan risk table and in G4's wording ("descendants of an already-exited direct child on Windows
   are not killed"). Justification: libuv jobs cover Node-forked workers, and QA-1.2-2 bounds the
   run and the slot.
+- **Resolution: a1415e0 (test follow-up c2e4b8f)**
+  - **What changed.** A deadline or abort that arrives after the direct child's `exit` never
+    targets the exited PID. The POSIX and Windows paths differ.
+  - **POSIX.** The process group is signalled, unless it was already empty at `exit`. A group seen
+    empty is never signalled again, which closes the "empty group, recycled id" hole.
+  - **Windows.** A sweeper finds the processes whose `ParentProcessId` is the exited PID and whose
+    `CreationDate` lies in `[spawnedAt − 50 ms, exitedAt + 50 ms]`. It pins each one with an open
+    process handle, re-checks its `StartTime`, and on request runs `taskkill /pid <root> /T /F` on
+    every live root. A pinned root that exited meanwhile is swept the same way, over its exact
+    lifetime.
+  - **The sweeper process.** Windows PowerShell 5.1, run as `powershell.exe -NoLogo -NoProfile
+    -NonInteractive`. It is spawned directly, not through `run`, at normal priority. It has a 5 s
+    kill-phase timeout and never throws; any failure means "nothing killed".
+  - **Why this beats the proposal.**
+    1. Pinning closes the PID-reuse window between the query and the kill.
+    2. The sweeper is armed 200 ms after an `exit` whose pipes stay open. That pays PowerShell's
+       startup before the deadline instead of inside G4's 3 s. Measured here: startup 0.6–1.5 s;
+       kill phase about 0.4 s.
+    3. It also completes a `taskkill` that raced the exit.
+  - **Result semantics.** `timedOut: true` and a non-zero code only when something was killed.
+    Otherwise the direct child's own exit code stands.
+  - **Tests.** Both use the `test/fixtures/exec/tree.cjs early-exit` fixture. The holder is
+    detached on Windows and stays in the process group on POSIX.
+    - "a deadline after the direct child exited kills what it left running within 3 s".
+    - The same case with an abort, fired after the run has seen `exit`.
+  - **Test follow-up (c2e4b8f).** The tests' `alive()` counts a Linux zombie as dead (see
+    CI run 36287129177 below).
+  - **Residual.** Some descendants cannot be attributed safely:
+    - on Windows, a descendant whose parent died before it could be pinned (a detached grandchild
+      of a short-lived middle process);
+    - on POSIX, a descendant that left the group via `setsid`.
+
+    QA-1.2-2's grace period bounds the run in that case. The QA-1.2-2 test asserts that such a
+    holder survives. The plan's risk table and G4's wording should record this.
 
 ### QA-1.2-2 — major — the result waits for `close`, so a descendant that holds a pipe and survives the kill keeps the run (and the S3 slot) past the deadline
 
@@ -184,6 +218,19 @@ plus the "no orphans after" margin) and whether the promise had resolved.
 
   Add a test with the `broken-tree` fixture: it resolves within the deadline plus the grace period,
   with `timedOut: true`.
+- **Resolution: a1415e0**
+  - **The grace timer.** Every kill arms a `KILL_GRACE_MS` timer: 2000 ms, `unref()`'d, cleared on
+    settle.
+  - **When it fires with the pipes still open:**
+    1. `stdout` and `stderr` are destroyed.
+    2. A direct child that did not exit gets `SIGKILL`.
+    3. The run resolves `{ code: exitCode || 1, timedOut: true }` with `[output streams
+       force-closed 2000 ms after the kill: a descendant still held them]` on stderr.
+  - **A sweep still running at `close`.** The run waits for it, bounded by the same timer, so
+    `timedOut` reflects what was actually killed.
+  - **Test.** The `broken-tree` fixture resolves 2000–4000 ms after the abort, with the
+    force-closed note. Its unreachable holder is still alive, which is the documented residual, and
+    the test releases it.
 
 ### QA-1.2-3 — minor — Windows env merge is case-sensitive, so an override whose key has a different case is silently dropped
 
@@ -202,6 +249,11 @@ plus the "no orphans after" margin) and whether the promise had resolved.
 - **Fix:** on win32, before assigning each override key, delete every inherited key whose
   `toUpperCase()` equals the override key's `toUpperCase()`. Add a Windows test: `env: { path: "X" }`
   → the child sees `X`, and no second Path/PATH entry exists.
+- **Resolution: 20da594**
+  - **Change.** `mergeEnv`: on win32, every inherited key that matches an override key
+    case-insensitively is deleted before the override is set.
+  - **Test (Windows).** `{ path: "OMR-X", Temp: "C:\omr-temp-override" }`: the child sees both
+    values, and exactly one PATH key and one TEMP key.
 
 ### QA-1.2-4 — minor — POSIX `lowPriority` breaks the spawn-error contract (`nice` exits 127 instead of an ENOENT `error`)
 
@@ -217,6 +269,18 @@ plus the "no orphans after" margin) and whether the promise had resolved.
   `nice:` to `{code: 1, stderr: "exec failed: …"}`. Pass `--` before the target
   (`nice -n 10 -- file …`). Run the spawn-error test on both platforms with and without
   `lowPriority`.
+- **Resolution: ce0d15e**
+  - **Change.**
+    - Both entry points now run `nice -n 10 -- <target>`.
+    - In `runArgv`, a nice exit of 127 or 126 whose stderr starts with `nice:` resolves as code 1
+      with `exec failed: spawn <file> ENOENT|EACCES (nice: …)`.
+    - `runShell` keeps `/bin/sh`'s own 127. Its nice target is always `/bin/sh`, so a missing
+      command is the shell's 127 with or without `lowPriority`.
+  - **Tests.**
+    - The spawn-error test runs with and without `lowPriority` on both platforms.
+    - A POSIX-only test covers 127, 126 (a non-executable file) and a name that starts with `-`,
+      which proves `--`. It also checks that `runShell` gives the same 127 either way.
+  - **Linux CI:** green.
 
 ### QA-1.2-5 — minor — `timeoutMs` ≥ 2^31 (or `Infinity`) kills the command immediately
 
@@ -232,6 +296,15 @@ plus the "no orphans after" margin) and whether the promise had resolved.
 - **Fix:** do not arm the timer when `!Number.isFinite(timeoutMs)`. Otherwise clamp with
   `Math.min(Math.max(timeoutMs, 0), 2 ** 31 - 1)`. Add a test for `2 ** 31`: the command completes
   normally.
+- **Resolution: ce0d15e**
+  - **Change.** `deadlineOf`:
+    - `Infinity` arms no timer;
+    - `NaN` counts as absent;
+    - any other value becomes `Math.min(Math.max(t, 0), 2 ** 31 - 1)`.
+  - **Tests.**
+    - `2 ** 31`, `Number.MAX_SAFE_INTEGER` and `Infinity` complete normally with no
+      `TimeoutOverflowWarning`.
+    - `-5` expires at once.
 
 ### QA-1.2-6 — minor — POSIX `detached` (new session) trees survive opencode exit; there is no exit cleanup
 
@@ -254,6 +327,16 @@ plus the "no orphans after" margin) and whether the promise had resolved.
      for each id in a try/catch. `process.kill` is synchronous, so it is allowed in `exit`.
   3. Document that death by an unhandled signal (the host's SIGTERM/SIGHUP policy) remains
      opencode's concern.
+- **Resolution: 48d88ca**
+  - **Tracking.** A module-level `Set` holds the live POSIX group ids:
+    - an id is added after spawn;
+    - it is removed when the run settles;
+    - it is also removed at `exit` if the group is already empty.
+  - **The hook.** One `process.once("exit", killTrackedProcessGroups)` is installed lazily on the
+    first run. It SIGKILLs every group still in the set.
+  - **Documentation.** The file header states that death by an unhandled signal skips `exit` hooks.
+  - **Test (POSIX).** After several runs exactly one hook is registered. Calling it mid-run kills
+    the fork fixture's grandchild.
 
 ### QA-1.2-7 — nit — a run with neither `timeoutMs` nor `signal` has no deadline
 
@@ -267,6 +350,18 @@ plus the "no orphans after" margin) and whether the promise had resolved.
   `signal`. Optionally apply a defensive 120000 ms default when both are absent (the same default as
   `DeterministicDeps.timeoutMs`). Phase 3.2 should re-check that every 1.3/1.5/2.x call site passes
   a deadline.
+- **Resolution: ce0d15e** (decided: document and add the default)
+  - **Change.**
+    - `RunOptions.timeoutMs` now documents that callers must bound every run.
+    - A run with neither `timeoutMs` nor `signal` gets `DEFAULT_TIMEOUT_MS` = 120000 (the same as
+      the `DeterministicDeps` default).
+  - **No caller breaks.**
+    - The only production caller, `wiring.ts` `execSeam`, always passes `timeoutMs ?? 120000`.
+    - `baseline-wiring.test.ts` mocks `runShell`.
+    - Every exec test passes `timeoutMs` or `signal`.
+    - The four wiring test files pass.
+  - **Unchanged.** `cwd` still defaults to `process.cwd()`; wiring passes `cwd ?? directory`.
+  - **Phase 3.2** should still re-check every call site.
 
 ### QA-1.2-8 — minor — multi-byte UTF-8 characters split across chunks become U+FFFD (pre-existing)
 
@@ -279,6 +374,10 @@ plus the "no orphans after" margin) and whether the promise had resolved.
   failure evidence.
 - **Fix:** call `child.stdout?.setEncoding("utf8")` and `child.stderr?.setEncoding("utf8")`, which
   use a StringDecoder, then concatenate the strings.
+- **Resolution: a55731e**
+  - **Change.** `setEncoding("utf8")` on both streams.
+  - **Test.** 200000 × `aé日本😀` on stdout and stderr decodes byte-exact, with no U+FFFD. The test
+    failed against the pre-fix code.
 
 ### QA-1.2-9 — nit — `maxBuffer` is not a cap, and truncation leaves no marker
 
@@ -294,6 +393,17 @@ plus the "no orphans after" margin) and whether the promise had resolved.
 - **Fix:** append `s.slice(0, limit - stdout.length)` and record `truncated` for each stream. Put a
   marker (`[stdout truncated at <limit> chars]`) on stderr or a `truncated?: boolean` field on the
   result. The test should assert `stdout.length <= maxBuffer` and the marker.
+- **Resolution: a55731e**
+  - **Change.** An exact per-stream cap:
+    - the chunk that crosses the cap is sliced, never inside a surrogate pair;
+    - later chunks are drained and dropped;
+    - `[stdout truncated at <n> chars]` and `[stderr truncated at <n> chars]` are appended to
+      stderr.
+  - **Stderr notes.** All notes now go at the end of stderr, including `[low priority not
+    applied …]`. None contains summary or identity tokens.
+  - **Tests.**
+    - `maxBuffer: 1000` gives exactly 1000 stdout chars and the exact stderr markers.
+    - A surrogate pair at the cut is kept whole.
 
 ### QA-1.2-10 — nit — the "abort after natural exit" test does not cover the window the Windows guard exists for
 
@@ -306,6 +416,21 @@ plus the "no orphans after" margin) and whether the promise had resolved.
   timedOut: true` for a child that exited 0).
 - **Fix:** add the `early-exit` fixture case with the abort fired between `exit` and `close`. Assert
   no kill of the direct PID, plus the behaviour chosen in QA-1.2-1.
+- **Resolution: a1415e0 (test follow-up c2e4b8f)**
+  - **Tests.** Two tests cover the window between `exit` and `close`. Both abort only after the run
+    has seen the child's `exit`.
+    - `early-exit` (a leftover is reachable): the holder dies, the result is `code 1, timedOut:
+      true`, and stderr has the sweep note.
+    - `unreachable` (nothing is reachable): the result is `{ code: 0, stdout: "", stderr: "",
+      timedOut: false }`, i.e. the abort is a no-op.
+  - **No kill of the direct PID.** This is structural: after `exit`, the Windows path only runs
+    the sweeper.
+  - **Abort racing the exit.** An abort can land after the OS ended the child but before libuv
+    delivered `exit`. It cannot be told apart from an abort of a running command, so it counts as
+    a kill; the comment in `kill()` documents this.
+  - **Why the tests wait.** The tests wait 300 ms after the OS-level death before aborting. A
+    stress run, 15 iterations under 6 CPU burners, failed 4 of 15 without the wait (resolved in
+    about 100 ms with `timedOut: true` and empty stderr) and 0 of 15 with it.
 
 ### QA-1.2-11 — nit — the Windows priority test depends on PowerShell 7
 
@@ -314,6 +439,10 @@ plus the "no orphans after" margin) and whether the promise had resolved.
   developer machines may not), and this test would fail with ENOENT there.
 - **Fix:** use `powershell.exe` (Windows PowerShell 5.1, always present), with the same
   `Get-CimInstance` query.
+- **Resolution: 20da594**
+  - **Change.** `priorityOf` runs `powershell.exe -NoProfile -NonInteractive -Command` with the
+    same `Get-CimInstance` query.
+  - **Also.** The QA-1.2-1 sweeper uses the same binary, by its full `%SystemRoot%` path.
 
 ### QA-1.2-12 — deferred by plan (3.2) — the `rg child_process src` acceptance check lists `src/index.ts`
 
@@ -368,3 +497,66 @@ plus the "no orphans after" margin) and whether the promise had resolved.
   (`31043d9`).
 - **Required tests.** All of plan 1.2.3's cases are present. Coverage gaps are QA-1.2-9 and
   QA-1.2-10.
+
+## Fix round (QA-1.2-1 … QA-1.2-11)
+
+Commits on `vrb/p12`, each pushed:
+- `20da594`: QA-1.2-3 and -11.
+- `a55731e`: QA-1.2-8 and -9.
+- `ce0d15e`: QA-1.2-4, -5 and -7.
+- `48d88ca`: QA-1.2-6.
+- `a1415e0`: QA-1.2-1, -2 and -10.
+- `c2e4b8f`: a test follow-up for QA-1.2-1 and -10.
+
+QA-1.2-12 and QA-1.2-13 remain deferred by plan (3.2 and 2.1).
+
+**Windows 11, node v24.21.0, head `c2e4b8f`:**
+- `npm run typecheck` is clean.
+- `npx vitest run --maxWorkers=2 test/unit/exec.test.ts` passed twice in a row: 31 passed and
+  2 skipped (the POSIX-only cases), in 23.40 s and 23.47 s. Three more consecutive runs at
+  `a1415e0` were also green.
+- `baseline-wiring`, `cwd-scoping`, `enforcement-defaults` and `wiring` tests: 4 files, 85 passed,
+  1 skipped.
+- **Regression check.** The new Windows-applicable tests were run against the pre-fix `exec.ts`,
+  and 11 of them failed:
+  - the `early-exit` and `broken-tree` cases waited 20 s on the holder;
+  - the no-op case got `code 1, timedOut: true`;
+  - U+FFFD appeared in the output;
+  - the 2^31 timeout killed at once;
+  - the env case was lost.
+- **Orphans.** Afterwards, `Get-CimInstance Win32_Process` filtered on the fixture and scratch
+  command lines matched nothing.
+
+**Linux CI.** This ran on the throwaway branch `vrb/p12-ci`: `vrb/p12` plus a temporary workflow,
+`on: push: branches: [vrb/p12-ci]`, ubuntu-latest, with a node 20 and 24 matrix. The workflow ran
+`npm ci` and then `npx vitest run --maxWorkers=2 test/unit/exec.test.ts` twice. The workflow was
+never committed to `vrb/p12`. The branch has since been deleted remotely and locally, and the
+temporary worktree has been removed.
+- **Run 36287129177** (at `a1415e0`):
+  - node 20: green.
+  - node 24: failed "an abort between the child's exit and the pipes closing…" at
+    `expect(alive(holder)).toBe(false)`. The run had resolved 662 ms after the abort.
+  - Cause: after the group SIGKILL, the re-parented holder stays a zombie until its new parent
+    reaps it, and `kill(pid, 0)` still succeeds on a zombie.
+  - Fix: `c2e4b8f`, a test-only change; `alive()` reads `/proc/<pid>/stat`.
+- **Run 36287282255** (at `c2e4b8f`), on ubuntu-24.04 with GNU coreutils nice 9.4: green on
+  node v20.20.2 and v24.21.0.
+  - Each node version ran twice in a row: 30 passed and 3 skipped (the Windows-only cases), about
+    15.6 s per run.
+  - QA-1.2-1 deadline case: 3004 ms. QA-1.2-10 abort case: 657 ms. QA-1.2-2 grace case: 2254 ms.
+  - The POSIX `nice` exec-failure test and the exit-hook test passed.
+  - A leftover-process step (`ps -eo pid,pgid,sid,ni,etime,args` filtered on the fixtures)
+    printed `none` on both.
+
+**Accepted residuals.** Each one is documented in `src/verify/exec.ts`.
+1. **Unattributable descendants are not killed.** This covers a descendant whose parent died
+   before it could be attributed: on Windows, one that was never pinned; on POSIX, one that called
+   `setsid` and left the group. Such a descendant is not killed. The run and its slot are still
+   bounded by the 2 s grace period (QA-1.2-2). The plan's risk table and G4's wording should say so.
+2. **Daemons of a finished command are not swept.** When a command completes naturally, `close`
+   fires and anything it left in the background is not swept. That is not a deadline expiry, and
+   it is unchanged from before.
+3. **Death by an unhandled signal skips the exit hook.** If opencode dies from an unhandled
+   signal, the POSIX `exit` hook does not run.
+4. **An abort that races the exit counts as a kill.** An abort that lands between the OS ending
+   the child and libuv delivering `exit` counts as a kill.
