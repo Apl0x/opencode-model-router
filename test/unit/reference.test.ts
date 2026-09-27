@@ -415,6 +415,40 @@ describe("materialize / dispose", { timeout: 60_000 }, () => {
     expect(await fsp.readFile(join(repo, "packages", "a", "node_modules", "sentinel.txt"), "utf8")).toBe("keep me");
   });
 
+  it("QA-1.5-10: the dir exists, empty and private (0o700 on POSIX), before git checks out into it", async () => {
+    let seen: { isDir: boolean; entries: string[]; mode: number } | undefined;
+    const checking: CaptureDeps["argv"] = async (file, args, opts) => {
+      if (args.includes("worktree") && args.includes("add")) {
+        const target = args[args.indexOf("--detach") + 1];
+        const stats = await fsp.lstat(target);
+        seen = { isDir: stats.isDirectory(), entries: await fsp.readdir(target), mode: stats.mode & 0o777 };
+      }
+      return argv(file, args, opts);
+    };
+    const handle = await mat(await capture(), { argv: checking });
+    try {
+      expect(seen).toMatchObject({ isDir: true, entries: [] });
+      if (!isWin) {
+        expect(seen?.mode).toBe(0o700);
+        expect((await fsp.lstat(handle.dir)).mode & 0o777).toBe(0o700);
+      }
+      expect(await fsp.readFile(join(handle.dir, "a.txt"), "utf8")).toBe("a0\n");
+    } finally {
+      await handle.dispose();
+    }
+  });
+
+  it("an existing dir with the chosen name is refused and left alone", async () => {
+    const suffix = "0123456789abcdef";
+    const existing = join(tmp, `omr-ref-${process.pid}-${suffix}`);
+    await fsp.mkdir(existing);
+    await fsp.writeFile(join(existing, "foreign.txt"), "not ours");
+    const result = await materialize(await capture(), undefined, new AbortController().signal, deps({ randomSuffix: () => suffix }));
+    expect(result).toMatchObject({ ok: false, reason: "unsafe-path" });
+    expect(await fsp.readFile(join(existing, "foreign.txt"), "utf8")).toBe("not ours");
+    await fsp.rm(existing, { recursive: true });
+  });
+
   it("dispose twice returns the same promise and never rejects", async () => {
     const handle = await mat(await capture());
     const first = handle.dispose();

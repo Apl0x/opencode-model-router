@@ -179,14 +179,18 @@
 //      slashes ("C:/Users/Marquinho/AppData/..."), even when TEMP is an 8.3
 //      short path. dir = tmp/<refDirName(pid, 16 random hex)>. Call
 //      assertSafeRefDir(dir) before anything is created. Add dir to the
-//      process-local ACTIVE set, which gcStaleReferences skips.
+//      process-local ACTIVE set, which gcStaleReferences skips. Then
+//      mkdir(dir, { mode: 0o700 }), non-recursive (QA-1.5-10): EEXIST returns
+//      ok:false "unsafe-path" and nothing is cleaned up. On POSIX,
+//      chmod(dir, 0o700) follows, so the mode is exact whatever the umask.
+//      The dir is private BEFORE git writes the first tracked byte into it.
 //   3. `git -c core.hooksPath=<dir>/.omr-no-hooks -c advice.detachedHead=false
-//      worktree add --detach <dir> <commit>` (cwd: root). The hooks path does
-//      not exist, so post-checkout hooks (repository code) never run.
-//      Clean/smudge filters such as LFS still run, within the budget. Failure
-//      returns ok:false "worktree-add-failed". Once the worktree exists, its
-//      HEAD pins the commit against gc (Spike E). On POSIX, chmod(dir, 0o700)
-//      before the first copy (section 9).
+//      worktree add --detach <dir> <commit>` (cwd: root). Git accepts the
+//      existing empty dir. The hooks path does not exist, so post-checkout
+//      hooks (repository code) never run. Clean/smudge filters such as LFS
+//      still run, within the budget. Failure returns ok:false
+//      "worktree-add-failed". Once the worktree exists, its HEAD pins the
+//      commit against gc (Spike E).
 //   4. Copy untracked files, for each [rel, hash] in ref.untracked, in sorted
 //      order:
 //      - rel fails the RELPATH rules -> inexact "untracked-unsafe-path".
@@ -349,8 +353,15 @@
 //     of the dispatch state. It is copied only if it existed at dispatch and is
 //     byte-identical now; otherwise exact=false. Nothing that appeared after
 //     dispatch is copied.
-//   - On POSIX, dir is chmod 0o700 before the first copy. On win32 the per-user
-//     %TEMP% ACL applies (os.tmpdir()).
+//   - dir, and capture's scratch dir, are created with mode 0o700 (plus an
+//     exact chmod on POSIX) before any content is written into them, so a
+//     shared /tmp never exposes the checkout (QA-1.5-10). On win32 the mode
+//     is not an ACL: the dir inherits the ACL of the tmp root. The default
+//     per-user %LOCALAPPDATA%\Temp is private; an injected or relocated TEMP
+//     (e.g. C:\Temp) usually grants broader access, and then so does dir.
+//   - Deferred to 2.1 (QA-1.5-10): materialize only inside the S3 slot, and
+//     run GC before each materialize, to bound concurrent references and
+//     temp-dir use; 1.5 caps only the untracked copy.
 //   - Lifetime: disposed right after the recheck. Crash leftovers are removed
 //     by GC once the owner is dead or after 1 h.
 //   - Logs carry counts and reasons, never file contents. Paths appear only in
@@ -1208,9 +1219,21 @@ export async function materialize(
     const candidate = p.join(realTmp, refDirName(deps.pid ?? process.pid, suffix));
     assertSafeRefDir(candidate, tmpRoots, platform);
     if (await lstatOrMissing(fs, candidate)) return fail("unsafe-path", `${candidate} already exists`);
+    const key = comparable(candidate, platform);
+    ACTIVE.add(key);
+    try {
+      // Private before the first checked-out byte (QA-1.5-10); git checks out into this
+      // empty dir. Non-recursive: a racing creator makes it throw, and a dir we did not
+      // create is never cleaned up.
+      await fs.mkdir(candidate, { mode: 0o700 });
+    } catch (error) {
+      ACTIVE.delete(key);
+      const code = errorCode(error);
+      return fail(code === "EEXIST" ? "unsafe-path" : "error", `${candidate} could not be created: ${describeError(error)}`);
+    }
     dir = candidate;
     ctx = { argv: deps.argv, fs, root, tmpRoots, platform, logger: deps.logger };
-    ACTIVE.add(comparable(dir, platform));
+    if (platform !== "win32") await fs.chmod(dir, 0o700); // exact mode, whatever the umask
     // 3. Hooks disabled (D9).
     const added = await git([
       "-c", `core.hooksPath=${p.join(dir, ".omr-no-hooks")}`,
@@ -1219,7 +1242,6 @@ export async function materialize(
     ]);
     if (budget.spent()) return await abandon("aborted", "aborted during git worktree add");
     if (!added || added.code !== 0) return await abandon("worktree-add-failed", added?.stderr.trim() ?? "");
-    if (platform !== "win32") await fs.chmod(dir, 0o700);
 
     // 4. Untracked files: the hashed buffer is the written buffer.
     const reasons: InexactReason[] = [];
