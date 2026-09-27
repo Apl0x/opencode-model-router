@@ -37,15 +37,17 @@ documented `kill(2)` semantics are the same (`ESRCH`/`EPERM`).
 
 ## Implementation notes (`src/verify/slot.ts`)
 
-Updated after the QA fixes (commits `25a7d4f`…`0024c3b`) and the round-2 fixes (`17fac6a`). The first
+Updated after the QA fixes (commits `25a7d4f`…`0024c3b`), the round-2 fixes (`17fac6a`) and the
+round-3 fixes (`a4034ec`). The first
 version's notes are superseded: its `.reap` time lease, its wall-clock deadline and its "future
 mtime = fresh" rule are gone. So is round 1's per-process observation map.
 
 - **API:** `acquireSlot({max, waitMs, signal, meta, onLost?}, deps?)` → `SlotHandle | {busy:true}`,
   with `SlotHandle = {release(), readonly lost}`, plus `withSlot`, which releases on success, throw
   and abort. `onLost` and `lost` are additive. `deps` injects the dir, the logger
-  (`Pick<PluginLogger,"warn">`), the wall clock `now` (used only against mtimes), the monotonic
-  clock `mono` (machine-wide `process.hrtime`), random, host, pid, the PID probe, the
+  (`Pick<PluginLogger,"warn">`), the wall clock `now` (used against mtimes and to tell clock
+  origins apart), the machine clock `mono` (`process.hrtime`, anchored to `os.uptime()` where it
+  counts from the process start, QA-1.4-27), random, host, pid, the PID probe, the
   `unlink`/`read`/`utimes` seams and every timing constant. The defaults are the plan values:
   heartbeat 5 s, stale 30 s, backoff 250 ms → 2 s. Two additions: a corrupt-file grace of 2 s and a
   claim hold limit of 5 s. `acquireSlot` never rejects.
@@ -53,25 +55,46 @@ mtime = fresh" rule are gone. So is round 1's per-process observation map.
   on the unlink schedule. The creator holds the slot only if its token is there. A slot lock still
   unreadable after the retries counts as held, because the heartbeat re-checks it within 5 s. A
   claim never counts as held that way (QA-1.4-26).
-- **Shared observation (QA-1.4-21):** every look at a lock or claim is recorded in a sidecar,
-  `slot-<i>.lock.seen-<sha256(file, identity, host)[:32]>`. The sidecar holds `{key, first, from,
-  last}` on the machine-wide monotonic clock:
-  - `key` is identity@mtime. `first` is the first sighting of that key by any process. `last` is the
-    latest look. `from` is the first look after the latest gap of more than 2 heartbeats between
-    two looks.
-  - `span = now − first` and `witnessed = now − from`.
-  - A new key, another boot, or a stamp from the future restarts the record. Another boot means the
-    Linux boot id changed, or the boot instant `wall − mono` moved by more than 60 s.
+- **Shared observation (QA-1.4-21, per clock origin since QA-1.4-27):** every look at a lock or
+  claim is recorded in a sidecar, `slot-<i>.lock.seen-<sha256(file, identity, host)[:32]>`. The
+  sidecar holds the file's `key` and one view per clock origin, `{boot, bootAt, slack, first, from,
+  last}`:
+  - `key` is identity@mtime; a new key drops every view.
+  - A look's origin is its boot (the Linux boot id) and its boot instant `bootAt = wall − mono`,
+    read together. It uses the view of its boot whose `bootAt` is within its slack of its own, or
+    starts one, and compares its `mono` with that view's stamps only. The slack is 1 s (the
+    uptime's resolution budget), or a fifth of the heartbeat when that is shorter (tests).
+  - Within one view two stamps disagree by at most the look's slack plus the largest slack of the
+    view's writers (2 s in production). Every `mono` threshold adds that, so no margin shrinks:
+    staleness needs a span ≥ `staleMs` + 2 s (or the wall age) and a witness ≥ 2 heartbeats + 2 s;
+    a claim is inert at span ≥ `staleMs` + 2 s and witness ≥ 2 × `claimHoldMaxMs` + 2 s.
+  - `first` is the view's first sighting of the key. `last` is its latest look. `from` is the first
+    look after the latest gap of more than 2 heartbeats between two looks. `span = now − first`
+    and `witnessed = now − from`. A stamp from the future (another boot's clock) restarts the view.
+  - At most 4 views are kept; the oldest goes first.
   - The host is part of the name, so hosts sharing a dir never mix clocks.
   - Sidecar I/O is advisory: a failure loses evidence and delays a reclaim; it never causes one.
-- **Clock:** `process.hrtime` is CLOCK_MONOTONIC on Linux and mach/CLOCK_UPTIME_RAW on macOS; both
-  stop during a system suspend. On Windows it is QPC.
-  - Verified on this Windows 11 host: three processes started one after another read consecutive
-    values, equal to `os.uptime()` within 21 ms.
+- **Clock (QA-1.4-27):** `mono` must be one counter for every process of the boot. `os.uptime()`
+  is: GetTickCount64 on Windows (15.6 ms steps), CLOCK_BOOTTIME on Linux, wall − boot time on
+  macOS; some runtimes round it to whole seconds. `process.hrtime` is on Node (QPC,
+  CLOCK_MONOTONIC, mach time), but not on Bun, which counts from the process start.
+  - Verified on this Windows 11 host: Node 24 and Bun 1.3.14 read the same `wall − os.uptime()`
+    within 15 ms (1790419230699…714 ms), and `os.uptime()` has 15.6 ms steps on both. Node's
+    `wall − hrtime` is the same in every process and within 25 ms of it; a fresh Bun process reads
+    `hrtime` ≈ 0.4 s.
+  - So each process, at its first use, takes `hrtime` as is when it reads within 2 s of the uptime.
+    Otherwise it anchors `hrtime` to the uptime: `mono = hrtime + max(uptime − hrtime)` over its
+    reads, with the uptime read first so that each sample is a lower bound. That never goes back,
+    is as fine as `hrtime` within the process, and agrees with the other processes within the
+    uptime's resolution. After a suspend that the uptime counts and `hrtime` does not (Linux,
+    macOS), it jumps ahead with the uptime.
   - Microsoft documents that GetTickCount64 counts sleep, but says nothing about QPC. Modern Standby
     pauses desktop processes while every clock runs.
   - So no rule assumes that the clock stops while processes are frozen; that is why the witness is
-    kept. The wall clock is compared only with mtimes.
+    kept. The wall clock is compared with mtimes, and it tells clock origins apart.
+  - Not verified here: Bun on Linux and macOS (no host). If its uptime counts whole seconds, the
+    processes still share a view whenever their anchors agree within 1 s; otherwise they get
+    separate views, which only costs sharing.
 - **Staleness:** a lock is stale if (a) it is from this host and its PID is dead, which is immediate;
   or (b) it is old **and** has been witnessed unchanged for 2 heartbeats.
   - Old means the wall age is over `staleMs`, or the span is ≥ `staleMs`.
@@ -89,6 +112,19 @@ mtime = fresh" rule are gone. So is round 1's per-process observation map.
   - Short-lived processes that each look once succeed through the sidecar when their looks are less
     than 2 heartbeats apart. If the looks are further apart, the reclaim falls to the next caller
     that waits, or lives, for 2 heartbeats.
+- **Residual (QA-1.4-21, accepted; documented in the header):** looks more than 2 heartbeats apart
+  cannot tell a dead holder from a frozen machine. So a lock whose owner is not provably dead (a
+  reused PID, another host, a hung holder) is reclaimed only by a caller that waits, or stays alive,
+  for 2 heartbeats after its look (10 s plus the 2 s slack), or by callers that look often enough
+  together. Until then every caller is told busy. A same-host holder with a dead PID is still
+  reclaimed at once by any caller. The Phase 2.x callers are opencode plugin processes, alive for a
+  whole session, so their watches do it. Phase 1.1/2.1 should state this next to `slotWaitMs`.
+- **Own leftovers (QA-1.4-28, QA-1.4-29):** a slot lock that a call created before an unexpected
+  error is removed under its claim (own-token check) before the busy result. If that fails too,
+  the process remembers it: its next look at the slot reaps it at once, and so does the exit hook.
+  A claim that the process created but could not confirm is remembered by token; the process drops
+  it at its next readable look, within the claim-drop fence (1.5 × `claimHoldMaxMs`), and at exit.
+  After the fence it is left to the inert rule.
 - **Deletion (TOCTOU):** every delete of a file with identity K runs under the claim file
   `slot-<i>.lock.reap-<sha256(K)[:32]>` (`wx`, `{pid, hostname, token, target, victim: K}`). K is
   the token, or for a corrupt file its mtime and size. This covers stale reaps, the owner's release
@@ -153,7 +189,7 @@ mtime = fresh" rule are gone. So is round 1's per-process observation map.
   A holder that stops heartbeating for 2 intervals while its lock looks old is reaped (the plan's
   contract), and it is told so through `lost`.
 
-## Tests (`test/unit/slot.test.ts`, 51 tests)
+## Tests (`test/unit/slot.test.ts`, 60 tests)
 
 Each test uses an isolated `mkdtemp` dir. The multi-process fixture `test/fixtures/slot/holder.mjs`
 imports a JS build of the real `slot.ts`, made in `beforeAll`. TypeScript 7 has no
@@ -205,6 +241,56 @@ Round 2 checks:
   - the ticket TTL set back to `staleMs`;
   - the ENOENT re-creation removed;
   - the housekeeping removed.
+
+Round 3 added 9 tests (`a4034ec`):
+- QA-1.4-27, in-process instances with injected `mono` seams:
+  - b1: a live holder (production heartbeat); observers Y and O whose clocks are 8 s apart see a
+    +31 s wall step. Y looks at 0.2 s and 3.0 s, O at 4.4 s. On one record O would count 12.2 s
+    (a 9.4 s gap, so no restart), more than 2 heartbeats plus the 2 s slack. O is busy, the holder
+    keeps its token and is not lost, and the sidecar holds 2 views.
+  - b3, twice: two observers whose clocks are 8 s apart, or read 0 at their own start 1.5 s apart
+    (like Bun's `hrtime`), alternate `waitMs: 0` calls every 200 ms against a hung lock. Each
+    reclaims on its own view, exactly one holds it, and 6 more calls are busy.
+  - The clock builder: a Node-like `hrtime` is taken as is. Two Bun-like ones (8 s apart), with a
+    whole-second uptime, never go back, never read ahead of the machine time, stay within 1 s of
+    each other, and within 7 ms (one step) once a tick has been seen.
+  - Three fresh Bun-like processes (anchored clocks) share one view; two raw per-process clocks add
+    one view each.
+- QA-1.4-28: an EMFILE on the creator's re-read gives busy with one warning, and no lock or claim is
+  left; the next call holds. With the undo's re-read failing too, the lock stays, and this
+  process's next call reaps it at once and holds.
+- QA-1.4-29: a scanner holds the claim reads for 600 ms from `release()`. The lock and the claim are
+  gone within 4 s (0.8 s measured), and the next caller holds.
+- QA-1.4-31: `waitMs` NaN and Infinity each make one attempt and return busy.
+- QA-1.4-30: the observers that confirm by watching use a 500 ms heartbeat (5 × `backoffMaxMs`):
+  the corrupt-lock tests, the release after a stale reclaim, and 5 similar ones (the live unrelated
+  PID, the foreign host, the future mtime, and both claim-inert tests).
+- The QA-1.4-26 test now waits past the claim-drop fence (150 ms there) before the inert part, since
+  the owner would otherwise drop its own claim (QA-1.4-29).
+
+Round 3 checks:
+- **Runs:** three consecutive scoped runs passed 60/60 in 57.6 s, 56.5 s and 56.8 s. Under load (14
+  `node -e "for(;;){}"` processes, killed afterwards) the run passed 60/60 in 68.2 s. `npm run
+  typecheck` is clean.
+- **Mutation checks**, each run on its tests and reverted:
+  - views matched without the origin (`bootAt`): 4 tests fail (b1, both b3, the views test);
+  - `hrtime` always taken as is: 2 tests fail;
+  - no removal of the stray lock: the QA-1.4-28 test fails;
+  - no drop of the unconfirmed claim: the QA-1.4-29 test fails;
+  - no `waitMs` clamp: both QA-1.4-31 tests fail.
+- **Multi-process runs on Bun and Node:** `test/fixtures/slot/runtime-repro.mjs <slot.ts>` runs the
+  QA's b1, b2 and b3 with real child processes on the runtime that runs it, with the production
+  clocks and constants (about 2 minutes). It is not part of vitest.
+
+  | runtime, code | b1 (O at 4.4 s after a beat) | b2 (fresh `waitMs: 0` processes, 3 s apart) | b3 (two watchers started 30 s apart) |
+  |---|---|---|---|
+  | Bun 1.3.14, `a4034ec` | origins 8.1 s apart; O busy, H not lost | 0.1–9.1 s busy, 12.1 s held | reclaimed after 15.1 s |
+  | Bun 1.3.14, `a4ce821` (before) | origins 8.5 s apart; **O held, H lost** | 8/8 busy up to 21.4 s | reclaimed after 30.3 s |
+  | Node v24.21.0, `a4034ec` | origins 0 ms apart; O busy, H not lost | 0.2–12.2 s busy, 15.2 s held | reclaimed after 15.1 s |
+
+  On Node, b2 takes one more 3 s step than in round 3 (12.2 s), because the witness now needs the
+  2 s slack too. Afterwards no `omr-slot-*` or `omr-repro-*` dir and no `node.exe` or `bun.exe`
+  child or busy loop was left.
 
 The read-only temp dir case is real. On Windows it uses `icacls <dir> /deny <user>:(OI)(CI)(W)`,
 non-elevated; on POSIX it uses `chmod 0555`, skipped as root. The test points
@@ -1249,6 +1335,10 @@ Other agents may have been running tests on this machine at the same time.
     `slotWaitMs`.
   - On Bun, it is not acceptable until QA-1.4-27 is fixed: fresh processes never share evidence
     there, and two long-lived watchers block each other.
+- **Resolution:** `a4034ec`. The residual is documented in the `slot.ts` header ("Residual") and in
+  the implementation notes above: callers must wait, or stay alive, for 2 heartbeats (plus the 2 s
+  slack) to reclaim a lock whose owner is not provably dead; 2.x callers are long-lived. With
+  QA-1.4-27 fixed, Bun behaves like Node (b2 at 12.1 s, b3 after 15.1 s).
 
 ### New findings
 
@@ -1309,6 +1399,24 @@ Other agents may have been running tests on this machine at the same time.
   - Add an in-process test with two module instances whose `mono` seams are 8 s apart; it
     reproduces `b1` today.
   - Consider a Bun leg for the multi-process tests.
+- **Resolution:** `a4034ec`. Both parts of the proposal are in.
+  - **Views per origin:** the sidecar keeps one view per clock origin (boot id, and `bootAt = wall −
+    mono` read together, matched within a 1 s slack). A look compares its `mono` only with its own
+    view's stamps. Every `mono` threshold adds the view's worst disagreement (the two slacks, 2 s),
+    so no margin shrinks, including the claim margins of QA-1.4-20. A wall step now starts a new
+    view instead of mixing for up to 60 s (`BOOT_SLACK_MS` is gone).
+  - **One machine clock on every runtime:** the default `mono` takes `hrtime` as is where it reads
+    within 2 s of `os.uptime()` (Node). Otherwise (Bun) it anchors `hrtime` to the uptime, which Node
+    and Bun read alike within 15 ms here, with 15.6 ms steps. So Bun processes share one view again,
+    and the QA-1.4-21 sharing holds on Bun too.
+  - **Header:** the clock and observation paragraphs are rewritten; they no longer claim that
+    `hrtime` is the same in every process.
+  - **Tests:** b1 with clocks 8 s apart, b3 with clocks 8 s apart and with per-process-origin clocks,
+    the clock builder, and one view shared by Bun-like processes. Mutation: matching views without
+    the origin fails 4 of them.
+  - **Bun, real processes** (`runtime-repro.mjs`): b1 no longer has two holders (before the fix, on
+    the same run: O held, H lost). b2 reclaims at 12.1 s (before: 8/8 busy), and b3 reclaims after
+    15.1 s (before: 30.3 s). The table is under "Round 3 checks".
 
 ### QA-1.4-28 — minor — An unexpected error after the exclusive create orphans a lock with the caller's live PID
 
@@ -1328,6 +1436,17 @@ Other agents may have been running tests on this machine at the same time.
   remove the file before the error propagates. The token is known, so this can be a best-effort
   `removeUnderClaim` with the own-token check. Test: the seam above gives busy, and the next caller
   then holds at once.
+- **Resolution:** `a4034ec`, as proposed. Once `open(wx)` has succeeded, a failure in the write, the
+  close or the re-read runs a stray handler before the error propagates.
+  - **Slot lock:** removed under its claim, with the own-token check. If that removal fails too,
+    the process remembers the lock: its next look at that slot finds it stale at once (like a dead
+    PID) and reaps it, and the exit hook removes it too.
+  - **Claim:** remembered as an unconfirmed claim (QA-1.4-29).
+  - **Empty file:** a write that failed leaves an empty file, which the corrupt grace reclaims, as
+    the finding's analysis says.
+  - **Test:** an EMFILE on the creator's re-read gives busy with one warning; no lock or claim is
+    left, and the next call holds. With the undo's re-read failing too, this process's next call
+    reaps the lock at once and holds. It fails by mutation.
 
 ### QA-1.4-29 — nit — An unconfirmed claim on the owner's own release blocks the slot for about 36 s
 
@@ -1341,6 +1460,18 @@ Other agents may have been running tests on this machine at the same time.
   - This is bounded, and it needs a scanner to hold a brand-new file for more than 3.15 s.
 - **Fix:** remember the tokens of this process's unconfirmed claims. A later readable look that shows
   one of them proves the claim is ours: drop it through `unlinkWhile` with the token check.
+- **Resolution:** `a4034ec`, as proposed. The process keeps its unconfirmed claims (path, token and
+  drop deadline; at most 64).
+  - **Drop:** `reclaimClaim` checks them before the inert rule. A readable look that shows our token
+    drops the claim through `unlinkWhile` with the token check. The deadline is the one for a held
+    claim's drop, 1.5 × `claimHoldMaxMs` from just before the create, so the QA-1.4-20 margins are
+    unchanged.
+  - **Forgotten:** once another token is there, or once the deadline has passed. After that the claim
+    is left to the inert rule.
+  - **Exit:** the hook removes the remembered claims by token, like held ones.
+  - **Test:** the u26 case, scaled: a scanner holds the claim reads for 600 ms from `release()`. The
+    lock and the claim are gone within 4 s (the test takes 0.8 s), and the next caller holds. It fails
+    by mutation. The QA-1.4-26 test now waits past the drop deadline before its inert part.
 
 ### QA-1.4-30 — minor — Four tests fail under CPU load: the `fast()` gap rule is tighter than one wake-up plus one attempt
 
@@ -1362,6 +1493,12 @@ Other agents may have been running tests on this machine at the same time.
 - **Fix:** in these tests, give the observer a heartbeat of at least 5 × `backoffMaxMs`, as
   QA-1.4-13 did elsewhere. For example, use `heartbeatMs: 500` with scaled waits, or raise the
   default heartbeat in `fast()`.
+- **Resolution:** `a4034ec`, as proposed. `WATCHER_HEARTBEAT_MS = 500` (5 × `backoffMaxMs`) is used by
+  the 4 failing tests and by 5 others that confirm by watching the same way: the live unrelated PID,
+  the foreign host, the future mtime, and both claim-inert tests. Their waits are raised where
+  needed. `fast()` keeps 100 ms, because the ticket-TTL tests depend on it.
+  - **Under load** (14 `node -e "for(;;){}"` processes, killed afterwards): 60/60 in 68.2 s.
+  - **Unloaded:** 60/60 three times (57.6 s, 56.5 s, 56.8 s).
 
 ### Deferred by plan
 
@@ -1372,3 +1509,7 @@ Other agents may have been running tests on this machine at the same time.
   - The call then polls until it gets a slot or its signal fires: 68 wake-ups in 1 s, against 4 for
     `waitMs: 1000`.
   - Phase 1.1 validates `slotWaitMs` as an integer ≥ 0.
+  - **Resolution:** `a4034ec`, a defensive clamp. `acquireSlot` treats a non-finite `waitMs` (NaN,
+    ±Infinity) as 0, and a negative one as 0, as before. Both paths, the file slots and the
+    in-process fallback, get the clamped value. Test: NaN and Infinity each make one attempt and
+    return busy, with no ticket; both fail by mutation. Phase 1.1 still validates the setting.
