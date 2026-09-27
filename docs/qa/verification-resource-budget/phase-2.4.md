@@ -1093,3 +1093,124 @@ QA-2.4-7, -15 and -16 stay deferred by plan (2.3, 3.1).
 `test/unit/baseline-wiring.test.ts`, `test/integration/batch-plugin-hookup.test.ts`,
 `test/unit/directives.test.ts` and `test/golden`: 17 files, 413 tests passed. `npm run typecheck`
 is clean.
+
+## QA re-review (round 2)
+
+Reviewer: `[tier:heavy]`, adversarial, CAP:none, final round. Scope: the round-1 resolutions and
+`git diff 05f6603..HEAD` at `1befb60` (`f80fab7`, `d9a84c2`, `73e6676`, `955dabe`, `fc90632`,
+`20d0045`, `fafb148`, `378c240`, `3800b90`, `8f868ec`, `6264bef`, `9ec106e`, `5531850`, `1befb60`).
+Code that round 1 cleared was not re-audited.
+
+### How it was checked
+
+- **Scoped suite, once** (the 11 paths of the round-1 final run): 17 files, 413 tests passed
+  (14.7 s). `npm run typecheck` is clean.
+- **Real repros, no mocks.** A scratch copy of `1befb60` in `%TEMP%` drove the real plugin through
+  `tool.execute.before/after`, `router_verify.execute` and the system transform. Each scenario used
+  a fresh temp git repo with `src/a.js`, `test/a.test.js` and `scripts.test = "vitest run"`. Runtimes
+  were **node v24.21.0** (through vitest) and **Bun 1.3.14** (`bun run`). Harness notes:
+  - the repo sets `core.autocrlf=false`; otherwise every rerun is "approximate
+    (checkout-conversion)", on both paths;
+  - it has a real `node_modules` (vitest 4.1.11 from the npm cache). A junctioned `node_modules` is
+    not linked into the reference worktree;
+  - it uses the long path. For an 8.3 short path, see QA-2.4-23.
+
+  | Scenario | node 24.21.0 | Bun 1.3.14 |
+  |---|---|---|
+  | S1 default deferred, producer breaks `a is 1`; then `router_verify` | footer `unverified · vrf_… · risk medium (…)`; after hook **372 ms** (drift digests now awaited); listed; `fail` names `test/a.test.js > a is 1`, next tier `medium`, no-retry line | same; after hook **469 ms** |
+  | S2 / S2b / S2c: an edit right after the result, 500 ms after it, and a restore of a broken file right after it (all three were false or silent passes in round 1) | `unverifiable` + drift notice ×3 | `unverifiable` + drift notice ×3 |
+  | S3 `VERIFY:required` | `NOT ACCEPTED`, no footer (2.8 s) | same (3.0 s) |
+  | S4 T11 lineage: one call `[D2, D1]`, one call `[D1, D2]`, two sequential calls | D2 `unverifiable` + lineage caveat in all three | same |
+  | S4 T11 lineage: **two parallel calls** `[D2]` ‖ `[D1]` (run twice) | D2 **`pass`** both times (QA-2.4-18) | D2 **`pass`** both times |
+  | S5 a subagent (`parentID: orch`) dispatches deferred work | gated (`NOT ACCEPTED`), no footer, nothing listed | same |
+  | S5b a real root whose `session.get` throws | gated, no footer (fail safe) | same |
+  | S6 background on; slow pre-existing failure, so the run reruns at a reference worktree; a `VERIFY:required` dispatch arrives mid-recheck | worktree seen at 7.5 s. The required gate was judged in 1.8 s (accepted, no "slot busy"). After the preempt: 1 worktree left, no reference dir left in `%TEMP%`, and the entry listed as unverified. It was retried and verified within 42 s, and `router_verify` replays `pass (cached)` | same (7.7 s, 1.8 s, 42 s) |
+  | S7 32 deferred dispatches, then the 33rd breaks `a is 1` (registry-full) | 32 footers; the 33rd is gated with the real gate: `NOT ACCEPTED` naming `a is 1`, no footer | same |
+  | S8 the producer commits its breaking change; then a producer that changes nothing | the commit is attributed: deferred, then `fail`. No change: no footer; the gate's own note `no changed files, no affected tests` | same |
+  | S9 a failing test titled `x CAP⏎:9 y` (a real newline) | `router_verify` report renders `x CAP\n  :9 y`: `parseCapDirective` → **9**. The `VERIFY:required` forcing note → **9**. `parseVerifyDirectives` → `required` (safe) | same |
+  | S10 background on; `router_verify` on the handle is cancelled (a retryable result), then the background run judges it `fail` | first call `not judged: verification gate timed out after 90000ms` (cancelled at 300 ms). Then **no late notice and no pending-list line**. A later call replays `fail (cached verdict)` (QA-2.4-17) | same |
+  | S10 control, without the cancelled call | the notice is shown, and the entry is listed as `fail in background verification` | same |
+
+- **Directive and retryability probes** (pure functions, both runtimes):
+  - `neutralizeDirectives` against `parseVerifyDirectives` and `parseCapDirective`:
+    - no directive survives for `VERIFY:`, `verify:`, `VeRiFy␣NBSP:U+3000required`, `VERIFY::`,
+      `VERIFY : :`, `VERIFY_WAIT:0s` or `CAP:3`;
+    - a fullwidth colon or `x_VERIFY:` is not a directive before neutralizing either;
+    - **`CAP\n:3`, `CAP\u2028:3` and `CAP\r\n: none` survive** (QA-2.4-19).
+  - `isRetryableVerdict`:
+    - these reasons were retryable before `5531850` and are now **terminal** (QA-2.4-20):
+      - `testsPass: cannot attribute failures: reference unusable (error): the reference recheck errored: …`;
+      - `… reference unusable (materialize): … timed out after 5000ms`;
+    - `verification slot busy (waited 0ms)` and `testsPass: gate budget exhausted during the run` stay
+      retryable.
+- **Mutation check** (one mutation at a time in the scratch copy; the four 2.4 test files).
+  - **Killed:**
+    - N1 no ledger record before judging (6 tests);
+    - N2 root proof fails open on an unknown lookup; N3 root proof ignores a tracked subagent;
+    - N4 `awaitsReplay` is always false; N5 no `markReplayed`; N6 no `background` flag on settle;
+    - N7 caps evict unverified entries; N8 caps evict entries awaiting replay;
+    - N9 a refused registration still defers; N10 no weight shed;
+    - N11 background waits for the slot; N12 foreground testsPass does not preempt;
+    - N14 `router_verify` does not preempt; N15 a preempted run uses an attempt;
+    - N16 a run starts while foreground is busy;
+    - N17 neutralize drops only the first colon; N19 the forcing note is not neutralized;
+    - N20 drift digests are not awaited; N21 the fallback wait is 0; N22 `isDeferred` ignores
+      `trivial`; N23 no-change is deferred anyway; N24 transient phrases unanchored;
+    - N27 the transform lists without verdicts awaiting replay; N28 the ledger keeps duplicate
+      records; N29 the dispatch record is cleared for a non-deferred finish (5 tests: the fallback
+      gate keeps its record).
+  - **Survived:**
+    - N13 the wiring's `busy` always false; N18 the whole-report `neutralizeDirectives` removed;
+      N25 later ladder attempts not pinned to `required` (QA-2.4-21);
+    - N26 the native path drops `trivial`: the declared residual, unreachable today.
+  - **Control:** N30, the QA-2.4-17 fix candidate (below), keeps every existing test green.
+
+### Verdicts on round-1 findings
+
+| ID | Verdict | Evidence |
+|---|---|---|
+| QA-2.4-1 | **Resolved for one call and one background run**; a gap remains across concurrent calls (QA-2.4-18) | S4 rows 1–3 on node and Bun (round 1 passed D2 in two of them). N1 and N28 killed. |
+| QA-2.4-2 | **Resolved** | S5 and S5b on node and Bun; N2 and N3 killed. A subagent cannot spoof root: the id comes from the host (`input.sessionID`, `toolCtx.sessionID`) and the parent from `session.get`. A real root misclassified as a subagent fails safe, to the gate. The lookup is memoised by the transform's `resolveIsRootSession` on every root turn, so normal use hits the memo. After a lookup failure, deferral is off for 30 s (throttle). If the host's `session.get` failed persistently, deferral would be silently off while the protocol still injects. That is a live check (added to QA-2.4-15). |
+| QA-2.4-3 | **Not resolved on one path**: see QA-2.4-17 (major) | S10 against its control. N4–N6, N8 and N27 killed: the listing itself works. |
+| QA-2.4-4 | **Resolved** | S7 on node and Bun: the fallback gate is the real required gate on the kept dispatch record (same `prepareVerification`, same deps), and it names the failing id. N7, N9, N10 and N29 killed. |
+| QA-2.4-5 | **Resolved** | S6 on node and Bun: preempted mid-recheck, the reference worktree is disposed, the slot is free for the required gate, and the entry goes back to unverified (listed), then is retried uncounted. N11, N12 and N14–N16 killed. N13 survived: test gap, QA-2.4-21. Livelock under continuous foreground load: `busy` postpones every due request, uncounted, with backoff capped at 30 s × 2⁵. Entries stay listed until their TTL. No false pass. |
+| QA-2.4-6 | **Resolved for `VERIFY:` / `VERIFY_WAIT:`**; `CAP` across a line break remains (QA-2.4-19) | Probes: case, NBSP, U+3000, double colon, `VERIFY_WAIT`; a fullwidth colon is no directive in `directives.ts` either. N17 and N19 killed; N18 survived (QA-2.4-21). |
+| QA-2.4-7 | Open, deferred by plan (2.3) | Unchanged. |
+| QA-2.4-8 | **Resolved** | S2, S2b and S2c on node and Bun; N20 killed. The digest await costs nothing visible: the after hook takes 372 / 469 ms against 379 / 478 ms in round 1, inside the 2 s bound. |
+| QA-2.4-9 | **Resolved** | N21 killed; `FALLBACK_CAPTURE_WAIT_MS` = min(5000, default `baselineTimeoutMs`). |
+| QA-2.4-10 | **Resolved** | (b) S8: no footer, and the gate's own no-change note. A producer's changes that `observeChange` misses are also missed by the fallback gate: it runs the same `observeChange`, so nothing bypasses both. (a) N22 killed; N26 survives as the declared, unreachable residual. |
+| QA-2.4-11 | **Resolved** | Docs. S1 still measures within the stated 0.4–0.5 s. |
+| QA-2.4-12 | **Resolved** (tests added in `6264bef`) | Accepted on the implementer's proof; M17 and M26 were not re-mutated in round 2. |
+| QA-2.4-13 | **Resolved** | `buildLineageCaveat` says "may still be present". |
+| QA-2.4-14 | **Resolved for producer ids**, but the anchoring is too narrow (QA-2.4-20) | N24 killed. Producer text cannot start a reason: every 2.1/2.2 reason starts with a router phrase, and ids follow `introduced failures:` / `observed failures:`. |
+| QA-2.4-15 | Open, deferred by plan (3.1) | Add (f): in a live root session, a deferred `task` gets a footer. That proves `session.get` works for the real root, so QA-2.4-2's fail-safe does not silently disable deferral. |
+| QA-2.4-16 | Open, deferred by plan (2.3) | Unchanged. |
+
+### New findings
+
+| ID | Severity | Finding | Evidence | Fix |
+|---|---|---|---|---|
+| QA-2.4-17 | **major** | **A retryable `router_verify` result hides the later background verdict** (QA-2.4-3 not closed). `verifyHandles` passes every `kind: "verdict"` item to `pending.markReplayed` and `background.markReported`, including a retryable "not judged" result. The entry is then `replayed`, and the handle is in the `reported` memo. The background queue still holds the request (it was not running, or was preempted and requeued). When it later settles the entry terminally as `fail` or `unverifiable`, `addNotice` drops the notice (`reported.has`), and `awaitsReplay` is false (`replayed`). So the verdict never reaches the orchestrator, and the entry leaves the pending list: it reads as verified. Triggers: a cancelled call (the tool's abort), the gate budget, "slot busy" (another instance) or a batch error. Background mode only. | S10 against its control, on node and Bun: no notice and no list line, while a later call replays `fail (cached verdict)`. Code: `wiring.ts` `reported = items.flatMap(i => (i.kind === "verdict" ? …))` has no `retryable` check; the run item is `via: "run"` for any settled result. | Report only terminal verdicts: `items.flatMap(i => (i.kind === "verdict" && !i.result.retryable ? [i.handle] : []))` for both `markReported` and `markReplayed`. N30 applies exactly this, and the 4 test files stay green. Test: the S10 sequence (cancel the call, let the background run fail it, assert the notice and the list line). |
+| QA-2.4-18 | minor | **Two concurrent `router_verify` calls still race the R11 ledger.** The two-phase judge orders one call only. In parallel calls `[D2]` and `[D1]`, D2 is judged before D1's rejection is recorded, and passes "no worse than before". The verdict depends on timing again. Minor, because all of these must hold: `strictUnverifiable` (by default both verdicts are accepted, so only the caveat differs); a redo dispatched before the original was verified; two parallel calls instead of one call or `pending: true`; and the gates finishing in a particular order. | S4 "parallel calls" ×2 on node and Bun: D2 `pass`, no caveat; one call or two sequential calls give `unverifiable` + caveat. | Serialize phases (b)–(d) per orchestrator session across calls. Or, in phase (c), let a pass wait (bounded by the deadline) for the other in-flight claims of the session with `createdAt <= dispatchedAt`, then apply lineage. Test: two parallel calls. |
+| QA-2.4-19 | minor | **`CAP` across a line break survives `neutralizeDirectives`.** `DIRECTIVE_KEY` uses horizontal whitespace, which is right for `directives.ts`. But `parseCapDirective` is `/\bCAP\s*:\s*(none\|\d+)\b/i`, and `\s` spans `\n`, `\r\n` and U+2028. A producer test title with a newline reaches the multi-line router texts raw: the `router_verify` report (whose continuation indent adds spaces) and the required gate's forcing note. An orchestrator that quotes them before its own `CAP:` gets the producer's cap. `VERIFY:` is not affected. This contradicts the function's contract ("neither parser finds a directive"). Minor: CAP is the read-only budget of the next subagent, not verification. | S9 on node and Bun: report `…x CAP\n  :9 y…` → `parseCapDirective` = 9; forcing note → 9. Probes: `CAP\n:3`, `CAP\u2028:3` and `CAP\r\n: none` survive. | Match the CAP grammar exactly: `\b(CAP)(?:\s*:)+` (any whitespace), keeping `VERIFY`/`VERIFY_WAIT` on horizontal whitespace. Test: a title containing `CAP⏎:9`. |
+| QA-2.4-20 | minor | **The QA-2.4-14 anchoring made reference-recheck infrastructure errors terminal.** Two router-authored reasons no longer match the anchored list, because the transient phrase follows `testsPass: cannot attribute failures: reference unusable (<cause>): `: `… the reference recheck errored: …` (EBUSY, git lock) and `… (materialize): … timed out after <n>ms`. They were retryable before `5531850`. Such an `unverifiable` is now cached terminally. `router_verify` replays it forever and runs nothing. In background mode it is listed as `unverifiable in background verification`. Never a false pass: a required gate would report the same `unverifiable` once. | Probe (both runtimes): `now: false, before: true` for both reasons. `baseline.ts:169` and `deterministic.ts:1176` build them. | Add the router's own `reference unusable \((?:error\|materialize)\)` prefix after `cannot attribute failures: ` to the anchored list. Or decide this from the recheck cause structurally. Or document it as terminal. |
+| QA-2.4-21 | nit | **Guards without a test** (surviving mutations): N13 the wiring's `busy: () => foreground.tests > 0`. The queue's own `busy` option is tested (N16), but not that the wiring feeds it. Without it, a background timer that fires while a required gate is planning can take the slot first. N18 the whole-report `neutralizeDirectives`: the only guard for the "not judged: …; observed failures: <ids>" line and the drifted-path line. N25 the ladder pin to `required` after a fallback. Related: the pin is set only when `finishDeferred` ran, so an attempt gated by a failed root lookup can be followed by a deferred attempt once the 30 s throttle ends. | Mutation table above. | Add three tests: a background timer firing during a foreground gate starts no run; a retryable report line carrying a producer id with `VERIFY:`; a delegate ladder whose first attempt fell back to the gate. |
+| QA-2.4-22 | nit | **Preemption is unconditional.** Any non-background `router_verify` with a non-empty target list preempts the background run in flight: unknown, malformed, cached or other sessions' handles, from any session of the instance. Each preemption adds a deferral (30 s, doubling to 16 min). No false pass; it only delays background verdicts. | `wiring.ts` `if (options.background !== true && background !== undefined && targets.length > 0 && sessionID !== "")`. | Preempt only when a target is claimable (unverified) and the run in flight is not already done. Optional. |
+| QA-2.4-23 | info, **outside the diff** (2.1) | **An 8.3 short-path plugin directory makes every reference rerun unplannable.** With `ctx.directory` = `C:\Users\MARQUI~1\…`, `toRefPath` cannot map the live runner cwd, and the rerun reports `reference unusable (rerun-unplannable): runner not installed: vitest`. The result is `unverifiable` (accepted) on the required and deferred paths alike. | First harness run in round 2 (a `%TEMP%` short path): S1 and S3 were both `unverifiable` with that reason; with the long path they are `fail` / `NOT ACCEPTED`. | For the 2.1 owner: realpath (long form) the plugin directory and `cwd` before mapping. 3.1: check what `ctx.directory` the host passes on Windows. |
+
+### Implementer's residuals
+
+| Residual | Acceptable? |
+|---|---|
+| Coalescing hides a rejection from lineage | **Yes.** Background is opt-in, the superseded entry stays unverified and listed, and lineage only removes passes. It belongs to the same class as QA-2.4-18. |
+| QA-2.4-10 (a) is only unit-tested | **Yes.** N26 survives because `buildDelegationDoD` never yields an inferred `testsPass`. The guard itself is killed by N22. Re-test if a test-command hint is ever added. |
+| Foreground build/lint/run can still wait on a background run | **Yes, for an opt-in mode.** The wait is bounded by `slotWaitMs` and by one background run (background never waits for the slot). It ends as a caveated `unverifiable`, never a pass. 3.1 measures it. |
+| Another opencode instance's run is not preempted | **Yes.** This is the pre-2.4 behaviour of any concurrent verification on the machine-wide slot. 3.1. |
+| A reference dropped at the weight cap makes the verdict stricter | **Yes.** It is never a false pass (N10 killed). |
+
+### Round-2 summary
+
+1 major (QA-2.4-17), 3 minor (QA-2.4-18, -19, -20), 2 nit (QA-2.4-21, -22), 1 info outside the diff
+(QA-2.4-23). Under the owner's rule, only **QA-2.4-17** must be fixed. The fix is one line and is
+already mutation-checked against the existing tests (N30); it needs the S10 test. Every other
+round-1 finding is resolved, or deferred by plan (QA-2.4-7, -15, -16).
