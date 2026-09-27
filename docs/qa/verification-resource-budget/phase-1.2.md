@@ -1058,3 +1058,9 @@ node and under **Bun 1.3.14**, the runtime the plugin actually runs in.
 **Status: phase 1.2 QA is not CLEAN.** QA-1.2-21 (minor), QA-1.2-22 (nit) and QA-1.2-23 (nit)
 are open.
 
+### Round-4 resolutions
+
+- QA-1.2-21 — Resolution: 2d6ff09 — `EXIT_TASKKILL_TIMEOUT_MS` raised from 2000 to 10_000 ms. The comment now states that host exit may be delayed up to 10 s, and only while a verification is in flight (with none, the hook spawns nothing). G4 known limit (wording deferred to 3.2): under normal-priority CPU saturation that slows taskkill past this limit, host exit can still leave part of a tree.
+- QA-1.2-22 — Resolution: 2d6ff09 — `waitForFile` takes a limit; the two `lowPriority` grandchild tests wait 30 s (test timeout 90 s), and the `lowPriority` exit-code tests use `timeoutMs: 60_000` (test timeout 130 s). Test-only change.
+- QA-1.2-23 — Resolution: 2d6ff09 — `tracked` is a `Map<pid, token>`; each run tracks with its own token and `untrack` deletes only when the token matches, so a recycled id tracked by a new run survives the old run's second untrack. Unit test `tracked-process bookkeeping (QA-1.2-23)` via `trackingForTests`. Documented residual (needs pidfd): a group that empties after `exit` and whose id is recycled by an unrelated group can be signalled by the late kill or the exit hook.
+- Verification: `npx vitest run --maxWorkers=2 test/unit/exec.test.ts` twice, 39 passed / 1 skipped each (36.3 s, 35.1 s); `npm run typecheck` clean; no fixture processes left.
