@@ -1931,7 +1931,15 @@ async function gcInner(
       // QA-1.5-12: our reference lock lasts the handle's whole life, so the section 11 rules
       // apply as to an unlocked entry, except a missing dir of an alive owner: that owner
       // may be between its fs.rm and its own unlock (section 6 step 4).
-      collect = released(keys) || !isAlive(parsed.pid) || (stats !== undefined && now() - stats.mtimeMs > STALE_REFERENCE_AGE_MS);
+      // QA-1.5-15: a missing dir carrying our exact reason is collected whatever the pid's
+      // liveness (a reused pid would otherwise keep it forever). Racing an alive owner between
+      // its fs.rm and its unlock is benign: both sides only unlock our reason and remove an
+      // entry whose dir is gone.
+      collect =
+        stats === undefined ||
+        released(keys) ||
+        !isAlive(parsed.pid) ||
+        now() - stats.mtimeMs > STALE_REFERENCE_AGE_MS;
     }
     if (!collect) {
       report.kept.push(dir);

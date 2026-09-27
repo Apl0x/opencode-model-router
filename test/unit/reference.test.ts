@@ -1039,6 +1039,16 @@ describe("gcStaleReferences", { timeout: 60_000 }, () => {
     }
   });
 
+  it("QA-1.5-15: GC collects an omr-locked entry whose dir is missing even when its pid is alive (reused)", async () => {
+    const LIVE = 222222;
+    const gone = join(tmp, `omr-ref-${LIVE}-00000000000000e1`);
+    await git(repo, "worktree", "add", "-q", "--detach", "--lock", "--reason", referenceLockReason(LIVE), gone, "HEAD");
+    await fsp.rm(gone, { recursive: true, force: true }); // junction-free test worktree
+    const report = await gcStaleReferences(repo, deps({ isAlive: () => true, now: () => Date.now() + 30 * 24 * 60 * 60 * 1000 }));
+    expect(report.removed.map((d) => d.toLowerCase())).toEqual([gone.toLowerCase()]);
+    expect(report.failed).toEqual([]);
+    expect(await git(repo, "worktree", "list", "--porcelain")).not.toContain("00000000000000e1");
+  });
   it("QA-1.5-4: a second copy of the module (two install paths) keeps the first copy's live reference", async () => {
     const handle = await mat(await capture());
     try {
