@@ -635,6 +635,48 @@ describe("tracked-process bookkeeping (QA-1.2-23)", () => {
     untrack(pid, newRun);
     expect(isTracked(pid)).toBe(false);
   });
+
+  it("stops an old run's late kill once a new run took its recycled id (QA-1.2-27)", () => {
+    const { track, untrack, ownsTracked } = trackingForTests;
+    const pid = 2_000_000_125;
+    const oldRun = Symbol("old");
+    const newRun = Symbol("new");
+    // The old run's child exited with its group still alive: it stays tracked.
+    track(pid, oldRun);
+    expect(ownsTracked(pid, oldRun)).toBe(true);
+    // The group emptied and a new run's group took the id.
+    track(pid, newRun);
+    // The old run's deadline or abort must not signal the new run's group.
+    expect(ownsTracked(pid, oldRun)).toBe(false);
+    expect(ownsTracked(pid, newRun)).toBe(true);
+    untrack(pid, newRun);
+    expect(ownsTracked(pid, newRun)).toBe(false);
+  });
+
+  it.runIf(!isWin)("a late kill skips a process group whose entry another run now owns (QA-1.2-27, POSIX-only: process groups)", async () => {
+    const { track, untrack } = trackingForTests;
+    const t = tree("early-exit");
+    const controller = new AbortController();
+    const pending = runArgv(process.execPath, t.args, { cwd: tmpdir(), timeoutMs: 30000, signal: controller.signal });
+    const recycler = Symbol("recycler");
+    let child = 0;
+    try {
+      await waitForFile(t.file("holder"));
+      expect(await t.childExited()).toBe(true);
+      child = t.pid("child");
+      const holder = t.pid("holder");
+      // Stand-in for a new run whose group took the id: it overwrites the entry.
+      track(child, recycler);
+      controller.abort();
+      const r = await pending;
+      expect(r.stderr).not.toMatch(/killed the process group/);
+      expect(alive(holder)).toBe(true);
+    } finally {
+      untrack(child, recycler);
+      await t.release();
+      await pending;
+    }
+  }, 30000);
 });
 
 describe("lowPriority", () => {

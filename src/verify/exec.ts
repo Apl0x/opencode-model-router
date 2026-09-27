@@ -304,9 +304,11 @@ function run(file: string, args: string[], shell: boolean, opts: RunOptions, nic
       // `taskkill` it. Only what it left running can remain.
       if (isWin) {
         sweep();
-      } else if (pid && !groupGone && signalGroup(pid, "SIGKILL")) {
+      } else if (pid && !groupGone && ownsTracked(pid, trackToken) && signalGroup(pid, "SIGKILL")) {
         // A group id is not reused while any member is alive, and `groupGone`
-        // stops us once the group was seen empty.
+        // stops us once the group was seen empty. If the group emptied later
+        // and a new run's group took the id, that run overwrote our entry, so
+        // the ownership check skips its group (QA-1.2-27).
         killed = true;
         notes.push("[killed the process group left running by the exited command]");
       }
@@ -434,9 +436,11 @@ function killTree(child: ChildProcess): void {
 // group both at `exit` and at settle, and its id may be recycled in between by
 // a new run's group. That run overwrites the entry, and the old run's second
 // untrack must not delete it, so only the owner's token deletes an entry.
-// Not fixable without pidfd: if a group empties after `exit` and its id is
-// recycled by an unrelated group, the late kill or this hook can signal that
-// group (it needs a `setsid` escapee holding the pipes plus PID wrap-around).
+// The same token keeps a run's late kill off a recycled id taken by another
+// run of this process (QA-1.2-27). Not fixable without pidfd: if a group
+// empties after `exit` and its id is recycled by an unrelated group (not one
+// of our runs), the late kill or this hook can signal that group (it needs a
+// `setsid` escapee holding the pipes plus PID wrap-around).
 const tracked = new Map<number, symbol>();
 let exitHookInstalled = false;
 
@@ -448,13 +452,19 @@ function track(pid: number, token: symbol): void {
 }
 
 function untrack(pid: number, token: symbol): void {
-  if (tracked.get(pid) === token) tracked.delete(pid);
+  if (ownsTracked(pid, token)) tracked.delete(pid);
 }
 
-/** The tracking helpers, for unit tests only (QA-1.2-23). */
+/** The entry for `pid` is still the one `token`'s run tracked. */
+function ownsTracked(pid: number, token: symbol): boolean {
+  return tracked.get(pid) === token;
+}
+
+/** The tracking helpers, for unit tests only (QA-1.2-23, QA-1.2-27). */
 export const trackingForTests = {
   track,
   untrack,
+  ownsTracked,
   isTracked: (pid: number): boolean => tracked.has(pid),
 };
 
