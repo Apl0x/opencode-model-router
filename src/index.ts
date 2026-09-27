@@ -355,7 +355,9 @@ const ModelRouterPlugin: Plugin = async (ctx: PluginInput) => {
     logger,
   });
   // 2.1.5b: sweep reference dirs a crashed instance left behind. Fire-and-forget; never throws.
-  startReferenceGc();
+  // QA-2.1-11: deferred (unref'd timer), so plugin start never holds the project directory with a
+  // git child; dispose cancels it.
+  const stopReferenceGc = startReferenceGc();
 
   // Best-effort, secret-free delegate scorecard dump (counts only).
   const dumpDelegateScorecard = (
@@ -436,6 +438,7 @@ const ModelRouterPlugin: Plugin = async (ctx: PluginInput) => {
     // enough for that to be the normal case. Verified against opencode 1.18.16
     // that dispose is both called and awaited, so flushing here is enough.
     dispose: async () => {
+      stopReferenceGc();
       await logger.flush();
     },
     tool: {

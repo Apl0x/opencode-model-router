@@ -96,6 +96,11 @@ export interface PreparedVerification {
   snapshot: TreeSnapshot | undefined;
 }
 
+/**
+ * QA-2.1-11: the start-up reference GC runs this long after plugin start, so the start itself never
+ * holds the project directory with a git child process.
+ */
+export const REFERENCE_GC_START_DELAY_MS = 45_000;
 /** How long the gate-time tree snapshot may take (bounded further by a gate deadline). */
 export const GRADE_SNAPSHOT_TIMEOUT_MS = 10_000;
 /** T3: each git test search, bounded further by a gate deadline. */
@@ -116,8 +121,14 @@ export interface VerificationWiring {
    * yet" and is logged. Never rejects.
    */
   beginVerificationBounded(store: ReturnType<typeof createChangedFileStore>, id: string, cwd: string | undefined, dod: DoD): Promise<void>;
-  /** 2.1.5b: fire-and-forget crash GC of stale reference dirs at plugin start. Never throws. */
-  startReferenceGc(): void;
+  /**
+   * 2.1.5b: the crash GC of stale reference dirs, fire-and-forget. QA-2.1-11: it runs `delayMs`
+   * (default REFERENCE_GC_START_DELAY_MS) after the call, on an unref'd timer, so plugin start
+   * never spawns a git process in the project directory (a process's cwd holds the directory on
+   * Windows: EBUSY for whoever removes it). Returns a cancel function for plugin dispose: it
+   * clears a pending timer and aborts the git calls of a GC in flight. Never throws.
+   */
+  startReferenceGc(delayMs?: number): () => void;
   /** P0: the snapshot, the changed files and the settled reference, each bounded by `deadline` when given. */
   prepareVerification(
     store: ReturnType<typeof createChangedFileStore>,
@@ -470,23 +481,38 @@ export function createVerificationWiring(deps: {
         logger.warn("[verify] dispatch reference capture failed; proceeding without a reference", { id, error: errorText(outcome.error) });
       }
     },
-    startReferenceGc() {
+    startReferenceGc(delayMs = REFERENCE_GC_START_DELAY_MS) {
       if (!directory) {
         logger.debug?.("[verify] reference GC skipped: plugin root unknown");
-        return;
+        return () => undefined;
       }
-      try {
-        const budget = resolveVerifyBudget(getConfig());
-        const argv: ArgvSeam = (file, args, opts) => argvSeam(file, args, { ...opts, lowPriority: budget.lowPriority });
-        gcStaleReferences(directory, { argv, fs: nodeReferenceFs, logger }).then(
-          report => {
-            if (report.removed.length > 0) logger.debug?.("[verify] reference GC removed stale dirs", { removed: report.removed.length });
-          },
-          (err: unknown) => logger.warn("[verify] reference GC failed", { error: errorText(err) }),
-        );
-      } catch (err) {
-        logger.warn("[verify] reference GC failed", { error: errorText(err) });
-      }
+      const stop = new AbortController();
+      const run = (): void => {
+        if (stop.signal.aborted) return;
+        try {
+          const budget = resolveVerifyBudget(getConfig());
+          // Low priority (QA-1.2-13), and every git call dies with the plugin (dispose).
+          const argv: ArgvSeam = (file, args, opts) => argvSeam(file, args, {
+            ...opts,
+            lowPriority: budget.lowPriority,
+            signal: opts?.signal ? AbortSignal.any([opts.signal, stop.signal]) : stop.signal,
+          });
+          gcStaleReferences(directory, { argv, fs: nodeReferenceFs, logger }).then(
+            report => {
+              if (report.removed.length > 0) logger.debug?.("[verify] reference GC removed stale dirs", { removed: report.removed.length });
+            },
+            (err: unknown) => logger.warn("[verify] reference GC failed", { error: errorText(err) }),
+          );
+        } catch (err) {
+          logger.warn("[verify] reference GC failed", { error: errorText(err) });
+        }
+      };
+      const timer = setTimeout(run, Math.max(0, delayMs));
+      timer.unref?.();
+      return () => {
+        clearTimeout(timer);
+        stop.abort();
+      };
     },
     async prepareVerification(store, id, childID, cwd, deadline) {
       const base = resolve(directory, cwd || ".");

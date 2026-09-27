@@ -3,7 +3,7 @@ import { join, resolve } from "node:path";
 import { execFileSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { awaitBounded, createVerificationWiring, DISPOSED_MEMO_MAX, TEST_SEARCH_TIMEOUT_MS } from "../../src/verify/wiring";
+import { awaitBounded, createVerificationWiring, DISPOSED_MEMO_MAX, REFERENCE_GC_START_DELAY_MS, TEST_SEARCH_TIMEOUT_MS } from "../../src/verify/wiring";
 import { resolveVerifyBudget } from "../../src/router/config";
 import type { Deadline } from "../../src/verify/types";
 import { createHash } from "node:crypto";
@@ -363,12 +363,29 @@ describe("dispatch reference wiring", () => {
       await expect(p).resolves.toBeUndefined();
       expect((await wiring.prepareVerification(store, "d", "child")).reference.kind).not.toBe("captured");
     });
-    it("gcStaleReferences runs once per start and its rejection is logged, not thrown", async () => {
+    it("gcStaleReferences runs once, REFERENCE_GC_START_DELAY_MS after start (QA-2.1-11), and its rejection is logged, not thrown", async () => {
       const { wiring, warnings } = bounded({}); state.gcRejects = true;
       expect(() => wiring.startReferenceGc()).not.toThrow();
-      await vi.advanceTimersByTimeAsync(0);
+      // Plugin start spawns nothing in the project directory.
+      await vi.advanceTimersByTimeAsync(REFERENCE_GC_START_DELAY_MS - 1);
+      expect(state.gcCalls).toEqual([]);
+      await vi.advanceTimersByTimeAsync(1);
       expect(state.gcCalls).toEqual([cwd]);
       expect(warnings.some(w => w.includes("reference GC failed"))).toBe(true);
+      await vi.advanceTimersByTimeAsync(10 * REFERENCE_GC_START_DELAY_MS);
+      expect(state.gcCalls).toEqual([cwd]);
+    });
+    it("cancelling before the delay runs no GC; the timer never keeps the process alive", async () => {
+      const { wiring } = bounded({});
+      const unref = vi.spyOn(globalThis, "setTimeout");
+      const cancel = wiring.startReferenceGc();
+      expect(unref).toHaveBeenCalledWith(expect.any(Function), REFERENCE_GC_START_DELAY_MS);
+      const timer = unref.mock.results[0]?.value as { hasRef?: () => boolean } | undefined;
+      expect(timer?.hasRef?.() ?? false).toBe(false);
+      unref.mockRestore();
+      cancel();
+      await vi.advanceTimersByTimeAsync(2 * REFERENCE_GC_START_DELAY_MS);
+      expect(state.gcCalls).toEqual([]);
     });
   });
 
@@ -440,30 +457,47 @@ describe("reference GC at start", () => {
   };
   it("is skipped without a plugin root", () => {
     const l = logs();
-    createVerificationWiring({ client: {}, directory: "", getConfig: () => harness().cfg, logger: l.logger }).startReferenceGc();
+    const cancel = createVerificationWiring({ client: {}, directory: "", getConfig: () => harness().cfg, logger: l.logger }).startReferenceGc(0);
     expect(state.gcCalls).toEqual([]);
     expect(l.debug).toEqual(["[verify] reference GC skipped: plugin root unknown"]);
+    expect(() => cancel()).not.toThrow();
   });
   it("logs removed stale dirs and runs its git at the configured priority", async () => {
     const l = logs(); const { cfg } = harness(); state.gcRemoved = [join(cwd, "stale")]; state.gcArgv = true;
-    createVerificationWiring({ client: {}, directory: cwd, getConfig: () => cfg, logger: l.logger }).startReferenceGc();
+    createVerificationWiring({ client: {}, directory: cwd, getConfig: () => cfg, logger: l.logger }).startReferenceGc(0);
     await vi.waitFor(() => expect(l.debug).toEqual(["[verify] reference GC removed stale dirs"]));
     expect(state.commands).toEqual(["git worktree prune"]);
     expect(state.execOpts[0]).toMatchObject({ cwd, lowPriority: resolveVerifyBudget(cfg).lowPriority });
+    expect(state.execOpts[0].signal?.aborted).toBe(false);
     expect(l.warn).toEqual([]);
+  });
+  it("cancelling aborts the git calls of a GC in flight", async () => {
+    const l = logs(); const { cfg } = harness(); state.gcArgv = true;
+    let seen: AbortSignal | undefined;
+    let release!: () => void;
+    state.argvImpl = (_file, _args, opts) => new Promise(resolve => {
+      seen = opts.signal;
+      release = () => resolve({ code: 0, stdout: "", stderr: "", timedOut: false });
+    });
+    const cancel = createVerificationWiring({ client: {}, directory: cwd, getConfig: () => cfg, logger: l.logger }).startReferenceGc(0);
+    await vi.waitFor(() => expect(seen).toBeDefined());
+    expect(seen?.aborted).toBe(false);
+    cancel();
+    expect(seen?.aborted).toBe(true);
+    release();
   });
   it("nothing removed logs nothing", async () => {
     const l = logs();
-    createVerificationWiring({ client: {}, directory: cwd, getConfig: () => harness().cfg, logger: l.logger }).startReferenceGc();
+    createVerificationWiring({ client: {}, directory: cwd, getConfig: () => harness().cfg, logger: l.logger }).startReferenceGc(0);
     await vi.waitFor(() => expect(state.gcCalls).toEqual([cwd]));
     await new Promise(r => setTimeout(r, 0));
     expect(l.debug).toEqual([]);
   });
-  it("a config that throws is logged, not thrown", () => {
+  it("a config that throws is logged, not thrown", async () => {
     const l = logs();
     const wiring = createVerificationWiring({ client: {}, directory: cwd, getConfig: () => { throw new Error("config broke"); }, logger: l.logger });
-    expect(() => wiring.startReferenceGc()).not.toThrow();
-    expect(l.warn).toEqual(["[verify] reference GC failed"]);
+    expect(() => wiring.startReferenceGc(0)).not.toThrow();
+    await vi.waitFor(() => expect(l.warn).toEqual(["[verify] reference GC failed"]));
     expect(state.gcCalls).toEqual([]);
   });
 });
