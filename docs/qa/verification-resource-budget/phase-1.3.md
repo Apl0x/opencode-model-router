@@ -813,3 +813,78 @@ Cleanup: the 34 junctions under `<W>` (`node_modules` links into `D:\git\omr-p13
 and the check found 0 reparse points left. Then `<W>` was deleted, together with the hard links it held to `bun.exe` and `node.exe`. The link
 targets are intact. `%TEMP%\bun-node-0d9b296af`, which this review's `bun --bun run` probe created, was removed. The final check found 0
 `omr-verify-*` files, 0 `bun-node-*` directories, and no process referring to `omr-qa13r4`. The Spike C fixtures were not modified.
+
+### Resolutions (round 4)
+
+Gates after the last fix: `npx vitest run --maxWorkers=2 --coverage --coverage.include=src/verify/runner.ts test/unit/runner.test.ts test/unit/deterministic.test.ts`
+gave `Test Files 2 passed (2)`, `Tests 695 passed (695)`, and runner.ts coverage of 99.52% statements, 97.98% branches (1654/1688), 100% functions
+and 99.86% lines. `npm run typecheck` was clean. runner.ts still imports no `child_process`.
+Contract changes are additive: `DetectedRunner` gains the optional `inlineConfigs`; `PytestFacts` gains the optional `rootdir`; `SETUP_REF_LIMIT`
+(1000) is exported; `config-too-large` gains a second reason template, `too many setup references in <path> (limit 1000)`. No S6 code was added.
+The G.8a note text `playwright test file excluded by the <runner> config, not run: <rel>` is gone (no consumer read it).
+Real-runner checks: runner.ts at abcdb15 ("before") and at 2e55d1e ("after") were driven under bun 1.3.14 from `%TEMP%\omr-fix13r4`. The
+planners used the real fs (native realpath, bigint stat) and a search seam backed by `git ls-files` / `git grep`; each fixture was a fresh
+directory with its own `git init` and commit. Specs were spawned with `spawnSync(file, args, {shell: false})`, and every run went through
+`readResult`. Runners: vitest 4.1.11 (`D:\git\omr-p13\node_modules`, by junction), jest 30.5.2 (Spike C `node_modules`, by junction), pytest
+9.1.1 + xdist 3.8.0 (the Spike C venv, through `host.pathEnv`); node v24.21.0 from PATH ran the JS specs. "User's own" is the check command
+run by itself in the fixture. Cleanup: the 5 junctions were removed with `rmdir` first (0 reparse points left), then the directory; the link
+targets are intact. The final check found 0 `omr-verify-*` files and 0 `bun-node-*` directories in `%TEMP%`, and no process referring to the
+scratch directory.
+
+- QA-1.3-38 Resolution: c53656e — The static exclusion is removed, not narrowed (the dispatch's fallback). A sound reading needs vitest's
+  `test.exclude` path, `root`/`dir` and `mergeConfig` inputs (create-vue merges an imported vite config) and Playwright's `projects`,
+  `testMatch`, `testIgnore` and regex matchers; each is a new way to drop a real test, and the exact answer is available from the runner
+  itself. A test file the runner's config excludes is an input again, the pre-round-3 behaviour: an e2e-only change runs 0 tests and the
+  zero-test guard (I 2a) makes it unverifiable, never a pass; with a source file in the same change, the source's related tests run.
+  Playwright configs are no longer read, and CONFIG_KEY_RE is back to the setup keys and rootDir. Section P now records e2e-only changes
+  as unverifiable (the round-3 `coverage.exclude` rationale is gone), and Q 2.1 names `vitest list --filesOnly --json <file>` /
+  `jest --listTests --findRelatedTests <file>` as the way 2.1 could turn them into NoAffected. Real vitest 4.1.11, changed test made to
+  fail: (a) `coverage: { exclude: ['tests/**'] }` + playwright `testDir: './tests', testMatch: '**/*.e2e.js'`, (b) `coverage.exclude`
+  `['test/**', 'e2e/**']` + playwright `testMatch: 'e2e/**/*.pw.js'`, (c) `typecheck: { exclude: ['tests/**'] }` + playwright
+  `testIgnore: '**/unit/**'`. Before, each gave `{"noAffected":true,…}`; after, the changed file was the input and the run gave
+  `exit=1 total=1 failingIds=["tests/unit/math.test.js > add"]` (b: `test/math.test.js > add`) `complete=true`. The user's own `vitest run`
+  gave `exit=1 Test Files 1 failed (1)` for all three. create-vue layout (`exclude: [...configDefaults.exclude, 'e2e/**']`, playwright
+  `testDir: './e2e'`), `e2e/login.spec.js` changed: before `NoAffected`; after `inputs=["e2e/login.spec.js"] exit=0 total=0
+  complete=false note=vitest ran no tests although a test file was passed` (unverifiable); the user's own run passed. The QA-1.3-37
+  unit tests were rewritten: (a)-(c), `test.exclude`, `--exclude` and jest `testPathIgnorePatterns` keep the file as an input.
+- QA-1.3-39 Resolution: 2e55d1e — The PYTEST_ADDOPTS value the spawn sees (cross-env, else the host's) is parsed before the config
+  lookup. Its last `-c`/`--config-file` is the explicit config unless the command has one, its `-o addopts=`/`-o python_files=` override the
+  file's keys (and exempt them from the odd-spelling S6), and its `--rootdir` turns off the QA-1.3-40 fallback; the command's own options
+  come later and win. The `-c` file from PYTEST_ADDOPTS is a config trigger. A host value that cross-env replaces is still xdist/cov
+  evidence, but its `-p no:xdist` no longer suppresses the appended `-n N` (found while fixing this: the spawn never sees it). Real pytest
+  9.1.1 with host `PYTEST_ADDOPTS="-c ci/ci.ini --rootdir=."`: with `python_files = check_*.py` in ci/ci.ini and `tests/check_math.py`
+  broken, before `{"noAffected":true,"note":"no affected tests: no test files map to the changed modules"}`, after `inputs=["tests/check_math.py"]
+  exit=1 total=1 failingIds=["tests/check_math.py::test_up"] complete=true` (user's own: `exit=1 … FAILED tests/check_math.py::test_up`);
+  with `addopts = -n 3` and the `WORKERS<=2` probe, before `n=- exit=1 failingIds=["tests/test_workers.py::test_workers"]`, after
+  `n=2 exit=0 total=1 complete=true` (user's own: `exit=1 WORKERS=3`). The host and cross-env sources, the command's `-c` winning, the
+  empty cross-env value, the `-p no:xdist` case and the trigger are unit tests.
+- QA-1.3-40 Resolution: 2e55d1e — determine_setup's fallback is modelled per release line in `findPytestConfigs`: when the lookup from
+  the common ancestor finds no accepted config, no `setup.py` (a file, with stat) lies at or above the ancestor, no `pyproject.toml`
+  does either (pytest 9 line only; pytest 8.0 and 7 have no such rule, so the legacy lines ignore it), no `--rootdir` is given (command
+  or PYTEST_ADDOPTS; an empty value is none, as pytest's `ns.rootdir or None`), and the argument directories are not just the ancestor,
+  each line takes the first accepted config walking up from each argument directory in order. Spec time uses the inputs' directories in
+  F's order; detection uses the path arguments in the user's order (python_files). planStaticScoping sees it through the QA-1.3-27
+  lookup. Real pytest 9.1.1: (a) `pytest tests/a tests/b`, `tests/a/pytest.ini` with `python_files = check_*.py`, `tests/b/check_math.py`
+  broken: before `NoAffected`, after `inputs=["tests/b/check_math.py"] exit=1 total=1 failingIds=["tests/b/check_math.py::test_up"]
+  complete=true` (user's own: `exit=1`). (b) plain `pytest`, `tests/a/pytest.ini` with `addopts = -n 3`, changed `tests/a/test_workers.py`
+  and `tests/b/test_b.py`: before `n=- exit=1 failingIds=["tests/a/test_workers.py::test_workers"]`, after `n=2 exit=0 total=2
+  complete=true`. The setup.py, `--rootdir`, table-less pyproject.toml (pytest 9 line only, shown with a `tests/a/pytest.toml`),
+  first-directory-wins and bad-config cases are unit tests.
+- QA-1.3-41 Resolution: 5dd8bb2 — A jest `--config`/`-c` value that starts with `{` and ends with `}` (jest-config's isJSONString) is the
+  config itself: it is kept out of `configFiles`, recorded in `DetectedRunner.inlineConfigs`, and S6 `unsupported jest argument "<value>" in
+  <where>` when JSON.parse rejects it. The setup files it names, at any depth, resolve against runnerCwd and its rootDir and are
+  triggers. JSON configs (jest.config.json and package.json's `"jest"`) are now also read with JSON.parse, so JSON escapes in keys and
+  paths count (`"setup\u0046iles"`, `"./src/te\u0073ting/…"`), and jest references resolve against every literal rootDir (a superset
+  of round 3). Real jest 30.5.2, `jest --config '{"setupFilesAfterEnv":["./src/testing/bootstrap.js"]}'` with bootstrap.js throwing
+  `setup broke`: before `inputs=["src/testing/bootstrap.js"] exit=0 total=0 failingIds=[] collectionError=false complete=true` (a pass);
+  after `{"unverifiable":true,"code":"config-changed","reason":"config file changed: src/testing/bootstrap.js"}`. The user's own jest gave
+  `exit=1 ● Test suite failed to run … setup broke`.
+- QA-1.3-42 Resolution: 5dd8bb2 — The cost was path resolution: Bun's `path.win32.resolve` took about 12 µs a call, and every literal
+  was resolved against two bases. A reference is now resolved only when its last segment names a changed file (a basename, a stem, or
+  the directory of an index file; `""`, `.`, `..`, `<rootDir>` and a drive always resolve), each distinct reference once, and at most
+  SETUP_REF_LIMIT (1000) resolutions per plan (references times bases, plus rootDir literals); beyond that, S6 config-too-large `too many
+  setup references in <path> (limit 1000)`. The literal scan compares quote characters directly instead of a regex per character.
+  `planStaticScoping` under bun 1.3.14, real fs, jest.config.js just under 1 MiB: 262000 `'a',` literals went from 3490-3683 ms to
+  149-190 ms (changed `src/math.js` or `src/a.js`, whose stem is `a`); distinct `'d<n>/a',` literals went from 1308-1440 ms to 119 ms
+  (changed `src/math.js`) or to the S6 in 89 ms (changed `src/a.js`). A unit test plans a 1 MiB config of literals under 3 s with coverage
+  and still finds the real reference in it.
