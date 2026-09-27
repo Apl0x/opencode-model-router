@@ -1463,6 +1463,56 @@ describe("createBatchCoordinator: windows and the union run", () => {
     await c.dispose();
   });
 
+  it("QA-2.2-25: a union plan or a hold that overruns its bound is checked again, and the batch splits", async () => {
+    const RUN_MS = 1_000;
+    const tick = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+    // e = 1 s, floor 2 s, two members with 20 s: the pooled schedule fits for 13 s more.
+    const run = async (slowPlan: boolean) => {
+      const inner = harness(MODEL, {
+        execute: async (spec) => {
+          await tick(RUN_MS);
+          return ranModel(MODEL, spec);
+        },
+        // A planner step that ignores its bound: the union plan takes 13.5 s.
+        plan: async (input) => {
+          if (slowPlan && input.changedFiles !== "unavailable" && input.changedFiles.length > 1) await tick(13_500);
+          return planModel(input);
+        },
+      });
+      const runtime: BatchRuntime = {
+        ...inner.runtime,
+        // The slow plan's scope has no hold (the union's execute would take it); the other's hold
+        // is granted after 13.5 s, past its bound.
+        openScope: (meta) =>
+          slowPlan
+            ? inner.runtime.openScope(meta)
+            : {
+                ...inner.runtime.openScope(meta),
+                hold: async () => {
+                  await tick(13_500);
+                  return true;
+                },
+              },
+      };
+      const c = createCoordinator({ platform: "linux" });
+      const hook = c.hook(runtime);
+      const warm = hook(req(["src/h.ts"]));
+      await vi.advanceTimersByTimeAsync(RUN_MS);
+      await warm;
+      const outs = [hook(req(["src/a.ts"], { deadline: liveDeadline(20_000) })), hook(req(["src/b.ts"], { deadline: liveDeadline(20_000) }))];
+      await vi.advanceTimersByTimeAsync(13_500 + RUN_MS);
+      expect((await Promise.all(outs)).map((r) => ran(r).notes), `slow ${slowPlan ? "plan" : "hold"}`).toEqual([["planned 1 input(s)"], ["planned 1 input(s)"]]);
+      expect(c.stats(), `slow ${slowPlan ? "plan" : "hold"}`).toMatchObject({ unionRuns: 0, ownRuns: 3, splits: 1 });
+      await c.dispose();
+      return inner.calls;
+    };
+    await run(true);
+    // The held scope is closed (its slot released) before the members' own scopes run.
+    const calls = await run(false);
+    expect(calls.executes.map((e) => e.scope)).toEqual([0, 2, 3]);
+    expect(calls.closes).toContain(1);
+  });
+
   it("a maximum size that is not a safe integer >= 1 means no batching", async () => {
     for (const maxBatchSize of [0, 1.5, Number.NaN]) {
       const { calls, runtime } = harness();
