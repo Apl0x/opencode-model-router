@@ -1,5 +1,8 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { resolve } from "node:path";
+import { join, resolve } from "node:path";
+import { spawnSync } from "node:child_process";
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { observeTests, REFERENCE_NONE } from "../../src/verify/baseline";
 import { ABSENT_DIGEST, createChangedFileStore, buildAcceptedSuffix, type TreeSnapshot, type DispatchCaptureDeps } from "../../src/verify/dispatch";
 import { accept, type Artefact } from "../../src/verify/gate";
@@ -250,6 +253,60 @@ describe("dispatch reference capture in the changed-file store", () => {
     expect(third.changedFiles).toContainEqual({ path: a, status: " M" });
     expect(third.changedFiles).toContainEqual({ path: b, status: "written" });
     expect(third.changedFiles).toContainEqual({ path: c, status: "modified" });
+  });
+  describe("canonical change-set keys (QA-2.1-8)", () => {
+    const withAlias = (body: (real: string, alias: string) => Promise<void>) => async () => {
+      const root = realpathSync.native(mkdtempSync(join(tmpdir(), "omr-canon-")));
+      const real = join(root, "Real Project");
+      mkdirSync(join(real, "src"), { recursive: true });
+      writeFileSync(join(real, "src", "b.js"), "export {};\n");
+      writeFileSync(join(real, "src", "gone.js"), "export {};\n");
+      const alias = join(root, "alias");
+      symlinkSync(real, alias, process.platform === "win32" ? "junction" : "dir");
+      try {
+        await body(real, alias);
+      } finally {
+        rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+      }
+    };
+    /** The 8.3 short spelling of `p`, or undefined when the volume has no short names. */
+    const shortName = (p: string): string | undefined => {
+      if (process.platform !== "win32") return undefined;
+      try {
+        const out = spawnSync("cmd.exe", ["/d", "/s", "/c", `"for %I in ("${p}") do @echo %~sI"`], {
+          encoding: "utf8", windowsHide: true, windowsVerbatimArguments: true,
+        }).stdout.trim();
+        return out && out.toLowerCase() !== p.toLowerCase() ? out : undefined;
+      } catch {
+        return undefined;
+      }
+    };
+    const oneEntry = async (dispatchCwd: string, toolPath: string, listedPath: string, status = " M") => {
+      const h = harness();
+      h.setTree(tree({ cwd: dispatchCwd }));
+      await h.store.beginDispatch("d", dispatchCwd, h.deps);
+      h.store.record("child", "edit", { filePath: toolPath });
+      return h.store.delta("d", "child", tree({ cwd: dispatchCwd, dirty: true, files: [{ path: listedPath, status }] })).changedFiles;
+    };
+    it("a tool path through a junction or symlink alias and the real snapshot path are one entry", withAlias(async (real, alias) => {
+      const changed = await oneEntry(alias, join(alias, "src", "b.js"), join(real, "src", "b.js"));
+      expect(changed).toEqual([{ path: join(real, "src", "b.js"), status: " M" }]);
+    }));
+    it("a deletion seen through the alias keeps the snapshot's status (canonical parent, missing file)", withAlias(async (real, alias) => {
+      rmSync(join(real, "src", "gone.js"));
+      const changed = await oneEntry(alias, join(alias, "src", "gone.js"), join(real, "src", "gone.js"), " D");
+      expect(changed).toEqual([{ path: join(real, "src", "gone.js"), status: " D" }]);
+    }));
+    it("an 8.3 short-name spelling and the long path of one file are one entry (win32, where short names exist)", withAlias(async (real) => {
+      const short = shortName(real);
+      if (short === undefined) return; // No 8.3 names on this volume (or not win32): nothing to collapse.
+      const changed = await oneEntry(short, join(short, "src", "b.js"), join(real, "src", "b.js"));
+      expect(changed).toEqual([{ path: join(real, "src", "b.js"), status: " M" }]);
+    }));
+    it.runIf(process.platform === "win32")("compares case-insensitively on win32", withAlias(async (real) => {
+      const changed = await oneEntry(real, join(real.toUpperCase(), "SRC", "B.JS"), join(real, "src", "b.js"));
+      expect(changed).toEqual([{ path: join(real, "src", "b.js"), status: " M" }]);
+    }));
   });
   describe("paths already dirty or untracked at dispatch (QA-2.1-2)", () => {
     const [a, b, c, d, u] = ["a.js", "b.js", "c.js", "d.js", "notes.txt"].map(n => resolve(cwd, n));
