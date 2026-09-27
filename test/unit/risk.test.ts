@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { readFileSync } from "node:fs";
-import { assessRisk, REASONS, MEDIUM_CHANGE_MAX, SMALL_CHANGE_MAX, type RiskInput } from "../../src/verify/risk";
+import { assessRisk, isConfigPath, REASONS, MEDIUM_CHANGE_MAX, SMALL_CHANGE_MAX, type RiskInput } from "../../src/verify/risk";
 import type { ChangedPath, StaticScoping } from "../../src/verify/runner";
 
 const scopable: StaticScoping = { scopable: true, runner: "vitest", pendingSearches: 0, notes: [] };
@@ -182,9 +182,29 @@ describe("assessRisk", () => {
     expect(run({ root: "C:\\r", changedFiles: win }).reasons).toContain(REASONS.small);
   });
 
+  it("QA-1.6-21: setup rule is limited to test-setup conventions and linear", () => {
+    for (const p of ["vitest.setup.ts", "src/setupTests.js", "e2e/global-setup.ts", "jest.setup.js", "tests/auth.setup.mts", "globalSetup.cjs", "test-setup.tsx"]) {
+      expect(isConfigPath(p)).toBe(true);
+    }
+    for (const p of ["src/setup.ts", "src/ui/SetupWizard.tsx", "src/hooks/useSetup.ts", "src/server/setupRoutes.js", "lib/teardownAndSetup.mjs"]) {
+      expect(isConfigPath(p)).toBe(false);
+    }
+    const long = `src/${"setup".repeat(20_000)}.ts`;
+    const t0 = performance.now();
+    isConfigPath(long);
+    run({ changedFiles: [{ path: long }] });
+    expect(performance.now() - t0).toBeLessThan(50);
+  });
+
+  it("QA-1.6-23: requirements/*.txt is a dependency manifest", () => {
+    expect(isConfigPath("requirements/base.txt")).toBe(true);
+    expect(run({ changedFiles: [{ path: "requirements/base.txt" }] }).reasons).toContain(REASONS.configChanged);
+    expect(isConfigPath("requirements/sub/notes.txt")).toBe(false);
+  });
+
   it("risk.ts imports nothing with side effects", () => {
     const src = readFileSync(new URL("../../src/verify/risk.ts", import.meta.url), "utf8");
-    expect(src).not.toMatch(/child_process|from ["'](node:)?(fs|http|https|net)["']|\brequire\(|\bimport\(|\bprocess\./);
+    expect(src).not.toMatch(/child_process|from ["'](node:)?(fs|http|https|net)["']|from ["']node:|\brequire\(|\bimport\(|\bprocess\.|\bfetch\(|\bWebSocket\b|\bXMLHttpRequest\b|^export .* from/m);
     expect(src.match(/^import .*$/gm)).toEqual(['import type { ChangedPath, StaticScoping } from "./runner";']);
   });
 });

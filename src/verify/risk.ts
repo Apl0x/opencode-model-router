@@ -6,7 +6,10 @@
  *
  * Paths: classification is done on repo-relative paths (QA-1.6-9). Pass the git root as `root`;
  * absolute paths under it are made relative (after `\` → `/`, case-insensitively for drive-letter
- * roots). An absolute path that cannot be made relative is classified conservatively: it never
+ * roots). CONTRACT (QA-1.6-22): `root` must be the git top-level the paths were resolved against
+ * (`git rev-parse --show-toplevel`, real path, as tree.ts uses) — never the delegation cwd: a
+ * subdirectory root strips inner segments such as `tests/` and can under-rate. Exposing the
+ * top-level on `TreeSnapshot` and passing it here is deferred to 2.1/2.4. An absolute path that cannot be made relative is classified conservatively: it never
  * counts as documentation. Paths are deduplicated (normalised, case-folded for drive-letter paths)
  * before counting (QA-1.6-15).
  *
@@ -136,6 +139,14 @@ export function isTestPath(p: string): boolean {
   );
 }
 
+/**
+ * Test-setup files (QA-1.6-21, adjustment to the §1.5-17 extension): `*.setup.<js/ts>` or the
+ * conventional basenames below. Both alternatives are anchored and linear-time; generic
+ * `*setup*` names (`src/setup.ts`, `SetupWizard.tsx`) are application code, not config.
+ */
+const SETUP_FILE =
+  /\.setup\.[cm]?[jt]sx?$|^(setupTests|setup-tests|test-setup|global-setup|globalSetup|vitest\.setup|jest\.setup)\.[cm]?[jt]sx?$/i;
+
 export function isConfigPath(p: string): boolean {
   const n = norm(p);
   const b = base(n);
@@ -154,7 +165,7 @@ export function isConfigPath(p: string): boolean {
     /^tsconfig.*\.json$/.test(b) ||
     /^(vite|vitest|jest)\.config\./.test(b) ||
     /^vitest\.workspace\./.test(b) ||
-    /setup[^/]*\.[cm]?[jt]sx?$/i.test(b) ||
+    SETUP_FILE.test(b) ||
     b === "conftest.py" ||
     b === "pyproject.toml" ||
     b === "pytest.ini" ||
@@ -164,7 +175,8 @@ export function isConfigPath(p: string): boolean {
     b === ".gitlab-ci.yml" ||
     b === "Makefile" ||
     b === "CMakeLists.txt" ||
-    /^(requirements|constraints).*\.txt$/.test(b)
+    /^(requirements|constraints).*\.txt$/.test(b) ||
+    /(^|\/)requirements\/[^/]*\.txt$/.test(n)
   );
 }
 
