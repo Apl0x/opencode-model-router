@@ -1286,3 +1286,194 @@ Verification (Windows 11, node): `npm run typecheck` clean. `npx vitest run --ma
 - The failure is in scratch-dir cleanup. It was not investigated further, and whether it happened before this change was not verified.
 
 No fixture or stand-in processes were left afterwards (`Win32_Process` query).
+
+## QA re-review (round 7)
+
+Reviewer: heavy QA, re-review of the round-6 fixes, `git diff 98d8580..2f5089d` on `vrb/p12`
+(`c5b105e`, `2f5089d`: `src/verify/exec.ts`, `test/unit/exec.test.ts`,
+`test/fixtures/exec/host.mjs` and this file). The review also root-causes the `EPERM` cleanup
+failure of the QA-1.2-19 test that the implementer recorded above.
+
+**Setup.**
+- Host: Windows 11, 16 logical cores, node v24.21.0.
+- `npm run typecheck` is clean.
+- `npx vitest run --maxWorkers=2 test/unit/exec.test.ts` was run 3 times in the worktree on an idle
+  machine: **42 passed, 2 skipped** (44) each time, 41.8–42.3 s.
+- The repro work lived in `%TEMP%\omr-qa12r7` and has been removed. Afterwards no scratch dir
+  was left in `%TEMP%`, a `Win32_Process` query on the scratch, fixture, stand-in and burner names
+  matched nothing, and the worktree was unchanged.
+  - **Diagnostic copy.** This was a `git archive` copy of `2f5089d`, with `node_modules` linked to
+    the worktree's. Only the copy was edited. Its `afterEach` catches a failed `rmSync`, then:
+    1. records `alive()` for the test's known PIDs (the host, the stand-in, and the `child`/`holder`
+       from the PID files);
+    2. retries `rmSync` once;
+    3. runs a `Win32_Process` query for every process whose command line names the dir, and for
+       those PIDs;
+    4. rethrows.
+  - **`cwdhold.mjs`.** (a) `rmSync` of a dir that a live node process uses as its cwd.
+    (b) A holder like `tree.cjs`'s (cwd = the scratch dir, exits when a release file appears). The
+    script polls `process.kill(pid, 0)` until it reports the holder dead, then calls `rmSync` at
+    once. If that fails, it retries every 5 ms and records when the dir became removable.
+  - **`harness.mjs`.** It replays the QA-1.2-19 test's sequence (`exec.test.ts:573-597`) outside
+    vitest: start `host.mjs hung-sweeper <dir>`, wait for the host's `close`, `waitForExit(stand-in,
+    3000)`, release the holder and `waitForExit(holder)`, then `rmSync(dir)`. It ran three arms,
+    interleaved, 15 runs each:
+    - A: the fixture as committed;
+    - B: the same, but the host runs the tree with the run's `cwd` set to `%TEMP%`;
+    - C: the same as A, with `rmSync(…, { maxRetries: 10, retryDelay: 50 })`.
+
+    It also ran `late-sweeper` and `unpinned-sweeper` 3 times each. For the unpinned stand-in, it
+    recorded `process.cwd()` to a probe file.
+  - **Load.** Load runs used 16 normal-priority `node` busy loops, one per logical core, each ending
+    itself after its set time.
+  - **handle.exe.** Sysinternals Handle v5.0 is installed, but the session is not elevated. It then
+    lists no File handles: with a live node process whose cwd was a scratch dir, it printed
+    `No matching handles found`. So it could not name the holder. The holder was found by
+    elimination and by the A/B experiment below.
+
+**Result.**
+- QA-1.2-28 and QA-1.2-29 are verified.
+- The EPERM flake is a test-harness race, not a leftover process: see the next section and
+  QA-1.2-30.
+- The new `unpinned-sweeper` test and the `late-sweeper` test leave no stand-in running. Their
+  stand-ins never sit in a test's scratch dir.
+- There is 1 new finding, a nit.
+- The DoD (zero open findings) is **not met**.
+
+### Round-6 findings
+
+| Finding | Status | Evidence |
+|---|---|---|
+| QA-1.2-28 | verified | **Code.** The `exec.ts` part of `98d8580..2f5089d` is comment-only: the header's G4 bullet (`exec.ts:21-27`) and the `ShellResult.timedOut` JSDoc (`:48-53`). No code line changed.<br>**Wording.** "Exactly when" is gone. The bullet says `timedOut` is true when the deadline or abort fired while something still held the run, so a kill was attempted. It names the ambiguous case that counts as a kill (fail-closed): the grace settling the run while a sweep that pinned trees is still reporting, even if the leftover exited on its own. The no-op sentence for an abort that finds nothing running is kept. `ShellResult.timedOut` says the same. This is fix items 1 and 2. Item 3 (the G4 wording) stays with 3.2. |
+| QA-1.2-29 | verified | **Code.**<br>• `host.mjs unpinned-sweeper` (`:24-29`, `:43-45`, `:72`, `:109`, `:123`) starts a stand-in that prints no marker, kills nothing and lives 5 s. It releases the holder right after the abort and reports `settledIn`.<br>• The test (`exec.test.ts:623-646`) asserts `{ code: 0, stderr: "", timedOut: false }` and `settledIn >= KILL_GRACE_MS - 50`.<br>**Mutant A** (the diagnostic copy, idle). The mutant drops `&& sweeper.pinnedCount() > 0` from `onGrace` (`exec.ts:289`). `-t "process lifecycle"` then gives **1 failed \| 10 passed \| 33 skipped**. The failure is the new test, with `expected { code: 1, stdout: '', …(2) } to match object { code: +0, stderr: '', …(1) }`. In round 6 the same mutant gave 10 passed and no failure. After the source was restored, the copy's `exec.ts` had no diff.<br>**Under load** (`harness.mjs`, 16 busy loops): all 3 unpinned runs gave `{ code: 0, timedOut: false }` with `settledIn` 2002–2008 ms. So the branch is reached, and the result holds under saturation too. |
+
+### The QA-1.2-19 `EPERM`: root cause
+
+**Reproduced.**
+- It is **load-dependent**. On an idle machine, 9 of 9 full-file runs were green: 3 in the
+  worktree and 6 in the diagnostic copy.
+- Under the 16 busy loops, it failed in two ways:
+  - `-t "QA-1.2-19"` alone failed 1 of 8 runs;
+  - a full-file run failed it in 1 of 2 runs.
+- Both failures carried the implementer's error, from the `afterEach` at `exec.test.ts:14`:
+  `Error: EPERM, Permission denied: \\?\C:\Users\…\Temp\omr-exec-UAIljz '\\?\C:\…\omr-exec-UAIljz'`.
+
+**At failure time** (the diagnostic `afterEach`, both failures):
+```
+alive at +2 ms: host=49928:false standIn=60716:false child=34240:false holder=63404:false
+immediate retry at +4 ms succeeds
+Win32_Process: no process names the dir; 49928, 60716, 34240 and 63404 absent
+```
+The second failure looked the same: `alive at +1 ms` (all four `false`), and the retry at +3 ms
+succeeded.
+- No process was alive at the failure, so nothing was left running.
+- The dir was released within 3–4 ms.
+
+**What gives this error.** `cwdhold.mjs` (a): with a live node process whose cwd was the scratch
+dir, `rmSync(dir, { recursive: true, force: true })` threw exactly
+`EPERM, Permission denied: \\?\…` and left both the dir and its file in place. So the error is
+the signature of a process that still has the dir as its current directory.
+
+**The window.** `cwdhold.mjs` (b) called `rmSync` as soon as `process.kill(pid, 0)` reported the
+cwd holder dead.
+- **Idle:** 0 of 60 failed.
+- **Under load:** **38 of 60** failed with `EPERM`. The dir became removable 124–233 ms later.
+
+On Windows, `process.kill(pid, 0)` checks whether the process has an exit code yet (libuv's
+signal-0 check; its source was not re-read here). So the test's `alive()` (`exec.test.ts:37-44`)
+reports a process dead before the process has closed its handles, including the handle to its
+current directory. Idle, that gap is too short to hit. Under CPU saturation the exiting process is
+descheduled mid-teardown, and the gap grows to hundreds of ms.
+
+**Which process.** The failing test's dir is the cwd of only two processes: the tree's direct
+child and the holder. That is because the host runs the tree with `cwd: dir` (`host.mjs:112`).
+- **The stand-in is not one of them.** exec.ts spawns the sweeper with no `cwd` (`exec.ts:618-621`),
+  and `startHost` passes none either (`exec.test.ts:357`). So the stand-in runs in the host's cwd,
+  and so does the host. The probe confirmed it: the unpinned stand-in's `process.cwd()` was the
+  host's cwd, not the scratch dir.
+- **The direct child is not the one either.** It exits before the abort, more than 2.5 s before
+  cleanup.
+- **That leaves the holder.** In `hung-sweeper` mode, the host releases it only after the result
+  (`host.mjs:126`). The test then waits for the host's exit and the stand-in, and `t.release()`
+  (`exec.test.ts:404-409`) returns as soon as `alive(holder)` is false. The `afterEach` then runs
+  at once, inside the holder's teardown window. The harness saw the holder dead 0–315 ms after the
+  host closed.
+
+**A/B** (`harness.mjs`, under load, 15 interleaved runs per arm):
+
+| Arm | `EPERM` | Dir removable again after |
+|---|---|---|
+| A: as committed (the holder's cwd is the scratch dir) | **6 / 15** | 127–451 ms |
+| B: only the run's cwd moved to `%TEMP%` | 0 / 15 | — |
+| C: as A, with `rmSync` `maxRetries: 10, retryDelay: 50` | 0 / 15 | — |
+
+Arm B leaves the same files in the same dir and never fails. So the lock is the holder's current
+directory, not an antivirus or indexer handle on the files. Arm C shows that Node 24's `rmSync`
+retries this `EPERM`.
+
+**Why only this test.**
+- The in-process lifecycle tests run the tree with `cwd: tmpdir()` (`exec.test.ts:428`, `:445`,
+  `:473`, `:493`, `:511`). So their holders, which also die just before cleanup, are not in the
+  scratch dir.
+- Of the three host modes, only `hung-sweeper` lets the holder live until after the result:
+  - in `late-sweeper`, the stand-in kills the holder at the abort;
+  - in `unpinned-sweeper`, the holder is released at the abort (`host.mjs:123`);
+  - either way, the holder is gone at least 2 s before cleanup.
+
+**Not caused by round 6.**
+- The QA-1.2-29 test runs after the QA-1.2-19 test in the file, and each test removes only its
+  own dirs.
+- In the harness, the `late-sweeper` and `unpinned-sweeper` stand-ins were already dead when the
+  host closed (3/3 each), because they die with the host's job. The tests' `killIfAlive(standIn)`
+  covers any other case.
+- `cwd: dir` and the release after the result are unchanged context lines in `98d8580..2f5089d`.
+  Both came with the QA-1.2-19 test itself (`0ec7ec5`, `git log -S`).
+
+**Verdict.**
+- It is a cleanup race in the test harness: `alive()` reports "dead" before Windows has closed the
+  process's handles.
+- It is not a leftover process in `exec.ts` or the fixture: every process had exited, and the dir
+  was free within 0.5 s.
+- It is not an antivirus or indexer effect.
+
+### New findings
+
+| ID | Severity | Where | Evidence | Fix |
+|---|---|---|---|---|
+| QA-1.2-30 | nit (test-only; load-dependent; pre-existing since `0ec7ec5`) | `test/unit/exec.test.ts:14` (`afterEach` `rmSync` without retries), with `host.mjs:112` (`cwd: dir`), `host.mjs:126` and `exec.test.ts:404-409` | **The QA-1.2-19 test's cleanup races Windows process teardown.** It failed the implementer's round-6 gating runs 2 of 3. See the root-cause section above.<br>• The `hung-sweeper` holder has the scratch dir as its cwd and dies right before `afterEach`.<br>• `alive()` reports it dead before its cwd handle is closed, so `rmSync` hits `EPERM`.<br>**Measured under load:**<br>• replay: 6 of 15 runs failed;<br>• micro-repro: 38 of 60 failed;<br>• the dir was removable 124–451 ms later.<br>Idle: 0 failures (9 full runs, 60 micro runs).<br>**Also exposed, in principle.** The `forkingFixture` tests run their trees with `cwd: f.dir` (for example `:92`, `:101`) and clean up right after the kill. They did not fail in this review's two loaded full runs. | 1. In `afterEach`, use `rmSync(d, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 })`. Arm C: 0 of 15 failed. This covers every test that uses a scratch dir as a cwd, and it costs time only while the dir is still held.<br>2. Optionally, have `host.mjs` run the tree with `cwd: tmpdir()`, as the in-process lifecycle tests do. The tree already gets its dir as an argument. Arm B: 0 of 15 failed.<br>3. Add a comment at `alive()`: on Windows, "dead" does not mean the process's handles are closed.<br>This is a test-only change. |
+
+### Checked, no finding
+
+- **No stand-in outlives its test.** This covers the new `unpinned-sweeper` stand-in (5 s
+  lifetime) and the `late-sweeper` one. When the host exits, both are ended by the host's job.
+  Their cwd is the host's, so even a live stand-in could not lock a scratch dir. After every batch
+  of runs in this review, the `Win32_Process` query matched nothing.
+- **The loaded full-file runs** (2 runs, 16 normal-priority busy loops). Apart from QA-1.2-30,
+  three tests failed. Each failure is the documented load limit, and none occurred idle:
+  - The QA-1.2-1 and QA-1.2-10 lifecycle tests failed in both runs, at their `waitForExit(holder…)`
+    G4 bound (`exec.test.ts:432`, `:456`: `expected false to be true`). The sweep finished after
+    3 s, which is G4 limit (c).
+  - The QA-1.2-2 test failed once. Its stderr was `[output streams force-closed 2000 ms after the
+    kill: the process did not exit]`, where `:524` expects "a descendant still held them".
+    Under saturation, `taskkill /T /F` of the live direct child had not finished when the grace
+    fired, and `exec.ts:288` names that case. The run was still bounded: the test took 4.1 s.
+  - All of this belongs to 3.1's loaded run (below).
+
+### Deferred by plan (not open)
+
+- **deferred by plan (3.1):** unchanged from round 4: the Bun smoke, the loaded run and the
+  coverage gate.
+  - The loaded run should expect the lifecycle tests to miss G4's 3 s under normal-priority
+    saturation (limit (c)).
+  - It should also expect QA-1.2-2's note to read "the process did not exit" when `taskkill` is
+    slower than the grace.
+- **deferred by plan (3.2):** unchanged from round 6:
+  - QA-1.2-12;
+  - the G4 wording and risk-table row, including QA-1.2-28 item 3;
+  - the QA-1.2-20 plan wording;
+  - the round-3 known limit;
+  - QA-1.2-21 item 2.
+- **deferred by plan (2.1):** QA-1.2-13, unchanged.
+
+**Status: phase 1.2 QA is NOT CLEAN.** QA-1.2-30 (nit, test-only) is open. QA-1.2-28 and
+QA-1.2-29 are verified.
