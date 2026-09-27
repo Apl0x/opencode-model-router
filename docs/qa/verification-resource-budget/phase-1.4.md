@@ -1679,6 +1679,8 @@ Other agents may have been running tests on this machine at the same time.
   - Test: remember a claim, pass its fence, run `releaseAllSlotsSync()`, and assert that the claim
     is still there.
 
+Resolution: f3fc392 — the exit hook drops an unconfirmed claim only while `mono() <= dropBy` (the entry keeps its `mono`); past the fence the claim is left to the inert rule. Test: "the exit hook drops this process's unconfirmed claim only within its drop fence" (both sides, via the `mono` seam).
+
 ### QA-1.4-33 — minor — Three more tests fail under CPU load
 
 - **Where:**
@@ -1705,6 +1707,8 @@ Other agents may have been running tests on this machine at the same time.
   - Tests that wait 5 s: explicit timeouts (for example 20 s).
   - In `:645`: give the first two looks fast deps, or allow for the 1.1 s pad in the timings.
 
+Resolution: f3fc392 — the ticket test uses a 500 ms heartbeat (TTL 1 s, `staleMs` 5 s) and `setAge(live, 1_500)`; every test that can wait 5 s or more has a 20 s timeout; `:645` uses one set of fast deps for all its looks. Slot tests: 61/61 twice, and 61/61 under 14 busy-loop processes.
+
 ### QA-1.4-34 — nit — The gap rule is not padded by the view's slack
 
 - **Where:**
@@ -1723,6 +1727,8 @@ Other agents may have been running tests on this machine at the same time.
   So the sentence is inaccurate, but the margins hold.
 - **Fix:** restart when `at − old.last > maxGap − errMs`, which is conservative. Otherwise, correct
   the sentence so that it leaves out the gap rule, and give the argument above.
+
+Resolution: f3fc392 — padded: `observe` restarts `from` when `at − old.last > maxGap − (slack + old.slack)`, so the header holds as written. The existing tests pass.
 
 ### Deferred by plan (round 4)
 
