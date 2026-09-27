@@ -30,8 +30,10 @@ import {
 } from "./deterministic";
 import { parseVerifyDirectives, type VerifyDirectives } from "./directives";
 import {
+  ABANDONED_REASON,
   ABSENT_DIGEST as PENDING_ABSENT_DIGEST,
   buildDeferredFooter,
+  DISPOSED_REASON,
   buildLineageCaveat,
   createBackgroundQueue,
   createPendingRegistry,
@@ -326,15 +328,43 @@ export function parseRouterVerifyArgs(args: unknown): VerifyTarget | { readonly 
   return { kind: "handles", handles: a.handles };
 }
 
+/** A literal phrase inside a RegExp source. */
+function escapeRegExp(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
 /**
  * pending.ts R4: reasons that say nothing about the producer's work (slot busy, the deadline or an
  * abort, a timeout, an executor or coordinator error). Matched on 2.1/2.2's stable phrases
  * (deterministic.ts u6, u7, u13, u14, u16; batch.ts BATCH_REASONS; baseline.ts
  * REFERENCE_NONE.gateBudget) and this module's own. REFERENCE_NONE.failed ("failed or timed out" at
  * dispatch) is deliberately not matched: that reference cannot be recaptured, so it is terminal.
+ *
+ * QA-2.4-14: only where the ROUTER writes it: at the start of a reason, after at most one check-kind
+ * word ("testsPass: ", "testsPass "). Producer-controlled text (failing test ids, "file > title")
+ * only ever follows a router phrase ("introduced failures: ", "; observed failures: "), so a test
+ * titled "verification slot busy" can never make a terminal verdict retryable.
  */
-const TRANSIENT_REASON =
-  /budget exhausted|within the gate budget|verification slot busy|timed out after \d+ ?ms|check errored|verification coordinator (?:disposed|failed)|verification batch (?:failed|ended without an outcome|produced no outcome)|verification unavailable:|verification run abandoned|verification registry disposed|router_verify was cancelled/i;
+const TRANSIENT_REASON = new RegExp(
+  "^(?:[A-Za-z]+:? )?(?:" +
+    [
+      "gate budget exhausted", // u7, u14 (deadline cut)
+      "verification slot busy", // u14
+      "timed out after \\d+ ?ms", // u13: "testsPass timed out after <n>ms: <command>"
+      "check errored", // u16: "testsPass check errored: <reason>"
+      "cannot attribute failures: the reference rerun timed out after \\d+ ?ms", // u6
+      `(?:no reference: pre-existing failures cannot be told apart \\()?${escapeRegExp(REFERENCE_NONE.gateBudget)}`,
+      "verification gate timed out after \\d+ ?ms",
+      "verification coordinator (?:disposed|failed)",
+      "verification batch (?:failed|ended without an outcome|produced no outcome)",
+      "verification unavailable:",
+      escapeRegExp(ABANDONED_REASON),
+      escapeRegExp(DISPOSED_REASON),
+      "router_verify was cancelled",
+    ].join("|") +
+    ")",
+  "i",
+);
 
 /**
  * pending.ts R4 `retryable`: only an unverifiable (or skipped) verdict can be retryable, and only

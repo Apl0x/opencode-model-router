@@ -400,7 +400,44 @@ describe("verifyHandles (2.4.3a)", () => {
       expect(isRetryableVerdict({ pass: true, outcome: "pass", method: "deterministic", reasons: [] }, true)).toBe(false);
       expect(isRetryableVerdict({ pass: false, outcome: "fail", method: "deterministic", reasons: ["verification slot busy"] }, true)).toBe(false);
       expect(isRetryableVerdict({ pass: false, method: "none", skipped: true, reasons: ["verification disabled"] }, false)).toBe(true);
+      // The router's own phrases, with or without the check-kind word in front.
+      expect(isRetryableVerdict(u("testsPass: verification slot busy (waited 0ms)"), false)).toBe(true);
+      expect(isRetryableVerdict(u("gate budget exhausted waiting for the verification slot"), false)).toBe(true);
+      expect(isRetryableVerdict(u("testsPass: cannot attribute failures: the reference rerun timed out after 500ms; observed failures: x > y"), false)).toBe(true);
+      expect(isRetryableVerdict(u(`testsPass: no reference: pre-existing failures cannot be told apart (${REFERENCE_NONE.gateBudget}); observed failures: x > y`), false)).toBe(true);
+      expect(isRetryableVerdict(u("testsPass check errored: verification batch failed: boom"), false)).toBe(true);
+      expect(isRetryableVerdict(u("verification gate timed out after 90000ms"), false)).toBe(true);
     });
+
+    it("QA-2.4-14: a producer test id that reads like a transient phrase never makes a verdict retryable", () => {
+      const id = "test/a.test.ts > verification slot busy (waited 0ms) gate budget exhausted check errored timed out after 5ms";
+      const u = (reason: string): Verdict => ({ pass: false, outcome: "unverifiable", method: "deterministic", reasons: [reason], caveats: [reason] });
+      expect(isRetryableVerdict(u(`testsPass: no reference: pre-existing failures cannot be told apart (${REFERENCE_NONE.failed}); observed failures: ${id}`), false)).toBe(false);
+      expect(isRetryableVerdict(u(`testsPass: cannot prove failures predate dispatch: ${id}`), false)).toBe(false);
+      expect(isRetryableVerdict(u(`${id} failed after vrf_x in this session and still fail`), false)).toBe(false);
+      expect(isRetryableVerdict({ pass: false, outcome: "fail", method: "deterministic", reasons: [`testsPass: introduced failures: ${id}`] }, false)).toBe(false);
+    });
+  });
+
+  it("QA-2.4-14: a failing test titled 'verification slot busy' stays a terminal fail, and a terminal unverifiable", async () => {
+    exactReference();
+    const title = "verification slot busy (waited 0ms)";
+    state.failing = { a: [title] };
+    const { wiring } = makeWiring();
+    const failed = await register(wiring.pending, "a");
+    const item = verdictOf((await wiring.verifyHandles("orch", { kind: "handles", handles: [failed] })).items[0]);
+    expect(item.result.verdict.outcome).toBe("fail");
+    expect(item.result.retryable).toBe(false);
+    expect(wiring.pending.get("orch", failed)).toMatchObject({ entry: { state: "verified" } });
+    // Without a reference the same failure is unverifiable: terminal, not "not judged".
+    const noRef = await register(wiring.pending, "a", { dispatchID: "task:orch:n", producerSessionID: "child-n", reference: Promise.resolve(NONE) });
+    const report = await wiring.verifyHandles("orch", { kind: "handles", handles: [noRef] });
+    const unverifiable = verdictOf(report.items[0]);
+    expect(unverifiable.result.verdict.outcome).toBe("unverifiable");
+    expect(unverifiable.result.verdict.reasons.join(" ")).toContain(title);
+    expect(unverifiable.result.retryable).toBe(false);
+    expect(report.text).not.toContain("not judged");
+    expect(wiring.pending.get("orch", noRef)).toMatchObject({ entry: { state: "verified" } });
   });
 
   it("pass: judged once, verified; a second call replays the cached verdict and spawns nothing", async () => {
