@@ -11,6 +11,7 @@ import {
   acquireSlot,
   exitReleaseFailures,
   isPidAlive,
+  machineClockFrom,
   nextBackoffMs,
   reapClaimPath,
   SLOT_DEFAULTS,
@@ -81,6 +82,12 @@ function freshDir(): string {
 function fast(dir: string, extra: SlotDeps = {}): SlotDeps {
   return { dir, heartbeatMs: 100, staleMs: 1_000, corruptGraceMs: 200, backoffMinMs: 20, backoffMaxMs: 100, unlinkRetryMs: 5, ...extra };
 }
+/**
+ * An observer that must confirm by watching: its looks come one wake-up (up to
+ * backoffMaxMs, 100 ms) plus one attempt apart, so the gap rule (2 heartbeats)
+ * needs a heartbeat of at least 5 x backoffMaxMs to hold under CPU load (QA-1.4-30).
+ */
+const WATCHER_HEARTBEAT_MS = 500;
 const meta = { cwd: "/x", command: "vitest" };
 function held(r: SlotResult): SlotHandle {
   if ("busy" in r) throw new Error("expected a slot, got busy");
@@ -267,7 +274,7 @@ describe("slot: stale detection", () => {
     const dir = freshDir();
     writeLock(join(dir, "slot-0.lock"), { pid: process.pid }); // live PID, fresh mtime, not ours
     const t0 = Date.now();
-    held(await acquireSlot({ max: 1, waitMs: 5_000, meta }, fast(dir, { staleMs: 600 })));
+    held(await acquireSlot({ max: 1, waitMs: 5_000, meta }, fast(dir, { staleMs: 600, heartbeatMs: WATCHER_HEARTBEAT_MS })));
     expect(Date.now() - t0).toBeGreaterThanOrEqual(500);
   });
 
@@ -284,13 +291,14 @@ describe("slot: stale detection", () => {
     const dir = freshDir();
     const p = join(dir, "slot-0.lock");
     writeLock(p, { hostname: "some-other-host", pid: await deadPid() });
-    expect(await acquireSlot({ max: 1, waitMs: 400, meta }, fast(dir, { staleMs: 5_000 }))).toEqual({ busy: true });
+    const deps = fast(dir, { staleMs: 5_000, heartbeatMs: WATCHER_HEARTBEAT_MS });
+    expect(await acquireSlot({ max: 1, waitMs: 400, meta }, deps)).toEqual({ busy: true });
     setAge(p, 6_000);
-    // One look is not enough: the same (token, mtime) must be seen for 2 heartbeats (2 x 100 ms).
-    expect(await acquireSlot({ max: 1, waitMs: 0, meta }, fast(dir, { staleMs: 5_000 }))).toEqual({ busy: true });
+    // One look is not enough: the same (token, mtime) must be seen for 2 heartbeats (2 x 500 ms, plus the slack).
+    expect(await acquireSlot({ max: 1, waitMs: 0, meta }, deps)).toEqual({ busy: true });
     const t0 = Date.now();
-    held(await acquireSlot({ max: 1, waitMs: 3_000, meta }, fast(dir, { staleMs: 5_000 })));
-    expect(Date.now() - t0).toBeGreaterThanOrEqual(190);
+    held(await acquireSlot({ max: 1, waitMs: 5_000, meta }, deps));
+    expect(Date.now() - t0).toBeGreaterThanOrEqual(950);
   });
 
   it("same host + dead PID is stale immediately, even with a fresh heartbeat", async () => {
@@ -303,9 +311,10 @@ describe("slot: stale detection", () => {
     const dir = freshDir();
     const p = join(dir, "slot-0.lock");
     writeFileSync(p, body);
-    expect(await acquireSlot({ max: 1, waitMs: 0, meta }, fast(dir, { corruptGraceMs: 300 }))).toEqual({ busy: true });
+    const deps = fast(dir, { corruptGraceMs: 300, heartbeatMs: WATCHER_HEARTBEAT_MS });
+    expect(await acquireSlot({ max: 1, waitMs: 0, meta }, deps)).toEqual({ busy: true });
     const t0 = Date.now();
-    held(await acquireSlot({ max: 1, waitMs: 3_000, meta }, fast(dir, { corruptGraceMs: 300 })));
+    held(await acquireSlot({ max: 1, waitMs: 5_000, meta }, deps));
     expect(Date.now() - t0).toBeGreaterThanOrEqual(250);
   });
 });
@@ -341,7 +350,7 @@ describe("slot: clock changes and suspend/resume (QA-1.4-1, QA-1.4-8)", () => {
     const future = new Date(Date.now() + 3_600_000);
     utimesSync(p, future, future);
     const t0 = Date.now();
-    held(await acquireSlot({ max: 1, waitMs: 5_000, meta }, fast(dir, { staleMs: 600 })));
+    held(await acquireSlot({ max: 1, waitMs: 5_000, meta }, fast(dir, { staleMs: 600, heartbeatMs: WATCHER_HEARTBEAT_MS })));
     expect(Date.now() - t0).toBeGreaterThanOrEqual(550);
   });
 
@@ -359,6 +368,124 @@ describe("slot: clock changes and suspend/resume (QA-1.4-1, QA-1.4-8)", () => {
     t0 = Date.now();
     expect(await acquireSlot({ max: 1, waitMs: 600, meta }, fast(dir, { heartbeatMs: 1_000, now: backward }))).toEqual({ busy: true });
     expect(Date.now() - t0).toBeLessThan(2_000);
+  });
+});
+
+describe("slot: observations never mix clock origins (QA-1.4-27)", () => {
+  /** A clock that reads 0 at `startedAt` (a `performance.now()` time), like Bun's per-process hrtime. */
+  const sinceStart = (startedAt: number) => () => performance.now() - startedAt;
+  /** The views of the one observation sidecar in `dir`. */
+  function viewsIn(dir: string): unknown[] {
+    const seen = readdirSync(dir).filter((n) => n.includes(".seen-"));
+    expect(seen).toHaveLength(1);
+    const rec: unknown = JSON.parse(readFileSync(join(dir, seen[0]!), "utf8"));
+    const views: unknown = typeof rec === "object" && rec !== null ? (rec as Record<string, unknown>).views : undefined;
+    if (!Array.isArray(views)) throw new Error("no views in the sidecar");
+    return views;
+  }
+
+  it("observers whose clocks are 8 s apart never add up each other's looks: a live holder is not reaped (b1)", async () => {
+    const dir = freshDir();
+    const p = join(dir, "slot-0.lock");
+    // Production heartbeat (5 s): the looks below all come before the holder's first heartbeat.
+    const h = held(await acquireSlot({ max: 1, waitMs: 0, meta }, { dir }));
+    const t0 = Date.now();
+    const mine = tokenAt(p);
+    // A +31 s wall step (NTP, a VM resume) makes the file look old to both observers.
+    const stepped = () => Date.now() + 31_000;
+    const y: SlotDeps = { dir, now: stepped, mono: () => performance.now() };
+    const o: SlotDeps = { dir, now: stepped, mono: () => performance.now() + 8_000 };
+    const at = (ms: number) => sleep(Math.max(0, t0 + ms - Date.now()));
+    await at(200);
+    expect(await acquireSlot({ max: 1, waitMs: 0, meta }, y)).toEqual({ busy: true });
+    await at(3_000);
+    expect(await acquireSlot({ max: 1, waitMs: 0, meta }, y)).toEqual({ busy: true });
+    await at(4_400);
+    // On one record, O's clock would see a 9.4 s gap (no restart) and count 4.2 s + 8 s = 12.2 s
+    // since Y's first look: 2 heartbeats plus the 2 s slack.
+    expect(await acquireSlot({ max: 1, waitMs: 0, meta }, o)).toEqual({ busy: true });
+    expect(tokenAt(p)).toBe(mine);
+    expect(h.lost).toBe(false);
+    expect(viewsIn(dir)).toHaveLength(2);
+  }, 15_000);
+
+  it.each([
+    ["8 s apart", (): Array<() => number> => [() => performance.now(), () => performance.now() + 8_000]],
+    [
+      "reading 0 at their own start, 1.5 s apart (Bun's hrtime)",
+      (): Array<() => number> => {
+        const s = performance.now();
+        return [sinceStart(s - 3_000), sinceStart(s - 1_500)];
+      },
+    ],
+  ])("two observers whose clocks are %s each reclaim a hung lock on their own view, and only one holds it (b3)", async (_n, clocks) => {
+    const dir = freshDir();
+    const p = join(dir, "slot-0.lock");
+    writeLock(p, { pid: process.pid, token: "hung" }, 60_000);
+    const [ma, mb] = clocks();
+    const base = fast(dir, { heartbeatMs: WATCHER_HEARTBEAT_MS, staleMs: 1_000 });
+    const deps: SlotDeps[] = [
+      { ...base, mono: ma },
+      { ...base, mono: mb },
+    ];
+    // They alternate, each looking every 400 ms (< 2 heartbeats): on one shared record each look
+    // would restart the other's witness (a gap, or a stamp from the future), for ever.
+    const t0 = Date.now();
+    let r: SlotResult = { busy: true };
+    for (let i = 0; "busy" in r && Date.now() - t0 < 10_000; i++) {
+      if (i > 0) await sleep(200);
+      r = await acquireSlot({ max: 1, waitMs: 0, meta }, deps[i % 2]);
+    }
+    const winner = held(r);
+    const owner = tokenAt(p);
+    expect(owner).not.toBe("hung");
+    for (let k = 0; k < 6; k++) {
+      await sleep(200);
+      expect(await acquireSlot({ max: 1, waitMs: 0, meta }, deps[k % 2])).toEqual({ busy: true });
+    }
+    expect(tokenAt(p)).toBe(owner);
+    expect(winner.lost).toBe(false);
+  }, 20_000);
+
+  it("the default clock: hrtime as is where it reads the uptime (Node), else anchored to the uptime (Bun), so every process reads one machine clock", () => {
+    // Simulated machine time T (ms since boot), and an uptime in whole seconds (the coarsest runtime).
+    let T = 3_600_123;
+    const up = () => Math.floor(T / 1_000) * 1_000;
+    const nodeHr = () => T + 2;
+    expect(machineClockFrom(nodeHr, up)).toBe(nodeHr);
+    // Bun: hrtime counts from the process start; A started 5 s ago, B 13 s ago (8 s apart).
+    const startA = T - 5_000;
+    const startB = T - 13_000;
+    const a = machineClockFrom(() => T - startA, up);
+    const b = machineClockFrom(() => T - startB, up);
+    let prev = -Infinity;
+    for (let k = 0; k < 400; k++, T += 7) {
+      const va = a();
+      const vb = b();
+      expect(va).toBeGreaterThanOrEqual(prev); // never goes back
+      prev = va;
+      expect(va).toBeLessThanOrEqual(T); // each sample is a lower bound
+      expect(T - va).toBeLessThan(1_000 + 7);
+      expect(Math.abs(va - vb)).toBeLessThan(1_000);
+    }
+    // Once a tick has been seen, both are within one sampling step of the machine time.
+    expect(T - a()).toBeLessThanOrEqual(7);
+    expect(Math.abs(a() - b())).toBeLessThanOrEqual(7);
+  });
+
+  it("fresh processes with Bun-like clocks share one view through the default clock; raw per-process clocks get one view each", async () => {
+    const dir = freshDir();
+    const p = join(dir, "slot-0.lock");
+    writeLock(p, { pid: process.pid, token: "hung" }, 60_000);
+    const s = performance.now();
+    const uptime = () => performance.now() + 3_600_000; // a boot clock, as the OS uptime
+    const deps = (mono: () => number) => fast(dir, { heartbeatMs: WATCHER_HEARTBEAT_MS, staleMs: 1_000, mono });
+    for (const ago of [500, 8_500, 20_000]) {
+      expect(await acquireSlot({ max: 1, waitMs: 0, meta }, deps(machineClockFrom(sinceStart(s - ago), uptime)))).toEqual({ busy: true });
+    }
+    expect(viewsIn(dir)).toHaveLength(1);
+    for (const ago of [500, 8_500]) expect(await acquireSlot({ max: 1, waitMs: 0, meta }, deps(sinceStart(s - ago)))).toEqual({ busy: true });
+    expect(viewsIn(dir)).toHaveLength(3);
   });
 });
 
@@ -451,7 +578,7 @@ describe("slot: release", () => {
     const p = join(dir, "slot-0.lock");
     const a = held(await acquireSlot({ max: 1, waitMs: 0, meta }, fast(dir, { heartbeatMs: 1_000_000 })));
     setAge(p, 10_000);
-    const b = held(await acquireSlot({ max: 1, waitMs: 2_000, meta }, fast(dir, { staleMs: 1_000 })));
+    const b = held(await acquireSlot({ max: 1, waitMs: 5_000, meta }, fast(dir, { staleMs: 1_000, heartbeatMs: WATCHER_HEARTBEAT_MS })));
     const owner = readFileSync(p, "utf8");
     await a.release();
     expect(readFileSync(p, "utf8")).toBe(owner);
@@ -526,8 +653,9 @@ describe("slot: claims replace the time-leased reap lock (QA-1.4-2, QA-1.4-11)",
     expect(await acquireSlot({ max: 1, waitMs: 0, meta }, { dir })).toEqual({ busy: true });
     expect(await acquireSlot({ max: 1, waitMs: 0, meta }, { dir, now: () => Date.now() + 10_500 })).toEqual({ busy: true });
     expect(existsSync(claim)).toBe(true);
-    // Inert: unchanged for staleMs (1 s here) since its first sighting above, witnessed for 2 x claimHoldMaxMs.
-    held(await acquireSlot({ max: 1, waitMs: 3_000, meta }, fast(dir, { claimHoldMaxMs: 100 })));
+    // Inert: unchanged for staleMs (1 s here) since its first sighting above, witnessed for 2 x claimHoldMaxMs
+    // (each plus the view's slack). The +10.5 s look has another origin, so it has its own view.
+    held(await acquireSlot({ max: 1, waitMs: 5_000, meta }, fast(dir, { claimHoldMaxMs: 100, heartbeatMs: WATCHER_HEARTBEAT_MS })));
     expect(Date.now() - t0).toBeGreaterThanOrEqual(950);
     expect(claimsIn(dir)).toEqual([]);
   });
@@ -555,7 +683,7 @@ describe("slot: claims replace the time-leased reap lock (QA-1.4-2, QA-1.4-11)",
     expect(warns.some((w) => w.includes("claim held too long"))).toBe(true);
   });
 
-  it("a claim is held only after a readable re-read shows its token; an unconfirmed one deletes nothing and is left to the inert rule (QA-1.4-26)", async () => {
+  it("a claim is held only after a readable re-read shows its token; an unconfirmed one deletes nothing and, past its owner's drop fence, is left to the inert rule (QA-1.4-26)", async () => {
     const dir = freshDir();
     const p = join(dir, "slot-0.lock");
     writeLock(p, { pid: await deadPid(), token: "dead-holder" });
@@ -564,10 +692,12 @@ describe("slot: claims replace the time-leased reap lock (QA-1.4-2, QA-1.4-11)",
       if (scanner && path.includes(".reap-")) throw Object.assign(new Error("scanner"), { code: "EBUSY" });
       return realRead(path);
     };
-    const deps = fast(dir, { read, claimHoldMaxMs: 100, unlinkRetries: 2 });
+    const deps = fast(dir, { read, claimHoldMaxMs: 100, unlinkRetries: 2, heartbeatMs: WATCHER_HEARTBEAT_MS });
     expect(await acquireSlot({ max: 1, waitMs: 0, meta }, deps)).toEqual({ busy: true });
     expect(tokenAt(p)).toBe("dead-holder");
     expect(existsSync(reapClaimPath(p, "dead-holder"))).toBe(true); // ours, but never confirmed
+    // Its owner drops it at a readable look within 1.5 x claimHoldMaxMs (QA-1.4-29); after that it is any claim.
+    await sleep(200);
     scanner = false;
     const t0 = Date.now();
     held(await acquireSlot({ max: 1, waitMs: 5_000, meta }, deps));
@@ -680,6 +810,25 @@ describe("slot: release never fails the caller (QA-1.4-4, QA-1.4-6, QA-1.4-17)",
     expect(await acquireSlot({ max: 1, waitMs: 0, meta }, fast(dir))).toEqual({ busy: true });
     locked = false;
     await waitUntil(() => !existsSync(p));
+    held(await acquireSlot({ max: 1, waitMs: 0, meta }, fast(dir)));
+  });
+
+  it("the owner's release drops its own claim that a scanner kept it from confirming, at the next readable look, so the slot is free at once (QA-1.4-29)", async () => {
+    const dir = freshDir();
+    const p = join(dir, "slot-0.lock");
+    let scanUntil = 0;
+    const read = async (path: string) => {
+      if (path.includes(".reap-") && Date.now() < scanUntil) throw Object.assign(new Error("scanner"), { code: "EBUSY" });
+      return realRead(path);
+    };
+    const a = held(await acquireSlot({ max: 1, waitMs: 0, meta }, fast(dir, { read, heartbeatMs: WATCHER_HEARTBEAT_MS })));
+    // Longer than the claim's re-read retries (5 ms x 2^i, 315 ms): the release's claim stays unconfirmed.
+    scanUntil = Date.now() + 600;
+    const t0 = Date.now();
+    await a.release();
+    // Without the drop, the claim (live PID) would block the slot until inert: 2 x claimHoldMaxMs = 10 s.
+    await waitUntil(() => !existsSync(p) && claimsIn(dir).length === 0, 4_000);
+    expect(Date.now() - t0).toBeLessThan(4_000);
     held(await acquireSlot({ max: 1, waitMs: 0, meta }, fast(dir)));
   });
 
@@ -863,6 +1012,17 @@ describe("slot: waiting", () => {
     expect(wakes).toBeLessThan(20);
   });
 
+  it.each([Number.NaN, Number.POSITIVE_INFINITY])("a non-finite waitMs (%s) counts as 0: one attempt, then busy (QA-1.4-31)", async (waitMs) => {
+    const dir = freshDir();
+    held(await acquireSlot({ max: 1, waitMs: 0, meta }, fast(dir, { heartbeatMs: 1_000_000 })));
+    let wakes = 0;
+    const t0 = Date.now();
+    expect(await acquireSlot({ max: 1, waitMs, meta }, fast(dir, { onAttempt: () => wakes++ }))).toEqual({ busy: true });
+    expect(wakes).toBe(1);
+    expect(Date.now() - t0).toBeLessThan(1_000);
+    expect(readdirSync(dir).filter((n) => n.endsWith(".ticket"))).toEqual([]);
+  });
+
   it("the production constants are the plan values: heartbeat 5 s, stale 30 s, backoff 250 ms -> 2 s (QA-1.4-15)", () => {
     expect(SLOT_DEFAULTS).toMatchObject({ heartbeatMs: 5_000, staleMs: 30_000, backoffMinMs: 250, backoffMaxMs: 2_000 });
   });
@@ -1011,6 +1171,34 @@ describe("slot: file-system errors never reject (QA-1.4-22)", () => {
     expect(await acquireSlot({ max: 1, waitMs: 0, meta }, deps2)).toEqual({ busy: true });
     held(await acquireSlot({ max: 1, waitMs: 0, meta }, deps2));
     expect(warns2.filter((w) => w.includes("in-process"))).toHaveLength(1);
+  });
+
+  it("an error after the exclusive create removes the new lock before busy is returned; if that fails too, this process's next look reaps it at once (QA-1.4-28)", async () => {
+    const dir = freshDir();
+    const p = join(dir, "slot-0.lock");
+    let failReads = 0;
+    const read = async (path: string) => {
+      if (path === p && failReads > 0) {
+        failReads--;
+        throw Object.assign(new Error("too many open files"), { code: "EMFILE" });
+      }
+      return realRead(path);
+    };
+    const warns: string[] = [];
+    const deps = fast(dir, { read, logger: { warn: (m) => warns.push(m) } });
+    failReads = 1; // the creator's re-read
+    expect(await acquireSlot({ max: 1, waitMs: 0, meta }, deps)).toEqual({ busy: true });
+    expect(warns.filter((w) => w.includes("file-system error"))).toHaveLength(1);
+    expect(existsSync(p)).toBe(false);
+    expect(claimsIn(dir)).toEqual([]);
+    await held(await acquireSlot({ max: 1, waitMs: 0, meta }, deps)).release();
+
+    failReads = 2; // the re-read, and the re-read under the claim that would remove it
+    expect(await acquireSlot({ max: 1, waitMs: 0, meta }, deps)).toEqual({ busy: true });
+    expect(tokenAt(p)).toBeDefined(); // left behind, with this process's live PID
+    // Fresh, live PID, never witnessed: only its creator knows it is nobody's, and reaps it at once.
+    held(await acquireSlot({ max: 1, waitMs: 0, meta }, deps));
+    expect(claimsIn(dir)).toEqual([]);
   });
 });
 

@@ -10,37 +10,56 @@
  * own token is there (a creator stalled between the create and the write may
  * have been reaped as an empty file).
  *
- * Clock. Every duration is measured on `mono`, the machine-wide monotonic clock
- * `process.hrtime`: CLOCK_MONOTONIC on Linux and mach/CLOCK_UPTIME_RAW on macOS
- * (both stop while the system is suspended), QueryPerformanceCounter on Windows.
- * Each reads the same value in every process of the host (checked on Windows 11:
- * processes started one after another read consecutive values, equal to
- * `os.uptime()`). Whether QPC counts a Windows sleep is not documented, and Modern
- * Standby pauses desktop processes while every clock runs, so no rule assumes
- * that the clock stops while the processes are frozen (see "witnessed"). The wall
- * clock is only compared with file mtimes.
+ * Clock. Every duration is measured on `mono`, a machine clock in ms. The one
+ * counter that every process of a boot reads alike, on every runtime, is the OS
+ * uptime (`os.uptime()`): GetTickCount64 on Windows (15.6 ms steps; Node 24 and
+ * Bun 1.3 read the same `wall - uptime` within 15 ms), CLOCK_BOOTTIME on Linux,
+ * the wall clock minus the boot time on macOS. Some runtimes round it to whole
+ * seconds. `process.hrtime` is not such a counter everywhere: Node reads a boot
+ * clock (QueryPerformanceCounter, CLOCK_MONOTONIC, mach time), but Bun, the
+ * runtime that loads opencode plugins, counts from the process start (a fresh Bun
+ * process reads about 0.4 s). So at its first use each process takes `hrtime` as
+ * is when it reads within 2 s of the uptime, and otherwise anchors it to the
+ * uptime: `mono = hrtime + max(uptime - hrtime)` over its reads. That never goes
+ * back, is as fine as `hrtime` within the process, and agrees with the other
+ * processes within the uptime's resolution; after a suspend that the uptime counts
+ * and `hrtime` does not, it jumps ahead with the uptime. Whether the clocks count
+ * a Windows sleep is not documented, and Modern Standby pauses desktop processes
+ * while every clock runs, so no rule assumes that the clock stops while the
+ * processes are frozen (see "witnessed"). The wall clock is compared with file
+ * mtimes, and it tells clock origins apart (below); nothing else.
  *
  * Shared observation. Staleness needs a file to be seen unchanged over time, and
  * one call may be too short for that (`slotWaitMs: 0`). So every look is
  * recorded in a sidecar `slot-<i>.lock.seen-<hash(file, identity, host)>` holding
- * `{key, first, from, last}` on `mono`. `key` is identity@mtime, `first` the first
- * sighting of that key, `last` the latest look by any process, and `from` the
- * first look after the latest gap of more than 2 heartbeats between two looks.
- * So `span = now - first` is how long the file has been unchanged, and
- * `witnessed = now - from` how long it has been watched without a gap. A new
- * key, another boot (the Linux boot id, or the boot instant `wall - mono` moved by
- * more than a minute) or a stamp from the future restarts the record. The host is
- * part of the name, so hosts sharing a dir never mix clocks. A stamp that
- * survives a reboot can only be for a file whose holder died with the reboot
- * (tokens are never reused). Sidecar I/O is advisory: a failure only loses
- * evidence, which delays a reclaim and never causes one.
+ * the file's `key` (identity@mtime) and one view per clock origin, `{boot, bootAt,
+ * slack, first, from, last}`, with stamps on that origin's `mono`. A look's origin
+ * is its boot (the Linux boot id) and its boot instant `bootAt = wall - mono`, read
+ * together. A look uses the view of its boot whose `bootAt` is within its slack
+ * (1 s, the uptime's resolution budget; a fifth of the heartbeat when that is
+ * shorter, in tests) of its own, or starts a new view, and compares its `mono`
+ * with that view's stamps only. So clocks with different
+ * origins never mix: Bun's per-process `hrtime` if it were used, a process whose
+ * `hrtime` stopped during a suspend, a wall-clock step. Two stamps of one view
+ * disagree by at most the two slacks (the look's and the largest of the view's
+ * writers', 2 s), and every `mono` threshold below adds that, so it never shortens
+ * a margin. `first` is the view's first sighting of the key, `last` its latest
+ * look, and `from` the first look after the latest gap of more than 2 heartbeats
+ * between two looks. So `span = now - first` is how long the file has been
+ * unchanged, and `witnessed = now - from` how long it has been watched without a
+ * gap. A new key drops every view; a stamp from the future (another boot's clock)
+ * restarts one. The host is part of the name, so hosts sharing a dir never mix
+ * clocks. A stamp that survives a reboot can only be for a file whose holder died
+ * with the reboot (tokens are never reused). Sidecar I/O is advisory: a failure
+ * only loses evidence, which delays a reclaim and never causes one.
  *
  * Staleness. The holder refreshes its file's mtime every `heartbeatMs` (5 s,
  * unref'd timer). A lock is stale when
- *   (a) its host is this host and its PID is dead (immediately), or
+ *   (a) its host is this host and its PID is dead (immediately), or this process
+ *       created it and never held it (below, "Errors"), or
  *   (b) it is old (its heartbeat is older than `staleMs`, 30 s, by the wall
  *       clock, or its span is at least `staleMs`) AND it has been witnessed
- *       unchanged for 2 heartbeats.
+ *       unchanged for 2 heartbeats (both plus the view's slack).
  * A suspend, a freeze or a clock step makes a live holder's file look old. But
  * the holder heartbeats within one interval once it runs again, which changes the
  * key, and a gap in the looks (everyone was frozen, or nobody looked) restarts
@@ -56,9 +75,14 @@
  * `waitMs: 0` once a minute still reclaims a lock whose owner is not provably
  * dead (a reused PID, another host, a hung holder). Short-lived processes that
  * each look once do it through the sidecar when their looks are less than 2
- * heartbeats apart; looks further apart than that cannot tell a dead holder from
- * a frozen machine, and leave the reclaim to the next caller that waits or lives
- * for 2 heartbeats.
+ * heartbeats apart (and their clocks share a view).
+ *
+ * Residual (accepted in QA-1.4-21): looks further apart than 2 heartbeats cannot
+ * tell a dead holder from a frozen machine. So a lock whose owner is not provably
+ * dead is reclaimed only by a caller that waits, or stays alive, for 2 heartbeats
+ * after its look (10 s plus the slack), or by callers that look often enough
+ * together. Until then every caller is told busy. The Phase 2.x callers are
+ * opencode plugin processes, alive for a whole session, so their watches do it.
  *
  * Deletion. Every delete of a lock file whose identity is K (its token; for a
  * corrupt file its mtime and size) runs under the claim file
@@ -72,16 +96,19 @@
  * the unlink (no ABA). A claim is removed by its owner. A crashed claimer's claim
  * is removed the same way, under the claim for *its* token, when its owner is
  * provably dead (same host, dead PID) or when it is inert: span >= `staleMs` AND
- * witnessed >= 2 x `claimHoldMaxMs`. The wall clock plays no part, because claims
- * are never refreshed. A claimer deletes its target only within `claimHoldMaxMs`
- * (5 s) of `mono`, counted from just before it created the claim and checked
- * again right before each unlink, and drops its own claim only within 1.5 x that
- * (7.5 s). So a claimer acts on a claim judged inert only if it freezes for more
- * than 25 s (target) or 22.5 s (drop) between that last check and the unlink
- * syscall; when every process was frozen together, the witness gives it 10 s of
- * running time after the thaw. Transient antivirus/indexer errors
- * (EBUSY/EPERM/EACCES) are retried, and a failed delete is never reported as
- * success.
+ * witnessed >= 2 x `claimHoldMaxMs` (both plus the view's slack). The wall clock
+ * plays no part, because claims are never refreshed. A claimer deletes its target
+ * only within `claimHoldMaxMs` (5 s) of `mono`, counted from just before it
+ * created the claim, and checked again right before each unlink, and drops its
+ * own claim only within 1.5 x that (7.5 s). That includes a claim it created but
+ * could not confirm (a scanner held the re-read): the process remembers its token
+ * and drops it at its next readable look within those 7.5 s, and at exit; after
+ * that it is left to the rules above. So a claimer acts on a claim judged inert
+ * only if it freezes for more than 25 s (target) or 22.5 s (drop) between that
+ * last check and the unlink syscall; when every process was frozen together, the
+ * witness gives it 10 s of running time after the thaw. Transient
+ * antivirus/indexer errors (EBUSY/EPERM/EACCES) are retried, and a failed delete
+ * is never reported as success.
  *
  * Fairness. A caller that waits files a ticket `wait-<startedAt>-<uuid>.ticket`
  * (`{pid, hostname, token}`), refreshes it every heartbeat (unref'd timer) and on
@@ -111,7 +138,10 @@
  * dir verdict is dropped. Any other unexpected file-system error (EMFILE, ENOSPC,
  * EIO, ...) resolves `{busy:true}` with one warning per dir and code, and drops
  * the dir verdict, so the next call probes again. A slot is never granted
- * without its lock file, so exclusion holds.
+ * without its lock file, so exclusion holds. A lock that the call created before
+ * such an error is removed under its claim (own token) before the busy result; if
+ * that fails too, the process remembers it, and its next look at the slot reaps
+ * it at once, as does the exit hook. A non-finite `waitMs` counts as 0.
  *
  * Residual risk: every check-then-act on a file system has a window between the
  * last check and the syscall; its bounds are above. A single process frozen there
@@ -125,7 +155,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { closeSync, openSync, readFileSync, unlinkSync, writeSync } from "node:fs";
 import { mkdir, open, readdir, readFile, stat, unlink, utimes, writeFile, type FileHandle } from "node:fs/promises";
-import { hostname as osHostname, tmpdir } from "node:os";
+import { hostname as osHostname, tmpdir, uptime as osUptime } from "node:os";
 import { basename, join } from "node:path";
 import type { PluginLogger } from "../router/logger";
 
@@ -170,8 +200,10 @@ export interface SlotDeps {
   /** Wall clock (ms). Compared with file mtimes and written into new files, nothing else. */
   now?: () => number;
   /**
-   * Machine-wide monotonic clock (ms): wait deadlines, shared observations and
-   * claim fencing. The default reads `process.hrtime`, the same in every process.
+   * Machine clock (ms): wait deadlines, shared observations and claim fencing.
+   * The default is `process.hrtime`, anchored to `os.uptime()` where it counts
+   * from the process start (Bun), see `machineClockFrom`. Observations compare
+   * only stamps of one clock origin (`now() - mono()`, see the header).
    */
   mono?: () => number;
   random?: () => number;
@@ -209,16 +241,55 @@ export const SLOT_DEFAULTS = {
 const ORPHAN_AGE_MS = 3_600_000;
 /** Housekeeping runs at most this often per dir and process (monotonic). */
 const HOUSEKEEPING_EVERY_MS = 600_000;
-/** How far the boot instant (`wall - mono`) may move before a stamp counts as another boot's. */
-const BOOT_SLACK_MS = 60_000;
+/**
+ * Clocks whose boot instants (`wall - mono`) agree within this share an observation
+ * view: the uptime's resolution (up to 1 s) plus read jitter. Scaled down with the
+ * heartbeat (a fifth of it), so that tests with short heartbeats keep short pads.
+ */
+const ORIGIN_SLACK_MS = 1_000;
+/** `hrtime` within this of the uptime reads the boot clock; else it is anchored to the uptime. */
+const HRTIME_IS_UPTIME_MS = 2_000;
+/** Views kept per sidecar; the oldest goes first. */
+const MAX_VIEWS = 4;
 
 export function defaultSlotDir(): string {
   return join(tmpdir(), "opencode-model-router", "verify-slots");
 }
 
-/** Machine-wide monotonic milliseconds: `process.hrtime` reads the same clock in every process (see the header). */
-function machineMonoMs(): number {
+function hrtimeMs(): number {
   return Number(process.hrtime.bigint() / 1_000n) / 1_000;
+}
+function uptimeMs(): number {
+  return osUptime() * 1_000;
+}
+
+/**
+ * The machine clock of one process, from its `hrtime` and the OS uptime (both in
+ * ms, see the header). An `hrtime` within 2 s of the uptime at the first read is
+ * the boot clock and is returned as is (Node). Otherwise (Bun: it counts from the
+ * process start) it is anchored to the uptime: `hr + max(uptime - hr)` over every
+ * read, the uptime read first, so each sample is a lower bound. Never goes back.
+ * Exported for tests.
+ */
+export function machineClockFrom(hr: () => number, uptime: () => number): () => number {
+  const u0 = uptime();
+  const h0 = hr();
+  if (Math.abs(h0 - u0) <= HRTIME_IS_UPTIME_MS) return hr;
+  let offset = u0 - h0;
+  return () => {
+    const u = uptime();
+    const h = hr();
+    if (u - h > offset) offset = u - h;
+    return h + offset;
+  };
+}
+
+let machineClock: (() => number) | undefined;
+
+/** The default `mono`: chosen once per process, at its first use. */
+function machineMonoMs(): number {
+  machineClock ??= machineClockFrom(hrtimeMs, uptimeMs);
+  return machineClock();
 }
 
 interface LockInfo {
@@ -408,24 +479,39 @@ function bootId(): string {
   return bootIdCache;
 }
 
-interface SeenRecord {
-  key: string;
+/** The looks of one clock origin at one key. Stamps are on that origin's `mono`. */
+interface SeenView {
   boot: string;
-  /** `wall - mono` when the record was started: moves at a reboot or a wall-clock step. */
+  /** `wall - mono` of the look that started the view: the origin of its clock. */
   bootAt: number;
+  /** The largest slack of the looks that wrote the view. */
+  slack: number;
   first: number;
   from: number;
   last: number;
+}
+
+interface SeenRecord {
+  key: string;
+  views: SeenView[];
+}
+
+const isNum = (n: unknown): n is number => typeof n === "number" && Number.isFinite(n);
+
+function parseView(v: unknown): SeenView | undefined {
+  if (typeof v !== "object" || v === null) return undefined;
+  const { boot, bootAt, slack, first, from, last } = v as Record<string, unknown>;
+  if (typeof boot !== "string" || !isNum(bootAt) || !isNum(slack) || !isNum(first) || !isNum(from) || !isNum(last)) return undefined;
+  return { boot, bootAt, slack, first, from, last };
 }
 
 function parseSeen(text: string): SeenRecord | undefined {
   try {
     const v: unknown = JSON.parse(text);
     if (typeof v !== "object" || v === null) return undefined;
-    const { key, boot, bootAt, first, from, last } = v as Record<string, unknown>;
-    if (typeof key !== "string" || typeof boot !== "string") return undefined;
-    if (typeof bootAt !== "number" || typeof first !== "number" || typeof from !== "number" || typeof last !== "number") return undefined;
-    return { key, boot, bootAt, first, from, last };
+    const { key, views } = v as Record<string, unknown>;
+    if (typeof key !== "string" || !Array.isArray(views)) return undefined;
+    return { key, views: views.map(parseView).filter((x): x is SeenView => x !== undefined) };
   } catch (e) {
     // A torn read of a concurrent write: no evidence, the record restarts.
     if (e instanceof SyntaxError) return undefined;
@@ -434,16 +520,24 @@ function parseSeen(text: string): SeenRecord | undefined {
 }
 
 interface Look {
-  /** How long the file has had its current key (mono), since the first sighting by any process. */
+  /** How long the file has had its current key (mono), since the view's first sighting. */
   span: number;
   /** How long it has been watched without a gap of more than 2 heartbeats. */
   witnessed: number;
+  /** How far two stamps of the view may disagree: every threshold adds it. */
+  errMs: number;
 }
-const NO_LOOK: Look = { span: 0, witnessed: 0 };
+const NO_LOOK: Look = { span: 0, witnessed: 0, errMs: 0 };
+
+/** This look's origin slack (see `ORIGIN_SLACK_MS`). */
+function originSlackMs(cfg: Cfg): number {
+  return Math.min(ORIGIN_SLACK_MS, cfg.heartbeatMs / 5);
+}
 
 /**
  * Record a look at `target` (state `s`, read at `at`, taken before the read) in
- * its shared sidecar, and return what all looks so far establish.
+ * its shared sidecar, in the view of this look's clock origin, and return what
+ * that view's looks establish. Stamps of other views are never read.
  */
 async function observe(slotPath: string, target: string, s: Present, at: number, cfg: Cfg): Promise<Look> {
   const file = seenPath(slotPath, target, identity(s), cfg.hostname);
@@ -458,27 +552,27 @@ async function observe(slotPath: string, target: string, s: Present, at: number,
   }
   const key = observedKey(s);
   const boot = bootId();
-  const bootAt = cfg.now() - at;
+  const bootAt = cfg.now() - cfg.mono(); // read together: the origin of this look's clock
+  const slack = originSlackMs(cfg);
   const maxGap = 2 * cfg.heartbeatMs;
-  let rec: SeenRecord;
-  if (
-    prev !== undefined &&
-    prev.key === key &&
-    prev.boot === boot &&
-    Math.abs(prev.bootAt - bootAt) <= BOOT_SLACK_MS &&
-    at >= prev.last - maxGap // a stamp far in the future: another boot's clock
-  ) {
-    rec = { ...prev, from: at - prev.last > maxGap ? at : prev.from, last: Math.max(prev.last, at) };
+  const views = prev?.key === key ? prev.views : []; // a new key: every view restarts
+  const i = views.findIndex((v) => v.boot === boot && Math.abs(v.bootAt - bootAt) <= slack);
+  const old = i >= 0 ? views[i] : undefined;
+  let view: SeenView;
+  // A stamp far in the future is another boot's clock: the view restarts.
+  if (old !== undefined && at >= old.last - maxGap) {
+    view = { ...old, slack: Math.max(old.slack, slack), from: at - old.last > maxGap ? at : old.from, last: Math.max(old.last, at) };
   } else {
-    rec = { key, boot, bootAt, first: at, from: at, last: at };
+    view = { boot, bootAt, slack, first: at, from: at, last: at };
   }
+  const rec: SeenRecord = { key, views: [...views.filter((_, j) => j !== i).slice(-(MAX_VIEWS - 1)), view] };
   try {
     await writeFile(file, JSON.stringify(rec));
   } catch (e) {
     // The verdict of this look stands; only later looks lose it.
     if (errCode(e) !== "ENOENT" && !isTransient(e)) ioTrouble(cfg, "observation", file, e);
   }
-  return { span: Math.max(0, at - rec.first), witnessed: Math.max(0, at - rec.from) };
+  return { span: Math.max(0, at - view.first), witnessed: Math.max(0, at - view.from), errMs: slack + view.slack };
 }
 
 /** Delete the sidecar of a file that is gone. Advisory: a leftover is collected by housekeeping. */
@@ -500,13 +594,13 @@ function ownerDead(s: Present, cfg: Cfg): boolean {
 type Verdict = "stale" | "aged" | "fresh";
 
 async function lockVerdict(slotPath: string, s: Present, at: number, cfg: Cfg): Promise<Verdict> {
-  if (ownerDead(s, cfg)) return "stale";
+  if (ownerDead(s, cfg) || isStray(slotPath, s)) return "stale";
   const corrupt = s.kind === "corrupt";
   const oldMs = corrupt ? cfg.corruptGraceMs : cfg.staleMs;
   const confirmMs = corrupt ? cfg.corruptGraceMs : 2 * cfg.heartbeatMs;
   const look = await observe(slotPath, slotPath, s, at, cfg);
-  if (!(cfg.now() - s.mtimeMs > oldMs || look.span >= oldMs)) return "fresh";
-  return look.witnessed >= confirmMs ? "stale" : "aged";
+  if (!(cfg.now() - s.mtimeMs > oldMs || look.span >= oldMs + look.errMs)) return "fresh";
+  return look.witnessed >= confirmMs + look.errMs ? "stale" : "aged";
 }
 
 /** A claim is inert by observation only (claims are never refreshed, so a wall age says nothing). */
@@ -516,7 +610,7 @@ async function claimInert(slotPath: string, claim: string, s: Present, at: numbe
   const oldMs = corrupt ? cfg.corruptGraceMs : cfg.staleMs;
   const confirmMs = corrupt ? cfg.corruptGraceMs : 2 * cfg.claimHoldMaxMs;
   const look = await observe(slotPath, claim, s, at, cfg);
-  return look.span >= oldMs && look.witnessed >= confirmMs;
+  return look.span >= oldMs + look.errMs && look.witnessed >= confirmMs + look.errMs;
 }
 
 // ---- exclusive create and claimed delete --------------------------------------
@@ -526,9 +620,17 @@ async function claimInert(slotPath: string, claim: string, s: Present, at: numbe
  * a scanner, is retried on the unlink schedule): true only when it holds
  * `info.token`. A re-read that stays unreadable counts as ours only when
  * `trustUnreadable` (a slot lock, whose heartbeat re-checks the token within one
- * interval), never for a claim, which nothing re-checks.
+ * interval), never for a claim, which nothing re-checks. When the file was
+ * created but is not held, `stray` runs first: after an unexpected error (before
+ * it propagates, QA-1.4-28) and for an unconfirmed claim (QA-1.4-29).
  */
-async function createOwned(path: string, info: LockInfo, cfg: Cfg, trustUnreadable: boolean): Promise<boolean> {
+async function createOwned(
+  path: string,
+  info: LockInfo,
+  cfg: Cfg,
+  trustUnreadable: boolean,
+  stray: () => Promise<void> | void,
+): Promise<boolean> {
   let fh: FileHandle;
   try {
     fh = await open(path, "wx");
@@ -538,21 +640,66 @@ async function createOwned(path: string, info: LockInfo, cfg: Cfg, trustUnreadab
     throw e;
   }
   try {
-    await fh.writeFile(JSON.stringify(info), "utf8");
-  } finally {
-    await fh.close();
+    try {
+      await fh.writeFile(JSON.stringify(info), "utf8");
+    } finally {
+      await fh.close();
+    }
+    for (let i = 0; ; i++) {
+      const s = await readLock(path, cfg);
+      if (s.kind !== "unreadable") return s.kind === "ok" && s.info.token === info.token;
+      if (i >= cfg.unlinkRetries) break;
+      await sleep(cfg.unlinkRetryMs * 2 ** i);
+    }
+  } catch (e) {
+    await stray();
+    throw e;
   }
-  for (let i = 0; ; i++) {
-    const s = await readLock(path, cfg);
-    if (s.kind !== "unreadable") return s.kind === "ok" && s.info.token === info.token;
-    if (i >= cfg.unlinkRetries) return trustUnreadable;
-    await sleep(cfg.unlinkRetryMs * 2 ** i);
-  }
+  if (trustUnreadable) return true;
+  await stray();
+  return false;
 }
 
 /** Claims currently held by this process (claim path -> claim token), for the exit hook. */
 const activeClaims = new Map<string, string>();
 const MAX_CLAIM_DEPTH = 3;
+
+/** A claim this process created but could not confirm (QA-1.4-29), until its drop fence (on its `mono`). */
+interface Unconfirmed {
+  token: string;
+  dropBy: number;
+}
+/** Claim path -> this process's unconfirmed claim there. Dropped at the next readable look, or at exit. */
+const unconfirmedClaims = new Map<string, Unconfirmed>();
+const MAX_UNCONFIRMED = 64;
+
+function noteUnconfirmed(claim: string, token: string, since: number, cfg: Cfg): void {
+  hookExit();
+  if (unconfirmedClaims.size >= MAX_UNCONFIRMED) {
+    const oldest = unconfirmedClaims.keys().next();
+    if (!oldest.done) unconfirmedClaims.delete(oldest.value);
+  }
+  unconfirmedClaims.set(claim, { token, dropBy: since + 1.5 * cfg.claimHoldMaxMs });
+}
+
+/**
+ * The claim at `claim` (seen as `s`) is this process's own unconfirmed one: drop
+ * it by its token, within the same fence as a held claim. Undefined when it is not
+ * ours (or no longer droppable); else whether the claim path is now free.
+ */
+async function dropUnconfirmed(slotPath: string, claim: string, s: Present, cfg: Cfg): Promise<boolean | undefined> {
+  const own = unconfirmedClaims.get(claim);
+  if (own === undefined) return undefined;
+  if (s.kind !== "ok" || s.info.token !== own.token || cfg.mono() > own.dropBy) {
+    // Replaced (ours is gone), or past the fence: from now on the rules for any claim apply.
+    unconfirmedClaims.delete(claim);
+    return undefined;
+  }
+  const r = await unlinkWhile(claim, own.dropBy, cfg, (c) => c.kind === "ok" && c.info.token === own.token);
+  if (r !== "failed") unconfirmedClaims.delete(claim);
+  if (r === "removed") await dropSeen(slotPath, claim, own.token, cfg);
+  return r === "removed" || r === "gone";
+}
 
 type Removal = "removed" | "gone" | "changed" | "contended" | "failed";
 
@@ -621,7 +768,7 @@ async function removeUnderClaim(
     const since = cfg.mono();
     let mine: boolean;
     try {
-      mine = await createOwned(claim, info, cfg, false);
+      mine = await createOwned(claim, info, cfg, false, () => noteUnconfirmed(claim, token, since, cfg));
     } catch (e) {
       if (errCode(e) === "ENOENT") return "gone"; // no dir: the target went with it
       throw e;
@@ -650,7 +797,10 @@ async function reclaimClaim(slotPath: string, claim: string, cfg: Cfg, depth: nu
   const at = cfg.mono();
   const s = await readLock(claim, cfg);
   if (s.kind === "missing") return true;
-  if (s.kind === "unreadable" || !(await claimInert(slotPath, claim, s, at, cfg))) return false;
+  if (s.kind === "unreadable") return false;
+  const own = await dropUnconfirmed(slotPath, claim, s, cfg);
+  if (own !== undefined) return own;
+  if (!(await claimInert(slotPath, claim, s, at, cfg))) return false;
   const key = observedKey(s);
   const r = await removeUnderClaim(slotPath, claim, identity(s), (c) => observedKey(c) === key, cfg, depth);
   return r === "removed" || r === "gone";
@@ -671,7 +821,29 @@ interface Held {
   hostname: string;
 }
 const held = new Set<Held>();
+/** Slot locks this process created but never held (an error after the create, QA-1.4-28): path -> lock. */
+const strays = new Map<string, Held>();
 let exitHooked = false;
+
+/** This process's own stray at `path`: stale at once. A different file there means ours is gone. */
+function isStray(path: string, s: Present): boolean {
+  const own = strays.get(path);
+  if (own === undefined) return false;
+  if (s.kind === "ok" && s.info.token === own.token) return true;
+  if (s.kind === "ok") strays.delete(path);
+  return false;
+}
+
+/** Remove a slot lock that this process created and does not hold, under its claim; else remember it. */
+async function dropStray(path: string, token: string, cfg: Cfg): Promise<void> {
+  hookExit();
+  strays.set(path, { path, token, pid: cfg.pid, hostname: cfg.hostname });
+  const r = await removeUnderClaim(path, path, token, (s) => s.kind === "ok" && s.info.token === token, cfg).catch(
+    (): Removal => "failed", // the error being surfaced says why; the next look or the exit hook retries
+  );
+  // "contended": a reaper holds the claim and deletes it.
+  if (r !== "failed") strays.delete(path);
+}
 /** Exit-time release failures (observable in tests; nothing can log at exit). */
 export let exitReleaseFailures = 0;
 export let lastExitReleaseError: string | undefined;
@@ -722,7 +894,7 @@ function noteExitFailure(e: unknown): void {
 }
 
 function releaseAllSync(): void {
-  for (const h of held) {
+  for (const h of [...held, ...strays.values()]) {
     try {
       releaseOneSync(h);
     } catch (e) {
@@ -732,7 +904,8 @@ function releaseAllSync(): void {
     }
   }
   held.clear();
-  for (const [claim, token] of activeClaims) {
+  strays.clear();
+  for (const [claim, token] of [...activeClaims, ...[...unconfirmedClaims].map(([c, u]) => [c, u.token] as const)]) {
     try {
       unlinkIfTokenSync(claim, token);
     } catch (e) {
@@ -740,6 +913,7 @@ function releaseAllSync(): void {
     }
   }
   activeClaims.clear();
+  unconfirmedClaims.clear();
   for (const t of tickets) {
     try {
       unlinkSync(t);
@@ -1111,10 +1285,13 @@ async function tryAcquireOnce(opts: SlotOptions, cfg: Cfg, aged: Set<string>): P
     for (let attempt = 0; attempt < 3; attempt++) {
       const token = randomUUID();
       const info: LockInfo = { pid: cfg.pid, hostname: cfg.hostname, token, startedAt: cfg.now(), cwd: opts.meta.cwd, command: opts.meta.command };
-      if (await createOwned(path, info, cfg, true)) return makeFileHandle(path, token, opts, cfg);
+      if (await createOwned(path, info, cfg, true, () => dropStray(path, token, cfg))) return makeFileHandle(path, token, opts, cfg);
       const at = cfg.mono();
       const cur = await readLock(path, cfg);
-      if (cur.kind === "missing") continue; // released meanwhile: create again
+      if (cur.kind === "missing") {
+        strays.delete(path); // ours, if any, is gone too
+        continue; // released meanwhile: create again
+      }
       if (cur.kind === "unreadable") break;
       const v = await lockVerdict(path, cur, at, cfg);
       if (v !== "stale") {
@@ -1373,7 +1550,9 @@ export async function acquireSlot(opts: SlotOptions, deps?: SlotDeps): Promise<S
   const cfg = resolveCfg(deps);
   if (opts.signal?.aborted) return { busy: true };
   const max = Math.max(1, Math.floor(opts.max));
-  const o = { ...opts, max };
+  // QA-1.4-31 (validated by Phase 1.1): NaN would never reach the deadline.
+  const waitMs = Number.isFinite(opts.waitMs) ? Math.max(0, opts.waitMs) : 0;
+  const o = { ...opts, max, waitMs };
   let writable: boolean;
   try {
     writable = await dirWritable(cfg);
