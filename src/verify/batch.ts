@@ -366,6 +366,17 @@
 //   and no requester's gate waits for a batch's close. Batches for different keys hold separate
 //   slots, but only as far as maxConcurrentVerifications allows (W6). A batch never waits for
 //   another batch, so batches cannot deadlock each other.
+//   Early-settled members (QA-2.2-5, accepted cost). A member settles as soon as its outcome is
+//   final (B5.8) while its batch may still hold the slot for the other members' runs and
+//   rechecks. Its gate then goes on to its next S3 check (lintClean, run, ...), which opens its
+//   own scope and waits for the slot like any other verification: under
+//   maxConcurrentVerifications 1 that wait lasts until the batch closes, bounded by the check's
+//   slot wait and the gate deadline, so the check can end slot-busy (u14). It cannot deadlock:
+//   the batch never waits on a gate or on another scope, a settled member is released from D
+//   and never extends it, and every step of the batch is bounded by a remaining member's
+//   deadline. Holding the member until the hold ends would spend the same wait inside testsPass
+//   instead, and would give back QA-2.2-3's early settlement. 2.2.3's wiring test asserts the
+//   behaviour (deferred by plan).
 //
 // -----------------------------------------------------------------------------------------------
 // B11. MEMORY AND DISPOSAL
@@ -379,14 +390,21 @@
 //   sweep() is called by the wiring's TTL sweep (2.2.3). It evicts defensively:
 //     - windows with no live member;
 //     - batches whose members are all settled but whose seam never returned (a hung executor
-//       that ignored its signal) for longer than BATCH_STALE_GRACE_MS.
+//       that ignored its signal) for longer than BATCH_STALE_GRACE_MS. D aborted when the last
+//       member settled, so the tree was killed that long ago: the batch's scope is closed and
+//       its slot released while the hung seam may still be exiting, and that is logged.
 //   It logs each eviction and returns the number of evictions.
+//   The slot is otherwise never released before the running tree has exited (QA-2.2-4): the
+//   scope is closed only by runBatch's finally, after its last seam returned.
 //   dispose():
 //     1. marks the coordinator disposed (later requests get B2.1);
 //     2. clears every window timer;
 //     3. settles every pending member with aborted BATCH_REASONS.disposed;
 //     4. aborts every batch deadline, which kills the running trees;
-//     5. awaits the batches' scope closes.
+//     5. awaits every running batch, that is its in-flight seam (the killed tree's exit) and
+//        then its scope close, for at most BATCH_STALE_GRACE_MS (one timer, cleared after);
+//        a batch still running after that is evicted as by sweep();
+//     6. awaits the scope closes.
 //   It is idempotent and never rejects. The default timers are unref'd, so an open window never
 //   keeps the process alive.
 //
@@ -724,6 +742,8 @@ interface Batch {
   final: boolean;
   /** B8.6: recheck outcomes that hold for any member at the same reference, by referenceKey. */
   readonly rechecked: Map<string, RecheckOutcome[]>;
+  /** runBatch's promise: it ends after the last seam returned, and closes the scope (B11, QA-2.2-4). */
+  run: Promise<void> | undefined;
 }
 
 function message(e: unknown): string {
@@ -929,6 +949,7 @@ export function createBatchCoordinator(options: BatchCoordinatorOptions = {}): B
       reproduced: new Set(),
       final: false,
       rechecked: new Map(),
+      run: undefined,
     };
     for (const m of members) {
       m.window = undefined;
@@ -937,7 +958,7 @@ export function createBatchCoordinator(options: BatchCoordinatorOptions = {}): B
       m.phase = members.length === 1 ? "own-wait" : "run";
     }
     running.add(b);
-    void runBatch(b);
+    b.run = runBatch(b);
   }
 
   // -- the batch (B5) --------------------------------------------------------------------------
@@ -1324,6 +1345,22 @@ export function createBatchCoordinator(options: BatchCoordinatorOptions = {}): B
     return b.closing;
   }
 
+  /**
+   * B11 (QA-2.2-4): gives up on a batch whose seam did not return after its tree was killed. Its
+   * scope is closed now, so the slot is released while that seam may still be exiting; this is
+   * only reached after BATCH_STALE_GRACE_MS, and it is logged.
+   */
+  function evict(b: Batch): void {
+    running.delete(b);
+    b.group?.dispose();
+    b.deadline.dispose();
+    warn("verify batch: evicted a batch whose seam never returned; its slot is released before the seam exits", {
+      key: b.key,
+      members: b.members.length,
+    });
+    void closeScope(b);
+  }
+
   // -- arrival (B2) ----------------------------------------------------------------------------
 
   async function submit(runtime: BatchRuntime, request: TestsPassRequest): Promise<TestsPassRun> {
@@ -1366,13 +1403,11 @@ export function createBatchCoordinator(options: BatchCoordinatorOptions = {}): B
       }
       const t = now();
       for (const b of running) {
+        // D aborted when its last member settled, which killed the running tree. A seam that has
+        // still not returned a grace period later is hung (QA-2.2-4).
         if (b.settledAt === undefined || t - b.settledAt <= BATCH_STALE_GRACE_MS) continue;
-        running.delete(b);
-        b.group?.dispose();
-        b.deadline.dispose();
-        void closeScope(b);
+        evict(b);
         evicted++;
-        warn("verify batch: evicted a batch whose seam never returned", { key: b.key, members: b.members.length });
       }
       return evicted;
     },
@@ -1392,10 +1427,25 @@ export function createBatchCoordinator(options: BatchCoordinatorOptions = {}): B
         windows.clear();
         for (const b of running) {
           for (const m of b.members) settle(m, abortedRun(BATCH_REASONS.disposed));
+          // B11.4: kill the running trees. The scope is NOT closed here: runBatch closes it once
+          // its seam has returned, that is once the killed tree has exited (QA-2.2-4).
           b.group?.dispose();
           b.deadline.dispose();
-          void closeScope(b);
         }
+      }
+      // B11.5: wait for the in-flight seams, at most BATCH_STALE_GRACE_MS. A seam still running
+      // after that is hung: its slot is released anyway, and logged (evict).
+      const inflight = [...running].map((b) => b.run);
+      if (inflight.length > 0) {
+        let grace: unknown;
+        await Promise.race([
+          Promise.all(inflight),
+          new Promise<void>((resolve) => {
+            grace = timers.setTimeout(resolve, BATCH_STALE_GRACE_MS);
+          }),
+        ]);
+        timers.clearTimeout(grace);
+        for (const b of running) evict(b);
       }
       await Promise.all([...closing]);
     },

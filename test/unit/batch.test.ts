@@ -805,6 +805,8 @@ interface HarnessOptions {
   readonly plan?: BatchPlanner;
   readonly argvCap?: number;
   readonly runtime?: Partial<BatchRuntime>;
+  /** Called when a scope releases its slot (its first close). */
+  readonly close?: () => void;
 }
 
 /** The runtime seams, each counting its calls. A scope throws when used after its close. */
@@ -843,6 +845,7 @@ function harness(model: Model = MODEL, o: HarnessOptions = {}) {
         closed = true;
         calls.closes.push(id);
         calls.events.push(`close ${id}`);
+        o.close?.();
       },
     };
   };
@@ -1389,9 +1392,71 @@ describe("createBatchCoordinator: windows and the union run", () => {
     await vi.advanceTimersByTimeAsync(BATCH_STALE_GRACE_MS + 1);
     expect(c.sweep()).toBe(1);
     expect(c.stats().runningBatches).toBe(0);
-    expect(warn).toHaveBeenCalledWith("verify batch: evicted a batch whose seam never returned", expect.objectContaining({ members: 2 }));
+    expect(warn).toHaveBeenCalledWith(
+      "verify batch: evicted a batch whose seam never returned; its slot is released before the seam exits",
+      expect.objectContaining({ members: 2 }),
+    );
     await c.dispose();
     expect(calls.closes).toEqual([0]);
+  });
+
+  it("QA-2.2-4: dispose releases the slot only once the killed tree has exited", async () => {
+    const log: string[] = [];
+    const { calls, runtime } = harness(MODEL, {
+      execute: (_spec, deadline) =>
+        new Promise<ScopedOutcome>((resolve) => {
+          const exit = () => {
+            log.push("tree exited");
+            resolve({ kind: "aborted", reason: "tree killed" });
+          };
+          deadline.signal.addEventListener("abort", () => setTimeout(exit, 500), { once: true });
+        }),
+      close: () => log.push("slot released"),
+    });
+    const c = createBatchCoordinator({ platform: "linux" });
+    const outs = [c.hook(runtime)(req(["src/a.ts"])), c.hook(runtime)(req(["src/b.ts"]))];
+    await vi.advanceTimersByTimeAsync(WINDOW);
+    let done = false;
+    const disposing = c.dispose().then(() => {
+      done = true;
+    });
+    const gone = aborted(BATCH_REASONS.disposed);
+    expect(await Promise.all(outs)).toEqual([gone, gone]);
+    expect(calls.executes[0]?.deadline.signal.aborted).toBe(true);
+    await vi.advanceTimersByTimeAsync(499);
+    expect(calls.closes).toEqual([]);
+    expect(done).toBe(false);
+    await vi.advanceTimersByTimeAsync(1);
+    await disposing;
+    expect(log).toEqual(["tree exited", "slot released"]);
+    expect(vi.getTimerCount()).toBe(0);
+    expect(c.stats().runningBatches).toBe(0);
+  });
+
+  it("QA-2.2-4: dispose waits at most the grace period for a hung seam, then releases its slot and logs it", async () => {
+    const { calls, runtime } = harness(MODEL, { execute: () => new Promise<ScopedOutcome>(() => undefined) });
+    const warn = vi.fn();
+    const c = createBatchCoordinator({ platform: "linux", logger: { warn } });
+    const outs = [c.hook(runtime)(req(["src/a.ts"])), c.hook(runtime)(req(["src/b.ts"]))];
+    await vi.advanceTimersByTimeAsync(WINDOW);
+    let done = false;
+    const disposing = c.dispose().then(() => {
+      done = true;
+    });
+    const gone = aborted(BATCH_REASONS.disposed);
+    expect(await Promise.all(outs)).toEqual([gone, gone]);
+    await vi.advanceTimersByTimeAsync(BATCH_STALE_GRACE_MS - 1);
+    expect(done).toBe(false);
+    expect(calls.closes).toEqual([]);
+    await vi.advanceTimersByTimeAsync(1);
+    await disposing;
+    expect(calls.closes).toEqual([0]);
+    expect(warn).toHaveBeenCalledWith(
+      "verify batch: evicted a batch whose seam never returned; its slot is released before the seam exits",
+      expect.objectContaining({ members: 2 }),
+    );
+    expect(vi.getTimerCount()).toBe(0);
+    expect(c.stats().runningBatches).toBe(0);
   });
 
   it("uses the injected timers and clock", async () => {
