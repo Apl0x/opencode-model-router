@@ -425,3 +425,70 @@ a data-deletion path that depends on a runtime contract; Low = hardening or test
 - Untracked copy: the hashed buffer is the written buffer, and `wx` never writes through a link (`:1119-1136`).
 - Case-only renames under `core.ignorecase=true` are invisible to git on both sides (analysis, not reproduced; no
   exactness impact on case-insensitive filesystems).
+
+## QA re-review (round 2)
+
+Scope: `git diff 14460ad..facfc14` (0fe514d, ad0a859, 28c5eae, d66bf69, 1ee91ce, bca1f4a, a650dfb, 7dbfada, e7acc5d,
+33633df, facfc14). Line numbers refer to `src/verify/reference.ts` at facfc14. `npx vitest run --maxWorkers=2
+test/unit/reference.test.ts`: **38/38 passed**, 186.35 s. Same host as round 1 (win32, Node v24.21.0,
+git 2.51.0.windows.1; system `core.autocrlf=true`, global `input`, `core.eol` unset). The repros ran under
+`%TEMP%\omr-qa15r2` and imported the real `reference.ts` through Node type stripping (a second instance through a
+`?copy=2` URL). `tmpdir` was always injected in its 8.3 form. The ArgvSeam was spawn-based, like runArgv: env merged
+over `process.env`, `taskkill /T /F` on abort or timeout, and it resolves on `close`. Slow filters were Node scripts,
+not MSYS `sleep`, so the tree kill reaches them. Nothing in the harness ran `git worktree remove` on a dir that
+contained a junction. Cleanup: every link was unlinked first (0 were left, because the module had already removed
+all of them), no `omr-ref-*` entry was registered in any of the 23 sandbox repos, the sandbox was deleted, and there
+were no `omr-ref-*`/`omr-nohooks-*` dirs in the TEMP root. In every scenario below, the root, nested and extra-victim
+sentinels read `keep me` / `real data` afterwards.
+
+### Resolutions: verification
+| Finding | Status | Evidence |
+|---|---|---|
+| QA-1.5-1 | **Verified** | `:1190-1199`: `stash create` gets `GIT_INDEX_FILE` and a timeout, no signal. **S6 (timeout):** a clean filter of 8 s kept `stash create` in its refresh. The call had `hasSignal: false` and was tree-killed by its timeout at 2 666 ms. Capture returned `undefined` after 3.4 s. `.git/index.lock` was absent, `.git/index` was byte-identical, the next `git add` exited 0, and no scratch dir was left. **S5 (d66bf69):** stat-identical same-size edit with a racily clean index. A control copy with a fresh mtime → `stash create` **missed** the edit (empty output). A control copy with the original mtime → `a1`. `captureReference` → `a1`. The copy's mtime (1790479358959) was not later than the original (1790479358959). The user's index mtime was unchanged. |
+| QA-1.5-2 | **Verified** | **S1:** every argv starts with `--no-optional-locks`. The `GIT_INDEX_FILE` of both `stash create` and the drift `diff` lies under realpath(tmp). With a stat-dirty file, the `.git` listing (objects excluded, bytes hashed) was identical after capture and again after dispose. **S4:** a producer holds `.git/index.lock` during capture and materialize. Both succeed (exact, dirty content present), the lock file is untouched (byte-identical) and `.git` is unchanged. Implementer's note confirmed (**S11**): on a stat-dirty index, `git --no-optional-locks status` did not rewrite `.git/index`, `git --no-optional-locks diff --name-only … HEAD --` **did**, and plumbing `diff-index` did not. That fits `builtin/diff.c`'s `refresh_index_quietly()`, which never consults `GIT_OPTIONAL_LOCKS`. Acceptable, because the drift diff now runs on a copy. |
+| QA-1.5-3 | **Verified** | Order at `:1095-1136`. **S7:** a holder process's cwd inside `packages` made dispose warn `fs.rm failed: EBUSY`. The links and the `.git` file were already gone, and the admin entry stayed registered. I then recreated two junctions in the leftover, one pointing at the victim and one at the real `packages/a/node_modules`. A GC while the dir was still held unlinked both in its sweep, `fs.rm` failed again and git was not run. After the holder exited, GC removed the dir and the entry. `git worktree remove` saw the dir absent (`[false]`). **S10** bounds the documented step-4 residual race (junction-free repro). A dir recreated **without** a valid `.git` gitfile → `fatal: validation failed, cannot remove working tree: '…/.git' does not exist`, and the sentinel survived. Once the original gitfile was restored, git deleted the dir. So git deletes a recreated dir only if its gitfile is back as well. |
+| QA-1.5-4 | **Verified** (residual noted) | **S13:** two module instances share the Set (size 1, then 0 after dispose). GC from the second instance with `now + 10 h` kept the live dir. **S15** (owner in a child process): with `heartbeatMs: 200`, the dir backdated 2 h was kept by GC 1 s later. With a late heartbeat (1 h), GC removed the **alive** owner's live reference. That is the PID-reuse rule by design, and no data was touched. **S8:** the interval is unref'd, because an owner with an undisposed handle exited 14 ms after its last output. Residual: for an alive owner, correctness assumes the heartbeat fires within 1 h. An event-loop stall or a suspended process breaks that assumption, and so may a system sleep on a platform whose timers use a clock that pauses during suspend (not verifiable on this host). The backstop is 2.1's rule "reference vanished → unverifiable" (deferred). |
+| QA-1.5-5 | **Verified** | `:1118-1130`: unlock runs only after the dir is gone and R3 passed, and only for reason === `initializing` with `unlockInitializing`. GC grants that only for a released dir or a dead owner (`:1732-1734`). S1 audit: `LC_ALL=C` is set only on `worktree add`. Its side effects are untranslated git messages, and filters inherit the C locale. The non-ASCII test paths (`ü テスト`) pass under it. Both QA-1.5-5 tests pass. |
+| QA-1.5-6 | **Verified**, but the residual is larger than documented → QA-1.5-13 | (b) `ls-files -v` flags work. Under `core.fsmonitor=true`, `-v` still printed only `H` (S3), so there is no false `index-flags`. A sparse index gives `index-flags` (S17). (a) Dirty files and `core.autocrlf≠false` are covered by the tests. The clean-file gap is QA-1.5-13. |
+| QA-1.5-8 | **Verified** | S1: the `core.hooksPath` parent is realpath(tmp), and the path is still absent after materialize. The test passes. |
+| QA-1.5-9 | (b)(c)(d) **verified**; (a) **partly** | The tests exist and pass. However, (a) covers only a holder at depth 1, and the claimed bound fails at depth 2 (QA-1.5-11). Its `spawn`-event gate is racy (QA-1.5-14). |
+| QA-1.5-10 | **Verified on win32** | Non-recursive `mkdir(dir, 0o700)` before `worktree add` (`:1415`); the scratch dir is made the same way (`:1287-1289`). The test asserts that the dir is empty when git starts. The POSIX mode (`:1433`) is not verifiable on this host. |
+
+Private index copy, further checks (no finding):
+- **Split index (S2):** the `link` extension is present. Capture gives staged/unstaged content (`a-dirty`, `b-unstaged`,
+  `^2` `b-staged`) and **the same tree as a plain `git stash create`**. The only change in `.git` is the mtime of
+  `sharedindex.*` (same bytes). That is git's `freshen_shared_index`: S18 shows that a plain
+  `git --no-optional-locks ls-files` freshens it too. No new `sharedindex.*` is written.
+- **Index v4 + untracked cache + builtin fsmonitor (S3):** version 4, `UNTR` and `FSMN` present. The reference is
+  exact, `.git` is unchanged (the daemon's cookie dir excluded), and the daemon was stopped afterwards.
+- **Sparse index (S17, cone, `index.sparse=true`, `sdir` extension):** capture and materialize work, the reference is
+  inexact via `index-flags`, and `.git` is unchanged.
+- **Copy consistency:** `lstat` runs before `readFile` (`:1291-1292`). A rewrite between the two gives newer bytes with
+  an older mtime, which only widens racy re-checks (analysis).
+- **Scratch cleanup:** no scratch dir was left after the normal path (S1-S4), the timeout kill and the abort (S6), or
+  an error path (**S14**: `.git/index` missing → the scratch dir was created, capture returned `undefined`, the
+  scratch dir was removed).
+- **Abort (S6):** abort at 400 ms, `stash create` busy for 3.2 s. It was not killed (`hasSignal: false`,
+  `killed: false`), and capture resolved `undefined` after 3.6 s. The abort latency is bounded by the remaining capture
+  budget (≤ 15 s by default).
+
+### New findings
+| ID | Severity | Evidence | Fix |
+|---|---|---|---|
+| QA-1.5-11 | Medium | **Dispose and GC latency grows 6× per directory level above a held dir.** Node's JS `fs.promises.rm` retries inside every recursive child call, so the `maxRetries: 5` loops nest: T(d) ≈ 6·T(d−1) + 1.5 s. Standalone, with the module's options and a cwd holder: depth 1 → `EBUSY` after **11.1 s**, depth 2 → **66.2 s**. A flat loop (`maxRetries: 0`, 6 attempts, 100·2ⁿ ms) → **3.1 s** at both depths. Module (S16), holder cwd in `packages/a`: `dispose()` **66.3 s**, then GC while held **66.3 s**, against GC's 30 s budget, which nothing checks during `fs.rm`. Extrapolated, not run: depth 3 ≈ 6.5 min, depth 4 ≈ 39 min. QA-1.5-9a's "resolves bounded" holds only for its depth-1 holder: S7, with the test's holder depth, took 10.8 s against the test's 20 s bound. Holders include processes that escape the tree kill (the fix notes say MSYS `sleep.exe` escapes `taskkill /T`). 2.1's planned GC before each materialize would hit this more often. | Call `fs.rm(dir, { recursive: true, force: true, maxRetries: 0 })` inside the module's own flat `withRetry`, and check GC's budget between attempts. Add a test with a ready-gated holder at depth ≥ 2 that asserts dispose resolves within a few seconds. |
+| QA-1.5-12 | Medium (pre-existing; not introduced by the fixes) | **A live or crashed reference is an unlocked registered worktree whose junctions lead into the real node_modules.** S8: an owner that exits without dispose (crash, closed terminal) leaves `worktree …/omr-ref-52920-…`, `detached`, with **no `locked` line**, and junctions `node_modules` and `packages\a\node_modules` → `…\repo ü\…\node_modules`. That state lasts until the next GC (which then removed it safely). The entry shows up in `git worktree list` and in IDE worktree views. `git worktree remove --force` on it empties the targets (Spike D method 5; not re-run, banned). Plain `remove` uses the same recursive deleter (analysis). Mitigation measured on a junction-free worktree (S9): `worktree add --lock --reason "omr reference: links into live node_modules"` → both `git worktree remove` and `remove --force` fail with `fatal: cannot remove a locked working tree, lock reason: … use 'remove -f -f' to override or unlock first`. The dir stays intact, and `prune --dry-run` lists nothing. | Add the worktree with `--lock --reason <OMR_LOCK_REASON>`. In step 4, once the dir is gone, unlock only that exact reason (plus `initializing`). GC treats that reason like `initializing` (released dir or dead owner). Update R4 and section 11. Unverified here: the minimum git version for `add --reason`, and whether `--lock` replaces the `initializing` reason from the start (per git's `add_worktree` source); check both, or fall back to `git worktree lock` right after `add`. |
+| QA-1.5-13 | Medium (extends QA-1.5-6a) | **The documented clean-file conversion gap fires on the common `* text=auto` on win32, not only on an explicit `eol=crlf`.** S12: `.gitattributes` `* text=auto`, `core.autocrlf=false`, `core.eol` unset (native = CRLF). Live `a.txt` = `"a0\n"` and `git status` is clean. `ls-files --eol` gives live `i/lf w/lf attr/text=auto` and reference `i/lf w/crlf attr/text=auto`. The reference bytes are `"a0\r\n"`, yet `exact: true, inexactReasons: []`. LF working files under `text=auto` are typical on Windows (e.g. Prettier's default `endOfLine: lf`). My answer to the implementer's question: this gap is **not acceptable** as a silent `exact`. | At materialize, compare the `w/` column of `git ls-files --eol -z` between root and dir for paths with a non-empty `attr/`, and add `checkout-conversion` per differing path. If the budget runs out, add path `""`. Note that `git check-attr --stdin` is not available, because ExecOptions (`:590-596`) has no stdin. Update OPEN RISKS so that only `filter` remains there. |
+| QA-1.5-14 | Low | **The QA-1.5-9a test gates its holder on the `spawn` event, which fires before the child has opened its cwd** (`test:507`). With the same gate, the round-2 harness once **lost** that race: the holder was in `packages/a`, dispose took 593 ms, removed the dir and gave no warning. Another time it won (~60 s). Gated on a line printed by the child, the holder blocked every time (S7, S16, the depth runs). The test's `exists(handle.dir) === true` can therefore flake. | Have the child print a line once started, and await it before disposing. |
+
+### Data-loss review (priority #1)
+In no scenario did the module delete or change data outside its own dirs. The destructive steps checked are:
+`unlink` behind `lstat` (R1); `fs.rm` only on a swept dir that passed R3 and is a real directory (`:1101-1110`); git
+only on a dir that `lstat` shows is gone (`:1114-1117`, S7 `[false]`); `unlock` only for our reason on our entry.
+Links recreated in a leftover are swept before any removal (S7). A heartbeat `utimes` in flight after `fs.rm` can only
+fail with ENOENT, because `utimes` creates nothing. The remaining deletion path is external: QA-1.5-12.
+
+### Deferred by plan (unchanged)
+- QA-1.5-7: the excuse policy for ignored inputs (2.1 wiring).
+- QA-1.5-10 (2.1 part): materialize only inside the S3 slot, and run GC before each materialize (which makes
+  QA-1.5-11 matter more).
+- QA-1.5-4 (2.1 part): "reference vanished → unverifiable" (the backstop for the heartbeat residual above).
