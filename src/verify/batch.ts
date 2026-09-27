@@ -434,6 +434,13 @@
 //     deadlineCut (u14, SLOT_DEADLINE_REASON): the scope does not expose when its first execute
 //     took the hold, and the union IS the member's scoped run. Both are unverifiable (u13, u14).
 //     .window and .attribution have no direct-path equivalent: those waits exist only in a batch.
+//     QA-2.2-27 (nit, recorded, not changed): the solo phase it was raised against is gone with
+//     QA-2.2-23. The same wording applies to the steps that remain: a member cut while a pooled
+//     batch plans its union or waits for its hold (step 3) is still in phase run and gets .run,
+//     as during the union run, where alone it would get slot-busy (u14); a member cut while it
+//     waits behind the union for its own run (mode B) gets .attribution. A member of a split
+//     starts its own run at once, in its batch of one, and so never waits in own-wait. Every
+//     one of these outcomes is unverifiable (u13), as the direct path's would be.
 //   - When all members have aborted, D aborts. The running execute or rechecker kills its tree
 //     (exec.ts), and nothing more is spawned: an aborted signal never spawns. The batch then
 //     finishes and closes its scope.

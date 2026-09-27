@@ -1015,3 +1015,133 @@ the gaps in W3 and B5.2a's estimates. All three reproduce on node and Bun with s
 tests, whose shapes are given above for the regression tests. Under the owner's rule, QA-2.2-23,
 QA-2.2-24 and QA-2.2-25 get fixed. QA-2.2-26 (minor, test-only) and QA-2.2-27 (nit) are
 recorded and not fixed.
+
+### Resolutions (2.2.3 wiring, round 2)
+
+Owner rule for this last round: for every gate, the batched verdict must be at least as strong as
+the direct verdict (`batchWindowMs: 0`). A batched unverifiable must never replace a direct fail,
+and a batched pass must never occur where direct is not pass. Correctness beats batching savings,
+so under deadline pressure the batch gives up pooling rather than a verdict. The B-sections of
+`batch.ts` changed: B-G3, B-G7, B4 W3, B5 steps 2a, 2, 3 and 6, B7.5, B9, B10, B13 and B15.
+
+- **QA-2.2-23 (major).** Resolution: `7ee5080` — a split runs each member in a scope of its own.
+  - The solo-first phase is gone. B5.2a is all or nothing: the batch pools only when every
+    member's budget covers the batched schedule, and otherwise splits.
+  - A split no longer runs its members one after another in the batch's scope. Each member runs
+    alone as a batch of one (B5.1), with its own gate's runtime:
+    - its own scope, whose hold it takes under its own deadline;
+    - its own run and its own recheck.
+    That is its direct path. The batches of one start in arrival order, the order in which the
+    direct hooks would have queued. They compete for the slot as the direct hooks would: in
+    parallel, as far as `maxConcurrentVerifications` allows.
+  - The split batch opens no scope, so no hold is shared or nested, and each batch of one holds
+    at most one.
+  - No member runs in a scope whose hold another member's deadline decides. A pooled scope's
+    first acquisition is the union's, under D (D' since QA-2.2-25), and a split member's scope is
+    its own. 2.1's P4 memoization is unchanged; the "memoize only a granted hold" option was not
+    needed.
+  - **Tests.**
+    - N1 (wiring): a 3.5 s slot holder; c has 2.5 s and no reference; a and b have 60 s and an
+      exact reference; a has an introduced failure. a is `fail`, `accepted: false`, batched as
+      alone.
+    - N1b (wiring): the same with a and c only.
+    - Unit: a scope that memoizes a failed hold, as P4 does. The short member gets its own
+      slot-busy, and the others run.
+    - All three fail with only `src` stashed (036174c) and pass at `7ee5080`.
+    - Changed unit tests:
+      - The W2/W3 joiner and the inconsistent-union cases expect one scope per member.
+      - The B5.2a case expects every member to run alone, in arrival order.
+      - The solo B-G2 case is replaced by the unit N1.
+- **QA-2.2-24 (major).** Resolution: `fb8da5e` — W3 reserves the split schedule.
+  - The member at arrival index k keeps floor + e × (2k + 1). That covers the run and recheck of
+    every member that joined before it, then its own run, then its recheck: what a split runs on
+    one slot, in the order the direct hooks would have queued.
+  - **Tests.**
+    - N2 (wiring): one FIFO slot; another gate is planning; c has 14.0 s and d 14.1 s, both with
+      introduced failures and an exact reference.
+    - N2b (wiring): two FIFO slots; a lone gate g with a run and a recheck; c and d arrive 100 ms
+      later.
+    - Unit: the (2k + 1) reserve.
+    - N2 and the unit case fail at `7ee5080` (`src` stashed) and pass at `fb8da5e`.
+    - N2b fails at 036174c, but already passes at `7ee5080`: once a split runs each member in its
+      own scope, the two slots run c and d in parallel, as alone. It stays as a regression test of
+      both fixes.
+- **QA-2.2-25 (major).** Resolution: `736ced5` — the union is priced per member, and its
+  unmeasured steps are bounded.
+  - B5.2a prices a union of n members at n × e. The union runs each of the members' related test
+    files once, where their own runs run each at least once, and e is usually one own run. A
+    member therefore pools only with floor + e × (2n + i) left: the union, n own runs and i
+    rechecks ahead of it. A union's run still updates e, which only overstates it.
+  - Union planning runs under D', which is D cut off where that check stops holding. The check
+    repeats after planning.
+  - The slot wait:
+    - 2.1's `CheckScope` gains an optional `hold(deadline)` in `deterministic.ts`. The frozen
+      `types.ts` block is unchanged.
+    - `hold` is the scope's one memoized hold attempt, taken without a spawn. The union's execute
+      reuses it, so a batch never takes two holds.
+    - The batch takes the hold first, under D', and repeats the check once it holds the slot.
+    - A hold not granted in time, or a failed check, closes the scope (releasing any hold) and
+      splits.
+  - Why the invariant holds: until D' runs out, every member has at least floor + 2n·e left. A
+    split needs at most floor + e·(2n − 1) (W3), so the split that follows still fits.
+  - Rejected: the suggested per-input union estimate. Scaling a measured union by its inputs
+    underestimates when run time is not linear in inputs (N3's own shape: 2 inputs take 1 s,
+    5 take 3 s), and there is no measurement before the first union.
+  - **Tests.**
+    - N3 (wiring): run time scales with inputs (1 s per 2); c arrives first.
+    - Wiring: a pooled batch behind a 6.5 s slot holder, with two distinct references and 20 s
+      each.
+    - Unit: the union price; the bounded planning and hold.
+    - 2.1: `hold()`.
+    - All fail at `fb8da5e` (`src` stashed) and pass at `736ced5`.
+    - N3 as first written, with an unordered barrier, passed at `fb8da5e`. The QA-2.2-24 reserve
+      had closed the window before the fifth member joined in that arrival order. The final N3
+      fixes the arrival order, with c first, matching the QA's "c is first in the FIFO".
+- **QA-2.2-26 (minor).** Resolution: `fb8da5e`, `736ced5` and `973733d` — tests only. Mutants
+  were applied in place against the final `batch.test.ts` (169 tests) and restored:
+  - M4 (W3 ignores e): killed by 2 tests.
+  - M12 (no recheck-queue term): killed by 3.
+  - M14 (no refit on a measurement): killed by 1.
+  - M10 (solo recheck deferred): moot, because the solo phase is gone.
+  - Mutants of the new logic:
+    - W3 with one run per member: killed by 1.
+    - The union priced as one run: killed by 3.
+    - Planning under D: killed by 1.
+    - The hold under D: killed by 1.
+    - A split in deadline order: killed by 2.
+    - A split in one shared scope: killed by 10.
+    - No check after planning, and no check after the hold: each killed by 1, both by
+      `973733d`'s case. Both survived before it.
+- **QA-2.2-27 (nit).** Resolution: recorded in B9, with no code change. The solo phase is gone.
+  A member cut while a pooled batch plans or waits for its hold gets `.run`. One cut while it
+  waits behind the union for its own run gets `.attribution`. A split member never waits in
+  `own-wait`. All of these outcomes are unverifiable.
+
+**Residuals (B15).**
+
+- e is 0 before a key's first measured run (unchanged).
+- A member's own run can be slower than the last measured run, or a recheck slower than a run.
+- A planner step that ignores its deadline's bound can overrun D'. The check after planning then
+  splits a batch that is already late.
+- The window itself. Under a first-come slot, a request that queues while a member waits in its
+  window is served before that member. W3 keeps the member's split schedule out of the wait, but
+  not such requests' runs. The wait is bounded by `batchWindowMs` (at most a tenth of the gate
+  budget) and removed by W7 when the coordinator is idle.
+- QA-2.2-5's early-settled member (unchanged).
+- Cost: the union is priced pessimistically, so batches split more often under deadline pressure
+  or when runs are long relative to budgets. The owner's rule accepts this.
+
+**Test runs (final state).**
+
+- The dispatched command, over 9 files including `deterministic.test.ts`: `npx vitest run
+  --maxWorkers=2 test/unit/batch.test.ts test/integration/batch-wiring.test.ts
+  test/integration/batch-plugin-hookup.test.ts test/unit/baseline-wiring.test.ts
+  test/unit/tests-pass-pipeline.test.ts test/unit/deterministic.test.ts
+  test/integration/layer2-wiring.test.ts test/integration/delegate-timeout.test.ts
+  test/integration/session-lifecycle.test.ts` → Test Files 9 passed (9), Tests 510 passed
+  (510), 119 s.
+- `batch.test.ts` has 169 tests (+5), `batch-wiring.test.ts` 22 (+6) and
+  `tests-pass-pipeline.test.ts` +1. The six new wiring cases take 8-23 s each, because they run
+  real 1 s runs twice.
+- The six wiring regression cases in their final form, run against 036174c's `src`: 6 of 6 fail.
+- `npm run typecheck` is clean. The full suite was not run (§0.6.7).
