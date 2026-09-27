@@ -951,10 +951,14 @@ export function createScopeOpener(deps: ScopeOpenerDeps): OpenCheckScope {
         return { ok: false, outcome: { kind: "slot-busy", waitedMs: 0, deadlineCut: true } };
       }
       const started = now();
+      // The deadline bounds the wait when it leaves less than slotWaitMs: a busy answer then ends
+      // at the deadline, even when the wait's own timer fires a few ms before remaining() reads 0.
+      const waitMs = deadline.bound(budget.slotWaitMs);
+      const cutByDeadline = waitMs < budget.slotWaitMs;
       try {
         const r = await acquire({
           max: budget.maxConcurrentVerifications,
-          waitMs: deadline.bound(budget.slotWaitMs),
+          waitMs,
           signal: deadline.signal,
           meta: { cwd: meta.cwd, command: meta.command },
           onLost,
@@ -962,7 +966,7 @@ export function createScopeOpener(deps: ScopeOpenerDeps): OpenCheckScope {
         if ("busy" in r) {
           return {
             ok: false,
-            outcome: { kind: "slot-busy", waitedMs: Math.max(0, now() - started), deadlineCut: deadline.remaining() === 0 },
+            outcome: { kind: "slot-busy", waitedMs: Math.max(0, now() - started), deadlineCut: cutByDeadline || deadline.remaining() === 0 },
           };
         }
         return { ok: true, handle: r };
