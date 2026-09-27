@@ -295,6 +295,26 @@ describe("wiring (2.4.2a)", () => {
       expect(done).toBe(true);
     });
 
+    it("counts the wait from the dispatch's start: a slow synchronous capture start-up is inside VERIFY_WAIT (CI round 1)", async () => {
+      vi.useFakeTimers();
+      state.captureDelayMs = 20_000;
+      // The snapshot's synchronous start-up (a git spawn on a loaded runner) takes 300 ms.
+      state.snapshotImpl = () => {
+        vi.setSystemTime(Date.now() + 300);
+        return Promise.resolve(state.snapshot);
+      };
+      const { wiring, store } = makeWiring();
+      let done = false;
+      const started = wiring.startDispatch(store, "d4", root, TESTS_DOD, "VERIFY_WAIT:5s", false).then(() => {
+        done = true;
+      });
+      await vi.advanceTimersByTimeAsync(4_699);
+      expect(done).toBe(false);
+      await vi.advanceTimersByTimeAsync(1);
+      await started;
+      expect(done).toBe(true);
+    });
+
     it("a capture that resolves at 2 s under a 5 s wait releases the dispatch at 2 s", async () => {
       vi.useFakeTimers();
       state.captureDelayMs = 2_000;

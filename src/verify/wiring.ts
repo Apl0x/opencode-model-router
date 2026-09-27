@@ -581,8 +581,9 @@ export interface VerificationWiring {
   resolveDirectives(text: string): VerifyDirectives;
   /**
    * 2.4.2a: resolveDirectives, then beginVerificationBounded for at most the directives' waitMs
-   * (section 1.5-14: VERIFY_WAIT, 0 allowed). `remember` keeps the start for takeDispatch (the
-   * native `task` after hook). Never rejects.
+   * (section 1.5-14: VERIFY_WAIT, 0 allowed), counted from this call, so the directive read and
+   * the capture's synchronous start-up are inside it. `remember` keeps the start for takeDispatch
+   * (the native `task` after hook). Never rejects.
    */
   startDispatch(
     store: ReturnType<typeof createChangedFileStore>,
@@ -1188,7 +1189,22 @@ export function createVerificationWiring(deps: {
     return { ...store.delta(id, childID, snapshot, base, committed), snapshot };
   };
 
-  const beginVerificationBounded: VerificationWiring["beginVerificationBounded"] = async (store, id, cwd, dod, waitOverrideMs) => {
+  /**
+   * beginVerificationBounded, with the wait counted from `startedAt` (a Date.now() value): the
+   * dispatch waits at most `waitMs` from its start, not `waitMs` after the capture's synchronous
+   * start-up returned. That start-up (config, the snapshot's first git spawn) is the dispatch's
+   * time too, and under load it is not negligible (CI round 1, 3.1.2.f: 20 parallel dispatches on
+   * a 4-core runner held their before hooks up to 104 ms past VERIFY_WAIT). Date.now rather than
+   * performance.now, so fake clocks drive it together with the timer.
+   */
+  const boundedCaptureWait = async (
+    store: ReturnType<typeof createChangedFileStore>,
+    id: string,
+    cwd: string | undefined,
+    dod: DoD,
+    waitOverrideMs: number | undefined,
+    startedAt: number,
+  ): Promise<void> => {
     let waitMs: number;
     let begun: Promise<void>;
     try {
@@ -1198,13 +1214,18 @@ export function createVerificationWiring(deps: {
       logger.warn("[verify] dispatch reference capture could not start", { id, error: errorText(err) });
       return;
     }
-    const outcome = await awaitBounded(begun, waitMs);
+    // A clock stepped backwards never lengthens the wait past waitMs.
+    const remaining = Math.min(waitMs, Math.max(0, waitMs - (Date.now() - startedAt)));
+    const outcome = await awaitBounded(begun, remaining);
     if (outcome.kind === "timeout") {
       logger.debug?.("[verify] dispatch reference not ready; proceeding without waiting further", { id, waitMs });
     } else if (outcome.kind === "error") {
       logger.warn("[verify] dispatch reference capture failed; proceeding without a reference", { id, error: errorText(outcome.error) });
     }
   };
+
+  const beginVerificationBounded: VerificationWiring["beginVerificationBounded"] = (store, id, cwd, dod, waitOverrideMs) =>
+    boundedCaptureWait(store, id, cwd, dod, waitOverrideMs, Date.now());
 
   const resolveDirectives = (text: string): VerifyDirectives => {
     try {
@@ -1759,6 +1780,8 @@ export function createVerificationWiring(deps: {
     beginVerification,
     resolveDirectives,
     async startDispatch(store, id, cwd, dod, text, remember) {
+      // VERIFY_WAIT counts from here, the dispatch's start (see boundedCaptureWait).
+      const startedAt = Date.now();
       const start: DispatchStart = { directives: resolveDirectives(text), dispatchedAt: pendingNow() };
       if (remember) {
         dispatchStarts.delete(id);
@@ -1769,7 +1792,7 @@ export function createVerificationWiring(deps: {
           dispatchStarts.delete(oldest.value);
         }
       }
-      await beginVerificationBounded(store, id, cwd, dod, start.directives.waitMs);
+      await boundedCaptureWait(store, id, cwd, dod, start.directives.waitMs, startedAt);
       return start;
     },
     takeDispatch(id, text) {
