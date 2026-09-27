@@ -480,6 +480,67 @@ Private index copy, further checks (no finding):
 | QA-1.5-13 | Medium (extends QA-1.5-6a) | **The documented clean-file conversion gap fires on the common `* text=auto` on win32, not only on an explicit `eol=crlf`.** S12: `.gitattributes` `* text=auto`, `core.autocrlf=false`, `core.eol` unset (native = CRLF). Live `a.txt` = `"a0\n"` and `git status` is clean. `ls-files --eol` gives live `i/lf w/lf attr/text=auto` and reference `i/lf w/crlf attr/text=auto`. The reference bytes are `"a0\r\n"`, yet `exact: true, inexactReasons: []`. LF working files under `text=auto` are typical on Windows (e.g. Prettier's default `endOfLine: lf`). My answer to the implementer's question: this gap is **not acceptable** as a silent `exact`. | At materialize, compare the `w/` column of `git ls-files --eol -z` between root and dir for paths with a non-empty `attr/`, and add `checkout-conversion` per differing path. If the budget runs out, add path `""`. Note that `git check-attr --stdin` is not available, because ExecOptions (`:590-596`) has no stdin. Update OPEN RISKS so that only `filter` remains there. |
 | QA-1.5-14 | Low | **The QA-1.5-9a test gates its holder on the `spawn` event, which fires before the child has opened its cwd** (`test:507`). With the same gate, the round-2 harness once **lost** that race: the holder was in `packages/a`, dispose took 593 ms, removed the dir and gave no warning. Another time it won (~60 s). Gated on a line printed by the child, the holder blocked every time (S7, S16, the depth runs). The test's `exists(handle.dir) === true` can therefore flake. | Have the child print a line once started, and await it before disposing. |
 
+### Resolutions (round 2)
+- QA-1.5-11 — Resolution: 7f6ff3e — `fs.rm(dir, { recursive: true, force: true, maxRetries: 0 })` now runs inside the
+  module's only retry loop (`withRetry`: 5 retries, 100·2ⁿ ms, about 3.1 s of backoff at any depth). `ReferenceFs.rm`
+  types `maxRetries` as the literal `0`. GC passes its budget end into the cleanup context. No retry (rm, unlink,
+  readdir) starts after it. Step 4 is skipped once the budget end has passed: a warning is logged, and the next GC
+  drops the entry. Dispose has no deadline, because it must finish after an abort; the retry count bounds it.
+  Header: section 6 (step 3 and the retry paragraph), section 11, plus a Bun item in OPEN RISKS. New win32 test with
+  a READY-gated holder whose cwd is `packages/a` (depth 2). Dispose must resolve in < 10 s, warn and leave the dir.
+  A GC with `timeoutMs: 1_500` while the holder still runs must finish in < 3 s with the dir in `failed` (the flat
+  loop alone would sleep 3.1 s). After the release, GC removes the dir, and the sentinels are intact. QA-1.5-9a's
+  bound went from 20 s to 10 s (depth 1 used to take about 11 s). The whole QA-1.5-11 test (capture, materialize,
+  dispose, two GCs) took 8.5 s and 6.2 s. Not run: a mutation with the old options, which should hit the 60 s test
+  timeout at depth 2.
+- QA-1.5-12 — Resolution: 9a0c3a5 — materialize runs `worktree add --detach --lock --reason "<referenceLockReason(pid)>"`,
+  with the reason `omr-verify-reference pid=<pid>: its node_modules links lead into the live repository, do not
+  force-remove`. Checked against git's `builtin/worktree.c` (v2.51.0): `add_worktree` writes `opts->keep_locked` (our
+  reason) into `locked` from the start, and writes `initializing` only without `--lock`. It unlinks the lock when the
+  add fails. `remove` refuses a locked entry unless `force >= 2`. Minimum git is **2.33** (RelNotes 2.33.0: "git
+  worktree add --lock learned to record why the worktree is locked with a custom message"). On this host,
+  `git worktree add -h` (2.51.0) lists `--lock [--reason <string>]`. Fallback for older git: if the add fails with
+  `unknown option` for `reason` or `lock` (under LC_ALL=C), the module checks that the dir is still empty, logs a
+  warning and repeats the add without `--lock`, which is the pre-fix behaviour. Dispose step 4 unlocks only
+  `referenceLockReason(<pid of the dir name>)` or `initializing`, and only after lstat shows the dir is gone and R3
+  passed. In GC, the omr reason follows the section 11 rules of an unlocked entry, except that a missing dir of an
+  alive owner is kept (that owner may be between its fs.rm and its unlock). `initializing` is unchanged (dead owner
+  or released dir only). Header: section 4 step 3, section 6 step 4, R4, section 11 step 2 and the new D10. Tests:
+  (1) The porcelain shows `locked <reason>`. A sandbox guard runs before any user remove: 2 links, each realpath
+  inside the test's mkdtemp sandbox, each target listing exactly `sentinel.txt`. Then `git worktree remove` and
+  `remove --force` (LC_ALL=C) both exit non-zero with `cannot remove a locked working tree, lock reason: <reason>`.
+  The checkout, the links and the sentinels are intact. Dispose leaves no entry and no warning. (2) A user's own
+  lock on our entry: dispose removes the dir, keeps the entry and warns. (3) Simulated git < 2.33: one rejected
+  call, a warning, an unlocked entry, and a clean dispose. (4) GC removes a dead owner's entry and an alive owner's
+  entry with a 2 h old heartbeat. It keeps a fresh alive owner's entry and an entry whose omr reason names another
+  pid. (5) The QA-1.5-5 abort test now also waits for the worktree's `index.lock` (mid-checkout), and asserts that
+  `locked` then holds our reason, not `initializing`. The QA-1.5-10 test's seam now takes the dir from the
+  second-to-last argument. `remove --force` ran against a dir with junctions only in test (1), behind the sandbox
+  guard, and git refused it. Every other `remove --force` in the tests ran on a dir that was already gone, or on a
+  test-made worktree without junctions.
+- QA-1.5-13 — Resolution: 9790b41 — new materialize step 7b: `git ls-files --eol -z` runs at root and at dir. The
+  records are parsed at the tab (`i/%-5s w/%-5s attr/%-17s\t<path>`, confirmed on this host). A path that is listed
+  on both sides, is not in `ref.tracked`, is not in the step 7 drift set, and has a different `w/` class adds
+  `checkout-conversion` for that path (sorted, at most MAX_CONVERSION_REASONS = 100, then one `""`). Why the drift
+  set is excluded: a file edited after capture differs by content. The normalizing diff hides exactly the
+  conversion case, so any path it does not list is clean. The step is skipped when a `""` conversion reason
+  (core.autocrlf) is already recorded. It runs last, with the remaining budget and only the caller's signal. A
+  failing call, or one that runs out of budget, adds `""`: the reference becomes approximate instead of failing. A
+  caller abort still returns `aborted`. Header: section 2e, section 4 step 7b, and OPEN RISKS, where only a
+  `filter`/`ident`/`working-tree-encoding` that keeps the eol class remains. Tests: three committed variants, each
+  with `git status` clean and `tracked` empty. `* text=auto` flags `.gitattributes`, `.gitignore`, `a.txt`, `b.txt`,
+  `package.json` and `packages/a/index.js` on win32, and the reference's `a.txt` is `"a0\r\n"` (exact on POSIX).
+  `*.txt text eol=crlf` flags `a.txt` and `b.txt`. The control `* text=auto eol=lf` is exact, with `a.txt` = `"a0\n"`.
+  A failing `ls-files --eol` gives `ok: true` with only `{checkout-conversion, ""}`.
+- QA-1.5-14 — Resolution: f693e13 — the test helper `holdCwd` spawns Node with the given cwd and resolves only after
+  the child has printed `READY`. It rejects, and cleans up, if the child exits first. QA-1.5-9a and QA-1.5-11 use it.
+- Test runs of `npx vitest run --maxWorkers=2 test/unit/reference.test.ts` (win32, Node v24.21.0, git
+  2.51.0.windows.1). f693e13: 38/38, 110.88 s. 7f6ff3e: 39/39, 103.84 s. 9a0c3a5: 43/43, 88.83 s; the run before it
+  had 1 failure, in the QA-1.5-10 seam's argument index, fixed in the same commit. 9790b41: 45/45 in 119.98 s, then
+  two consecutive runs at 153.33 s and 106.42 s. `npm run typecheck` was clean at each commit. Afterwards there were
+  no `omr-ref-*`/`omr-nohooks-*` entries in TEMP, no test sandboxes, no holder processes, and no `omr-ref` worktree
+  in the list.
+
 ### Data-loss review (priority #1)
 In no scenario did the module delete or change data outside its own dirs. The destructive steps checked are:
 `unlink` behind `lstat` (R1); `fs.rm` only on a swept dir that passed R3 and is a real directory (`:1101-1110`); git
