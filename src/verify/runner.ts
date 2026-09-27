@@ -533,19 +533,25 @@
 //     fail-closed by this guard. 2.1 must still pass the native realpath (Q).
 //     A parser exception is an unusable report: step 4 with the note `report could not be
 //     parsed: <message>` (QA-1.3-12). readResult never rejects.
-//   Step 3  pytest junit XML, parsed at regex level (no XML library).
-//     - Read each <testcase .../> and <testcase ...>...</testcase>, with its classname and name
-//       attributes. Decode &amp; &lt; &gt; &quot; &apos; &#N; and &#xN;. A numeric reference
-//       outside 0..0xD7FF and 0xE000..0x10FFFF stays literal text (QA-1.3-12).
+//   Step 3  pytest junit XML, parsed without an XML library, in linear time (QA-1.3-25).
+//     - Read each <testcase .../> and <testcase ...>...</testcase> with a forward indexOf scan,
+//       with its classname and name attributes. A testcase with no </testcase>, or one that
+//       contains another <testcase, makes the report unusable (step 4). Decode &amp; &lt; &gt;
+//       &quot; &apos; &#N; and &#xN;. A numeric reference outside 0..0xD7FF and 0xE000..0x10FFFF
+//       stays literal text (QA-1.3-12).
 //     - A <failure> child marks a failing test.
-//     - An <error message="collection failure"> child, or classname="", marks a collection
-//       error. Any other <error> (fixture setup or teardown) marks a failing test.
+//     - Only an <error message="collection failure"> child marks a collection error
+//       (QA-1.3-22). classname="" alone does not: pytest writes it for a real test outside its
+//       rootdir (-c/--config-file elsewhere, --rootdir), and a green run of those tests must stay
+//       green. A FAILING case with classname="" is unmapped (below), so it is never a pass. Any
+//       other <error> (fixture setup or teardown) marks a failing test.
 //     - <skipped> is not a failure.
 //     Module mapping. For each spec input f:
 //       dotted(f) = its gitRoot-relative path without ".py", with "/" replaced by ".".
-//       The candidates are the segment-suffixes of dotted(f).
+//       The candidates are the segment-suffixes of dotted(f), kept in a map (first input wins).
 //       The longest candidate D with classname === D or classname.startsWith(D + ".") names the
-//       file. rest = the part of classname after D, split on ".".
+//       file: walk the classname's dot prefixes from the longest, one map lookup each. rest = the
+//       part of classname after D, split on ".".
 //       id = `${P.relative(spec.cwd, f) with "/"}::${[...rest, name].join("::")}`. This matches
 //       pytest's "FAILED <nodeid>" text.
 //       A collection pseudo-case maps `name` the same way and gets a bare file id.
@@ -3089,22 +3095,31 @@ function decodeXml(s: string): string {
   });
 }
 
-/** I step 3: pytest junit XML at regex level. undefined = unusable (truncated). */
+/**
+ * I step 3: pytest junit XML, parsed without an XML library. undefined = unusable (truncated or
+ * malformed). QA-1.3-25: linear in the report and the inputs. Each dotted suffix of each input is
+ * put in a map once (the first input wins a shared suffix), a classname walks its own dot
+ * prefixes from the longest, and testcases are found with indexOf, never a backtracking regex.
+ */
 function parseJunit(ctx: Ctx, spec: ScopedSpec, text: string, code: number): RunResult | undefined {
   const P = ctx.P;
   if (!text.includes("</testsuites>")) return undefined;
-  const modules = spec.inputs.map((f) => {
+  const suffixes = new Map<string, string>();
+  for (const f of spec.inputs) {
     const segs = P.relative(spec.gitRoot, f).replace(/\\/g, "/").replace(/\.py$/, "").split("/");
-    return { f, candidates: segs.map((_s, i) => segs.slice(i).join(".")) };
-  });
-  const map = (dotted: string): { file: string; rest: string[] } | undefined => {
-    let best: { file: string; d: string } | undefined;
-    for (const m of modules) {
-      for (const d of m.candidates) {
-        if ((dotted === d || dotted.startsWith(`${d}.`)) && (!best || d.length > best.d.length)) best = { file: m.f, d };
-      }
+    for (let i = 0; i < segs.length; i++) {
+      const d = segs.slice(i).join(".");
+      if (!suffixes.has(d)) suffixes.set(d, f);
     }
-    return best && { file: best.file, rest: dotted.slice(best.d.length + 1).split(".").filter(Boolean) };
+  }
+  const map = (dotted: string): { file: string; rest: string[] } | undefined => {
+    for (let d = dotted; ; ) {
+      const file = suffixes.get(d);
+      if (file !== undefined) return { file, rest: dotted.slice(d.length + 1).split(".").filter(Boolean) };
+      const dot = d.lastIndexOf(".");
+      if (dot < 0) return undefined;
+      d = d.slice(0, dot);
+    }
   };
   const relOf = (f: string) => P.relative(spec.cwd, f).replace(/\\/g, "/");
   const ids = new Set<string>();
@@ -3112,14 +3127,17 @@ function parseJunit(ctx: Ctx, spec: ScopedSpec, text: string, code: number): Run
   let collectionError = false;
   let total = 0;
   let unmapped: string | undefined;
-  const caseRe = /<testcase\b([^>]*?)(?:\/>|>([\s\S]*?)<\/testcase>)/g;
-  for (const m of text.matchAll(caseRe)) {
+  const cases = junitCases(text);
+  if (!cases) return undefined;
+  for (const c of cases) {
     const attrs: Record<string, string> = {};
-    for (const a of m[1].matchAll(/([\w:-]+)="([^"]*)"/g)) attrs[a[1]] = decodeXml(a[2]);
+    for (const a of c.attrs.matchAll(/([\w:-]+)="([^"]*)"/g)) attrs[a[1]] = decodeXml(a[2]);
     const classname = attrs.classname ?? "";
     const name = attrs.name ?? "";
-    const body = m[2] ?? "";
-    const collection = classname === "" || /<error\b[^>]*\bmessage="collection failure"/.test(body);
+    const body = c.body;
+    // QA-1.3-22: only the collection-failure <error> marks a collection case. pytest also writes
+    // classname="" for a test outside its rootdir (-c elsewhere, --rootdir), which is a real test.
+    const collection = /<error\b[^>]*\bmessage="collection failure"/.test(body);
     if (collection) {
       collectionError = true;
       const target = classname || name;
@@ -3141,7 +3159,7 @@ function parseJunit(ctx: Ctx, spec: ScopedSpec, text: string, code: number): Run
       files.add(hit.file);
     } else {
       ids.add(`${classname}::${name}`);
-      unmapped ??= classname;
+      unmapped ??= classname === "" ? `"" (${name})` : classname;
     }
   }
   const forced =
@@ -3153,6 +3171,37 @@ function parseJunit(ctx: Ctx, spec: ScopedSpec, text: string, code: number): Run
           ? `pytest classname not mapped to a test file: ${unmapped}`
           : undefined;
   return finishResult(ids, files, collectionError, total, code, forced, code === 0 || code === 5);
+}
+
+/**
+ * QA-1.3-25: the <testcase> elements of a junit report, in one forward pass. A non-self-closing
+ * testcase whose `</testcase>` is missing, or that contains another `<testcase`, makes the report
+ * malformed (undefined), never a silently skipped case: pytest writes neither, a test that
+ * rewrites its own report can. Attributes are assumed to hold no literal ">" (pytest escapes it).
+ */
+function junitCases(text: string): { attrs: string; body: string }[] | undefined {
+  const out: { attrs: string; body: string }[] = [];
+  let pos = 0;
+  for (;;) {
+    const start = text.indexOf("<testcase", pos);
+    if (start < 0) return out;
+    pos = start + 9;
+    if (!/^[\s/>]/.test(text.slice(pos, pos + 1))) continue;
+    const tagEnd = text.indexOf(">", pos);
+    if (tagEnd < 0) return undefined;
+    if (text[tagEnd - 1] === "/") {
+      out.push({ attrs: text.slice(pos, tagEnd - 1), body: "" });
+      pos = tagEnd + 1;
+      continue;
+    }
+    // Each search starts after the previous case's end tag, so the whole pass stays linear.
+    const close = text.indexOf("</testcase>", tagEnd);
+    if (close < 0) return undefined;
+    const body = text.slice(tagEnd + 1, close);
+    if (body.includes("<testcase")) return undefined;
+    out.push({ attrs: text.slice(pos, tagEnd), body });
+    pos = close + 11;
+  }
 }
 
 /** I step 4: no usable report; the text observation is never a complete inventory. */

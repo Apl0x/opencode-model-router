@@ -1256,9 +1256,9 @@ describe("readResult: pytest junit", () => {
       '<testcase classname="tests.test_math" name="test_s"><skipped message="s"/></testcase>' +
       "<testcase /></testsuite></testsuites>";
     const r = await read(pspec(), { [RPT_XML]: xml }, 1);
-    // The attribute-less <testcase /> has classname "": an unmapped collection pseudo-case with an empty id.
-    expect(r.failingIds).toEqual(["", "tests/test_math.py::test_p[a&bAB<>\"']"]);
-    expect(r).toMatchObject({ total: 2, collectionError: true, complete: false });
+    // The attribute-less <testcase /> is a passing case (QA-1.3-22: classname "" alone is not a collection error).
+    expect(r.failingIds).toEqual(["tests/test_math.py::test_p[a&bAB<>\"']"]);
+    expect(r).toMatchObject({ total: 3, collectionError: false, complete: true });
     const t = await read(pspec(), { [RPT_XML]: report("pytest-fail.xml", "/root").slice(0, 300) }, 1);
     expect(t.source).toBe("text");
   });
@@ -2326,5 +2326,69 @@ describe("QA-1.3-21: the config every pytest release line would read counts", ()
     expectS6(await detectRunner("pytest", "/r", memFs(pyRepo({ "/r/pyproject.toml": bad })), POSIX_HOST), "unsupported-argument", 'unsupported pytest argument "addopts" in /r/pyproject.toml');
     expect(await det({ "/r/cfg/x.toml": '[tool.pytest.ini_options]\naddopts = "-n 3"\n' }, "pytest -c cfg/x.toml")).toMatchObject({ xdist: true, userWorkers: { count: 3 } });
     expectS6(await detectRunner("pytest -c cfg/x.toml", "/r", memFs(pyRepo({ "/r/cfg/x.toml": '[tool.pytest]\nini_options.addopts = "-n 3"\n' })), POSIX_HOST), "unsupported-argument");
+  });
+});
+
+describe("QA-1.3-22: classname=\"\" alone is a real test, not a collection error", () => {
+  const pspec = () => mkSpec({ runner: "pytest", reportPath: RPT_XML, cwd: "/root/p", gitRoot: "/root", inputs: ["/root/p/tests/test_w.py"], inputsAreTests: true });
+  const xml = (cases: string) => `<?xml version="1.0"?><testsuites><testsuite>${cases}</testsuite></testsuites>`;
+
+  it("pytest -c elsewhere: a green run outside the rootdir stays green", async () => {
+    const r = await read(pspec(), { [RPT_XML]: xml('<testcase classname="" name="test_workers" time="0.01"/>') }, 0);
+    expect(r).toMatchObject({ failingIds: [], total: 1, collectionError: false, complete: true });
+  });
+
+  it("a failing test with classname=\"\" is unmapped, so never a pass", async () => {
+    const r = await read(pspec(), { [RPT_XML]: xml('<testcase classname="" name="test_workers"><failure message="x"/></testcase>') }, 1);
+    expect(r).toMatchObject({ failingIds: ["::test_workers"], collectionError: false, complete: false, note: 'pytest classname not mapped to a test file: "" (test_workers)' });
+  });
+
+  it("the collection-failure <error> is still a collection error, with or without a classname", async () => {
+    const r = await read(pspec(), { [RPT_XML]: xml('<testcase classname="" name="p.tests.test_w"><error message="collection failure">E</error></testcase>') }, 2);
+    expect(r).toMatchObject({ failingIds: ["tests/test_w.py"], collectionError: true, total: 0 });
+  });
+});
+
+describe("QA-1.3-25: junit parsing is linear", () => {
+  it("700 inputs x 20000 failing testcases parse in well under a second", async () => {
+    const inputs = Array.from({ length: 700 }, (_, i) => `/root/p/tests/pkg${i}/sub${i % 7}/test_m${i}.py`);
+    const cases: string[] = [];
+    for (let j = 0; j < 20000; j++) {
+      const k = j % 700;
+      cases.push(`<testcase classname="p.tests.pkg${k}.sub${k % 7}.test_m${k}.TestC" name="test_${j}" time="0.001"><failure message="boom">x</failure></testcase>`);
+    }
+    const text = `<?xml version="1.0"?><testsuites><testsuite>${cases.join("")}</testsuite></testsuites>`;
+    const sp = mkSpec({ runner: "pytest", reportPath: RPT_XML, cwd: "/root/p", gitRoot: "/root", inputs, inputsAreTests: true });
+    const t0 = performance.now();
+    const r = await read(sp, { [RPT_XML]: text }, 1);
+    const ms = performance.now() - t0;
+    expect(r).toMatchObject({ total: 20000, complete: true, source: "report" });
+    expect(r.failingIds).toHaveLength(20000);
+    expect(r.failingIds).toContain("tests/pkg399/sub0/test_m399.py::TestC::test_19999");
+    expect(r.failingIds).toContain("tests/pkg699/sub6/test_m699.py::TestC::test_19599");
+    expect(ms).toBeLessThan(1000);
+  });
+
+  it("the first input wins a shared suffix; the longest suffix wins", async () => {
+    const sp = mkSpec({ runner: "pytest", reportPath: RPT_XML, cwd: "/root", gitRoot: "/root", inputs: ["/root/a/test_x.py", "/root/b/test_x.py", "/root/c/a/test_x.py"], inputsAreTests: true });
+    const xml = '<testsuites><testcase classname="test_x" name="t"><failure/></testcase><testcase classname="c.a.test_x.K" name="u"><failure/></testcase></testsuites>';
+    expect((await read(sp, { [RPT_XML]: xml }, 1)).failingIds).toEqual(["a/test_x.py::t", "c/a/test_x.py::K::u"]);
+  });
+
+  it.each([
+    ["8000 unclosed testcases", `<testsuites>${'<testcase classname="a" name="b">'.repeat(8000)}</testsuites>`],
+    ["an unclosed testcase before a closed one", '<testsuites><testcase classname="a" name="b"><testcase classname="a" name="c"><failure/></testcase></testsuites>'],
+    ["a start tag cut short", "<testsuites></testsuites><testcase classname="],
+  ])("malformed: %s -> text fallback, fast", async (_n, xml) => {
+    const t0 = performance.now();
+    const r = await read(mkSpec({ runner: "pytest", reportPath: RPT_XML, inputs: ["/root/vitest-proj/tests/test_a.py"] }), { [RPT_XML]: xml }, 1);
+    expect(r).toMatchObject({ source: "text", complete: false });
+    expect(performance.now() - t0).toBeLessThan(1000);
+  });
+
+  it("<testcases> and a bare <testcase> at the end are not cases", async () => {
+    const xml = '<testsuites><testcases/><testcase classname="tests.test_math" name="ok"/></testsuites><testcase';
+    const sp = mkSpec({ runner: "pytest", reportPath: RPT_XML, cwd: "/root/p", gitRoot: "/root/p", inputs: ["/root/p/tests/test_math.py"], inputsAreTests: true });
+    expect(await read(sp, { [RPT_XML]: xml }, 0)).toMatchObject({ total: 1, complete: true, source: "report" });
   });
 });
