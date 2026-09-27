@@ -241,3 +241,57 @@ scratch script that imports `src/router/config.ts`. The script is outside the re
   `VerifyBudget`/`resolveVerifyBudget` code (1238-1318) has no uncovered line. Branch coverage of
   the validation block could not be confirmed independently because the text reporter truncates the
   earlier ranges.
+
+## QA re-review (round 2)
+
+Reviewer: heavy QA, adversarial re-review of the fix round, `git diff 5e393dc..5f8bb2f` on
+`vrb/p11` (`src/router/config.ts`, `test/unit/config-verify-budget.test.ts`,
+`test/unit/config.validate.test.ts`, this file), against plan Phase 1.1 and §1.4.
+
+**Setup.**
+- Host: Windows 11, node v24.21.0, bun 1.3.14.
+- `npx vitest run --maxWorkers=2 test/unit/config-verify-budget.test.ts test/unit/config.validate.test.ts`
+  passed: 2 files, 112 tests, 393 ms.
+- A scratch script in `%TEMP%\omr-qa-r2` ran under bun. It imported `src/router/config.ts` and
+  `src/router/jsonc.ts`, and merged override layers onto the real `tiers.json` through `parseJsonc`
+  and `deepMerge`, which is the `loadConfig` path. The script has been removed.
+- The branch history was rewritten, so the Resolution lines above quote old SHAs. They map by
+  subject as follows:
+  - `c63361a` → `55324c5`;
+  - `277a200` → `3194bec`;
+  - `8bc503d` → `efb12a9`;
+  - `ca98fdc` → `0480cdf`.
+
+**Result.** All 6 round-1 findings are verified. There is 1 new nit, and the fix does not change
+code. The DoD (zero open findings) is **not met** until QA-1.1-7 is fixed.
+
+### Round-1 findings
+
+| Finding | Status | Evidence |
+|---|---|---|
+| QA-1.1-1 | verified | `config.ts:728-733` throws `tiers.json: enforcement.verify must be an object` for anything that is not a plain object. Tests: `config-verify-budget.test.ts:226-236` (`null`, `"x"`, `5`, `[]`, and a `deepMerge` `verify: null` override) and `config.validate.test.ts:196-202`. Repro on the real `tiers.json` base: `REJECTED override verify:null + unrelated key: tiers.json: enforcement.verify must be an object`. Through `loadConfig` the whole layer then falls back with a warning, as it does for any invalid layer. The bundled base still validates (`ACCEPTED bundled tiers.json`). The deviation from "existing config tests pass unchanged" is recorded in the Resolution line; see the deferred items. |
+| QA-1.1-2 | verified | `MAX_TIMER_MS = 2_147_483_647` bounds both millisecond loops (`config.ts:780-813`), 9 keys in total. Counts use `Number.isSafeInteger` (`:816-821`). The tests cover `2 ** 31` for 7 ms keys and `1e21` for all keys. Repro for the 2 untested pre-existing keys: `REJECTED delegateTimeoutMs: 2**31` and `REJECTED graderTimeoutMs: 2**31` with the new message, and `2**31-1` is accepted for both. The loop is shared, so no separate finding. The new message still matches `enforcement-defaults.test.ts:172-214` (a prefix regex `must be an integer >= 1`). No caller adds to these budgets before `setTimeout`: `index.ts:570-573` and `:593-596`, `wiring.ts:211` and `:257`. |
+| QA-1.1-3 | verified | Every line in the pre-flight list (lines 10-23) is current at `5f8bb2f`: `wiring.ts:257`, `:258` and `:276`; `index.ts:82` and `:593-596`; `timeout.ts:37`; `tiers.json:21` (`"gateBudgetMs": 90000`). The `warnDeprecatedVerifyKeys` call is assigned to 2.1. |
+| QA-1.1-4 | verified | `resolveVerifyBudget` (`config.ts:1323-1359`) reads no module state and takes no logger, because `ResolveVerifyBudgetOptions` is `{ cores? }`. `warnDeprecatedVerifyKeys(cfg, logger: PluginLogger)` requires a logger and owns the flag (`:1297-1315`). The test "resolving never warns and consumes no warning state" (`:254-259`) passes. |
+| QA-1.1-5 | verified | The test was renamed and asserts `Object.getPrototypeOf(verify) === Object.prototype` (`:204-213`). The reserved-key rejection is at `config.ts:737-741`, and tests at `:214-219` cover `constructor` and `prototype`. Observation, not a finding: on the override path, `deepMerge` (`config.ts:1053`) drops `__proto__` and `constructor` before validation (`ACCEPTED override layer with own verify.__proto__`/`constructor`, with the key gone). `prototype` reaches validation and is rejected. Either way, no reserved key reaches the merged config. |
+| QA-1.1-6 | verified | The exact formula against `availableParallelism()` is at `:90-93`. The cores table has `15.9 → 1`, `16.5 → 2` and `Infinity → 1` (`:123-125`). The fresh-flag test for `testBaseline: true` alone is at `:270-274`. |
+
+### New findings
+
+| ID | Severity | Where | Evidence | Fix |
+|---|---|---|---|---|
+| QA-1.1-7 | nit | this file, "Implementation notes" (lines 36-49) and "Verified, no finding → Existing tests" (line 238) | The fix round made both passages stale. Line 36 says `resolveVerifyBudget(cfg, { cores?, logger? })`, but the code has `ResolveVerifyBudgetOptions { cores?: number }` (`config.ts:1280-1283`). Lines 43-49 say the warning goes through "an optional `PluginLogger` passed in `opts.logger`" and that "a resolve without a logger does not consume the once-per-process flag". The code has `warnDeprecatedVerifyKeys(cfg, logger)` with a required logger, and resolving never touches the flag. Line 238 says "the diff adds only the new test file, so existing config tests are unchanged", but `config.validate.test.ts:196-202` changed under QA-1.1-1. Plan 1.1.1.b makes this report Phase 2.1's switch-over input, so a stale signature points 2.1 at the wrong call. | Rewrite lines 36-49 to describe the split: `resolveVerifyBudget(cfg, { cores? })` is pure, and `warnDeprecatedVerifyKeys(cfg, logger)` has a required logger, the once flag and `resetVerifyBudgetWarnings()`. Mark line 238 as superseded by QA-1.1-1. This is a docs-only change. |
+
+### Deferred by plan (not open)
+
+- **deferred by plan (2.1):** the three items listed in round 1 still apply. In addition, 2.1 must
+  call `warnDeprecatedVerifyKeys(cfg, logger)` after every `loadConfig()`. Until then no deprecation
+  warning is emitted in production, so plan §1.4's `testBaseline` row is met only from 2.1 on.
+- **deferred by plan (3.2):** align the plan text with the split. Three places need it:
+  - 1.1.1.b/c: the warning lives in `warnDeprecatedVerifyKeys`, not in `resolveVerifyBudget`.
+  - The Phase 1.1 test bullet "the warning fires once across repeated resolves" becomes "across
+    repeated `warnDeprecatedVerifyKeys` calls".
+  - The acceptance line "existing config tests pass unchanged" needs a note on the approved
+    QA-1.1-1 deviation in `config.validate.test.ts`.
+- **deferred by plan (2.3), unchanged:** the §1.3 S3 "(default 1)" wording.
+- **deferred by plan (1.6 / 2.4), unchanged:** the `captureWaitMs > baselineTimeoutMs` clamp.
