@@ -1279,8 +1279,6 @@ export interface VerifyBudget {
 export interface ResolveVerifyBudgetOptions {
   /** Core count; defaults to `os.availableParallelism()`. Injected by tests. */
   cores?: number;
-  /** Receives the one-time `testBaseline` deprecation warning. */
-  logger?: PluginLogger;
 }
 
 let warnedTestBaselineDeprecated = false;
@@ -1291,9 +1289,35 @@ export function resetVerifyBudgetWarnings(): void {
 }
 
 /**
- * The single place verification-budget defaults are applied. Pure apart from
- * the once-per-process deprecation warning. Reads own properties only, so a
- * value inherited through a prototype is never applied.
+ * Logs the once-per-process deprecation warning for `enforcement.verify.testBaseline`
+ * (any value) through the plugin logger. Call once after every `loadConfig()`.
+ * Kept apart from `resolveVerifyBudget` so that function stays pure.
+ */
+export function warnDeprecatedVerifyKeys(
+  cfg: RouterConfig | undefined,
+  logger: PluginLogger,
+): void {
+  const v = cfg?.enforcement?.verify;
+  if (
+    warnedTestBaselineDeprecated ||
+    !isPlainObject(v) ||
+    !Object.prototype.hasOwnProperty.call(v, "testBaseline") ||
+    v.testBaseline === undefined
+  ) {
+    return;
+  }
+  warnedTestBaselineDeprecated = true;
+  logger.warn(
+    "enforcement.verify.testBaseline is deprecated; use enforcement.verify.failureRecheck",
+    { key: "testBaseline" },
+  );
+}
+
+/**
+ * The single place verification-budget defaults are applied. Pure and
+ * synchronous: no module state, no logging (see `warnDeprecatedVerifyKeys`).
+ * Reads own properties only, so a value inherited through a prototype is never
+ * applied. A non-finite or `< 1` core count (including `Infinity`) counts as 1.
  */
 export function resolveVerifyBudget(
   cfg: RouterConfig | undefined,
@@ -1307,13 +1331,7 @@ export function resolveVerifyBudget(
       : undefined;
 
   const testBaseline = own<boolean>("testBaseline");
-  if (testBaseline !== undefined && !warnedTestBaselineDeprecated && opts.logger) {
-    warnedTestBaselineDeprecated = true;
-    opts.logger.warn(
-      "enforcement.verify.testBaseline is deprecated; use enforcement.verify.failureRecheck",
-      { key: "testBaseline" },
-    );
-  }
+
   const failureRecheck =
     own<boolean>("failureRecheck") ?? (testBaseline === false ? false : true);
 

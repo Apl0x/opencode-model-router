@@ -1,9 +1,11 @@
+import { availableParallelism } from "node:os";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   deepMerge,
   resolveVerifyBudget,
   resetVerifyBudgetWarnings,
   validateConfig,
+  warnDeprecatedVerifyKeys,
   type RouterConfig,
   type VerifyBudget,
 } from "../../src/router/config";
@@ -87,7 +89,7 @@ describe("resolveVerifyBudget — defaults", () => {
   });
   it("uses the real core count when none is injected", () => {
     const n = resolveVerifyBudget(cfgWith()).maxConcurrentVerifications;
-    expect(Number.isInteger(n) && n >= 1).toBe(true);
+    expect(n).toBe(Math.max(1, Math.floor(availableParallelism() / 8)));
   });
   it("round-trips every explicit value", () => {
     const explicit: VerifyBudget = {
@@ -118,6 +120,9 @@ describe("resolveVerifyBudget — maxConcurrentVerifications from injected cores
     [64, 8],
     [0, 1],
     [Number.NaN, 1],
+    [15.9, 1],
+    [16.5, 2],
+    [Number.POSITIVE_INFINITY, 1],
   ])("%s cores → %s", (cores, expected) => {
     expect(resolveVerifyBudget(cfgWith(), { cores }).maxConcurrentVerifications).toBe(expected);
   });
@@ -238,22 +243,38 @@ describe("resolveVerifyBudget — testBaseline deprecation", () => {
       resolveVerifyBudget(cfgWith({ testBaseline: true, failureRecheck: false })).failureRecheck,
     ).toBe(false);
   });
-  it("warns once across repeated resolves, through the logger", () => {
+  it("resolving never warns and consumes no warning state", () => {
     const logger = mockLogger();
-    for (let i = 0; i < 5; i++) resolveVerifyBudget(cfgWith({ testBaseline: false }), { logger });
-    resolveVerifyBudget(cfgWith({ testBaseline: true }), { logger });
+    resolveVerifyBudget(cfgWith({ testBaseline: false }), { cores: 1 });
+    warnDeprecatedVerifyKeys(cfgWith({ testBaseline: false }), logger);
+    expect(logger.warn).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("warnDeprecatedVerifyKeys", () => {
+  it("warns once across repeated calls, through the logger", () => {
+    const logger = mockLogger();
+    for (let i = 0; i < 5; i++) warnDeprecatedVerifyKeys(cfgWith({ testBaseline: false }), logger);
+    warnDeprecatedVerifyKeys(cfgWith({ testBaseline: true }), logger);
     expect(logger.warn).toHaveBeenCalledTimes(1);
     expect(logger.warn.mock.calls[0]![0]).toMatch(/testBaseline is deprecated/);
   });
+  it("testBaseline:true alone warns on a fresh flag", () => {
+    const logger = mockLogger();
+    warnDeprecatedVerifyKeys(cfgWith({ testBaseline: true }), logger);
+    expect(logger.warn).toHaveBeenCalledTimes(1);
+  });
   it("does not warn when the deprecated key is absent", () => {
     const logger = mockLogger();
-    resolveVerifyBudget(cfgWith({ failureRecheck: false }), { logger });
+    warnDeprecatedVerifyKeys(cfgWith({ failureRecheck: false }), logger);
+    warnDeprecatedVerifyKeys(cfgWith(), logger);
+    warnDeprecatedVerifyKeys(undefined, logger);
     expect(logger.warn).not.toHaveBeenCalled();
   });
-  it("a resolve without a logger does not consume the one warning", () => {
-    resolveVerifyBudget(cfgWith({ testBaseline: false }));
+  it("a call without the key does not consume the one warning", () => {
     const logger = mockLogger();
-    resolveVerifyBudget(cfgWith({ testBaseline: false }), { logger });
+    warnDeprecatedVerifyKeys(cfgWith({}), logger);
+    warnDeprecatedVerifyKeys(cfgWith({ testBaseline: false }), logger);
     expect(logger.warn).toHaveBeenCalledTimes(1);
   });
 });
