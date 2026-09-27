@@ -110,3 +110,108 @@ text, prompt sizes were re-measured with a script, and the scoped tests and type
 - QA-2.3-16 — info, no action.
 - QA-2.3-17 — info, no action.
 - Follow-up (QA-2.3-5 leftover) — Resolution: `92eca0e` — CONFIG_REFERENCE and ADR 0003 no longer list the `gateBudgetMs` `tiers.json` change under *Deprecations*.
+
+## QA re-review (round 2)
+
+Final round. Reviewed diff: `git diff f626a9c..HEAD` (commits `2e4ed81`, `c34df3e`, `92eca0e`,
+`4c33edc`; 12 files). Text cleared in round 1 was not re-audited. Owner rule: only critical, major
+or blocking findings are fixed after this round.
+
+### Runs
+
+- `npx vitest run --maxWorkers=2 test/golden test/unit/protocol-directives.test.ts test/unit/config-verify-budget.test.ts test/unit/packaging.test.ts test/unit/docs-drift.test.ts`
+  gives **11 files / 142 tests passed** (2.0 s). The extra test is the new `DELEGATE_TOOL_DESCRIPTION` probe.
+- `npm run typecheck` (`tsc --noEmit`) is **clean** (exit 0).
+- Measurement (tsx script over `tiers.json`, `anthropic` / `normal`):
+  - Claude path: 4,010 characters with enforcement off and **6,189** with it on, a difference of **2,179**.
+  - `buildDoDProtocolSection` alone is 2,172 characters. The 2,179 includes the 7-character
+    `\n\n---\n\n` separator. Round 1 used the same convention (1,982 vs 1,975).
+  - Non-Claude path: 3,238 characters.
+  - Tokens: 2,179 → **545–606**, and 3,238 / 6,189 → **810–1,720**. Both use the ceiling at 4.0 / 3.6
+    characters per token, the same rounding as round 1. The README figures match.
+- Directive probe (`parseVerifyDirectives` with sentinel defaults, and `parseCapDirective`):
+  - The DoD section, and the full Claude and non-Claude prompts with enforcement off and on, all
+    return the **defaults** (`deferred`, sentinel wait, both sources `default`).
+  - The same holds for the assembled enforcement-on prompt of every preset and mode, on both paths:
+    22 prompts, 0 non-default.
+  - CAP is `null` for the DoD section and 8 for the full prompts. Both are unchanged.
+  - Change from round 1: the new wording ``add `VERIFY:` followed by `required` …`` is no longer a
+    silent placeholder. It records `firstInvalid` = `` ` `` and would log
+    `ignoring unknown VERIFY value`. This has no runtime effect, because the system prompt is never
+    parsed as dispatch text (see below). It does matter for QA-2.3-18.
+- `DELEGATE_TOOL_DESCRIPTION` parses as `{mode:"required", modeSource:"directive"}`, as intended
+  and as pinned by the new test.
+  - Could it make a real dispatch accidentally required? **No.** The constant is referenced only at
+    `src/router/protocol.ts:271` (definition) and `src/index.ts:52`/`:503` (the `tool({ description })`
+    field). It is not part of `assembleSystemPrompt`.
+  - The only inputs to `parseVerifyDirectives` are `resolveDirectives(text)` (`src/verify/wiring.ts:1208-1215`),
+    which is reached from `startDispatch` / `takeDispatch`. Those receive:
+    - `args.task` on the `delegate` path (`src/index.ts:619`);
+    - `dispatchDirectiveText(prompt, description)` of the `task` call's own args on the native path
+      (`src/index.ts:1084-1092`, `:1284`).
+  - The dispatch header is prepended to `args.prompt` only after that parse (`:1148-1150`), and the
+    after hook reuses the stored start.
+  - `parseCapDirective` reads `args.prompt` (`:1143`) and the session dispatch text (`src/router/sessions.ts:493`).
+  - The tool description is never concatenated into any of these. Even if it were, `required` is the
+    fail-safe direction: a stronger gate that costs only latency.
+- Golden diff: exactly three lines change in each of the two snapshots. They are the QA-2.3-7 reword,
+  the QA-2.3-3/-10 `VERIFY` line and the QA-2.3-11 allowlist line. There are no other changes.
+- Acceptance grep `rg -n "warm|baseline capture|full suite" docs README.md`: the hits are the same set
+  as in round 1.
+  - `CONFIG_REFERENCE.md:540` is now `:562` because of the added lines. It is about the prompt cache.
+  - The fix diff adds no hit. **Pass.**
+
+### Verdicts on round-1 findings
+
+| ID | Verdict | Evidence |
+|---|---|---|
+| QA-2.3-1 | **Resolved** | `README.md:876` now makes an exception for a DoD with `testsPass` ("deferred by default and returns unverified with a `vrf_` handle"). `:881` replaces "always verified" with "verified, but one with `testsPass` is deferred by default". This matches `wiring.ts:1782-1790` and `index.ts:1290`, `:671`. There is a link nit in QA-2.3-20. |
+| QA-2.3-2 | **Resolved** | The `CONFIG_REFERENCE.md:202` row now says "any scoped failure is then `unverifiable` … never a fail". This matches `deterministic.ts:464` (row R2, column D = `V u5`). |
+| QA-2.3-3 | **Resolved** | `DELEGATE_TOOL_DESCRIPTION` shows the literal `` `VERIFY:required` `` "in the task", and `args.task` is the parsed text (`index.ts:619`). The probe gives `required`. The protocol line has no pipe placeholder, which the test pins (`not.toMatch(/VERIFY:[a-z]+\|/i)`). QA-2.3-18 records a residual. |
+| QA-2.3-4 | **Resolved** | CHANGELOG, the ADR 0003 consequences and CONFIG_REFERENCE now all state `VERIFY_WAIT` at dispatch plus up to 2 s at return. The dispatch wait is awaited before the producer starts (`index.ts:619` then `:644`; native `:1089`) and applies in either mode (`wiring.ts:1771`, `:1200`). |
+| QA-2.3-5 | **Resolved** | *Added* no longer lists `baselineTimeoutMs` or `gateBudgetMs`. *Changed* now has the `baselineTimeoutMs` bullet and the `tiers.json` bullet. *Deprecations* keeps only `testBaseline`. `git show v1.14.0:tiers.json` has `"gateBudgetMs": 90000` (:21), and HEAD's `tiers.json` has no such key. The in-code default is `?? 90_000` (`config.ts:1368`). The 15 s default is pinned by the docs-table test, which is green. |
+| QA-2.3-6 | **Resolved** | The listed conditions match the code: mode (`wiring.ts:1783`), `require` (`:1787`), registration (`index.ts:462`, `:471`), proven root (`:672`, `:1290`), trivial/inferred (`wiring.ts:1785`; the `delegate` path never passes `trivial`, and its gate uses `trivial: false`, `index.ts:753`), producer error (`:671`), and attributed empty set → `no-change` / unattributed → `unattributedRisk` (`wiring.ts:1274`, `:1281`). There is an omission nit in QA-2.3-21. |
+| QA-2.3-7 | **Resolved in the model-facing text; the docs part was not done** | The protocol line and `DELEGATE_TOOL_DESCRIPTION` now say a DoD containing testsPass defers "as a whole (its build, lint, run and criteria checks too)". This matches `wiring.ts:1783` (`hasTestsPass` only). Round 1 also asked for this in CONFIG_REFERENCE, but `rg "as a whole\|all of its checks" docs/CONFIG_REFERENCE.md docs/VERIFICATION.md README.md` finds nothing. See QA-2.3-23. |
+| QA-2.3-8 | **Resolved** | CONFIG_REFERENCE, VERIFICATION.md and the ADR name `ctx.directory`, "every reference rerun is unplannable" and the 3.1 cross-reference, as QA-2.4-23 (`phase-2.4.md:1199`) observed. A possible overstatement is recorded in QA-2.3-19. |
+| QA-2.3-9 | **Resolved** | All four bullets match `exec.ts`: FullLanguage and exit 3 (`:574-587`), `[orphan sweep unavailable: …]` only while the run is unsettled (`:262`), taskkill under saturation (`:90-96`), unhandled signal skipping the exit hook (`:28-37`), and priority applied after spawn, "not a guarantee" (`:201-215`). "Windows PowerShell 5.1" matches `:568`. There is a scope nit in QA-2.3-22. |
+| QA-2.3-10 | **Resolved** | "until verified or expired (1 h, or a restart); absent from the list does not mean verified". This matches `config.ts` `pendingTtlMs ?? 3_600_000` and `pending.ts:341`, `:419`. |
+| QA-2.3-11 | **Resolved** | The allowlist line adds "pytest (plus exactly `uv run pytest`)". The golden is updated, and the README numbers were re-measured and match (see *Runs*). |
+| QA-2.3-12 | **Resolved** | The text now reads "a pass becomes `unverifiable` with a drift notice naming the drifted paths (a fail stays a fail)". This matches `wiring.ts:1557-1571` ("A fail stays a fail") and `:458-459` (paths in the notice). |
+| QA-2.3-13 | **Resolved, and more precise than the round-1 fix text** | "from `prompt`, or from `description` when `prompt` is missing or blank (never both)" is exactly `dispatchDirectiveText` (`wiring.ts:254-256`). The round-1 suggestion ("`prompt` and `description`") was imprecise, and the implementer read the body correctly. |
+| QA-2.3-14 | **Resolved** | ADR 0002 now has the "Superseded in part by ADR 0003" sub-bullet. It matches `deterministic.ts:307-308` ("buildPasses and run keep the mutex"). |
+| QA-2.3-15 | **Resolved** | The `COMMAND_REFERENCE_INDEX.md:275` condition is exactly `index.ts:461-462`, evaluated once at plugin start. |
+| QA-2.3-16 | info, unchanged | Still accurate. `DELEGATE_TOOL_DESCRIPTION` now carries the literal form, which covers the mode-`off` + `delegate` configuration. |
+| QA-2.3-17 | info, amended | One bullet no longer holds as written: "No model-facing text parses as a live directive". `DELEGATE_TOOL_DESCRIPTION` now parses as `required` by design. It is a tool description, not dispatch text, and it never reaches the parser (see *Runs*). Every other bullet stands. |
+| Follow-up (`92eca0e`) | **Resolved** | Neither CONFIG_REFERENCE nor ADR 0003 *Deprecations* mentions `gateBudgetMs` now. Both have a *Bundled defaults* note that says "still supported, not deprecated". |
+
+### New findings
+
+| ID | Severity | Finding | Evidence | Fix |
+|---|---|---|---|---|
+| QA-2.3-18 | minor | **The fill-in instruction admits a rendering that silently gives `deferred`.** The protocol line now says "add `` `VERIFY:` `` followed by `` `required` `` or `` `deferred` ``". The natural fill-ins parse: `VERIFY:required`, `VERIFY: required`, `` VERIFY:`required` ``, and lower-case `verify: required` on its own line all give `required`. A model that copies the two code spans as they are rendered does not: `` `VERIFY:` `required` `` parses as **`deferred`** (`modeSource: default`), with only a log line. That is the QA-2.3-3 failure class, but much less likely. The round-1 fix text had "(one word)", and it was dropped. It is not major, because the result still carries the `[router] unverified · vrf_…` footer and stays in the pending list. The orchestrator is told that it was not gated and is never told it was verified. This path matters most on the native `task` path, where the protocol line is the only teaching. | Probe: `` "`VERIFY:` `required`\nImplement X" `` → `{mode:"deferred",modeSource:"default"}`. `src/verify/directives.ts:153-158`, `:175`: the closing backtick ends the token, so `v` is null → `firstInvalid`. `src/router/protocol.ts` DoD line (golden `.snap` :59, :193). | Optional under the owner rule. Write it as one token with a `<…>` placeholder, which is skipped silently and keeps the no-live-directive test green. For example: "add `VERIFY:<mode>` (one token; mode `required` or `deferred`)". Then update the golden, the README numbers and the test's `toContain`. |
+| QA-2.3-19 | nit (unverified) | **"Scoped failures are then always `unverifiable` … `testsPass` cannot reject" may overstate the 8.3 effect.** This wording is QA's own round-1 fix text. In the recheck order, failing files absent at the reference (new test files) are classified at step g. When the rerun list is empty, step h returns `exact` without planning. The unplannable rerun that QA-2.4-23 observed ("runner not installed: vitest", from `resolveEntry`) is at step i. So a failure confined to a new test file may still be rejected. Whether `toRefPath(f)` also fails for the failing files under a short path, which would leave them unknown, was not checked. The error is in the pessimistic direction and has no safety impact. | `src/verify/deterministic.ts:405-410` (steps g–i), `:435` (absent → introduced), `:1076` (`rerun-unplannable` from `resolveEntry`); `phase-2.4.md:1199`. | Leave it for 3.1. The live check should also try a new-test-file failure under a short path, and soften the wording to "generally" if it fails there. |
+| QA-2.3-20 | nit | **The README Layer-2 link is imprecise.** `[Deferred verification](docs/VERIFICATION.md)` has no anchor. Its label names the CONFIG_REFERENCE section, and the sentence then repeats "See docs/VERIFICATION.md". | `README.md:881`; the VERIFICATION.md heading is "Deferred path (the default)" (`:183`). | `docs/CONFIG_REFERENCE.md#deferred-verification` or `docs/VERIFICATION.md#deferred-path-the-default`. |
+| QA-2.3-21 | nit | **The deferral list and its "Otherwise" sentence omit the live enforcement mode.** The native `task` path runs neither `startDispatch` nor any gate when the enforcement mode at dispatch time is `off` (for example after `/router enforce off`). So "Otherwise … the required (synchronous) gate, or no gate when `require` is `"never"`" leaves out a second no-gate case. Registration is a start-time condition only. | `docs/CONFIG_REFERENCE.md` §Which delegations defer vs `src/index.ts:1082-1083`, `:1265-1266` (`shouldVerifyTask(…, mode, …)`). | Add "on the native `task` path, the enforcement mode at dispatch is not `off`", and "or no gate when the mode is `off`". |
+| QA-2.3-22 | nit | **The unhandled-signal limit is not Windows-specific.** It is listed under *Windows limits*, but `exec.ts` states it for the exit hook on every platform (POSIX process groups included). | `docs/VERIFICATION.md` *Windows limits* ("Unhandled signals"), ADR 0003 consequences vs `src/verify/exec.ts:28-37`. | Move it to a general limits line, or add "(all platforms)". |
+| QA-2.3-23 | nit | **The QA-2.3-7 leftover: the user docs do not say a `testsPass` DoD defers all of its checks.** The model-facing text does. CONFIG_REFERENCE ("the DoD carries a `testsPass` check"), VERIFICATION.md ("Deferral applies to delegations whose DoD has a `testsPass` check") and the README do not say that build, lint, `run` and criteria checks are deferred too. | The `rg` above (no hits); `src/verify/wiring.ts:1783`. | Add one sentence to CONFIG_REFERENCE §Which delegations defer, the same as the protocol wording. |
+
+### Not verified in this round
+
+- QA-2.3-19: whether `toRefPath` maps failing test files under an 8.3 `ctx.directory`. This needs the
+  3.1 live check.
+- The three items under *Not verified in this round* in round 1 are outside the fix diff and were not
+  revisited.
+
+### Summary
+
+- **Every round-1 finding is resolved.** QA-2.3-7 is resolved in the model-facing text, which is where
+  it affects behaviour. Its docs half is QA-2.3-23 (nit).
+- The fix diff introduced **no critical, major or blocking defect**. The new findings are 1 minor
+  (QA-2.3-18) and 5 nits (QA-2.3-19 to -23). Under the owner's final-round rule none of them has to
+  be fixed. QA-2.3-18 is the one worth taking if the protocol text is touched again, for example in 3.2.
+- The golden diff contains only the intended text. The README figures (6,189 / 2,179, 545–606,
+  810–1,720) match the re-measurement. `DELEGATE_TOOL_DESCRIPTION` parsing as `required` cannot leak
+  into dispatch text. Scoped tests and typecheck are green.
+
+**Status: CLEAN.** There are no critical, major or blocking findings. 1 minor and 5 nits are recorded
+and not fixed, per the owner's rule.
