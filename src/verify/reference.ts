@@ -89,7 +89,13 @@
 //       CLEAN (QA-1.5-13), the working-tree eol class (`w/` column of
 //       `git ls-files --eol -z`: lf, crlf, mixed, none, -text) must be the
 //       same in root and dir for every tracked path that is neither in
-//       `tracked` nor changed since the commit (section 4 step 7b). QA's
+//       `tracked` nor changed since the commit (section 4 step 7b; the full
+//       listing, QA-1.5-18: a clean file's live bytes come from its LAST
+//       checkout, e.g. under an older core.autocrlf, a legacy `crlf`
+//       attribute or a working-tree-encoding added later, so no attribute
+//       pathspec can limit it). A path changed since the commit but not in
+//       `tracked` (edited after capture, QA-1.5-16) is flagged when the
+//       reference's own `w/` class differs from its `i/` class. QA's
 //       repro: `* text=auto`, core.autocrlf=false, core.eol unset (native
 //       CRLF on win32), live "a0\n" and `git status` clean; the reference got
 //       "a0\r\n" while exact stayed true. LF files under text=auto are common
@@ -293,10 +299,8 @@
 //      index lock whenever it is free, whatever GIT_OPTIONAL_LOCKS says.
 //   7b. Clean-file conversion (section 2e, QA-1.5-13), skipped when a ""
 //      "checkout-conversion" reason (core.autocrlf) is already recorded:
-//      `git ls-files --eol -z -- ':(attr:text)' ':(attr:text=auto)'
-//      ':(attr:eol=crlf)' ':(attr:eol=lf)'` at root and at dir (QA-1.5-17:
-//      only attributed paths can convert without core.autocrlf, which the ""
-//      reason already covers). A path in both lists, not in ref.tracked and
+//      `git ls-files --eol -z` at root and at dir, run concurrently
+//      (the cost of QA-1.5-17; QA-1.5-18: no pathspec limit is sound). A path in both lists, not in ref.tracked and
 //      not in the drift set of step 7, whose `w/` class differs adds
 //      "checkout-conversion" for it. A path in the drift set but not in
 //      ref.tracked (edited after capture, QA-1.5-16) has unknown dispatch
@@ -627,13 +631,21 @@
 //     client) reflects the live tree; check (c) only catches manifest and
 //     lockfile drift.
 //   - Checkout conversion of files git reports as CLEAN is detected through
-//     core.autocrlf and the eol-class comparison (section 2e, QA-1.5-13), so
-//     `text`/`eol` attributes are covered. What remains is a `filter` (or
-//     `ident`, `working-tree-encoding`) whose smudge output differs from the
-//     live bytes while keeping the eol class: such a clean file still
+//     core.autocrlf and the eol-class comparison (section 2e, QA-1.5-13,
+//     QA-1.5-18), which sees any conversion that changes the `w/` class. What
+//     remains is a `filter` or `ident` smudge (or a working-tree-encoding
+//     change) whose output differs from the live bytes while keeping the eol
+//     class: such a clean file still
 //     differs at the reference while exact stays true. Hashing every tracked
 //     file at capture would close this, at a cost the capture budget cannot
 //     bound. Dirty files are always compared byte for byte.
+//   - False inexact (QA-1.5-19, safe direction): a file clean at capture and
+//     edited before materialize is flagged whenever the reference's checkout
+//     converts it (`w/` != `i/`), even if the live file already had those
+//     bytes. On win32 with `* text=auto` (native CRLF) any such edit makes the
+//     reference inexact. Avoiding it needs each path's `w/` class at capture,
+//     i.e. a full `ls-files --eol` inside the capture budget; not done, since
+//     the error only yields "unverifiable", never a wrong excuse.
 //   - An ignored file that tests need (.env, generated code) is absent at the
 //     reference. The recheck must classify the resulting failure as a setup
 //     failure (§1.5-8). `unreproduced` supports that decision but cannot make
