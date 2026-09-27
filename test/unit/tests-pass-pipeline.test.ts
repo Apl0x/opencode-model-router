@@ -1,5 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { join } from "node:path";
+import { tmpdir } from "node:os";
+import { judgeScoped } from "../../src/verify/baseline";
+import { createChangedFileStore } from "../../src/verify/dispatch";
 import type { VerifyBudget } from "../../src/router/config";
 import type {
   DetectedRunner,
@@ -984,5 +987,235 @@ describe("createDirectTestsPassHook (2.1.2.4)", () => {
     expect(out.scoped.kind).toBe("ran");
     expect(out.recheck).toEqual({ kind: "unusable", cause: "error", reason: "the reference recheck errored: recheck exploded" });
     expect(s.close).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("gate pipeline end to end (2.1.6c): real opener, rechecker, hook, planner and judgeScoped", () => {
+  const TMP = tmpdir();
+  const ROOT = process.platform === "win32" ? "C:\\omr-e2e\\repo" : "/omr-e2e/repo";
+  const P = (...s: string[]): string => join(ROOT, ...s);
+  const FULL = "npm test";
+  const BUDGET: VerifyBudget = {
+    testScope: "affected",
+    maxWorkers: 2,
+    lowPriority: true,
+    maxConcurrentVerifications: 1,
+    defaultVerify: "required",
+    captureWaitMs: 5_000,
+    background: false,
+    pendingTtlMs: 600_000,
+    slotWaitMs: 60_000,
+    batchWindowMs: 250,
+    failureRecheck: true,
+    recheckTimeoutMs: 120_000,
+    baselineTimeoutMs: 60_000,
+    gateBudgetMs: 5_000,
+  };
+  const REFERENCE: DispatchReference = {
+    root: ROOT, head: "a".repeat(40), commit: "b".repeat(40), untracked: new Map(), tracked: new Map(), captureReasons: [], capturedAt: 0,
+  };
+  const FILES: Record<string, string> = {
+    [P(".git")]: "",
+    [P("package.json")]: JSON.stringify({ name: "e2e", scripts: { test: "vitest run" }, devDependencies: { vitest: "3.0.0" } }),
+    [P("node_modules", "vitest", "package.json")]: JSON.stringify({ name: "vitest", version: "3.0.0", bin: { vitest: "vitest.mjs" } }),
+    [P("node_modules", "vitest", "vitest.mjs")]: "",
+    [P("src", "a.ts")]: "export const a = 1;\n",
+    [P("test", "a.test.ts")]: "",
+  };
+  const plannerFs: PlannerFs = {
+    fileExists: async p => p in FILES,
+    readFile: async p => {
+      if (p in FILES) return FILES[p];
+      throw new Error(`ENOENT: ${p}`);
+    },
+  };
+  const FAIL_OUT = "FAIL test/a.test.ts > suite > fails\n Tests  1 failed | 2 passed (3)\n";
+  const FAIL_ID = "test/a.test.ts > suite > fails";
+
+  interface Spawn { file: string; args: readonly string[]; signal: AbortSignal | undefined; at: number }
+  function pipeline(o: { argv?: ArgvSeam; exec?: ExecSeam; acquire?: typeof acquireSlot; search?: Partial<TestSearchSeam> } = {}) {
+    const spawned: Spawn[] = [];
+    const argv = vi.fn<ArgvSeam>(async (file, args, opts) => {
+      spawned.push({ file, args, signal: opts?.signal, at: Date.now() });
+      return o.argv ? o.argv(file, args, opts) : { code: 0, stdout: "", stderr: "" };
+    });
+    const exec = vi.fn<ExecSeam>(o.exec ?? (async () => ({ code: 0, stdout: "", stderr: "" })));
+    const release = vi.fn(async (): Promise<void> => {});
+    const acquire = vi.fn<typeof acquireSlot>(o.acquire ?? (async () => ({ release, lost: false })));
+    const refuse = (name: string) => async (): Promise<never> => { throw new Error(`recheck reached ${name}`); };
+    const detectRunner = vi.fn<RecheckSeams["detectRunner"]>(refuse("detectRunner"));
+    const materialize = vi.fn<RecheckSeams["materialize"]>(refuse("materialize"));
+    const openScope = createScopeOpener({
+      argv, exec, acquire, budget: BUDGET, checkTimeoutMs: 120_000,
+      fs: { fileExists: plannerFs.fileExists, readFile: async (p: string) => { throw new Error(`ENOENT: ${p}`); }, unlink: async () => {} },
+      host: { platform: process.platform, tmpdir: TMP },
+      logger: { warn: vi.fn() },
+      recheck: {
+        detectRunner, materialize,
+        gcStaleReferences: vi.fn<RecheckSeams["gcStaleReferences"]>(refuse("gcStaleReferences")),
+        resolveEntry: vi.fn<RecheckSeams["resolveEntry"]>(refuse("resolveEntry")),
+        planRerun: vi.fn<RecheckSeams["planRerun"]>(refuse("planRerun")),
+        readResult: vi.fn<RecheckSeams["readResult"]>(refuse("readResult")),
+      },
+    });
+    const search: TestSearchSeam = {
+      findByName: vi.fn(o.search?.findByName ?? (async () => [])),
+      findByContent: vi.fn(o.search?.findByContent ?? (async () => [])),
+    };
+    const hook = createDirectTestsPassHook({
+      openScope, plannerFs, search, budget: { maxWorkers: 2, failureRecheck: true }, host: { platform: process.platform, tmpdir: TMP },
+    });
+    const run = async (req: TestsPassRequest) => {
+      const out = await hook(req);
+      return { out, verdict: judgeScoped(out.scoped, out.recheck) };
+    };
+    return { run, spawned, argv, exec, acquire, release, detectRunner, materialize, search };
+  }
+
+  const request = (deadline: Deadline, over: Partial<TestsPassRequest> = {}): TestsPassRequest => ({
+    command: FULL,
+    cwd: ROOT,
+    testScope: "affected",
+    changedFiles: [{ path: P("src", "a.ts"), status: " M" }],
+    reference: { kind: "captured", reference: REFERENCE },
+    deadline,
+    ...over,
+  });
+
+  afterEach(() => { vi.useRealTimers(); });
+
+  it("a gate budget exhausted before the run is unverifiable, and nothing is acquired or spawned", async () => {
+    const s = pipeline();
+    const d = createDeadline(60_000);
+    d.abort("gate budget exhausted");
+    const { out, verdict } = await s.run(request(d));
+    expect(out.scoped).toEqual({ kind: "slot-busy", waitedMs: 0, deadlineCut: true });
+    expect(verdict).toEqual({ ok: false, unverifiable: true, reason: "gate budget exhausted waiting for the verification slot" });
+    expect(s.acquire).not.toHaveBeenCalled();
+    expect(s.argv).not.toHaveBeenCalled();
+    expect(s.exec).not.toHaveBeenCalled();
+  });
+
+  it("a 5 s gate budget cuts a 60 s slot wait at 5 s, and no process is spawned afterwards", async () => {
+    vi.useFakeTimers();
+    const start = Date.now();
+    let waitMs: number | undefined;
+    let gaveUpAt = 0;
+    const s = pipeline({
+      acquire: opts => new Promise(res => {
+        waitMs = opts.waitMs;
+        opts.signal?.addEventListener("abort", () => { gaveUpAt = Date.now(); res({ busy: true }); }, { once: true });
+      }),
+    });
+    const d = createDeadline(BUDGET.gateBudgetMs);
+    const pending = s.run(request(d));
+    await vi.advanceTimersByTimeAsync(5_000);
+    const { verdict } = await pending;
+    expect(waitMs).toBe(5_000);
+    expect(gaveUpAt - start).toBeLessThanOrEqual(5_000);
+    expect(verdict).toEqual({ ok: false, unverifiable: true, reason: "gate budget exhausted waiting for the verification slot" });
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(s.argv).not.toHaveBeenCalled();
+    expect(s.exec).not.toHaveBeenCalled();
+    d.dispose();
+  });
+
+  it("a scoped run ending with 8 s left skips the recheck (full mode through the real opener)", async () => {
+    let t = 0;
+    const d = createDeadline(20_000, { now: () => t });
+    const s = pipeline({ exec: async () => { t += 12_000; return { code: 1, stdout: FAIL_OUT, stderr: "" }; } });
+    const { out, verdict } = await s.run(request(d, { testScope: "full" }));
+    expect(out.recheck).toEqual({ kind: "skipped-deadline", remainingMs: 8_000 });
+    expect(verdict).toEqual({ ok: false, unverifiable: true, reason: `testsPass: gate budget exhausted before recheck; observed failures: ${FAIL_ID}` });
+    // Full mode: the resolved command runs once through the shell seam; no scoped spec is spawned.
+    expect(s.exec).toHaveBeenCalledTimes(1);
+    expect(s.exec.mock.calls[0]?.[0]).toBe(FULL);
+    expect(s.argv).not.toHaveBeenCalled();
+    expect(s.detectRunner).not.toHaveBeenCalled();
+    expect(s.materialize).not.toHaveBeenCalled();
+    expect(s.release).toHaveBeenCalledTimes(1);
+    d.dispose();
+  });
+
+  it("full mode with time left applies S2: the failing file is rechecked at the reference", async () => {
+    const d = createDeadline(300_000);
+    const s = pipeline({ exec: async () => ({ code: 1, stdout: FAIL_OUT, stderr: "" }) });
+    const { verdict } = await s.run(request(d, { testScope: "full" }));
+    expect(s.exec).toHaveBeenCalledTimes(1);
+    expect(s.detectRunner).toHaveBeenCalledTimes(1);
+    expect(verdict.unverifiable).toBe(true);
+    expect(verdict.reason).toContain("reference unusable (error)");
+    expect(verdict.reason).toContain(FAIL_ID);
+    d.dispose();
+  });
+
+  it("an owner abort (native task gate timeout) during the scoped run kills the tree: the argv seam's signal aborts", async () => {
+    const d = createDeadline(300_000);
+    const s = pipeline({
+      argv: (_file, _args, opts) => new Promise(res => {
+        opts?.signal?.addEventListener("abort", () => res({ code: -1, stdout: "", stderr: "", timedOut: true }), { once: true });
+      }),
+    });
+    const pending = s.run(request(d));
+    await vi.waitFor(() => expect(s.argv).toHaveBeenCalledTimes(1));
+    expect(s.spawned[0]?.signal?.aborted).toBe(false);
+    d.abort("verification gate timed out");
+    const { out, verdict } = await pending;
+    expect(s.spawned[0]?.signal?.aborted).toBe(true);
+    expect(out.scoped).toEqual({ kind: "aborted", reason: ABORTED_DURING_RUN });
+    expect(verdict).toEqual({ ok: false, unverifiable: true, reason: `testsPass: ${ABORTED_DURING_RUN}` });
+    expect(s.release).toHaveBeenCalledTimes(1);
+    expect(s.argv).toHaveBeenCalledTimes(1);
+  });
+
+  describe("acceptance: no dispatch-time run, and every spawned argv is scoped", () => {
+    const expectScoped = (spawn: Spawn | undefined, inputs: string[]): void => {
+      expect(spawn?.args[0]).toBe(P("node_modules", "vitest", "vitest.mjs"));
+      expect(spawn?.args[1]).toBe("related");
+      expect(spawn?.args).toContain("--run");
+      for (const input of inputs) expect(spawn?.args).toContain(input);
+    };
+
+    it("dispatch captures without spawning; the gate spawns exactly one related run over the changed file", async () => {
+      const s = pipeline();
+      const store = createChangedFileStore();
+      const capture = vi.fn(async (_cwd: string, _signal: AbortSignal): Promise<DispatchReference | undefined> => REFERENCE);
+      await store.beginDispatch("dispatch", ROOT, { snapshot: async () => undefined, capture, timeoutMs: 1_000 });
+      const reference = await store.reference("dispatch");
+      expect(capture).toHaveBeenCalledTimes(1);
+      expect(s.argv).not.toHaveBeenCalled();
+      expect(s.exec).not.toHaveBeenCalled();
+      expect(s.acquire).not.toHaveBeenCalled();
+
+      const d = createDeadline(300_000);
+      await s.run(request(d, { reference }));
+      expect(s.argv).toHaveBeenCalledTimes(1);
+      expectScoped(s.spawned[0], [P("src", "a.ts")]);
+      // Never the full command: nothing goes through the shell seam in affected mode.
+      expect(s.exec).not.toHaveBeenCalled();
+      d.dispose();
+    });
+
+    it("a deleted source is scoped through the test search, never widened to the full suite", async () => {
+      const s = pipeline({ search: { findByContent: async () => [P("test", "a.test.ts")] } });
+      const d = createDeadline(300_000);
+      await s.run(request(d, { changedFiles: [{ path: P("src", "gone.ts"), status: " D" }] }));
+      expect(s.search.findByContent).toHaveBeenCalledTimes(1);
+      expect(s.argv).toHaveBeenCalledTimes(1);
+      expectScoped(s.spawned[0], [P("test", "a.test.ts")]);
+      expect(s.exec).not.toHaveBeenCalled();
+      d.dispose();
+    });
+
+    it("no changed files spawns nothing at all", async () => {
+      const s = pipeline();
+      const d = createDeadline(300_000);
+      const { verdict } = await s.run(request(d, { changedFiles: [] }));
+      expect(verdict.ok).toBe(true);
+      expect(s.argv).not.toHaveBeenCalled();
+      expect(s.exec).not.toHaveBeenCalled();
+      expect(s.acquire).not.toHaveBeenCalled();
+      d.dispose();
+    });
   });
 });
