@@ -2894,3 +2894,42 @@ describe("QA-1.3-37: a Playwright spec the runner's config excludes is not an in
     expect(spec(await planScopedRun(input({ fs, changedFiles: changed("e2e/login.spec.ts") }))).inputs).toEqual(["/r/e2e/login.spec.ts"]);
   });
 });
+describe("QA-1.3-32: .npmrc keys as npm's ini parser reads them, and npx", () => {
+  const files = (extra: Record<string, string>) => jsRepo({ test: "vitest", ptest: "npx vitest run" }, { "/r/src/a.ts": "", ...extra });
+  const plan = (extra: Record<string, string>, command = "npm test", over: Partial<PlanScopedRunInput> = {}) =>
+    planScopedRun(input({ command, files: files(extra), changedFiles: changed("src/a.ts"), ...over }));
+
+  it.each([
+    ['"workspace" = packages/app', "npm workspace"],
+    ["'workspaces' = true", "npm workspaces"],
+    ["\uFEFFworkspace=packages/app", "npm workspace"],
+    ['"work\\u0073pace"=x', "npm workspace"],
+    ["'\"workspace\"'=x", "npm workspace"],
+    ["workspaces", "npm workspaces"],
+    ["workspace;note=x", "npm workspace"],
+    ["  WORKSPACE[] = a", "npm workspace"],
+    ["[section]\nworkspace=a", "npm workspace"],
+  ])(".npmrc %j -> S6 %s", async (npmrc, prefix) => {
+    expectS6(await plan({ "/r/.npmrc": npmrc }), "unsupported-command", `unsupported command "${prefix}" in /r/.npmrc`);
+  });
+
+  it.each(['"workspaces-update" = false', "=workspace", "work\\;space=1", "wo\\rkspace=1", "a\\", "'\"'=1", "[workspace]", "# workspace=x"])(".npmrc %j still plans", async (npmrc) => {
+    expect(isScopedSpec(await plan({ "/r/.npmrc": npmrc })), npmrc).toBe(true);
+  });
+
+  it("npx reads the same config, as a command or inside any package script", async () => {
+    const why = 'unsupported command "npm workspace" in /r/.npmrc';
+    expectS6(await plan({ "/r/.npmrc": "workspace=packages/app" }, "npx vitest run"), "unsupported-command", why);
+    expectS6(await plan({ "/r/.npmrc": "workspace=packages/app" }, "pnpm run ptest"), "unsupported-command", why);
+    const host = { ...POSIX_HOST, pathEnv: "/usr/bin", env: { npm_config_workspace: "packages/app" } };
+    expectS6(await plan({}, "npx jest", { host }), "unsupported-command", 'unsupported command "npm npm_config_workspace" in the environment');
+    expectS6(await plan({}, "cross-env NPM_CONFIG_WORKSPACES=true npx vitest"), "unsupported-command", 'unsupported command "npm NPM_CONFIG_WORKSPACES" in cross-env');
+    for (const command of ["vitest run", "pnpm exec vitest", "yarn test"]) {
+      expect(isScopedSpec(await plan({ "/r/.npmrc": "workspace=packages/app" }, command)), command).toBe(true);
+    }
+  });
+
+  it("an oversized .npmrc is S6 config-too-large", async () => {
+    expectS6(await plan({ "/r/.npmrc": "x".repeat(CONFIG_SIZE_LIMIT + 1) }), "config-too-large");
+  });
+});

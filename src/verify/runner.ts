@@ -72,7 +72,12 @@
 //     non-empty npm_config_workspace(s) variable, any case, in the host env or cross-env -> S6
 //     "npm <NAME>" in "the environment" / "cross-env". npm 12.0.2 ran the workspace's script for
 //     each. `prefix` and `include-workspace-root` are not checked: set there they did not move
-//     `npm test` off the root script (prefix only moves the global prefix).
+//     `npm test` off the root script (prefix only moves the global prefix). QA-1.3-32: keys are
+//     read the way npm's ini parser reads them (a BOM, quotes around the key and JSON escapes
+//     inside them, a key without "=", `;`/`#` cutting an unquoted key), and the same check runs
+//     for the npx launcher (npm exec honours the workspace config and runs in the workspace's
+//     directory), from runnerCwd, in commands and scripts alike. An .npmrc over
+//     CONFIG_SIZE_LIMIT -> S6 config-too-large.
 //   - The script text goes through C.2 (<where> = "scripts.<s>"), C.1, C.3 and the head table,
 //     restricted to the DIRECT forms (vitest, jest, pytest, npx, pnpm exec, uv run pytest).
 //     Only one level of script resolution: a package-manager head inside a script (npm run x,
@@ -2643,9 +2648,50 @@ async function detectImpl<K extends ToolKind>(
   );
 }
 
-/** npm config keys that make a plain `npm test` run another package's script (QA-1.3-24). */
-const NPM_WORKSPACE_KEY_RE = /^[ \t]*(workspaces?)[ \t]*(?:\[\])?[ \t]*=/im;
 const NPM_WORKSPACE_ENV_RE = /^npm_config_workspaces?$/i;
+
+/**
+ * QA-1.3-32: the keys of an .npmrc as npm's `ini` parser reads them: lines split on CR/LF, comment
+ * (; #) and blank lines skipped, a line without "=" is a key set to true, and the key text goes
+ * through ini's unsafe(): trimmed (JS trim also drops a BOM), a quoted key ('...' or "...") is
+ * unquoted and JSON-decoded when it parses ("work\u0073pace" is workspace), an unquoted key stops
+ * at the first unescaped ; or #. A trailing [] (array key) is dropped. Keys under a [section]
+ * are kept too (a superset). Lower-cased.
+ */
+function npmrcKeys(text: string): string[] {
+  const out: string[] = [];
+  for (const line of text.split(/[\r\n]+/)) {
+    if (/^\s*(?:[;#]|$)/.test(line) || /^\[[^\]]*\]\s*$/.test(line)) continue;
+    const eq = line.indexOf("=");
+    if (eq === 0) continue;
+    let key = npmUnsafe(eq < 0 ? line : line.slice(0, eq));
+    if (key.length > 2 && key.endsWith("[]")) key = key.slice(0, -2);
+    out.push(key.toLowerCase());
+  }
+  return out;
+}
+
+/** ini's unsafe() for a key (see npmrcKeys). */
+function npmUnsafe(raw: string): string {
+  const v = raw.trim();
+  if (v.length >= 2 && ((v.startsWith('"') && v.endsWith('"')) || (v.startsWith("'") && v.endsWith("'")))) {
+    const inner = v.startsWith("'") ? v.slice(1, -1) : v;
+    try {
+      return String(JSON.parse(inner));
+    } catch {
+      return inner; // ini keeps the text when JSON.parse fails.
+    }
+  }
+  let out = "";
+  for (let i = 0; i < v.length; i++) {
+    const c = v[i];
+    if (c === ";" || c === "#") break;
+    if (c !== "\\") out += c;
+    else if (i + 1 < v.length) out += ";#\\".includes(v[i + 1]) ? v[++i] : `\\${v[++i]}`;
+    else out += "\\";
+  }
+  return out.trim();
+}
 
 /**
  * B (QA-1.3-24): npm reads `workspace` / `workspaces` from a project .npmrc and from
@@ -2668,15 +2714,12 @@ async function npmWorkspaceConfig(
   }
   for (const d of ancestors(ctx, cwd, gitRoot)) {
     const p = ctx.P.join(d, ".npmrc");
-    if (!(await fs.fileExists(p))) continue;
-    let text: string;
-    try {
-      text = await fs.readFile(p);
-    } catch {
-      return unsupported("npm", `${p} (unreadable)`);
-    }
-    const m = NPM_WORKSPACE_KEY_RE.exec(text);
-    if (m) return unsupported(`npm ${m[1].toLowerCase()}`, p);
+    if (!(await existsCached(ctx, fs, p))) continue;
+    const t = await readConfigText(ctx, fs, p);
+    if (t === "too-large") return tooLarge(p);
+    if (t === "unreadable") return unsupported("npm", `${p} (unreadable)`);
+    const key = npmrcKeys(t.text).find((k) => k === "workspace" || k === "workspaces");
+    if (key !== undefined) return unsupported(`npm ${key}`, p);
   }
   return undefined;
 }
@@ -2694,6 +2737,12 @@ async function finishDetection<K extends ToolKind>(
   where: string,
   notes: string[],
 ): Promise<Detected<K> | Unverifiable> {
+  // QA-1.3-32: npx (npm exec) reads the same workspace config as npm and then runs in the
+  // workspace's directory, so `npx vitest run` would test another package than the planned one.
+  if (launcher === "npx") {
+    const redirect = await npmWorkspaceConfig(ctx, fs, runnerCwd, gitRoot, env);
+    if (redirect) return redirect;
+  }
   const a = await processArgs(ctx, kind, args, where, runnerCwd, gitRoot);
   if (isS6(a)) return a;
   const allNotes = [...notes, ...a.notes];
