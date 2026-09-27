@@ -8,19 +8,23 @@
  *   within maxWorkers x maxConcurrentVerifications, the runner tree runs below normal priority,
  *   nothing runs inside a before hook, and no run covers the full file set.
  * - c: two child processes (two "opencode sessions"), each with its own plugin and repo but the
- *   same TEMP (so the same machine-wide slot dir), are jointly held to the same bound.
+ *   same TEMP (so the same machine-wide slot dir), are jointly held to the same bound; every
+ *   dispatch carries a verdict and no deferred footer.
+ * - d: a gate with a small gateBudgetMs and a 120 s test returns on time, not as a pass, and no
+ *   attributable process is alive 3 s after it returned.
+ * - e (last): no reference worktree or omr-ref dir is left, and each fixture install is intact.
  */
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { spawn } from "node:child_process";
 import { builtinModules, createRequire } from "node:module";
-import { appendFileSync, realpathSync } from "node:fs";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { appendFileSync, existsSync, realpathSync } from "node:fs";
+import { lstat, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { e2eEnabled, prepareFixtureRepo, type FixtureRepo } from "./e2e/fixture-repo";
 import { acceptance, createE2EPlugin, type E2EPlugin, type E2ETaskResult } from "./e2e/harness";
-import { peak, priorityViolations, seen, startSampler, type ProcSample, type Snapshot } from "./e2e/sampler";
+import { descendantsOf, peak, priorityViolations, seen, startSampler, type ProcSample, type Snapshot } from "./e2e/sampler";
 import type { ChildConfig, ChildSummary } from "./e2e/child-instance";
 
 const suite = e2eEnabled() ? describe.sequential : describe.skip;
@@ -41,6 +45,48 @@ const REPO_ROOT = fileURLToPath(new URL("../../", import.meta.url));
 function norm(s: string): string {
   return s.replace(/\\/g, "/").toLowerCase();
 }
+
+/** Case-insensitive on win32 (paths there are), case-sensitive elsewhere. */
+function foldCase(s: string): string {
+  return process.platform === "win32" ? s.toLowerCase() : s;
+}
+
+/**
+ * Every spelling of `dir` a command line may carry: raw and realpath (an 8.3 short os.tmpdir()
+ * vs its long form), each with `\` and with `/` separators, case-folded on win32.
+ */
+function pathSpellings(dir: string): string[] {
+  const forms = [dir];
+  try {
+    forms.push(realpathSync.native(dir));
+  } catch (e) {
+    // A dir that does not exist (yet) has only its raw spelling.
+    if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e;
+  }
+  const out = new Set<string>();
+  for (const f of forms) {
+    out.add(foldCase(f.replace(/\//g, "\\")));
+    out.add(foldCase(f.replace(/\\/g, "/")));
+  }
+  return [...out];
+}
+
+/** Whether `args` mentions any of `spellings`, compared as-is and with separators unified to `/`. */
+function mentionsAny(args: string, spellings: readonly string[]): boolean {
+  const raw = foldCase(args);
+  const slashed = raw.replace(/\\/g, "/");
+  return spellings.some(s => raw.includes(s) || slashed.includes(s.replace(/\\/g, "/")));
+}
+
+/** Verdict markers appended by the gate (src/verify/dispatch.ts buildAcceptedSuffix / buildForcingNote). */
+const ACCEPTED_MARK = "[router \u2713 accepted";
+const REJECTED_MARK = "NOT ACCEPTED";
+const CAVEAT_MARK = "Verification caveats \u2014 NOT verified";
+/** A deferred verification footer names a vrf_ handle; VERIFY:required dispatches must not carry one. */
+const DEFERRED_FOOTER = /\bvrf_/;
+/** 3.1.2.d: small enough for the 120 s slow test to hit it, larger than capture + planning (measured). */
+const GATE_BUDGET_MS = 6000;
+const SLOW_TEST = `\nit("slow", async () => { await new Promise(r => setTimeout(r, 120000)); }, 200000);\n`;
 
 /** Logs the measured numbers; with OMR_E2E_REPORT=<file> also appends them there (vitest may hide a passing test's console). */
 function emit(text: string): void {
@@ -82,7 +128,7 @@ function testFileArgs(args: string): string[] {
   return args.split(/\s+/).filter(t => /\.test\.[cm]?[jt]sx?"?$/.test(t));
 }
 
-suite("verify resource budget: machine-wide bound (3.1.2.b-c)", () => {
+suite("verify resource budget: machine-wide bound (3.1.2.b-e)", () => {
   let root = "";
   let tmpDir = "";
   const repos: FixtureRepo[] = [];
@@ -91,21 +137,25 @@ suite("verify resource budget: machine-wide bound (3.1.2.b-c)", () => {
   let bundlePath = "";
   let bundleDir = "";
 
-  /** Runner processes scoped to one of our repos or a reference worktree of one. */
-  const inScope = (p: ProcSample): boolean => {
-    const a = norm(p.args);
-    return a.includes(norm(join(tmpDir, "omr-ref-"))) || repos.some(r => a.includes(norm(r.dir)));
+  /** Spellings of every repo dir and of `<tmp>/omr-ref-`, rebuilt when a repo is added. */
+  let scopeCache: { n: number; spellings: string[] } = { n: -1, spellings: [] };
+  const scopeSpellings = (): string[] => {
+    if (scopeCache.n !== repos.length) {
+      const refPrefixes = pathSpellings(tmpDir).flatMap(t => [`${t}\\omr-ref-`, `${t}/omr-ref-`]);
+      scopeCache = { n: repos.length, spellings: [...refPrefixes, ...repos.flatMap(r => pathSpellings(r.dir))] };
+    }
+    return scopeCache.spellings;
   };
+  /** Runner processes scoped to one of our repos or a reference worktree of one. */
+  const inScope = (p: ProcSample): boolean => mentionsAny(p.args, scopeSpellings());
   const isWorker = (p: ProcSample): boolean => inScope(p) && isWorkerArgs(p.args);
   const isMain = (p: ProcSample): boolean => inScope(p) && isMainArgs(p.args);
   const isRunnerTree = (p: ProcSample): boolean => isWorker(p) || isMain(p);
 
   beforeAll(async () => {
-    // TEMPORARY realpath: os.tmpdir() may be an 8.3 short path (C:\Users\ABCDEF~1\...); the reference
-    // worktree then fails its node_modules link check and every recheck reports "runner not
-    // installed: vitest" (fix landing separately in src/verify/reference.ts). It also keeps the
-    // repo dir comparable with the long paths in the sampled command lines.
-    root = await mkdtemp(join(realpathSync.native(os.tmpdir()), "omr-e2e-bound-"));
+    // The raw os.tmpdir(), possibly an 8.3 short path (fixed in 29760a6); the scope predicates
+    // match both the raw and the realpath spelling of every dir.
+    root = await mkdtemp(join(os.tmpdir(), "omr-e2e-bound-"));
     tmpDir = join(root, "tmp");
     await mkdir(join(root, "repos"), { recursive: true });
     await mkdir(tmpDir, { recursive: true });
@@ -340,10 +390,162 @@ suite("verify resource budget: machine-wide bound (3.1.2.b-c)", () => {
     for (const s of summaries) {
       expect(s).toBeDefined();
       expect(s?.dispatches.length).toBe(3);
-      for (const d of s?.dispatches ?? []) expect(d.output.trim()).not.toBe("");
+      for (const d of s?.dispatches ?? []) {
+        expect(d.output.trim()).not.toBe("");
+        // VERIFY:required: every dispatch carries a verdict and no deferred-verification footer.
+        expect(d.output.includes(ACCEPTED_MARK) || d.output.includes(REJECTED_MARK), d.output).toBe(true);
+        expect(DEFERRED_FOOTER.test(d.output), d.output).toBe(false);
+      }
     }
     expect(peakWorkers).toBeGreaterThanOrEqual(1);
     expect(workers.length).toBeGreaterThanOrEqual(1);
     expect(peakWorkers).toBeLessThanOrEqual(WORKER_BOUND);
   }, TEST_TIMEOUT_MS);
+
+  it("3.1.2.d: a gate that hits its budget returns on time and leaves no orphan", async () => {
+    const repo = await prepareFixtureRepo("vitest-app", { root: join(root, "repos") });
+    repos.push(repo);
+    const plugin = await createE2EPlugin({ directory: repo.dir, home: join(root, "home", "d"), verify: { gateBudgetMs: GATE_BUDGET_MS } });
+    plugins.push(plugin);
+    const spellings = [...pathSpellings(repo.dir), ...pathSpellings(tmpDir).flatMap(t => [`${t}\\omr-ref-`, `${t}/omr-ref-`])];
+    const attributable = (p: ProcSample): boolean => mentionsAny(p.args, spellings) || /vitest/i.test(p.args);
+
+    const sampler = startSampler({ intervalMs: 100 });
+    let snapshots: Snapshot[] = [];
+    let result: E2ETaskResult | undefined;
+    let dispatchedAt = 0;
+    try {
+      dispatchedAt = Date.now();
+      result = await plugin.task({
+        sessionID: "orch-d",
+        callID: "d-slow",
+        prompt: `VERIFY:required\nAdjust ${mod(7)} and cover it.\n${acceptance(repo.testCommand)}`,
+        description: `adjust ${mod(7)}`,
+        produce: async () => {
+          await sleep(1000);
+          const src = await readFile(join(repo.dir, mod(7)), "utf8");
+          await repo.write(mod(7), `${src}\n// neutral edit d\n`);
+          const rel = "test/m07-1.test.js";
+          const t = await readFile(join(repo.dir, rel), "utf8");
+          await repo.write(rel, `${t}${SLOW_TEST}`);
+        },
+      });
+      // Keep sampling well past return + 3 s so at least one snapshot starts after it.
+      await sleep(Math.max(0, result.returnedAt + 5000 - Date.now()));
+    } finally {
+      snapshots = await sampler.stop();
+    }
+    if (result === undefined) throw new Error("the dispatch did not return");
+    const res: E2ETaskResult = result;
+
+    const excl = [sampler.pid];
+    const gateStartedAt = res.returnedAt - res.afterMs;
+    const deadlineAt = gateStartedAt + GATE_BUDGET_MS;
+    const deadlineToReturn = res.returnedAt - deadlineAt;
+    const runDuring = seen(
+      snapshots.filter(s => s.t <= res.returnedAt),
+      process.pid,
+      excl,
+      p => isRunnerTree(p),
+    );
+    const trackedDuring = seen(
+      snapshots.filter(s => s.t <= res.returnedAt),
+      process.pid,
+      excl,
+      attributable,
+    );
+    const late = snapshots.filter(s => s.t >= res.returnedAt + 3000);
+    // Descendants still attached to this process, and (Windows does not reparent) any process on
+    // the machine that is one of the tracked pids (same creation time) or names our paths.
+    const tracked = new Map(trackedDuring.map(p => [p.pid, p.createdMs]));
+    const lateDesc = late.flatMap(s => descendantsOf(s, process.pid, excl).filter(attributable).map(p => ({ t: s.t, p })));
+    const lateMachine = late.flatMap(s =>
+      s.procs
+        .filter(p => p.pid !== sampler.pid && p.pid !== process.pid)
+        .filter(p => (tracked.has(p.pid) && tracked.get(p.pid) === p.createdMs) || mentionsAny(p.args, spellings))
+        .map(p => ({ t: s.t, p })),
+    );
+    // Direct check, after the sampler stopped: signal 0 on every pid seen.
+    const directAlive: number[] = [];
+    for (const pid of tracked.keys()) {
+      try {
+        process.kill(pid, 0);
+        directAlive.push(pid);
+      } catch (e) {
+        const code = (e as NodeJS.ErrnoException).code;
+        if (code === "EPERM") directAlive.push(pid);
+        else if (code !== "ESRCH") throw e;
+      }
+    }
+    const directAliveAt = Date.now() - res.returnedAt;
+
+    emit(
+      [
+        `[3.1.2.d] gateBudgetMs=${GATE_BUDGET_MS} beforeMs=${res.beforeMs.toFixed(0)} afterMs(gate)=${res.afterMs.toFixed(0)}`,
+        `[3.1.2.d] dispatch->return=${res.returnedAt - dispatchedAt}ms deadline->gate return=${deadlineToReturn.toFixed(0)}ms`,
+        `[3.1.2.d] sampler snapshots=${snapshots.length} interval ${intervalStats(snapshots)}; snapshots >= return+3s=${late.length} (first at +${late.length > 0 ? late[0].t - res.returnedAt : -1}ms, last at +${late.length > 0 ? late[late.length - 1].t - res.returnedAt : -1}ms)`,
+        `[3.1.2.d] runner processes seen during the run=${runDuring.length} attributable descendants seen=${trackedDuring.length}`,
+        ...trackedDuring.map(p => `  seen ${p.pid} ppid=${p.ppid} ${p.args.slice(0, 200)}`),
+        `[3.1.2.d] alive >= 3 s after return: descendants=${lateDesc.length} machine-wide=${lateMachine.length} direct kill(0) at +${directAliveAt}ms=${directAlive.length} [${directAlive.join(",")}]`,
+        ...[...lateDesc, ...lateMachine].map(x => `  alive at +${x.t - res.returnedAt}ms ${x.p.pid} ppid=${x.p.ppid} ${x.p.args.slice(0, 200)}`),
+        `[3.1.2.d] output:\n${res.output}`,
+      ].join("\n"),
+    );
+
+    // Non-vacuity: the runner did start, and the sampler covered the +3 s mark.
+    expect(runDuring.length).toBeGreaterThanOrEqual(1);
+    expect(late.length).toBeGreaterThanOrEqual(1);
+    // Returns on time.
+    expect(res.afterMs).toBeLessThanOrEqual(GATE_BUDGET_MS + 3000);
+    // Not a pass: rejected, or accepted only with an unverified caveat naming the timeout.
+    const out = res.output;
+    const notPass = out.includes(REJECTED_MARK) || (out.includes(ACCEPTED_MARK) && out.includes(CAVEAT_MARK));
+    expect(notPass, out).toBe(true);
+    expect(/timed out|budget|deadline/i.test(out), out).toBe(true);
+    expect(DEFERRED_FOOTER.test(out), out).toBe(false);
+    // No orphans 3 s after return.
+    expect(lateDesc.map(x => `${x.p.pid} ${x.p.args}`)).toEqual([]);
+    expect(lateMachine.map(x => `${x.p.pid} ${x.p.args}`)).toEqual([]);
+    expect(directAlive).toEqual([]);
+  }, TEST_TIMEOUT_MS);
+
+  // Keep last: checks what every test above left behind.
+  it("3.1.2.e: reference worktrees are disposed and the fixture installs are intact", async () => {
+    const refEntries = (r: FixtureRepo): string[] =>
+      r
+        .git("worktree", "list", "--porcelain")
+        .split("\n")
+        .filter(l => l.startsWith("worktree ") && /omr-ref-/.test(l));
+    const refDirs = async (): Promise<string[]> => (await readdir(tmpDir)).filter(n => n.startsWith("omr-ref-"));
+    const t0 = Date.now();
+    let worktrees = repos.flatMap(refEntries);
+    let dirs = await refDirs();
+    while ((worktrees.length > 0 || dirs.length > 0) && Date.now() - t0 < 15_000) {
+      await sleep(500);
+      worktrees = repos.flatMap(refEntries);
+      dirs = await refDirs();
+    }
+    const settledMs = Date.now() - t0;
+    const installs = await Promise.all(
+      repos.map(async r => {
+        const nm = await lstat(join(r.dir, "node_modules"));
+        return { dir: r.dir, sentinel: existsSync(r.sentinelPath), realDir: nm.isDirectory() && !nm.isSymbolicLink() };
+      }),
+    );
+    emit(
+      [
+        `[3.1.2.e] repos=${repos.length} settled after ${settledMs}ms; omr-ref worktrees=${worktrees.length} omr-ref dirs in tmp=${dirs.length}`,
+        ...worktrees.map(w => `  worktree ${w}`),
+        ...dirs.map(d => `  dir ${d}`),
+        ...installs.map(i => `  ${i.dir} sentinel=${i.sentinel} node_modules real dir=${i.realDir}`),
+      ].join("\n"),
+    );
+    expect(repos.length).toBeGreaterThanOrEqual(4);
+    expect(worktrees).toEqual([]);
+    expect(dirs).toEqual([]);
+    for (const i of installs) {
+      expect(i.sentinel, i.dir).toBe(true);
+      expect(i.realDir, i.dir).toBe(true);
+    }
+  }, 60_000);
 });
