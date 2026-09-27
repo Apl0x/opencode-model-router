@@ -151,13 +151,29 @@ describe("runArgv", () => {
     expect(JSON.parse(r.stdout)).toEqual({ path: "OMR-X", temp: "C:\\omr-temp-override", paths: 1, temps: 1 });
   }, 20000);
 
-  it("truncates output over maxBuffer without hanging", async () => {
-    const r = await runArgv(process.execPath, ["-e", "process.stdout.write('x'.repeat(5 * 1024 * 1024))"], { cwd: tmpdir(), timeoutMs: 20000, maxBuffer: 1000 });
+  it("caps output at exactly maxBuffer and marks the truncation on stderr", async () => {
+    const r = await runArgv(process.execPath, ["-e", "process.stdout.write('x'.repeat(5 * 1024 * 1024)); process.stderr.write('y'.repeat(3000))"], { cwd: tmpdir(), timeoutMs: 20000, maxBuffer: 1000 });
     expect(r.code).toBe(0);
     expect(r.timedOut).toBe(false);
-    expect(r.stdout.length).toBeGreaterThan(0);
-    expect(r.stdout.length).toBeLessThan(5 * 1024 * 1024);
+    expect(r.stdout).toBe("x".repeat(1000));
+    expect(r.stderr).toBe(`${"y".repeat(1000)}\n[stdout truncated at 1000 chars]\n[stderr truncated at 1000 chars]\n`);
   }, 20000);
+
+  it("never splits a surrogate pair at the maxBuffer cut", async () => {
+    const r = await runArgv(process.execPath, ["-e", "process.stdout.write('a' + '\\ud83d\\ude00'.repeat(10))"], { cwd: tmpdir(), timeoutMs: 20000, maxBuffer: 4 });
+    expect(r.stdout).toBe("a\u{1F600}");
+    expect(r.stderr).toBe("[stdout truncated at 4 chars]\n");
+  }, 20000);
+
+  it("decodes multi-byte UTF-8 characters split across pipe chunks (QA-1.2-8)", async () => {
+    const unit = "a\u00e9\u65e5\u672c\u{1F600}";
+    const script = "const u = 'a\\u00e9\\u65e5\\u672c\\ud83d\\ude00'.repeat(200000); process.stdout.write(u); process.stderr.write(u);";
+    const r = await runArgv(process.execPath, ["-e", script], { cwd: tmpdir(), timeoutMs: 30000 });
+    const expected = unit.repeat(200000);
+    expect(r.code).toBe(0);
+    expect(r.stdout.includes("\uFFFD") || r.stderr.includes("\uFFFD")).toBe(false);
+    expect(r.stdout === expected && r.stderr === expected).toBe(true);
+  }, 30000);
 
   it("resolves a spawn error as code 1 with the error in stderr, never rejecting", async () => {
     const r = await runArgv("omr-no-such-executable-xyz", ["a"], { cwd: tmpdir(), timeoutMs: 20000 });

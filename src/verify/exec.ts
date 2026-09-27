@@ -23,9 +23,15 @@ export interface ShellResult {
 }
 
 export interface RunOptions extends ExecOptions {
-  /** Per-stream cap in characters; output past it is dropped. Default 10 MB. */
+  /**
+   * Per-stream cap in characters (UTF-16 code units). Output past it is
+   * dropped and a `[stdout truncated at <n> chars]` line is appended to stderr.
+   * Default 10 MB.
+   */
   maxBuffer?: number;
 }
+
+const DEFAULT_MAX_BUFFER = 10 * 1024 * 1024;
 
 const isWin = process.platform === "win32";
 
@@ -57,9 +63,10 @@ export const argvSeam: ArgvSeam = runArgv;
 function run(file: string, args: string[], shell: boolean, opts: RunOptions): Promise<ShellResult> {
   if (opts.signal?.aborted) return Promise.resolve({ code: 1, stdout: "", stderr: "", timedOut: true });
   return new Promise((resolve) => {
-    const limit = opts.maxBuffer ?? 10 * 1024 * 1024;
-    let stdout = "";
-    let stderr = "";
+    const limit = opts.maxBuffer === undefined || Number.isNaN(opts.maxBuffer) ? DEFAULT_MAX_BUFFER : Math.max(0, opts.maxBuffer);
+    const out = capture(limit);
+    const err = capture(limit);
+    const notes: string[] = [];
     let killed = false;
     let exited = false;
     let settled = false;
@@ -74,8 +81,8 @@ function run(file: string, args: string[], shell: boolean, opts: RunOptions): Pr
         detached: !isWin,
         stdio: ["ignore", "pipe", "pipe"],
       });
-    } catch (err) {
-      resolve({ code: 1, stdout: "", stderr: `exec failed: ${String(err)}`, timedOut: false });
+    } catch (e) {
+      resolve({ code: 1, stdout: "", stderr: `exec failed: ${String(e)}`, timedOut: false });
       return;
     }
     if (opts.lowPriority && isWin && child.pid) {
@@ -89,16 +96,20 @@ function run(file: string, args: string[], shell: boolean, opts: RunOptions): Pr
       // no grandchild exists yet — but it is not a guarantee.
       try {
         setPriority(child.pid, osConstants.priority.PRIORITY_BELOW_NORMAL);
-      } catch (err) {
+      } catch (e) {
         // The child may already have exited; the run itself is unaffected.
-        stderr += `[low priority not applied: ${String(err)}]\n`;
+        notes.push(`[low priority not applied: ${String(e)}]`);
       }
     }
+    // A StringDecoder per stream, so a multi-byte character split across two
+    // chunks is not turned into U+FFFD.
+    child.stdout?.setEncoding("utf8");
+    child.stderr?.setEncoding("utf8");
     // Output past the cap is dropped rather than failing the run; the verdict
     // is parsed from the summary lines, which runners print last only when the
     // run completes, so truncation degrades to "unknown output", never a pass.
-    child.stdout?.on("data", (chunk) => { if (stdout.length < limit) stdout += String(chunk); });
-    child.stderr?.on("data", (chunk) => { if (stderr.length < limit) stderr += String(chunk); });
+    child.stdout?.on("data", (s: string) => out.push(s));
+    child.stderr?.on("data", (s: string) => err.push(s));
 
     const kill = () => {
       if (killed || settled) return;
@@ -117,8 +128,12 @@ function run(file: string, args: string[], shell: boolean, opts: RunOptions): Pr
       settled = true;
       clearTimeout(timer);
       opts.signal?.removeEventListener("abort", kill);
+      let stderr = err.text;
       if (error) stderr += String(error);
-      resolve({ code: killed ? code || 1 : code ?? 1, stdout, stderr, timedOut: killed });
+      if (out.truncated) notes.push(`[stdout truncated at ${limit} chars]`);
+      if (err.truncated) notes.push(`[stderr truncated at ${limit} chars]`);
+      for (const note of notes) stderr += `${stderr && !stderr.endsWith("\n") ? "\n" : ""}${note}\n`;
+      resolve({ code: killed ? code || 1 : code ?? 1, stdout: out.text, stderr, timedOut: killed });
     };
     child.on("exit", () => { exited = true; });
     child.on("error", (err) => finish(1, err));
@@ -143,6 +158,34 @@ function mergeEnv(overrides: Record<string, string> | undefined): NodeJS.Process
     env[key] = value;
   }
   return env;
+}
+
+interface Capture {
+  text: string;
+  truncated: boolean;
+  push(s: string): void;
+}
+
+function capture(limit: number): Capture {
+  const c: Capture = {
+    text: "",
+    truncated: false,
+    push(s) {
+      if (c.truncated) return;
+      const room = limit - c.text.length;
+      if (s.length <= room) {
+        c.text += s;
+        return;
+      }
+      let cut = Math.max(room, 0);
+      // Do not keep half of a surrogate pair.
+      const last = s.charCodeAt(cut - 1);
+      if (cut > 0 && last >= 0xd800 && last <= 0xdbff) cut--;
+      c.text += s.slice(0, cut);
+      c.truncated = true;
+    },
+  };
+  return c;
 }
 
 function killTree(child: ChildProcess): void {
