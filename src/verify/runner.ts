@@ -421,13 +421,29 @@
 //        vitest and jest, also (QA-1.3-8): package-lock.json, npm-shrinkwrap.json,
 //                pnpm-lock.yaml, yarn.lock, bun.lock, bun.lockb, pnpm-workspace.yaml, .npmrc,
 //                .yarnrc, .yarnrc.yml, .pnpmfile.cjs (a lockfile-only change can upgrade a
-//                dependency within its range); and setup files that are not test files, by the
-//                rule 1.6 risk.ts uses (QA-1.3-28): /\.setup\.[cm]?[jt]sx?$/ or the basenames
-//                setupTests, setup-tests, test-setup, global-setup, globalSetup, vitest.setup,
-//                jest.setup with a JS/TS extension, case-insensitive (QA-1.3-15: vitest adds
-//                setupFiles to forceRerunTriggers and reran every test file; jest's related graph
-//                never reaches a setup file). A bare setup.ts is application code. A setup file
-//                under another name is the P residual.
+//                dependency within its range); and setup files that are not test files
+//                (QA-1.3-15: vitest adds setupFiles to forceRerunTriggers and reran every test
+//                file; QA-1.3-29: jest's related graph never reaches a setup file, so
+//                `--findRelatedTests <setup>` ran 0 tests with exit 0). By name, a SUPERSET of
+//                the rule 1.6 risk.ts uses, case-insensitive, JS/TS extensions: *.setup.<ext>;
+//                the risk.ts basenames (setupTests, setup-tests, test-setup, global-setup,
+//                globalSetup, vitest.setup, jest.setup, setup-jest, jest-setup, vitest-setup,
+//                global-teardown); (jest|vitest|test|tests)[._-]?(setup|teardown)<anything>
+//                (jest.setupAfterEnv.js, testSetup.ts); setup[._-]?(tests|jest|vitest|env|
+//                after-env|files|files-after-env) (setupVitest.ts, setupFilesAfterEnv.ts);
+//                global[._-]?(setup|teardown)<anything>; and a bare setup.<ext> or teardown.<ext>
+//                below a test, tests, spec, specs, testing, jest, vitest or __tests__ directory
+//                (test/setup.js). src/setup.ts and SetupWizard.tsx stay application code. And
+//                (G.7a) any file a vitest/jest config names statically.
+//   7a. (QA-1.3-29) vitest.config.*/vite.config.* (vitest) or jest.config.*/package.json (jest)
+//      in every directory from runnerCwd up to gitRoot, plus the --config file, are read once
+//      (CONFIG_SIZE_LIMIT; over it -> S6 config-too-large). The string literals of setupFiles,
+//      setupFilesAfterEnv, globalSetup and globalTeardown (one literal, or the literal elements
+//      of an array, calls such as require.resolve('./x') included) resolve against the config's
+//      directory and runnerCwd (vitest) or rootDir (jest: `<rootDir>` is the config's directory
+//      or a literal rootDir); a reference without an extension also matches <ref>.<ext> and
+//      <ref>/index.<ext>. Each such file is a trigger. A non-literal value names nothing; the
+//      name rule above still applies (P).
 //        pytest  conftest.py, pyproject.toml, pytest.ini, setup.cfg, tox.ini (section 1.5-3),
 //                plus .pytest.ini, pytest.toml, .pytest.toml (QA-1.3-4: pytest 9 reads them;
 //                plan amendment to section 1.5-3, fixtures in 3.2) and uv.lock, poetry.lock,
@@ -460,6 +476,20 @@
 //            .prettierignore. (Lockfiles are triggers now, 7.)
 //        vitest/jest:
 //          - an existing file becomes an input. A changed test file runs itself (evidence R).
+//          - 8a (QA-1.3-37) except an existing test file that the runner's own config statically
+//            excludes AND that lies in a Playwright testDir: note `playwright test file excluded
+//            by the <runner> config, not run: <rel>`. The exclusion comes from the one config
+//            the runner loads (the last --config file, else runnerCwd's single vitest.config.*,
+//            else vite.config.*; jest.config.*, else package.json) and only when no projects or
+//            workspace key, vitest.workspace/projects file, vitest --root/--dir, or jest
+//            --rootDir/--testPathIgnorePatterns can change it. vitest: an `exclude` literal (or
+//            --exclude) of the form X/**, X/**/*, or either after **/, X a plain path relative
+//            to runnerCwd. jest: a testPathIgnorePatterns literal made only of word characters
+//            and . / : - that is a substring of the path (a literal match implies jest's regex
+//            match), after <rootDir>. Playwright: playwright.config.* from runnerCwd up to
+//            gitRoot; testDir is its literal, the config's directory when absent, or <dir>/e2e
+//            when not a literal. Otherwise the file stays an input, and the I 2a guard keeps a
+//            0-test run unverifiable (fail-closed).
 //          - a gone test file adds the note `deleted test file not run: <rel>`; the risk signal
 //            covers it.
 //          - any other gone file goes to the stem search (9).
@@ -810,9 +840,13 @@
 //   - Custom vitest forceRerunTriggers in the user's config cannot be read statically and can
 //     make `related` run every file. This is an accepted residual risk (plan section 5,
 //     config-driven tests). vitest adds setupFiles to them (QA-1.3-15 evidence; globalSetup is
-//     not verified): a change to a setup file under a name G.7 does not recognize runs every
-//     test file (correct, at full cost). Under jest such a change is not seen by the related
-//     graph at all.
+//     not verified). Setup files are triggers by name (G.7) and by static reference (G.7a); what
+//     remains is a setup file under an unconventional name that a config names only through a
+//     non-literal expression (a variable, a computed path). Under vitest that change reruns
+//     every test file (correct, at full cost); under jest the related graph does not see it.
+//   - G.8a (QA-1.3-37) reads `exclude` literals anywhere in the vitest config, so an
+//     `X/**` literal under coverage.exclude also counts. It is only used for a file inside a
+//     Playwright testDir, which Playwright itself runs as its own test.
 //   - A conftest.py or plugin hook (pytest_load_initial_conftests, pytest_cmdline_main) that
 //     adds -n cannot be seen statically; the appended "-n N" only lands when D.4 found xdist.
 //   - Tokenizing: npm on Windows (cmd.exe) does not treat '...' as quotes, while C.1 applies
@@ -825,8 +859,6 @@
 //   - npm workspace selection from the user or global npmrc (~/.npmrc, $PREFIX/etc/npmrc, or a
 //     npm_config_userconfig/globalconfig file) is not read (QA-1.3-24 covers the project .npmrc
 //     files and the environment).
-//   - Setup files under names the G.7 rule does not know (a bare test/setup.ts,
-//     jest.setupAfterEnv.js) are ordinary inputs (QA-1.3-28 narrowed the rule to 1.6's).
 //
 // ------------------------------------------------------------------------------------------------
 // Q. CONSUMER CONTRACT
@@ -2951,13 +2983,227 @@ const TRIGGERS: Record<RunnerKind, RegExp> = {
 };
 /** G.7 (QA-1.3-23): pip requirement files kept in a `requirements/` directory (requirements/base.txt, dev.in). */
 const PY_REQ_DIR_FILE_RE = /\.(?:txt|in)$/i;
+const JS_EXT = String.raw`\.[cm]?[jt]sx?$`;
+const JS_EXT_RE = new RegExp(JS_EXT, "i");
 /**
- * G.7 (QA-1.3-15, QA-1.3-28): vitest/jest setup files, by the rule 1.6 risk.ts uses (QA-1.6-21):
- * `*.setup.<js/ts>` or a conventional setup basename. vitest reruns every test for a setupFiles
- * change and jest's related-test graph never reaches one, so both fail closed. A bare `setup.ts`
- * or `SetupWizard.tsx` is application code.
+ * G.7 (QA-1.3-15, QA-1.3-28, QA-1.3-29): vitest/jest setup files by name. A SUPERSET of the rule
+ * 1.6 risk.ts uses (QA-1.6-21: `*.setup.<js/ts>` and its basenames), plus the names with a test
+ * marker that round 2 caught: jest-setup.js, jest.setupAfterEnv.js, testSetup.ts, setupVitest.ts,
+ * setupFilesAfterEnv.ts, globalTeardown.ts, ... vitest reruns every test for a setupFiles change
+ * and jest's related-test graph never reaches one (QA-1.3-29: `--findRelatedTests <setup>` ran 0
+ * tests, exit 0), so both fail closed. A bare `setup.ts` or `SetupWizard.tsx` is application code
+ * unless it lies in a test directory (SETUP_DIR_RE). All alternatives are anchored and linear.
  */
-const SETUP_FILE_RE = /\.setup\.[cm]?[jt]sx?$|^(setupTests|setup-tests|test-setup|global-setup|globalSetup|vitest\.setup|jest\.setup)\.[cm]?[jt]sx?$/i;
+const SETUP_FILE_RE = new RegExp(
+  [
+    String.raw`\.setup${JS_EXT}`,
+    String.raw`^(?:setupTests|setup-tests|test-setup|global-setup|globalSetup|vitest\.setup|jest\.setup|setup-jest|jest-setup|vitest-setup|global-teardown)${JS_EXT}`,
+    String.raw`^(?:jest|vitest|tests?)[._-]?(?:setup|teardown)[\w.-]*${JS_EXT}`,
+    String.raw`^setup[._-]?(?:tests?|jest|vitest|env|after[._-]?env|files?(?:[._-]?after[._-]?env)?)${JS_EXT}`,
+    String.raw`^global[._-]?(?:setup|teardown)[\w.-]*${JS_EXT}`,
+  ].join("|"),
+  "i",
+);
+/** G.7 (QA-1.3-29): a bare setup/teardown file counts when a directory above it is a test directory (test/setup.js). */
+const SETUP_BARE_RE = new RegExp(String.raw`^(?:setup|teardown)${JS_EXT}`, "i");
+const SETUP_DIR_RE = /^(?:tests?|specs?|testing|jest|vitest|__tests__)$/i;
+
+/** The JS runner config files scanned for static references (G.7a), per directory from runnerCwd up to gitRoot. */
+const JS_CONFIG_EXTS = ["js", "ts", "mjs", "cjs", "mts", "cts"];
+const JS_CONFIG_NAMES: Readonly<Record<"vitest" | "jest", readonly string[]>> = {
+  vitest: ["vitest.config", "vite.config"].flatMap((b) => JS_CONFIG_EXTS.map((x) => `${b}.${x}`)),
+  jest: [...JS_CONFIG_EXTS.map((x) => `jest.config.${x}`), "jest.config.json", "package.json"],
+};
+const PLAYWRIGHT_CONFIG_NAMES = JS_CONFIG_EXTS.map((x) => `playwright.config.${x}`);
+/** Config keys whose values name setup files (vitest and jest share them). */
+const SETUP_KEYS = ["setupFiles", "setupFilesAfterEnv", "globalSetup", "globalTeardown"] as const;
+const CONFIG_KEY_RE =
+  /(?<![\w$])["']?(setupFiles|setupFilesAfterEnv|globalSetup|globalTeardown|rootDir|exclude|testPathIgnorePatterns|testDir|projects|workspace)["']?[ \t]*:[ \t\r\n]*/g;
+
+/**
+ * G.7a: the string literals a JS/TS/JSON config assigns to CONFIG_KEY_RE's keys, statically: the
+ * value is one literal or an array whose literal elements are taken (spreads, calls and variables
+ * are skipped; `require.resolve('./x')` inside the array still yields './x'). A key present with no
+ * literal value maps to []. Comments are skipped; a template literal with `${` is not static. One
+ * forward pass: the key search resumes after each scanned value, so the cost stays linear.
+ */
+function configLiterals(text: string): Map<string, string[]> {
+  const out = new Map<string, string[]>();
+  const re = new RegExp(CONFIG_KEY_RE.source, "g");
+  for (let m = re.exec(text); m; m = re.exec(text)) {
+    const vals = out.get(m[1]) ?? [];
+    out.set(m[1], vals);
+    let i = m.index + m[0].length;
+    const literal = (): boolean => {
+      const q = text[i];
+      let v = "";
+      for (i++; i < text.length && text[i] !== q; i++) {
+        if (text[i] === "\\") v += text[++i] ?? "";
+        else if (text[i] === "\n" && q !== "`") return false;
+        else v += text[i];
+      }
+      i++;
+      if (!(q === "`" && v.includes("${"))) vals.push(v);
+      return true;
+    };
+    if (/["'`]/.test(text[i] ?? "")) literal();
+    else if (text[i] === "[") {
+      for (i++; i < text.length && text[i] !== "]"; ) {
+        if (/["'`]/.test(text[i])) {
+          if (!literal()) break;
+        } else if (text.startsWith("//", i)) {
+          const nl = text.indexOf("\n", i);
+          i = nl < 0 ? text.length : nl;
+        } else if (text.startsWith("/*", i)) {
+          const end = text.indexOf("*/", i + 2);
+          i = end < 0 ? text.length : end + 2;
+        } else i++;
+      }
+    }
+    re.lastIndex = Math.max(re.lastIndex, i);
+  }
+  return out;
+}
+
+/** What the vitest/jest configs say statically (G.7a, QA-1.3-29, QA-1.3-37). */
+interface JsConfigFacts {
+  /** Keys of the files named as setupFiles/setupFilesAfterEnv/globalSetup/globalTeardown. */
+  readonly setupKeys: ReadonlySet<string>;
+  /** The same for references without an extension, which jest resolves (compared without the extension, or as a directory index). */
+  readonly setupStems: ReadonlySet<string>;
+  /** vitest `exclude` globs (and --exclude) or jest testPathIgnorePatterns, from the config the runner itself loads. */
+  readonly excludes: readonly { readonly base: string; readonly value: string }[];
+}
+
+/**
+ * G.7a: read the vitest or jest config files (every directory from runnerCwd up to gitRoot, and the
+ * --config file) once. setup references from any of them are triggers: a superset only adds S6.
+ * Exclusions (G.8a) can only remove inputs, so they come from the one file the runner loads and
+ * only when nothing else can change what applies: the last --config file, else runnerCwd's own
+ * config when exactly one candidate of the first kind present exists (vitest.config.* before
+ * vite.config.*; jest.config.* before package.json). No exclusions with a `projects`/`workspace`
+ * key, a vitest.workspace/projects file, vitest --root/--dir, or jest --rootDir or
+ * --testPathIgnorePatterns on the command line. jest `<rootDir>` resolves only when rootDir is
+ * absent (the config's directory) or one literal.
+ */
+async function jsConfigFacts(ctx: Ctx, fs: PlannerFs, det: DetectedRunner): Promise<JsConfigFacts | Unverifiable> {
+  const P = ctx.P;
+  const kind = det.kind === "jest" ? "jest" : "vitest";
+  const files = new Set<string>(det.configFiles ?? []);
+  for (const d of ancestors(ctx, det.runnerCwd, det.gitRoot)) {
+    for (const n of JS_CONFIG_NAMES[kind]) {
+      const p = P.join(d, n);
+      if (await existsCached(ctx, fs, p)) files.add(p);
+    }
+  }
+  const kept = det.keptArgs.map(camelOption);
+  const optionSet = (names: readonly string[]) => kept.some((t) => names.some((n) => t === n || t.startsWith(`${n}=`)));
+  let loaded: string | undefined;
+  if (det.configFiles !== undefined && det.configFiles.length > 0) {
+    loaded = det.configFiles.at(-1);
+  } else {
+    const groups = kind === "vitest" ? [JS_CONFIG_NAMES.vitest.slice(0, 6), JS_CONFIG_NAMES.vitest.slice(6)] : [JS_CONFIG_NAMES.jest.slice(0, -1), ["package.json"]];
+    for (const g of groups) {
+      const own = g.map((n) => P.join(det.runnerCwd, n)).filter((p) => files.has(p));
+      if (own.length === 0) continue;
+      loaded = own.length === 1 ? own[0] : undefined;
+      break;
+    }
+  }
+  const workspaceFile =
+    kind === "vitest" &&
+    (await Promise.all(["vitest.workspace", "vitest.projects"].flatMap((b) => [...JS_CONFIG_EXTS, "json"].map((x) => existsCached(ctx, fs, P.join(det.runnerCwd, `${b}.${x}`)))))).some(Boolean);
+  const cliBlocks = kind === "vitest" ? optionSet(["--root", "-r", "--dir"]) : optionSet(["--rootDir", "--testPathIgnorePatterns"]);
+  const setupKeys = new Set<string>();
+  const setupStems = new Set<string>();
+  const excludes: { base: string; value: string }[] = [];
+  for (const file of files) {
+    const t = await readConfigText(ctx, fs, file);
+    if (t === "too-large") return tooLarge(file);
+    if (t === "unreadable") continue;
+    const lits = configLiterals(t.text);
+    const dir = P.dirname(file);
+    const rootLits = lits.get("rootDir");
+    const rootDir = rootLits === undefined ? dir : rootLits.length === 1 ? P.resolve(dir, rootLits[0]) : undefined;
+    const bases = [...new Set([dir, kind === "jest" ? (rootDir ?? dir) : det.runnerCwd])];
+    for (const key of SETUP_KEYS) {
+      for (const v of lits.get(key) ?? []) {
+        if (v.trim() === "" || /[*?{}]/.test(v)) continue;
+        for (const b of bases) {
+          const abs = P.resolve(b, v.replace(/<rootDir>/g, b));
+          (JS_EXT_RE.test(v) ? setupKeys : setupStems).add(ctx.key(abs));
+        }
+      }
+    }
+    if (file !== loaded || workspaceFile || cliBlocks || lits.has("projects") || lits.has("workspace")) continue;
+    if (kind === "vitest") {
+      for (const v of lits.get("exclude") ?? []) excludes.push({ base: det.runnerCwd, value: v });
+    } else {
+      for (const v of lits.get("testPathIgnorePatterns") ?? []) {
+        if (v.includes("<rootDir>") && rootDir === undefined) continue;
+        excludes.push({ base: dir, value: v.replace(/<rootDir>/g, rootDir ?? dir) });
+      }
+    }
+  }
+  if (kind === "vitest" && !cliBlocks) {
+    for (let i = 0; i < kept.length; i++) {
+      if (kept[i] === "--exclude" && i + 1 < kept.length) excludes.push({ base: det.runnerCwd, value: det.keptArgs[++i] });
+      else if (kept[i].startsWith("--exclude=")) excludes.push({ base: det.runnerCwd, value: kept[i].slice("--exclude=".length) });
+    }
+  }
+  return { setupKeys, setupStems, excludes };
+}
+
+/** G.7a: `abs` is a setup file a config names (with its extension, or without it / as a directory index). */
+function isReferencedSetup(ctx: Ctx, facts: JsConfigFacts, abs: string): boolean {
+  if (facts.setupKeys.has(ctx.key(abs))) return true;
+  const ext = ctx.P.extname(abs);
+  const stem = ext === "" ? abs : abs.slice(0, -ext.length);
+  return facts.setupStems.has(ctx.key(stem)) || (ctx.P.basename(stem) === "index" && facts.setupStems.has(ctx.key(ctx.P.dirname(abs))));
+}
+
+/**
+ * G.8a (QA-1.3-37): the runner's own static exclusion covers `abs`. vitest: an exclude glob of the
+ * form `X/**`, `X/**` + `/*`, or the same after `**` + `/`, with X a plain path (relative to runnerCwd).
+ * jest: a testPathIgnorePatterns entry made only of word characters, ".", "/", ":" and "-" that is
+ * a substring of the path: jest matches it as a regex, and a literal match implies a regex match.
+ * Anything else is not understood and excludes nothing (the file stays an input: fail-closed).
+ */
+function excludedByRunner(ctx: Ctx, facts: JsConfigFacts, kind: RunnerKind, abs: string): boolean {
+  const slash = (s: string) => s.replace(/\\/g, "/");
+  return facts.excludes.some((ex) => {
+    if (kind === "jest") {
+      const v = slash(ex.value);
+      return /^[\w./:-]+$/.test(v) && slash(abs).includes(v);
+    }
+    const m = /^(?:\.\/)?(\*\*\/)?([\w.-]+(?:\/[\w.-]+)*)\/\*\*(?:\/\*)?$/.exec(ex.value);
+    if (!m) return false;
+    const rel = slash(ctx.P.relative(ex.base, abs));
+    return m[1] ? `/${rel}`.includes(`/${m[2]}/`) : rel.startsWith(`${m[2]}/`);
+  });
+}
+
+/**
+ * G.8a (QA-1.3-37): Playwright test directories: each playwright.config.* from runnerCwd up to
+ * gitRoot gives its literal testDir (resolved against the config's directory), the config's
+ * directory when testDir is absent (Playwright's default), or `<dir>/e2e` when testDir is not a
+ * literal.
+ */
+async function playwrightDirs(ctx: Ctx, fs: PlannerFs, det: DetectedRunner): Promise<string[] | Unverifiable> {
+  const out: string[] = [];
+  for (const d of ancestors(ctx, det.runnerCwd, det.gitRoot)) {
+    for (const n of PLAYWRIGHT_CONFIG_NAMES) {
+      const p = ctx.P.join(d, n);
+      if (!(await existsCached(ctx, fs, p))) continue;
+      const t = await readConfigText(ctx, fs, p);
+      if (t === "too-large") return tooLarge(p);
+      if (t === "unreadable") continue;
+      const dirs = configLiterals(t.text).get("testDir");
+      out.push(dirs === undefined ? d : dirs.length > 0 ? ctx.P.resolve(d, dirs[0]) : ctx.P.join(d, "e2e"));
+    }
+  }
+  return out;
+}
 const NOTE_NO_CHANGES = "no changed files, no affected tests";
 const NOTE_NO_INPUT = "no affected tests: no changed file is a test input";
 const NOTE_NO_PY_MAP = "no affected tests: no test files map to the changed modules";
@@ -3007,16 +3253,23 @@ async function plan(input: StaticScopingInput, search: TestSearchSeam | undefine
   const sourcePj = det.source.type === "script" ? ctx.key(det.source.packageJson) : undefined;
   const configKeys = new Set((det.configFiles ?? []).map((p) => ctx.key(p)));
   const js = det.kind === "vitest" || det.kind === "jest";
+  const facts = js ? await jsConfigFacts(ctx, fs, det) : undefined;
+  if (facts && isS6(facts)) return facts;
   for (const f of sorted) {
     const names = namesOf(ctx, f);
-    const setup = js && !isJsTestPath(f.rel) && names.some((b) => SETUP_FILE_RE.test(b));
     const segs = f.rel.split("/");
+    // QA-1.3-29: a setup file by name (not a test file), a bare setup.* in a test directory, or a
+    // file the vitest/jest config names as a setup file.
+    const setup =
+      js &&
+      ((!isJsTestPath(f.rel) && (names.some((b) => SETUP_FILE_RE.test(b)) || (names.some((b) => SETUP_BARE_RE.test(b)) && segs.slice(0, -1).some((s) => SETUP_DIR_RE.test(s))))) ||
+        (facts !== undefined && isReferencedSetup(ctx, facts, f.abs)));
     const reqDir = det.kind === "pytest" && PY_REQ_DIR_FILE_RE.test(segs[segs.length - 1]) && segs.slice(0, -1).some((s) => ctx.key(s) === "requirements");
     if (setup || reqDir || names.some((b) => TRIGGERS[det.kind].test(b)) || ctx.key(f.abs) === sourcePj || configKeys.has(ctx.key(f.abs))) {
       return s6("config-changed", `config file changed: ${f.rel}`);
     }
   }
-  return classify(ctx, input, det, sorted, notes, search);
+  return classify(ctx, input, det, sorted, notes, search, facts);
 }
 
 /** Change attribution that names only paths the planner cannot use (G.4a). */
@@ -3074,10 +3327,23 @@ async function classify(
   sorted: readonly FileRef[],
   notes: string[],
   search: TestSearchSeam | undefined,
+  facts: JsConfigFacts | undefined,
 ): Promise<ScopingPlan | StaticScoping> {
   const P = ctx.P;
   const fs = input.fs;
   const gitRoot = det.gitRoot;
+  // G.8a (QA-1.3-37): a changed test file in a Playwright testDir that the runner's own config
+  // statically excludes is not an input: the runner would never run it.
+  let pw: string[] | undefined;
+  const playwrightOnly = async (abs: string): Promise<boolean | Unverifiable> => {
+    if (!facts || facts.excludes.length === 0 || !excludedByRunner(ctx, facts, det.kind, abs)) return false;
+    if (pw === undefined) {
+      const dirs = await playwrightDirs(ctx, fs, det);
+      if (isS6(dirs)) return dirs;
+      pw = dirs;
+    }
+    return pw.some((d) => isInside(ctx, d, abs));
+  };
   // G.8: classification.
   const inputs = new Map<string, string>();
   const addInput = (abs: string) => inputs.set(ctx.key(abs), abs);
@@ -3106,7 +3372,10 @@ async function classify(
       else goneModules.push(f);
     } else {
       const isTest = JS_TEST_RE.test(base) || f.rel.split("/").includes("__tests__");
-      if (exists) addInput(f.abs);
+      const e2e = exists && isTest ? await playwrightOnly(f.abs) : false;
+      if (typeof e2e === "object") return e2e;
+      if (e2e) notes.push(`playwright test file excluded by the ${det.kind} config, not run: ${f.rel}`);
+      else if (exists) addInput(f.abs);
       else if (isTest) notes.push(`deleted test file not run: ${f.rel}`);
       else goneSources.push(f);
     }

@@ -2451,11 +2451,11 @@ describe("QA-1.3-24: npm workspace configuration outside the command line is S6"
 });
 
 describe("QA-1.3-28: the setup-file trigger follows 1.6's rule", () => {
-  it("setup.ts, SetupWizard.tsx and test/setup.ts are application inputs", async () => {
-    const files = jsRepo({}, { "/r/src/setup.ts": "", "/r/src/SetupWizard.tsx": "", "/r/test/setup.ts": "" });
+  it("setup.ts and SetupWizard.tsx outside a test directory are application inputs", async () => {
+    const files = jsRepo({}, { "/r/src/setup.ts": "", "/r/src/SetupWizard.tsx": "", "/r/src/setupEnvironment.ts": "" });
     for (const command of ["vitest", "jest"]) {
-      const s = spec(await planScopedRun(input({ command, files, changedFiles: changed("src/setup.ts", "src/SetupWizard.tsx", "test/setup.ts") })));
-      expect(s.inputs).toEqual(["/r/src/SetupWizard.tsx", "/r/src/setup.ts", "/r/test/setup.ts"]);
+      const s = spec(await planScopedRun(input({ command, files, changedFiles: changed("src/setup.ts", "src/SetupWizard.tsx", "src/setupEnvironment.ts") })));
+      expect(s.inputs).toEqual(["/r/src/SetupWizard.tsx", "/r/src/setup.ts", "/r/src/setupEnvironment.ts"]);
     }
   });
 
@@ -2750,5 +2750,147 @@ describe("QA-1.3-34: config files are size-capped and read once per plan", () =>
     const t0 = performance.now();
     expect(await detect("pytest", pyRepo({ "/r/pyproject.toml": text }))).toMatchObject({ xdist: false });
     expect(performance.now() - t0).toBeLessThan(3000);
+  });
+});
+describe("QA-1.3-29: setup files are triggers under a superset of 1.6's rule", () => {
+  const planJs = (command: string, extra: Record<string, string>, paths: string[]) =>
+    planScopedRun(input({ command, files: jsRepo({}, extra), changedFiles: changed(...paths) }));
+  // risk.ts (vrb/p16) SETUP_FILE, every alternative: the runner rule must contain it.
+  const RISK = ["a.setup.tsx", "setupTests.ts", "setup-tests.js", "test-setup.ts", "global-setup.ts", "globalSetup.mts", "vitest.setup.ts", "jest.setup.cjs", "setup-jest.js", "jest-setup.js", "vitest-setup.ts", "global-teardown.js"];
+  const MORE = ["test/setup.js", "tests/setup.ts", "src/test/setup.tsx", "spec/teardown.mjs", "jest/setup.cjs", "__setup__/../testing/setup.js", "jest.setupAfterEnv.js", "jestSetup.ts", "testSetup.ts", "tests.setup.ts", "setupVitest.ts", "setupJest.js", "setupEnv.js", "setupAfterEnv.ts", "setupFilesAfterEnv.ts", "globalTeardown.ts", "global.setup.e2e.ts"];
+
+  it.each([...RISK, ...MORE])("%s -> config-changed under vitest and jest", async (f) => {
+    for (const command of ["vitest", "jest"]) {
+      const r = await planJs(command, {}, [f]);
+      expect(isUnverifiable(r) && r.code === "config-changed", `${command} ${f}: ${JSON.stringify(r)}`).toBe(true);
+    }
+  });
+
+  it("test files stay inputs even with a setup-like name; pytest is unaffected", async () => {
+    const extra = { "/r/test/jest-setup.test.js": "", "/r/__tests__/setup.js": "" };
+    expect(spec(await planJs("jest", extra, ["test/jest-setup.test.js", "__tests__/setup.js"])).inputs).toEqual(["/r/__tests__/setup.js", "/r/test/jest-setup.test.js"]);
+    expect(isNoAffected(await planScopedRun(input({ command: "pytest", files: pyRepo(), changedFiles: changed("test/setup.js") })))).toBe(true);
+  });
+
+  it("files a jest config names statically are triggers, whatever their name", async () => {
+    const cases: [Record<string, string>, string][] = [
+      [{ "/r/jest.config.js": "module.exports = { setupFilesAfterEnv: ['<rootDir>/src/testing/bootstrap.ts'] };" }, "src/testing/bootstrap.ts"],
+      [{ "/r/package.json": JSON.stringify({ name: "app", jest: { setupFiles: ["./tools/env.js"] } }) }, "tools/env.js"],
+      [{ "/r/jest.config.json": JSON.stringify({ rootDir: "src", globalSetup: "<rootDir>/boot.js" }) }, "src/boot.js"],
+      [{ "/r/jest.config.ts": "export default { globalTeardown: '<rootDir>/tools/polyfills' }" }, "tools/polyfills.ts"],
+      [{ "/r/jest.config.ts": "export default { setupFiles: ['./tools/shim'] }" }, "tools/shim/index.js"],
+      [{ "/r/jest.config.js": "module.exports = { setupFiles: [/* c */ ...base, require.resolve(\"./a/b.js\"), // it's\n 'c/d.js', `e/f.js`] }" }, "c/d.js"],
+      [{ "/r/jest.config.js": "module.exports = { setupFiles: [/* c */ ...base, require.resolve(\"./a/b.js\")] }" }, "a/b.js"],
+      [{ "/r/jest.config.js": "module.exports = { \"setupFiles\": [path.join(__dirname, 'x/y.js')] }" }, "x/y.js"],
+    ];
+    for (const [extra, f] of cases) {
+      const r = await planJs("jest", { ...extra, [`/r/${f}`]: "" }, [f]);
+      expect(r, `${f}: ${JSON.stringify(extra)}`).toEqual({ unverifiable: true, code: "config-changed", reason: `config file changed: ${f}` });
+    }
+  });
+
+  it("vitest configs and the --config file count; parent configs add triggers too", async () => {
+    const vcfg = "export default defineConfig({ test: { setupFiles: ['./src/vitest-boot.ts'], globalSetup: \"./scripts/gs.ts\" } })";
+    for (const f of ["src/vitest-boot.ts", "scripts/gs.ts"]) {
+      expectS6(await planJs("vitest", { "/r/vitest.config.ts": vcfg }, [f]), "config-changed", `config file changed: ${f}`);
+    }
+    expectS6(await planJs("vitest run --config cfg/unit.mjs", { "/r/cfg/unit.mjs": "export default { test: { setupFiles: 'boot.js' } }" }, ["cfg/boot.js"]), "config-changed");
+    const mono = { "/r/pkg/package.json": JSON.stringify({ name: "p", scripts: { test: "jest" } }), "/r/jest.config.js": "module.exports = { setupFiles: ['<rootDir>/shared/boot.js'] }" };
+    expectS6(await planScopedRun(input({ command: "npm test", cwd: "/r/pkg", files: jsRepo({}, mono), changedFiles: changed("/r/shared/boot.js") })), "config-changed");
+  });
+
+  it("globs, templates with ${}, empty values and non-literal values name nothing", async () => {
+    const cfg = "module.exports = { setupFiles: ['src/*.js', `${root}/a.js`, '', \"unterminated\n], globalSetup: makePath(), rootDir: dirs }";
+    const s = spec(await planJs("jest", { "/r/jest.config.js": cfg, "/r/src/a.js": "" }, ["src/a.js"]));
+    expect(s.inputs).toEqual(["/r/src/a.js"]);
+  });
+
+  it("an oversized runner config is S6; an unreadable one is skipped", async () => {
+    const big = "x".repeat(CONFIG_SIZE_LIMIT + 1);
+    expectS6(await planJs("jest", { "/r/jest.config.js": big, "/r/src/a.js": "" }, ["src/a.js"]), "config-too-large", `config file too large to read: /r/jest.config.js (limit ${CONFIG_SIZE_LIMIT} bytes)`);
+    const fs = memFs(jsRepo({}, { "/r/jest.config.js": "x", "/r/src/a.js": "" }), false, {}, ["/r/jest.config.js"]);
+    expect(spec(await planScopedRun(input({ command: "jest", fs, changedFiles: changed("src/a.js") }))).inputs).toEqual(["/r/src/a.js"]);
+  });
+
+  it("win32: names match case-insensitively, references by key", async () => {
+    const W = { ...Object.fromEntries(Object.entries(jsRepo()).map(([k, v]) => [k.replace(/^\/r/, "C:\\repo").replace(/\//g, "\\"), v])), "C:\\repo\\jest.config.js": "module.exports = { setupFiles: ['<rootDir>/Tools/Env.js'] }" };
+    const host = WIN_HOST;
+    for (const f of ["JEST-SETUP.JS", "Test\\Setup.js", "tools\\env.js"]) {
+      expectS6(await planScopedRun(input({ win: true, command: "jest", files: W, cwd: "C:\\repo", host, changedFiles: changed(f) })), "config-changed");
+    }
+  });
+});
+
+describe("QA-1.3-37: a Playwright spec the runner's config excludes is not an input", () => {
+  const PW = { "/r/playwright.config.ts": "export default defineConfig({ testDir: './e2e' })" };
+  const VCFG = "export default mergeConfig(viteConfig, defineConfig({ test: { environment: 'jsdom', exclude: [...configDefaults.exclude, 'e2e/**'] } }))";
+  const plan = (command: string, extra: Record<string, string>, paths: string[]) =>
+    planScopedRun(input({ command, files: jsRepo({}, { "/r/e2e/login.spec.ts": "", "/r/src/a.ts": "", ...extra }), changedFiles: changed(...paths) }));
+  const NOTE = (kind: string) => `playwright test file excluded by the ${kind} config, not run: e2e/login.spec.ts`;
+
+  it("create-vue shape: an e2e-only change is NoAffected with a note; with a source it runs the source only", async () => {
+    const extra = { ...PW, "/r/vitest.config.ts": VCFG };
+    expect(await plan("vitest", extra, ["e2e/login.spec.ts"])).toEqual({ noAffected: true, note: "no affected tests: no changed file is a test input" });
+    const s = spec(await plan("vitest", extra, ["e2e/login.spec.ts", "src/a.ts"]));
+    expect(s.inputs).toEqual(["/r/src/a.ts"]);
+    expect(s.notes).toContain(NOTE("vitest"));
+  });
+
+  it.each([
+    ["**/e2e/**", "vitest"],
+    ["./e2e/**/*", "vitest"],
+    ["e2e/**", "vitest run --exclude e2e/**"],
+    ["e2e/**", "vitest run --exclude=**/e2e/**"],
+  ])("vitest exclude %s (%s)", async (glob, command) => {
+    const cfg: Record<string, string> = command === "vitest" ? { "/r/vitest.config.ts": `export default { test: { exclude: ['${glob}'] } }` } : {};
+    expect(isNoAffected(await plan(command, { ...PW, ...cfg }, ["e2e/login.spec.ts"]))).toBe(true);
+  });
+
+  it("jest: a plain testPathIgnorePatterns entry, with or without <rootDir>", async () => {
+    for (const pat of ["/e2e/", "<rootDir>/e2e/"]) {
+      const cfg = { "/r/jest.config.js": `module.exports = { testPathIgnorePatterns: ['/node_modules/', '${pat}'] }` };
+      const s = spec(await plan("jest", { ...PW, ...cfg }, ["e2e/login.spec.ts", "src/a.ts"]));
+      expect(s.inputs).toEqual(["/r/src/a.ts"]);
+      expect(s.notes).toContain(NOTE("jest"));
+    }
+  });
+
+  it("Playwright's own testDir rules: absent means the config's directory, a non-literal means e2e", async () => {
+    const extra = { "/r/vitest.config.ts": VCFG };
+    expect(isNoAffected(await plan("vitest", { ...extra, "/r/playwright.config.js": "module.exports = { use: {} }" }, ["e2e/login.spec.ts"]))).toBe(true);
+    expect(isNoAffected(await plan("vitest", { ...extra, "/r/playwright.config.js": "module.exports = { testDir: path.join(__dirname, x) }" }, ["e2e/login.spec.ts"]))).toBe(true);
+    const other = { ...extra, "/r/playwright.config.js": "module.exports = { testDir: './tests-e2e' }" };
+    expect(spec(await plan("vitest", other, ["e2e/login.spec.ts"])).inputs).toEqual(["/r/e2e/login.spec.ts"]);
+  });
+
+  it.each<[string, string, Record<string, string>]>([
+    ["no Playwright config", "vitest", { "/r/vitest.config.ts": VCFG }],
+    ["no exclusion", "vitest", { ...PW, "/r/vitest.config.ts": "export default {}" }],
+    ["a glob it does not model", "vitest", { ...PW, "/r/vitest.config.ts": "export default { test: { exclude: ['e2e/*.spec.ts'] } }" }],
+    ["two vitest configs", "vitest", { ...PW, "/r/vitest.config.ts": VCFG, "/r/vitest.config.mjs": VCFG }],
+    ["vite.config when vitest.config exists", "vitest", { ...PW, "/r/vitest.config.ts": "export default {}", "/r/vite.config.ts": VCFG }],
+    ["a projects key", "vitest", { ...PW, "/r/vitest.config.ts": VCFG.replace("environment", "projects: [a], environment") }],
+    ["a workspace file", "vitest", { ...PW, "/r/vitest.config.ts": VCFG, "/r/vitest.workspace.ts": "" }],
+    ["--root on the command line", "vitest --root .", { ...PW, "/r/vitest.config.ts": VCFG }],
+    ["a parent config", "npm test", { ...PW, "/r/vitest.config.ts": VCFG }],
+    ["jest regex pattern", "jest", { ...PW, "/r/jest.config.js": "module.exports = { testPathIgnorePatterns: ['e2e/.*\\\\.spec'] }" }],
+    ["jest <rootDir> with a non-literal rootDir", "jest", { ...PW, "/r/jest.config.js": "module.exports = { rootDir: base, testPathIgnorePatterns: ['<rootDir>/e2e/'] }" }],
+    ["jest --rootDir", "jest --rootDir .", { ...PW, "/r/jest.config.js": "module.exports = { testPathIgnorePatterns: ['/e2e/'] }" }],
+  ])("stays an input (fail-closed): %s", async (_n, command, extra) => {
+    const files = { ...extra, "/r/sub/package.json": JSON.stringify({ name: "s", scripts: { test: "vitest" } }), "/r/sub/e2e/login.spec.ts": "" };
+    const sub = command === "npm test";
+    const r = sub
+      ? await planScopedRun(input({ command, cwd: "/r/sub", files: jsRepo({}, files), changedFiles: changed("/r/sub/e2e/login.spec.ts") }))
+      : await plan(command, extra, ["e2e/login.spec.ts"]);
+    expect(isScopedSpec(r), JSON.stringify(r)).toBe(true);
+  });
+
+  it("the --config file is the one loaded; an oversized Playwright config is S6, an unreadable one is skipped", async () => {
+    const cfg = { "/r/cfg/unit.mts": "export default { test: { exclude: ['e2e/**'] } }" };
+    expect(isNoAffected(await plan("vitest run --config cfg/unit.mts", { ...PW, ...cfg }, ["e2e/login.spec.ts"]))).toBe(true);
+    const big = { "/r/vitest.config.ts": VCFG, "/r/playwright.config.ts": "x".repeat(CONFIG_SIZE_LIMIT + 1) };
+    expectS6(await plan("vitest", big, ["e2e/login.spec.ts"]), "config-too-large");
+    const fs = memFs(jsRepo({}, { ...PW, "/r/vitest.config.ts": VCFG, "/r/e2e/login.spec.ts": "" }), false, {}, ["/r/playwright.config.ts"]);
+    expect(spec(await planScopedRun(input({ fs, changedFiles: changed("e2e/login.spec.ts") }))).inputs).toEqual(["/r/e2e/login.spec.ts"]);
   });
 });
