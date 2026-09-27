@@ -2011,3 +2011,221 @@ Resolution: 3ebc8a1 — after its assertion each iteration moves the seam clock 
 
 **Open, not deferred:** QA-1.4-35 (minor), and QA-1.4-36, -37 and -38 (nits). Phase 1.4 QA is
 **not** clean.
+
+## QA re-review (round 6)
+
+Reviewer: adversarial QA, `[tier:heavy]` (CAP:none).
+
+- **Scope:** `git diff cf10f7b..d9362a2` (`3ebc8a1`, `d9362a2`). It was checked against the round-5
+  findings (QA-1.4-35…38) and searched for defects the diff introduces. Product code cleared in
+  rounds 1–5 was not re-audited. Line numbers refer to `src/verify/slot.ts` and
+  `test/unit/slot.test.ts` at `d9362a2`.
+- **`slot.ts` changes only comments.**
+  - All 11 changed lines in `git diff -U0` are comment lines.
+  - The two versions were transpiled with oxc (`rolldown/experimental`) and their comments
+    stripped. The results are byte-identical (32 455 bytes each).
+- **Environment:** Windows 11 Pro, NTFS, 16 logical CPUs, Node v24.21.0, vitest 4.1.11. Other
+  agents' sessions ran on this machine the whole time: their `node` and `bun` processes, and temp
+  dirs they created during the review.
+- **Repros:** `%TEMP%\omr-qa14r6\` held scratch copies of the package. Each linked the worktree's
+  `node_modules` through a junction.
+  - **A** is `d9362a2`.
+  - **AI** is A with logging added. The QA-1.4-34 test logs the real-time gaps between its looks,
+    and the two claim tests log their warnings, all to a file.
+  - **F** is A with the QA-1.4-34 test's seam clocks frozen: `now: () => wall0 + shift` and
+    `mono: () => mono0 + shift`.
+  - **Mutations of `slot.ts`:**
+    - B: the gap is unpadded (`:565`, `> maxGap`).
+    - S: the gap is padded by one slack only (`> maxGap − slack`).
+    - W: the watch ignores `until` (`:1343`, `if (again) schedule()`).
+    - C: there is no exit fence (the `.filter` at `:913` is removed).
+    - FB and FS are F with B and with S.
+- **Cleanup:**
+  - The junctions were removed before the dir was deleted, and the worktree's `node_modules` was
+    checked intact.
+  - Every busy loop was killed by PID; none was alive after any loaded run.
+  - Afterwards there was no `omr-qa14r6` dir, and no `node.exe` running a busy loop or a vitest from
+    this review.
+  - The two `omr-slot-*` dirs in `%TEMP%` (03:11) predate this review and were left alone.
+  - The worktree is clean.
+
+**Test runs** (`npx vitest run --maxWorkers=2 test/unit/slot.test.ts`):
+
+| run | result | duration |
+|---|---|---|
+| unloaded | 62/62 | 84.4 s |
+| load 1: 14 `node -e "for(;;){}"` processes, killed afterwards | **54/62** (see below) | 201.8 s |
+| load 2, same setup | 62/62 | 99.8 s |
+| load 3, same setup, copy AI (logging only) | 62/62 | 86.0 s |
+| load 4: 28 busy loops (2 × the protocol), copy AI, a diagnostic run | **58/62** (see below) | 153.0 s |
+
+- **Load 1 was heavier than the protocol load.**
+  - A vitest run from another worktree (`D:\git\wt\idx-874-linkage`) was running seconds before
+    load 1 started; it was gone before load 2.
+  - CPU was at 13–18 % before the loops started, against 10–13 % before load 2.
+  - The run took 201.8 s, against 99.8 s for load 2, like round 5's load 1 (238.6 s).
+  - One `waitMs: 0` call took 366 ms (`:1050`).
+- **Load 1's 8 failures.** Only the tail of the output was kept, so three messages are missing.
+  - **Fixed timing budgets:**
+    - `:1050`: 366 ms against < 200 ms.
+    - `:1064`: 315 ms against < 100 ms.
+  - **Confirm by watching, messages not captured:** the hard-kill waiter (20.3 s), the live
+    unrelated PID (5.0 s) and b3 (10.4 s).
+  - **The two claim tests:** `:645` (6.0 s), and `:689`, still busy after its 10 s wait (`:707`).
+  - **The new QA-1.4-34 test:** `["BUSY","BUSY","BUSY","BUSY","BUSY","BUSY","BUSY","BUSY"]: expected
+    'BUSY' to be 'HELD'` (`:943`, the 700 ms side). This is QA-1.4-39.
+- **Load 4 (28 loops):** 4 failures. Three are in tests this diff does not touch:
+  - `:300`, the foreign-host test: busy.
+  - `:488`: `SyntaxError: Unexpected end of JSON input` in `viewsIn` (`:381`). This is likely a torn
+    read of a sidecar that is being rewritten; not investigated, because the test is unchanged.
+  - `:1014`, the ticket test: `expected 1 to be +0`. Copy AI reported it as `:1018`, because its
+    logging adds 4 lines above it.
+
+  The fourth is `:661`, busy at the end of its 5 s wait (see QA-1.4-35 below). The QA-1.4-34 test
+  and `:689` passed.
+- **The QA-1.4-34 test's real-time gaps** (copy AI): this is the seam gap between the last look at
+  one step and the first look at the next, minus the step.
+  - 7 ms unloaded, 9–14 ms in load 3, and 2 ms in load 4.
+  - So CPU load alone leaves the 100 ms margin wide, but load 1's calls of 300 ms or more did not.
+- **The QA-1.4-34 test alone** (`-t`): A and F ran at the same time under 14 busy loops, for 8
+  rounds. A passed 8/8 and F passed 8/8.
+
+**Mutations** (one test each, `-t`, unloaded):
+
+| copy | QA-1.4-34 test (`:920`) | QA-1.4-32/-38 test (`:889`) |
+|---|---|---|
+| A (`d9362a2`) | passes | passes |
+| B: gap unpadded | fails: `["BUSY","BUSY","HELD"]: expected false to be true` (the 900 ms side) | — |
+| S: one slack (an 800 → 900 ms limit) | **passes** | — |
+| F: frozen seam clocks | passes | — |
+| FB | fails, like B | — |
+| FS | fails: `["BUSY","BUSY","HELD"]` | — |
+| W: the watch ignores `until` | — | fails: `expected 4 to be +0` (`:915`) |
+| C: no exit fence | — | fails: `expected false to be true` (`:909`), as in round 5 |
+
+**Summary (round 6):**
+- `slot.ts` is unchanged apart from comments.
+- QA-1.4-35, -36 and -38 are verified.
+- QA-1.4-37 is verified for the numbers. One phrase and one test comment are imprecise (QA-1.4-40).
+- The new QA-1.4-34 test pins the padding: B fails it. Its 700 ms side has 100 ms of real time per
+  step, and it failed in load 1 (QA-1.4-39).
+- No test change weakens what a test proves.
+- New findings: 0 critical, 0 major, 0 minor and 2 nits (QA-1.4-39, -40). Neither is a product
+  defect.
+
+### Verification of QA-1.4-35…38
+
+| finding | status | evidence |
+|---|---|---|
+| QA-1.4-35 | verified | **Code:** `:654` and `:699` use `claimHoldMaxMs: 1_000`, so the target's deadline is 1 s and the drop fence 1.5 s. `:704` sleeps 1.7 s, past the fence, and `:707` waits up to 10 s.<br>**Runs:** both tests pass in loads 2 and 3. In load 4 (2 × the load), neither test logged "claim held too long, delete abandoned", so the QA-1.4-35 mechanism is gone. There `:689` passed and `:661` ended busy, like the unchanged gap-rule tests of that run (see the observations below).<br>**What they prove:** `:658`, `:662` and `:701-702` assert what they did before. The inert rule now needs a witness of 2 × 1 s + 0.2 s = 2.2 s (`:612`, `:614`). So `:662`'s ≥ 950 ms and `:708`'s ≥ 900 ms still separate "left to the inert rule" from "dropped at once", with more room. The longer wait at `:707` weakens nothing, because the test has no upper bound. |
+| QA-1.4-36 | verified | **Fix:** the `it.each` gets 20 s (`:319`), and so do `:818` and `:837`.<br>**Scan:** among the tests without a timeout, one more can wait 5 s: `:551-574`. Its `waitUntil` (default 5 s, `:560`) waits for two ticks of a 30 ms heartbeat. That 5 s is a failure bound, so a 20 s timeout would not change the outcome. |
+| QA-1.4-37 | verified (the numbers) | **Limits:** each look's slack is `min(1 s, heartbeat / 5)` (`:534-536`). So the limit is 2 × 5 s − 2 × 1 s = 8 s in production. In the tests it is 2 × 1 s − 2 × 200 ms = 1.6 s (`:499`), 2 × 200 ms − 2 × 40 ms = 320 ms (`:521`) and 2 × 500 ms − 2 × 100 ms = 800 ms (`:921`).<br>**Residual:** stated as 8 s (`slot.ts:81`, notes `:116`).<br>**Wording:** "both looks' slacks" is imprecise, and the comment at `:708` is stale (QA-1.4-40). |
+| QA-1.4-38 | verified | **Fix:** `:910-915` moves the seam clock past the watch's `until` (`:1334`). The next pass (100 ms heartbeat) reads once and stops (`:1343`).<br>**Mutations:** with W (the watch ignores `until`), `:915` fails with 4 reads, so the assertion is not vacuous. `:909` still runs first, and C still fails it.<br>**Cleanup:** `:916` removes the claim that the last pass re-creates in the first iteration.<br>**Runs:** it passed in all five full-file runs. |
+
+### The new QA-1.4-34 test (`:920-946`)
+
+- **What it pins.**
+  - `heartbeatMs` is 500 ms, so `maxGap` is 1 s and each look's slack 100 ms: the limit is 800 ms.
+    Looks 700 ms apart must be reclaimed. Looks 900 ms apart, inside 2 heartbeats, must stay busy.
+  - Mutation B (no padding) fails it, as the resolution says.
+  - Mutation S (one slack, a 900 ms limit) passes it. The seam clocks add real time to the shift, so
+    every 900 ms step becomes a gap of 900 ms plus a few ms, which is over S's limit too. With frozen
+    clocks (F) the gap is exactly 900 ms, and FS fails.
+  - Every look has the same slack, so the test cannot tell the view's slack from this look's. That
+    is acceptable: in production every slack is the same.
+- **Background watch.**
+  - On the 900 ms side, the third and later looks are `aged`, so a watch starts (`:1331`). Its
+    `until` is 12 s ahead on the seam clock, because the default `claimHoldMaxMs` is 5 s.
+  - `:938` moves the clock past `until`. The watch's first pass comes 500 ms after it started,
+    possibly after the test returns. It reads once and stops. That is harmless.
+- **Load:** see QA-1.4-39.
+
+### Answers to the usual questions
+
+- **Two holders, deadlocks, unbounded lockouts, rejections:** none new. The product code is
+  unchanged apart from comments.
+- **Timers:**
+  - The QA-1.4-32 test no longer leaves a 10 Hz watch running (QA-1.4-38).
+  - The new test's watch makes at most one pass after the test.
+
+### New findings
+
+| ID | severity | finding | evidence | fix |
+|---|---|---|---|---|
+| QA-1.4-39 | nit | The QA-1.4-34 test's 700 ms side leaves 100 ms of real time per step. Its seam clocks are `Date.now()` and `performance.now()` plus the shift (`:927`), so each gap is the step plus the real time between two looks. That real time is the rest of one call and the start of the next, which is several file-system calls. When it passes 100 ms, the look restarts the witness. The peer watcher tests have about 700 ms for a wake-up plus an attempt. | Load 1: `["BUSY" × 8]: expected 'BUSY' to be 'HELD'` (`:943`). In the same run one `waitMs: 0` call took 366 ms (`:1050`). The real time per step measured 2–14 ms in the other runs. | Freeze real time in the seam clocks, so the gaps are exactly 700 and 900 ms. Copy F passes unloaded and 8/8 under 14 busy loops, and it still fails with B (and with S). |
+| QA-1.4-40 | nit | "2 heartbeats minus both looks' slacks" says the previous look's slack is used. The code uses the view's slack, the largest of its writers' slacks (`:565`), as `:44-45` and the test comment at `:652` say. In production every slack is 1 s, so the 8 s stands. Also, `:708`'s comment says the claim is inert after `staleMs` (1 s); with `claimHoldMaxMs` at 1 s, the term that decides is the 2.2 s witness. | `slot.ts:47-48`, `:77-78` and `:526`. Notes `:72`. Test `:708`. | Say "minus this look's slack and the view's", or "minus both slacks" as notes `:114` and `:117` do. Correct `:708`'s comment. |
+
+### QA-1.4-39 — nit — The new QA-1.4-34 test's 700 ms side has 100 ms of real time per step
+
+- **Where:** `slot.test.ts:920-946`. The deps at `:927` are `now: () => Date.now() + shift` and
+  `mono: () => performance.now() + shift`. The 700 ms side is at `:942-943`.
+- **Mechanism:**
+  - A look's `at` is `cfg.mono()`, taken just before its read (`:1295-1296`).
+  - Between the last look at step i and the first at step i + 1, the shift grows by the step, and
+    the real clock grows by the time the rest of call i and the start of call i + 1 take. That is
+    the sidecar read and write, the return, and the next call's exclusive create.
+  - The limit is 800 ms (`:565`). So at 700 ms, each step that takes more than 100 ms of real time
+    restarts `from`.
+  - The side is held only after two good steps in a row (a witness of at least 1.2 s, `:604`).
+    Restarts at least every other step keep all 8 looks busy.
+  - The 900 ms side cannot fail this way: real time only lengthens its gaps.
+- **Evidence:**
+  - Load 1: `["BUSY","BUSY","BUSY","BUSY","BUSY","BUSY","BUSY","BUSY"]: expected 'BUSY' to be
+    'HELD'`. In the same run `:1050` measured a `waitMs: 0` call at 366 ms.
+  - Copy AI measured the real time per step at 7 ms unloaded, 9–14 ms under 14 busy loops, and 2 ms
+    under 28. So only I/O-heavy contention like load 1's pushes it past 100 ms.
+  - Alone, under 14 busy loops, A passed 8/8.
+- **Effect:** a flaky test under heavy load, nothing else. It is avoidable: the step does not need
+  real time.
+- **Fix:**
+  - After `writeLock`, take `const wall0 = Date.now()` and `const mono0 = performance.now()`. Then
+    use `now: () => wall0 + shift` and `mono: () => mono0 + shift`.
+  - The gaps are then exactly 700 and 900 ms, whatever the load, and the watch's `until` still
+    moves with the shift.
+  - Copy F did exactly this. It passed unloaded and 8/8 under 14 busy loops (in parallel with A),
+    and it still fails with B. It also fails with S, so it pins the two-slack padding more tightly
+    than A does.
+  - The alternative is a smaller step on the 700 ms side (400–500 ms, a 300–400 ms margin), which
+    pins less.
+
+### QA-1.4-40 — nit — "Both looks' slacks" is the view's slack in the code; one test comment is stale
+
+- **Where:**
+  - "minus both looks' slacks": `slot.ts:47-48`, `:77-78`, `:526` and notes `:72`.
+  - `slot.test.ts:708`: `// inert after staleMs (1 s) from its first readable sighting`.
+- **Effect:**
+  - The gap rule subtracts this look's slack plus `old.slack`, the largest slack of the view's
+    writers (`:565`). The previous look's slack is not used. The header says so three lines earlier
+    (`:44-45`: "the look's and the largest of the view's writers'"), and so does the test comment at
+    `:652`.
+  - The two differ only in views whose writers have different heartbeats: tests, or the version
+    skew noted in round 5. In production every slack is 1 s, so the 8 s is right.
+  - At `:708`, the claim's inert rule needs a span ≥ 1.2 s and a witness ≥ 2 × `claimHoldMaxMs` +
+    0.2 s = 2.2 s (`:612`, `:614`). Since `3ebc8a1`, the witness is the term that decides, not
+    `staleMs`. The assertion (≥ 900 ms) is still valid.
+- **Fix:**
+  - Say "minus this look's slack and the view's", or "minus both slacks" as notes `:114` and `:117`
+    do.
+  - Correct `:708`'s comment. Optionally raise its bound to about 2 s.
+  - Optionally rewrap `slot.ts:48`: at 139 characters, it is the longest line in the header.
+
+### Observations (not findings)
+
+- **`:661` under 2 × the load.**
+  - QA-1.4-35's fix raised the witness this test's claim needs from 0.4 s to 2.2 s. Its wait stayed
+    at 5 s; `:707` got 10 s.
+  - Round 5 recommended exactly this, and the test passes the protocol load (loads 2 and 3).
+  - It ended busy in load 4 without the abandon warning, and in load 1.
+  - If the tests should also pass at 2 × the load, give `:661` a 10 s wait too.
+- **Unchanged tests fail beyond the protocol load:** `:300`, `:488` (`:381`) and `:1014` in load 4,
+  and load 1's timing budgets and watch tests. They are outside this review's scope.
+
+### Deferred by plan (round 6)
+
+- **QA-1.4-18** (Phase 2.1 / 2.2), nested acquisition: unchanged.
+- **QA-1.4-19** (Phase 1.1 schema, Phase 2.1 wiring), non-finite `max`: unchanged.
+- **QA-1.4-31** (Phase 1.1): the clamp is in the code; validating `slotWaitMs` stays with Phase 1.1.
+- **QA-1.4-21 residual** (Phase 1.1 / 2.1): state it next to `slotWaitMs`, with looks 8 s apart.
+
+**Open, not deferred:** QA-1.4-39 and QA-1.4-40 (nits, neither a product defect). Phase 1.4 QA is
+**not** clean.
