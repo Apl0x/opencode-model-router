@@ -167,15 +167,30 @@ describe("child session lifecycle", () => {
     invalidateConfigCache();
   });
 
-  it.each(["task", "delegate"])("%s grader receives the dispatch-time delta, not the dirty tree", async mode => {
+  it.each([
+    { mode: "task", digests: true },
+    { mode: "delegate", digests: true },
+    { mode: "task", digests: false },
+    { mode: "delegate", digests: false },
+  ])("$mode grader receives the dispatch-time delta, not the dirty tree (digests: $digests)", async ({ mode, digests }) => {
     const cfg = loadConfig();
     cfg.enforcement ??= {}; cfg.enforcement.verify ??= {};
     cfg.enforcement.verify.testBaseline = false;
     const old = join(process.cwd(), "predating.ts");
     const added = join(process.cwd(), "producer.ts");
-    const before = { cwd: process.cwd(), head: "head", fingerprint: "before", dirty: true, files: [{ path: old, status: " M" }] };
+    // As the real snapshotTree does: the dispatch snapshot digests its listed paths, the gate
+    // snapshot digests the dispatch snapshot's paths. predating.ts is unchanged between the two.
+    // Without digests (over the digest bounds) nothing proves predating.ts unchanged (QA-2.1-14).
+    const unchanged = new Map([[old, "file:predating"]]);
+    const before = {
+      cwd: process.cwd(), head: "head", fingerprint: "before", dirty: true, files: [{ path: old, status: " M" }],
+      digests: digests ? unchanged : "unavailable" as const,
+    };
     vi.mocked(snapshotTree).mockResolvedValue(before);
-    const after = { ...before, fingerprint: "after", files: [...before.files, { path: added, status: "??" }] };
+    const after = {
+      ...before, fingerprint: "after", files: [...before.files, { path: added, status: "??" }],
+      digests: digests ? new Map(unchanged) : "unavailable" as const,
+    };
     const h = makeHarness({ onProducer: async () => { vi.mocked(snapshotTree).mockResolvedValue(after); } });
     if (mode === "delegate") await runDelegate(h);
     else {
@@ -189,7 +204,8 @@ describe("child session lifecycle", () => {
     expect(h.graderPrompts).toHaveLength(1);
     expect(h.graderPrompts[0]).toContain("Producer delta only");
     expect(h.graderPrompts[0]).toContain(added);
-    expect(h.graderPrompts[0]).not.toContain(old);
+    if (digests) expect(h.graderPrompts[0]).not.toContain(old);
+    else expect(h.graderPrompts[0]).toContain(old);
   });
 
   describe("task false-refusal detection", () => {
