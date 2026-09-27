@@ -624,3 +624,233 @@ Medium finding is open.
 - QA-1.6-24 — Resolution: fixed in dcbd023. Logged values escape C1/DEL, soft hyphen, U+061C, U+180E, U+200B–200F, U+2028–202E, U+2060–206F, U+FEFF and U+FFF9–FFFB.
 - QA-1.6-25 — Resolution: fixed in dcbd023 and 8ce93d5. Both purity guards also reject `fetch(`, `WebSocket`, `XMLHttpRequest` and `export … from`; both reject any `from "node:…"`.
 - QA-1.6-26 — Resolution: accepted, no change (Info). Word statuses will be mapped explicitly if 2.x introduces them.
+
+## QA re-review (round 3)
+
+Reviewer: @heavy, adversarial re-review of `9ef28ec..225a55b` (dcbd023, 8ce93d5, 225a55b):
+`src/verify/directives.ts`, `src/verify/risk.ts`, both test files, the "Round-2 resolutions" above,
+and plan "Phase 1.6" (L857-915) plus §1.5-15/§1.5-17.
+
+Method:
+- `npx vitest run --maxWorkers=2 test/unit/directives.test.ts test/unit/risk.test.ts` → 2 files, 47 passed.
+- Throwaway scripts in `%TEMP%\omr-qa16r3` (deleted afterwards), run with `node --experimental-strip-types`
+  (node v24.21.0). They import both modules and a verbatim copy of `parseCapDirective` (sessions.ts:59-66).
+  Bracketed labels (`[L1]`, `[24b]`, ...) are probe cases, and the quoted results are their actual output.
+- Timing: each adversarial case ran in its own child process with a 30 s kill timeout, after a warm-up call.
+- Fix prototypes were patched **copies** of directives.ts inside the temp dir. The repository has no code changes.
+
+### Round-2 findings — verification
+
+| Finding | Status | Evidence |
+|---|---|---|
+| QA-1.6-18 | Verified; residual QA-1.6-27 | All six round-2 strings are rejected: [18a] `Verify: required fields are validated` → deferred/default; [18b]/[18c]/[18d] with `defaultVerify:"required"` → required/default; [18e]/[18f] → default, no log. [18g] `verify:Required` and [18h] `verify: required` → required/directive (plan test kept). [18i] upper-case `VERIFY: required fields are validated` → required (documented). [18j] CRLF `verify: *required*.` → required. |
+| QA-1.6-19 | Verified; residual QA-1.6-28 | [19a] `VERIFY:maybe,VERIFY:required` → required, no log (`CAP:abc,CAP:3` → 3); [19b] `;` form → required; [19c] `(VERIFY:tbd)/VERIFY:required` → required; [19d] `VERIFY_WAIT:soon,VERIFY_WAIT:2s` → 2000; [19e] `VERIFY:VERIFY:required` → required (`CAP:CAP:3` → 3); [19f] mixed keys both parse; [19g] lower-case `verify:maybe,verify:required` → required. |
+| QA-1.6-20 | Verified | After and before the colon: NBSP, U+3000, U+2007, U+202F, U+FEFF, TAB, VT, FF and U+1680 → required. `CAP:` with the same character → 3 (parity). LF, CR, U+2028 and U+2029 after the colon → default, no log; `CAP:` straddles → 3. That is the intended QA-1.6-3 deviation. NEL and ZWSP → default + one log line; `CAP:` → null (parity). |
+| QA-1.6-21 | Verified; Info residual QA-1.6-31 | `vitest.setup.ts`, `src/setupTests.js`, `e2e/global-setup.ts`, `jest.setup.js`, `tests/auth.setup.mts`, `globalSetup.cjs`, `test-setup.tsx`, `SETUPTESTS.TS`, `src/a.setup.jsx` → config. `src/setup.ts`, `SetupWizard.tsx`, `useSetup.ts`, `setupRoutes.js`, `teardownAndSetup.mjs` → low `["1-5 files changed"]`. Linear: a 1M-character `setup…` path takes 1.8 ms (`isConfigPath`) / 5.9 ms (`assessRisk`); round 2 measured 1.3 s at 100k. The unit timing test allows 50 ms, and 100k measured 0.7 ms (~70× margin under concurrent load). |
+| QA-1.6-22 | Verified (doc) | The risk.ts:9-12 header states the top-level contract. [22a] root `D:\repo\tests`, deleted `D:\repo\tests\helpers\db.ts` → medium `["1-5 files changed","files were deleted or renamed"]`; [22b] root `D:/repo` → high "a test file was deleted", so the documented hazard is real. Wiring stays deferred (2.1/2.4). The optional UNC case-fold was not done; that is conservative, and not a finding. |
+| QA-1.6-23 | Verified; Info residual QA-1.6-31 | `requirements/base.txt` and `backend/requirements/dev.txt` → config (no reference → high); `requirements/sub/notes.txt` → not config (as tested); `requirements/README.md` → docs. |
+| QA-1.6-24 | Verified for the listed classes; residual QA-1.6-29 | [24a] `VERIFY:x\u202eevil\u200b\u2066` → the log holds `\u202e`, `\u200b` and `\u2066` escaped. [24d] A surrogate pair cut at 32 units → `\ud83d` escaped (no lone surrogate). |
+| QA-1.6-25 | Verified; residual QA-1.6-30 | Both guards now contain `\bfetch\(`, `\bWebSocket\b`, `\bXMLHttpRequest\b` and `^export .* from` (`m` flag); risk adds `from ["']node:`. Tests pass, so neither module contains these forms. |
+| QA-1.6-26 | Accepted (Info), unchanged | `statusHas` (risk.ts:185-189) is unchanged; no producer emits D/R word forms (round-2 evidence stands). |
+
+### New findings
+
+| ID | Severity | Summary |
+|---|---|---|
+| QA-1.6-27 | Low | A valid lower-case directive followed by another directive (or any other text) on the same line is dropped silently |
+| QA-1.6-28 | Low | The directive scan is quadratic on whitespace-free runs of keys (a regression from the QA-1.6-19 fix) |
+| QA-1.6-29 | Info | Log escaping still passes 4,173 invisible code points raw, including Unicode tag characters |
+| QA-1.6-30 | Info | The purity guards have whitespace/optional-call false negatives, and comment false positives |
+| QA-1.6-31 | Info | Test/dependency config conventions left out after the QA-1.6-21/23 changes (within §1.5-17) |
+| QA-1.6-32 | Info | Trimming trailing slashes from `root` (`/\/+$/`) is quadratic; the round-2 "all other regexes linear" claim is corrected |
+| QA-1.6-33 | Info | The lower-case prose guard deviates from §1.5-15 "same rules as `CAP:`" but is not recorded as a deviation |
+
+**QA-1.6-27 — Low — a valid lower-case directive followed by another directive on the same line is dropped silently**
+- Where: directives.ts:90 (`LINE_TAIL`), :127-131.
+- Evidence (probe; every case logs nothing):
+  - [L1] `verify:required verify_wait:2s` → `deferred/default`, while the wait on the same line applies (2000/directive);
+  - [L2] `verify: required, VERIFY_WAIT:2s` → deferred/default;
+  - [L3] `verify:required cap:none` → deferred/default, while `parseCapDirective` on the same text → `none`;
+  - [L6] `| verify:required |` → default, while `| cap:3 |` → 3;
+  - [L4] `verify: required (per QA)`, [L5] `verify: required -- tests must pass`, [L7] `<!-- verify: required -->`,
+    [L8] `Verify: required; Verify_Wait: 2s` → mode default.
+
+  The round-2 fix text (QA-1.6-18) accepted the value "before the end of the line **or the next directive**".
+  The implementation dropped the second half. This is the 2.4 failure class "a required one silently
+  becomes deferred", reachable only with a lower-case key, which the plan sanctions (`verify:Required`).
+  Separately, the tail is tested on a 256-character slice. [L9] `verify: required` + 300 spaces +
+  `fields are validated` → required, and [L10] the same with 300 dots → required. That is pathological.
+- Fix: let the tail also end at another key: after the closing marks and horizontal space, accept
+  `(?:VERIFY(?:_WAIT)?|CAP)[^\S\r\n\u2028\u2029]*:` (flag `i`) as well as the end of line. Add `|` to the
+  closing marks (table cells). Test the tail with a sticky regex at `end` on `text` itself, instead of a
+  256-character slice; it stays linear because its two classes are disjoint. Add L1, L2, L3 and L6 as
+  tests. L4, L5 and L7 may stay prose, but record that decision in the header.
+
+**QA-1.6-28 — Low — the directive scan is quadratic on whitespace-free runs of keys (a regression from dcbd023)**
+- Where: directives.ts:117-123. Each key match re-reads the rest of its whitespace-free token with
+  `/\S*/y` and copies it (`raw.replace(LEAD, "")`). Because scanning resumes right after the colon
+  (the QA-1.6-19 fix), a run of k keys costs O(k × run length).
+- Evidence (timing, one parse per child process):
+
+  | input | 10k | 20k | 40k | 100k | 1M |
+  |---|---|---|---|---|---|
+  | `"VERIFY:".repeat` | 8 ms | 23.2 ms | 81.9 ms | 539.2 ms | killed > 30 s |
+  | `"VERIFY_WAIT:".repeat` | 3.6 ms | 13.8 ms | 52 ms | 330.6 ms | killed > 30 s |
+  | `"verify:".repeat` | 10 ms | 25.8 ms | 90.8 ms | 555.8 ms | killed > 30 s |
+  | `"VERIFY:a,".repeat` | 5.5 ms | 18 ms | 81.8 ms | 424 ms | killed > 30 s |
+
+  Doubling the input gives about 4× the time. With the round-2 grammar the same inputs took ≤ 4.1 ms at 100k.
+  Every other directive shape is linear at 1M ≤ 67.6 ms: spaced keys, long HWS runs, long values,
+  prose, and a minified `{verify:function(e){return e}},` blob (26.6 ms). 2.4 runs the parse
+  synchronously on the dispatch path, so a pasted whitespace-free blob stalls the event loop.
+- Fix (prototyped on a temp copy, not committed): memoise the token end per whitespace-free run
+  (recompute only when `start >= tokEnd`). Match the values with sticky versions of
+  `MODE_VALUE`/`WAIT_VALUE` on `text` at `start + lead`, and slice only the ≤ 32-character logged value.
+  Measured at 1M: 34.6 / 15.5 / 65.2 ms (`VERIFY:` / `VERIFY_WAIT:` / `verify:`). There were **0**
+  behaviour differences on 49 inputs, covering every unit-test string plus this round's probes. A bare
+  `/\S{0,64}/y` bound is also linear (77-99 ms at 1M), but it changes 2 behaviours. It loses the log line
+  for the QA-1.6-7 lower-case 200 × `A` case, which breaks that test, and it turns a 400-digit wait from
+  "capped at 15000" into "malformed". So it is not recommended. Add a timing test such as
+  `"VERIFY:".repeat(15_000)` < 50 ms (the QA-1.6-21 pattern).
+
+**QA-1.6-29 — Info — log escaping still passes invisible code points raw**
+- Where: directives.ts:93 (`UNSAFE`).
+- Evidence: the probe enumerated every non-whitespace code point in `\p{Cc}`, `\p{Cf}`,
+  `\p{Default_Ignorable_Code_Point}`, `\p{Zl}` or `\p{Zp}`, placed each one inside a logged value, and
+  checked the log line. [24b] 4,173 of them stay raw: U+034F, U+0600-0605, U+06DD, U+070F, U+0890-0891,
+  U+08E2, U+115F-1160, U+17B4-17B5, U+180B-180D, U+180F, U+3164, U+FE00-FE0F, U+FFA0, U+FFF0-FFF8,
+  U+110BD, U+110CD, U+13430-1343F, U+1BCA0-1BCA3, U+1D173-1D17A and U+E0000-E0FFF. [24c] Tag characters
+  (U+E0049 U+E0047 U+E004E), the invisible "ASCII smuggling" carrier, appear raw in the line. The
+  exposure is bounded to 32 UTF-16 units and the log only.
+- Fix (optional): after `JSON.stringify`, escape everything outside printable ASCII (`/[^\x20-\x7e]/g`).
+  That is complete, and simpler than a list; every valid value is ASCII.
+
+**QA-1.6-30 — Info — purity-guard false negatives and false positives**
+- Where: directives.test.ts:155-156; the risk.test.ts purity test.
+- Evidence: the guard regexes, copied verbatim, were run on sample lines.
+  - Missed by **both** guards:
+    - `await import ("fs")`, `import\n("fs")`, `require ("child_process")`;
+    - `fetch ("http://x")`, `globalThis.fetch?.(…)`;
+    - `process?.env`, `const { env } = process`, `process["env"]`;
+    - `import{readFileSync}from"fs"`, `export*from"fs"`;
+    - `new Worker(…)`, `new EventSource(…)`, `navigator.sendBeacon(…)`, `Bun.spawn(…)`.
+  - Missed by the directives guard only: an indented `  import { readFileSync } from "fs"`
+    (the risk guard catches `from "fs"`).
+  - False positives (the test fails, so they fail closed):
+    - comments mentioning `fetch()`, `import()`, `process.` or `WebSocket`;
+    - an `export type … // from the plan` line;
+    - in directives only, a string containing `node:`.
+  - The installed TypeScript (7.0.2) has no `preProcessFile`, so a comment-aware import scan through
+    the TS API is not available.
+- Fix (optional): `\bimport\s*\(`, `\brequire\s*\(`, `\bfetch\b`, `\bprocess\b`, `^\s*(import|export)\b.*\bfrom\b`,
+  and add `\bWorker\b|\bEventSource\b|sendBeacon|\bBun\.|\bDeno\.`. False positives are acceptable.
+
+**QA-1.6-31 — Info — test/dependency config conventions outside the rules**
+- Where: risk.ts:147-148 (`SETUP_FILE`), :165-179.
+- Evidence (probe): each of these → low `["1-5 files changed"]`:
+  - test-setup/teardown names:
+    - `src/setup-jest.ts` (the jest-preset-angular default);
+    - `jest-setup.ts`, `vitest-setup.ts`, `setupVitest.ts`, `src/testSetup.ts`;
+    - `global-teardown.ts`, `globalTeardown.js`;
+  - runner configs: `playwright.config.ts`, `cypress.config.ts`, `karma.conf.js`, `.mocharc.yml`,
+    `babel.config.js`.
+
+  With no reference → medium (no config reason): `requirements.in`, `requirements/base.in` (pip-tools
+  sources), `Requirements/base.txt`, `Pipfile` and `environment.yml`.
+
+  None is named in §1.5-17. The plan list is `package.json`, lockfiles, `tsconfig*.json`,
+  `vitest|jest.config.*`, `conftest.py`, `pyproject.toml` and `.github/**`, so the implementation
+  conforms. These paths are rated at the file-count level, never below it. Setup files under
+  `test/`/`tests/` already hit the test row.
+- Fix (optional, a further §1.5-17 extension):
+  - add `^(setup-jest|jest-setup|vitest-setup|setup-vitest|setupVitest|testSetup|global-teardown|globalTeardown)\.[cm]?[jt]sx?$`;
+  - add `^(playwright|cypress)\.config\.`;
+  - add `.in` beside `.txt` in both requirements rules;
+  - add `Pipfile`.
+
+**QA-1.6-32 — Info — trimming trailing slashes from `root` is quadratic**
+- Where: risk.ts:109 (`norm(root).replace(/\/+$/, "")`).
+- Evidence (timing, root = `"/".repeat(n) + "x"`): 10k → 66.9 ms, 20k → 282.3 ms, 40k → 1217.6 ms,
+  100k → 6744.2 ms, 1M → killed > 30 s. The round-2 claim "all other directive and risk regexes are
+  linear" timed only changed paths, so it is corrected here. Every changed-path regex is linear:
+  the probes cover dots, slashes, `./` prefixes, `requirements/` runs, `tsconfig…`, `test_…py`,
+  `docs/` runs and `.setup` runs, all ≤ 10.7 ms at 1M.
+  Under the QA-1.6-22 contract, `root` is `git rev-parse --show-toplevel` output, not model input.
+- Fix (optional): trim with a loop (`while (r.endsWith("/")) r = r.slice(0, -1)`).
+
+**QA-1.6-33 — Info — the lower-case prose guard is an unrecorded deviation from §1.5-15**
+- Where: this report, "Result" (the deviation list) and the round-2 "Deferred by plan" row "Amend the
+  plan's 1.6.1 signature".
+- Evidence: §1.5-15 says "the same rules as `CAP:`". `CAP:`'s key is case-insensitive with no prose
+  guard: `| cap:3 |` → 3 and `verify:required cap:none` → `none`, while [L6]/[L3] leave VERIFY at the
+  default. The guard is a deliberate decision (QA-1.6-18), and it is documented in the directives.ts
+  header, but it is not listed with the `modeSource`/`waitSource` deviation.
+- Fix: add "Deviation (QA-1.6-18): a non-upper-case key counts only when its value ends the line" under
+  "Result", and include it in the next plan revision.
+
+### Other checks (no finding)
+
+- The upper-case test is `m[0].startsWith(upperKey)`, which is case-sensitive: `VERIFY_wait:` gets the
+  guard ([L15] `VERIFY_wait: 2s please` → default), and upper-case `VERIFY:required VERIFY_WAIT:2s` →
+  both parse ([L14]).
+- Accepted by design: [L11] `Steps to verify: deferred.` → deferred/directive (a one-word sentence-final
+  value), [L12] `Please verify: required` → required, and [L16] trailing NBSP → required.
+- Curly quotes: [L13] `verify: “required”` and `VERIFY: “required”` → default + one log line; `CAP: “3”` → null (parity, not silent).
+- Placeholders are checked before the prose guard, so lower-case placeholders are skipped silently, as upper-case ones are.
+- Plan contract (L873-908), as amended:
+  - 1.6.1: signature plus the log seam, and `modeSource`/`waitSource` (recorded deviations).
+  - 1.6.2: `assessRisk` plus optional `root` (recorded); header table; pure and synchronous.
+  - Directive edge-case tests present: `verify:Required`; first wins; unknown → default + log; `0s`/`750ms`/`99999s`;
+    `-1s`/`abc`/`5`; router example; fenced-block parity; `CAP:`+`VERIFY:` in both orders.
+  - Risk edge-case tests: all rows and thresholds are covered (round-2 evidence stands; risk.test.ts
+    only gained tests in this range).
+  - Acceptance: directives.ts has no imports; risk.ts has only `import type … from "./runner"`, and takes
+    the scoping plan as input.
+  - The only gaps are QA-1.6-27 (the directive grammar) and QA-1.6-33 (the deviation record).
+
+### Deferred by plan (unchanged; nothing new deferred)
+
+| Item | Phase |
+|---|---|
+| Golden check that `parseVerifyDirectives` returns defaults over the final header/protocol text (QA-1.6-4) | 2.3 / 2.4 |
+| "Subagent cannot self-select" enforcement test; parse only the orchestrator `prompt` (QA-1.6-5) | 2.4 |
+| Clamp `captureWaitMs ≤ baselineTimeoutMs` (QA-1.6-8) | §1.4 config resolver phase |
+| Fill `previousPath` from the porcelain rename source (QA-1.6-13) | 2.1 |
+| Unknown or failed attribution must not become `[]` → low (QA-1.6-14) | 2.4 |
+| Expose the git top-level on `TreeSnapshot` and pass it as `root` (QA-1.6-22) | 2.1 / 2.4 |
+| Tool-observed `ChangedFile` never carries a deletion (`written`/`modified` only) | 2.1 / 2.4 |
+| Amend the plan's 1.6.1 signature (`source` → `modeSource`/`waitSource`) and record the QA-1.6-18 guard (QA-1.6-33) | next plan revision |
+
+### Handoff to 2.4
+
+1. **Result shape:** destructure `mode`, `waitMs`, `modeSource`, `waitSource`; there is no `source`.
+   Use `modeSource` for "the orchestrator chose the mode" (the `defaultVerify:"required"` test expects
+   `modeSource:"default"`), and never infer it from `waitSource`.
+2. **Input:** parse only the orchestrator-authored `task`/`delegate` `prompt` argument. Never parse tool
+   results, the subagent's final text or child-session messages.
+3. **Router examples:** any VERIFY example injected into dispatch text uses `|`/`<…>` placeholders, or
+   the resolved `VERIFY:<mode>`/`VERIFY_WAIT:<n>ms` is pinned first (the `CAP:` pattern). A pinned value
+   also defeats quoted subagent text.
+4. **Key case:** a lower-case key counts only when its value ends the line (QA-1.6-18, and QA-1.6-27 while
+   open). Protocol text (2.3) and any router-authored example should show upper-case
+   `VERIFY:`/`VERIFY_WAIT:`.
+5. **Logging:** wire the `log` seam to the router logger. The default is a no-op, so unknown values
+   would otherwise be invisible.
+6. **Wait:** `waitMs` may be `0` (start immediately). `VERIFY_WAIT` is capped at `baselineTimeoutMs`,
+   the default `captureWaitMs` is not (QA-1.6-8).
+7. **Root:** pass `root` = the git top-level the paths were resolved against (`rev-parse --show-toplevel`,
+   as tree.ts). Never the delegation cwd; `TreeSnapshot.cwd` is not the top-level. A subdirectory root
+   under-rates a test deletion ([22a] medium vs [22b] high). Without `root`, absolute paths never count
+   as docs (conservative).
+8. **Tier:** `producerTier` must be the canonical lowercase id. Only exact `"fast"` triggers row 11;
+   `"Fast"`, `"FAST"` and `" fast"` → low.
+9. **Attribution:** never map failed attribution (`snapshotTree` → `undefined`) to `[]`, which is rated
+   low "no changes attributed" (QA-1.6-14).
+10. **Renames and deletions:** pass `previousPath` when known (2.1); without it, a test renamed out of
+    test naming is medium, not high. Tool-observed changes carry no deletions.
+11. **Scoping:** `scopingPlan` is the no-spawn `planStaticScoping` result. `Unverifiable` → medium;
+    `NoAffected` is informational only.
+
+Outcome: QA-1.6-18..26 are verified (QA-1.6-26 accepted as Info). Open and not deferred: two Low
+(QA-1.6-27, QA-1.6-28) and five Info (QA-1.6-29..33). No High or Medium finding is open. Phase 1.6 QA is
+**not** clean until QA-1.6-27 and QA-1.6-28 are resolved, or explicitly accepted.
