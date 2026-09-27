@@ -644,3 +644,64 @@ Resolution: 8e71e32 — step 7b lists `ls-files --eol -z -- ':(attr:text)' ':(at
 - QA-1.5-4 (2.1 part): "reference vanished → unverifiable".
 - POSIX: the 1.5.3 key safety test on POSIX CI (dir symlinks, `fs.rm`, `git worktree remove`). Not testable on this host.
 - Bun smoke (3.1): the win32 answers are above. POSIX Bun and the plugin's real load path remain with 3.1.
+
+## QA re-review (round 4)
+
+Scope: `git diff d6f0c1e..eff85ef` (5d7df0c, ebf49d8, 8e71e32, 5ced990, eff85ef). Line numbers refer to
+`src/verify/reference.ts` at eff85ef. `npx vitest run --maxWorkers=2 test/unit/reference.test.ts`: **47/47 passed**,
+246.21 s. Host: win32, Node v24.21.0, Bun 1.3.14, git 2.51.0.windows.1; system `core.autocrlf=true`, global `input`.
+Every sandbox repo set a repo-local `core.autocrlf=false` and left `core.eol` unset (native CRLF). The repros ran under
+`%TEMP%\omr-qa15r4` and imported the real `reference.ts` (Node through type stripping, Bun natively). The control was
+`git show 5d7df0c:src/verify/reference.ts`, which has the QA-1.5-16 fix but not QA-1.5-17 or QA-1.5-15. Repo paths
+were `r ü …`, and `tmpdir` was `tmp ä dir`, injected in its 8.3 form. The ArgvSeam was the spawn-based seam of round 3
+(no shell, env merged over `process.env`, `taskkill /T /F`, resolves on `close`). Before each capture the harness
+waited 1.1 s, so no entry was racily clean. Every junction target was a sentinel dir inside the sandbox. Git never ran
+on a dir that contained a link, and the harness never called `git worktree remove`. Cleanup: 47 sandbox repos with 0
+`omr-ref-*` entries. The 9 junctions that were left were the ones in the users' own worktrees; they were unlinked
+first (0 links left). Then the sandbox was deleted (`gone true`). Afterwards TEMP held no `omr-ref-*` or
+`omr-nohooks-*` dirs, and no harness process was running.
+
+### Resolutions: verification
+| Finding | Status | Evidence |
+|---|---|---|
+| QA-1.5-15 | **Verified** | `:1952-1956` adds `stats === undefined` only on the omr-reason branch. `lstatOrMissing` (`:985-993`) maps only ENOENT/ENOTDIR to "missing", and every other error propagates. Owner = a separate Node process (and a separate Bun process under Bun) with a live reference whose links lead into the sentinels. **C1:** dir present, real clock → **kept**. An fs seam that throws `EACCES` on the dir's lstat → `reference GC failed {"error":"EACCES: simulated"}`, 0 removed; the dir, the links and the locked entry are intact, and the owner's later dispose is clean. **C2:** a "temp cleaner" (links unlinked first) deletes the live dir, and the owner stays alive → GC **removed 1**, and the entry is gone. The 5d7df0c control **kept** it (`registered+locked`). The owner's later dispose logs only `reference heartbeat failed … ENOENT, utime` (harmless). **C3:** GC between the owner's `fs.rm` and its step 4 → GC removes the entry, and the owner's dispose finishes with **no warnings** (`registeredEntry` → null). **C4:** GC between the owner's `unlock` and its `remove --force` → GC removes the entry. The owner warns `admin entry left registered … is not a working tree` and nothing else happens. So both race orders are benign, as the fix claims. Node and Bun gave identical outcomes. In every run, the sentinels read `keep me`, the user's worktree stayed registered and its junction still read `keep me`, and `.git/index` was byte-identical (C1). |
+| QA-1.5-16 | **Verified** (precision cost → QA-1.5-19) | `:1800`. **A1** (Node and Bun): `sub/a.txt text eol=crlf`, clean at capture, edited to `"a1\n"` before materialize → reference `"a0\r\n"`, `exact: false`, `checkout-conversion:sub/a.txt`. **A3** (control, no attribute, same edit) → exact, reference `"a0\n"`. The unit test passes. |
+| QA-1.5-17 | **Performance goal met, but it reopens exactness → QA-1.5-18** | The attribute sources that the pathspecs do match are all flagged under both runtimes: **B1** `* text=auto` in a nested `sub/.gitattributes`; **B2** `.git/info/attributes` (read from the common dir by the linked worktree too); **B3** `core.attributesFile`; **B4** a macro `[attr]crlfy text eol=crlf`; **B5** `eol=crlf` without `text`. Controls are exact and correct: **B6b** `crlf=input`, **B7** `binary`, **B8** `-text eol=crlf`. The limit itself is unsound (QA-1.5-18). |
+| 5ced990 (header) | **Partly** → QA-1.5-20 | Section 4 step 7b (`:294-308`) and section 11 (`:514-519`) describe the fixes. Section 2e and OPEN RISKS do not. |
+
+### New findings
+| ID | Severity | Evidence | Fix |
+|---|---|---|---|
+| QA-1.5-18 | Medium (regression from 8e71e32) | **The attribute pathspec limit makes step 7b skip clean files whose working bytes differ from what the checkout writes.** The premise "without attributes only core.autocrlf converts" describes the reference's checkout, not the live tree. A clean file's live bytes come from its **last** checkout and the settings at that time, and `git status` stays clean on stat alone. Four clean-file cases give **`exact: true` at eff85ef** under Node and Bun, and each one is flagged by the 5d7df0c control: **B9** checked out under `core.autocrlf=true`, which is the Git for Windows system default at clone time, and refreshed; the user later sets `false`. Live `"a0\r\n"` (`i/lf w/crlf attr/`), reference `"a0\n"`. The file has no attribute, so it is never listed. **B6** legacy `*.txt crlf`: `ls-files --eol` shows `attr/text`, but `:(attr:text)` does not match the `crlf` attribute. Live `"a0\n"`, reference `"a0\r\n"`. **B10** `working-tree-encoding=UTF-16LE-BOM` added after the file was committed. Live UTF-8 `"a0\n"`, reference `FF FE 61 00 30 00 0A 00` (`w/-text`, `attr/` empty). **B11** `GIT_LITERAL_PATHSPECS=1` in the plugin's environment, which the ArgvSeam merges in: git takes `:(attr:…)` literally. `git ls-files --eol -z -- ':(attr:text)' …` then exits **0 with no output**, where `=0` or unset lists `sub/a.txt`. So the check is off silently; the control without the env var is flagged. A reference-side failure that these bytes cause could then excuse the producer's failure (§1.5-7). | Drop the pathspecs and restore the full listing on both sides (the 5d7df0c behaviour). This closes B6, B9, B10 and B11 together. For QA-1.5-17's cost, run the two listings concurrently. The existing `""` fallback already keeps a spent budget safe, as approximate, not wrong. A limit cannot be made sound. B9 has no attribute at all. Git's attr magic (`ATTR`, `-ATTR`, `ATTR=VALUE`, `!ATTR`) has no form for "any value", so it cannot select `working-tree-encoding`. Adding `crlf` plus `env: { GIT_LITERAL_PATHSPECS: "0" }` would fix only B6 and B11. Tests: B9 (checkout with `-c core.autocrlf=true`, `update-index --refresh`, then `false`), B6, and B11 (env on the seam). |
+| QA-1.5-19 | Low | **The QA-1.5-16 rule also flags edited files whose dispatch bytes already matched the checkout, so on win32 a `* text=auto` repo is never exact once the producer edits a text file.** **A2** (Node, Bun, and the 5d7df0c control): `* text=auto`, files CRLF on disk and clean (`w/crlf`). The capture sees `sub/a.txt` = `"a0\r\n"`, and the producer then edits it to `"a1\r\n"`. The reference's `sub/a.txt` is `"a0\r\n"`, identical to the dispatch bytes, yet the result is `exact: false` with `checkout-conversion:sub/a.txt`. No other path is flagged. The failure is in the safe direction (`unverifiable`, never a wrong excuse), but S2 cannot excuse anything in such repos on the primary host. | Record the `w/` class at capture: one `ls-files --eol -z` at root; after QA-1.5-18 it is the same listing. For a path in `changed` and not in `ref.tracked`, compare the reference's `w/` with the capture-time `w/`, and flag only when they differ or the path has no capture-time class. If the capture budget cannot afford the listing, keep the current rule and document the false-inexact case in section 2e. |
+| QA-1.5-20 | Low (docs) | **The header drifts from the code.** Section 2e (`:84-98`) still describes the clean-file check as covering "every tracked path that is neither in `tracked` nor changed". It mentions neither the attribute limit nor the QA-1.5-16 rule for changed paths. OPEN RISKS (`:629-636`) says "`text`/`eol` attributes are covered" and keeps only a filter/ident/working-tree-encoding "keeping the eol class" as residual. At eff85ef, B6, B9 and B10 contradict both. `parseEolList`'s JSDoc (`:1025-1029`) now sits directly above the `EOL_ATTR_PATHSPECS` JSDoc (`:1030`), so the function has no doc comment and the constant has two. | Update section 2e and OPEN RISKS together with QA-1.5-18 (and QA-1.5-19 if the rule changes), and move the JSDoc back onto `parseEolList`. |
+
+### Data-loss review (priority #1)
+QA-1.5-15 changes only the verdict for a registered omr-locked entry whose dir `lstat` reports as missing. A present
+dir still follows the unchanged rules (C1: kept), and an lstat error fails GC closed (C1: EACCES). Git still runs only
+after the lstats at `:1243` and `:1263` show the dir gone. That guard is the same as on the dead-owner path, so the
+change adds no new way to reach `git worktree remove` on an existing dir. Across C1-C4 under Node and Bun, the
+sentinels, the user's worktree with its junction, and the user's `.git/index` (C1, and every eol case: `indexSame
+true`) were untouched. Every reference dir was gone, and no omr entry remained. The eol cases created no links and
+left one worktree per repo.
+
+Residual, analysis only (not testable on this host): a GC in another mount namespace sees a live reference as missing.
+Examples are a dev container, or a second WSL distro, that shares the repository and uses the same tmp path (`/tmp`)
+but has its own `/tmp`. Such a GC now always drops the entry; before this fix it did so only when the pid was not alive
+in its own namespace. Git acts in the GC's namespace, where the path does not exist, so it deletes no data. The owner's
+reference loses its admin entry, and the "reference vanished → unverifiable" rule (deferred to 2.1) covers that.
+
+### Checked with no finding
+- The pathspecs work for attributes from nested `.gitattributes`, `info/attributes` (also in the linked worktree),
+  `core.attributesFile` and macros (B1-B4). `binary`, `-text` and `crlf=input` produce no false flags (B6b-B8).
+- `GIT_LITERAL_PATHSPECS` affects no other call in the module: only step 7b passes pathspec magic.
+- Bun 1.3.14 matched Node in every B, A and C case (identical flags, bytes and GC reports). Only the dispose timings
+  differed, and they include the harness's own pauses.
+
+Open non-deferred findings: QA-1.5-18 (Medium), QA-1.5-19 (Low), QA-1.5-20 (Low). Phase 1.5 QA is **not** clean.
+
+### Deferred by plan (unchanged)
+- QA-1.5-7: the excuse policy for ignored inputs (2.1 wiring).
+- QA-1.5-10 (2.1 part): materialize only inside the S3 slot, and run GC before each materialize.
+- QA-1.5-4 (2.1 part): "reference vanished → unverifiable". It is also the backstop for the namespace residual above.
+- POSIX: the 1.5.3 key safety test on POSIX CI. Bun smoke on POSIX and on the plugin's real load path (3.1).
