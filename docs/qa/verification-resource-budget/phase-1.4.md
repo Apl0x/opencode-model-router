@@ -37,37 +37,88 @@ documented `kill(2)` semantics are the same (`ESRCH`/`EPERM`).
 
 ## Implementation notes (`src/verify/slot.ts`)
 
-- `acquireSlot({max, waitMs, signal, meta}, deps?)` → `SlotHandle | {busy:true}`, plus `withSlot`,
-  which releases on success, throw and abort. `deps` injects dir, logger (`Pick<PluginLogger,"warn">`,
-  the `src/router/logger.ts` seam), clock, random, host, pid, PID probe, unlink and all timing
-  constants. The defaults are the plan values: heartbeat 5 s, stale 30 s, backoff 250 ms → 2 s.
-- **TOCTOU:** every delete of a slot file (a stale reap or the owner's release) runs under a per-slot
-  `slot-<i>.lock.reap` lock (`wx`). Under that lock the file is re-read, and it is deleted only if the
-  token (and the staleness) is unchanged. Only deleters remove slot files, and they are serialized,
-  so the file cannot change identity between the re-read and the unlink. A crashed reaper's
-  reap lock is reclaimed by age (10 s).
-- **Unlink:** `EBUSY`/`EPERM`/`EACCES` are retried with exponential backoff (6 retries). A persistent
-  failure logs a warning and leaves the file (the slot is not reported as freed).
-- **Corrupt/empty lock:** stale only after a 2 s write grace (**deviation from the plan**). A creator
-  writes JSON right after the exclusive create, so an empty file younger than the grace may be a
-  lock being written. Reaping it immediately could produce two winners.
-- **Clock:** an mtime in the future counts as fresh (never reclaims a live holder). Same-host
-  crashes are still caught by the PID probe.
-- **Exit:** a single `process.on("exit")` listener (registered once) synchronously unlinks the files
-  this process holds, after a token check.
-- **Unwritable dir:** `mkdir` plus a probe file. On failure it uses an in-process semaphore with the
-  same API, and logs once per dir.
+Updated after the QA fixes (commits `25a7d4f`…`0024c3b`). The first version's notes are superseded:
+its `.reap` time lease, its wall-clock deadline and its "future mtime = fresh" rule are gone.
 
-## Tests (`test/unit/slot.test.ts`, 19 tests)
+- **API:** `acquireSlot({max, waitMs, signal, meta, onLost?}, deps?)` → `SlotHandle | {busy:true}`,
+  with `SlotHandle = {release(), readonly lost}`, plus `withSlot`, which releases on success, throw
+  and abort. `onLost` and `lost` are additive. `deps` injects the dir, the logger
+  (`Pick<PluginLogger,"warn">`), the wall clock `now` (used only against mtimes), the monotonic
+  clock `mono` (`performance.now()`), random, host, pid, the PID probe, the `unlink`/`read`/`utimes`
+  seams and every timing constant. The defaults are the plan values: heartbeat 5 s, stale 30 s,
+  backoff 250 ms → 2 s. Two additions: a corrupt-file grace of 2 s and a claim hold limit of 5 s.
+- **Creation:** `open(slot, "wx")` and a JSON write, then a re-read. The creator holds the slot only
+  if its token is there.
+- **Staleness:** a lock is stale if (a) it is from this host and its PID is dead, which is immediate;
+  or (b) its mtime is older than `staleMs` **and** this process has seen the same (token, mtime)
+  for ≥ 2 heartbeats of its own monotonic clock, with no gap over 2 heartbeats between two looks.
+  A lock seen unchanged for `staleMs` of monotonic time is stale whatever its mtime says. A foreign
+  host is never judged by PID. A corrupt or empty lock follows (b), with `corruptGraceMs` for both
+  the age and the observation (**deviation from the plan**, accepted in QA-1.4-14).
+- **Deletion (TOCTOU):** every delete of a file with identity K runs under the claim file
+  `slot-<i>.lock.reap-<sha256(K)[:32]>` (`wx`, `{pid, hostname, token}`). K is the token, or for a
+  corrupt file its mtime and size. This covers stale reaps, the owner's release and the exit hook.
+  The claim holder re-reads the file before every unlink attempt and deletes it only while it is
+  still K. K is never reused and only a K-claim holder deletes K's file, so there is no ABA between
+  the re-read and the unlink, and no time lease.
+  - A crashed claimer's claim is removed the same way, under the claim for its token. That happens
+    when its owner is a dead same-host PID, or when the claim is inert: older than `staleMs` and seen
+    unchanged for 2 × `claimHoldMaxMs`. The chain goes at most 3 levels deep.
+  - A claimer never deletes after holding its claim for `claimHoldMaxMs` of monotonic time
+    (self-fencing), and drops its own claim only within 1.5 × that time.
+- **Unlink:** `EBUSY`/`EPERM`/`EACCES` are retried with exponential backoff (6 retries, 50 ms × 2ⁱ).
+  A persistent failure is logged and never reported as success.
+- **Release:** it never rejects and never caches a failure. An unreadable lock (a scanner) is
+  retried on the unlink schedule; it is never taken for "missing". If the delete is not confirmed,
+  the file stays ours: the heartbeat keeps running and the exit hook still covers it. The delete is
+  retried on an unref'd timer every heartbeat, up to `staleMs / heartbeatMs` times, with one
+  warning. Then the file is left to stale detection with a second warning. A release first waits
+  for any heartbeat tick in flight, and a tick checks the phase before `utimes`.
+- **Loss:** when the heartbeat finds the lock gone or holding another token, `lost` becomes true,
+  `onLost` runs and one warning is logged, once.
+- **Fairness:** a waiter files `wait-<startedAt>-<uuid>.ticket`, refreshes it on every wake-up, and
+  tries only while fewer than `max` live tickets are older than its own (FIFO for max=1). A caller
+  with `waitMs=0` defers while `max` live tickets exist. Tickets are advisory: exclusion never
+  depends on them.
+- **Clock:** deadlines and observations use `performance.now()`. The wall clock is compared only
+  with mtimes.
+- **Exit:** a single `process.on("exit")` listener (registered once) follows the claim protocol
+  synchronously. It takes the claim, checks the token, unlinks the lock and drops the claim. If
+  another process holds the claim, it leaves the file to that process. It also removes its tickets.
+- **Unwritable dir:** the verdict comes only from `mkdir`/exclusive-create codes. EACCES, EPERM,
+  EBUSY and ENOENT are retried twice; EROFS, ENOTDIR and EEXIST are final. Once the probe is
+  created, the dir counts as writable, and removing the probe is housekeeping. The verdict is
+  memoized per dir for the process, so file and in-process holders never mix. The in-process
+  fallback logs once per dir.
+- **Residual risk (documented in the header):** check-then-act on a file system keeps a window of
+  microseconds between the last check and the syscall. A process frozen exactly there (SIGSTOP, a
+  debugger) can act late. A holder that stops heartbeating for 2 intervals while its lock looks
+  older than `staleMs` is reaped (the plan's contract), and it is told so through `lost`.
 
-Isolated `mkdtemp` dir per test. The multi-process fixture is `test/fixtures/slot/holder.mjs`, which
-loads `slot.ts` via Node type stripping. **Deviation:** the unwritable temp dir is simulated by a
-slot dir under a regular file (`ENOTDIR`), not a read-only `TEMP`. Windows directory ACLs cannot
-be made read-only portably without admin rights.
+## Tests (`test/unit/slot.test.ts`, 42 tests)
 
-Three scoped runs (`npx vitest run --maxWorkers=2 test/unit/slot.test.ts`): 19/19 passed each time
-(7.68 s, 8.54 s, 8.50 s). No `holder.mjs` or `omr-slot` node processes remained afterwards.
-`npm run typecheck` is clean.
+Each test uses an isolated `mkdtemp` dir. The multi-process fixture `test/fixtures/slot/holder.mjs`
+imports a JS build of the real `slot.ts`. The build is made in `beforeAll` with vite's
+`transformWithOxc`, which ships with vitest; TypeScript 7 has no `transpileModule`. The children
+therefore need no type stripping. This was verified by running the file with
+`NODE_OPTIONS=--no-experimental-strip-types`, which is the Node 20 condition: 42/42 passed. The
+children start behind a barrier (READY, then a `go` file).
+
+The read-only temp dir case is real. On Windows it uses `icacls <dir> /deny <user>:(OI)(CI)(W)`,
+non-elevated; on POSIX it uses `chmod 0555`, skipped as root. The test points
+`TEMP`/`TMP`/`TMPDIR` at the dir, uses the default slot dir, and restores the env and the ACL in
+`finally`. The earlier `ENOTDIR` case stays as an extra.
+
+Three consecutive runs (`npx vitest run --maxWorkers=2 test/unit/slot.test.ts`) passed 42/42 each
+time (27.0 s, 32.1 s, 30.9 s). Afterwards no `node.exe` with `slot` in its command line remained,
+and no `omr-slot-*` temp dirs were left. `npm run typecheck` is clean.
+
+Mutation checks were run and reverted. Each broken rule failed its tests:
+- Drop the observation requirement (QA-1.4-1): 5 tests fail.
+- Reclaim claims by age only (QA-1.4-2): 2 tests fail.
+- Bypass the ticket gate (QA-1.4-9): 2 tests fail. The waiter starves ("expected a slot, got busy").
+- Keep the heartbeat running after release (QA-1.4-10): 1 test fails.
+- Restore the old downward jitter (QA-1.4-16): 1 test fails.
 
 ## QA findings
 
@@ -111,6 +162,19 @@ The slot-file unlink retries EBUSY/EPERM and never treats a persistent failure a
   30 s", so a later reclaim still conforms. Correct the header comment. Add a test: a live holder
   whose file was aged 31 s is not reaped by a waiter within `2 × heartbeatMs`, and an aged dead lock
   is reaped after the confirmation.
+- **Resolution:** `d2bdeef`. `lockStale` has two paths:
+  - Same host and dead PID: immediate, as before.
+  - Otherwise: the wall age must be over `staleMs`, **and** a per-process `observations` map
+    (path → key `token@mtime`, first/last on `performance.now()`) must show the same key for
+    ≥ 2 × `heartbeatMs`, with no gap over 2 × `heartbeatMs` between two looks. After a resume, the
+    gap restarts the observation, and the holder's first heartbeat changes the key. The wait loop
+    wakes at least once per heartbeat so the observation stays unbroken.
+
+  The header is corrected. New tests:
+  - P1 and P1b with the production defaults (aged file / +31 s clock) → busy.
+  - A live holder against a waiting observer with an aged file and with a stepped clock → keeps the
+    slot.
+  - An aged foreign lock → busy on one look, reaped after ≥ 2 heartbeats.
 
 ### QA-1.4-2 — major — The `.reap` lock is an unfenced time lease: two reapers can be inside it, giving two holders
 
@@ -158,6 +222,31 @@ The slot-file unlink retries EBUSY/EPERM and never treats a persistent failure a
   4. Add holder-side loss detection (QA-1.4-7).
   5. Correct the header and QA notes.
   6. Add the multi-process concurrent-reaper test of QA-1.4-11.
+- **Resolution:** `d2bdeef`. This is a redesign rather than a PID-owned `.reap` lock, and it is
+  strictly better: there is no single reap lock, no time lease and no rename/restore step.
+  - Every delete of a file with identity K runs under the claim
+    `slot-<i>.lock.reap-<sha256(K)[:32]>`. The claim is `wx` and holds `{pid, hostname, token}`.
+  - The claim holder re-reads the target before **every** unlink attempt, retries included, and
+    deletes only while the key is unchanged.
+  - K is unique and only a K-claim holder deletes K's file, so the P2 interleaving cannot happen.
+    R3 could not delete R4's reap file, because there is none to share. R4's retry re-reads and
+    finds R5's token, so it stops.
+  - A rename-then-verify reclaim was rejected. When a stale file was already replaced, it moves a
+    live file, and its restore (`link`) can fail with EEXIST: two holders again.
+  - Crashed claimers: a claim is removed under the claim for *its* token (chained, depth ≤ 3).
+    That happens only when its owner is a dead same-host PID, or when the claim is inert: older
+    than `staleMs` and seen unchanged for 2 × `claimHoldMaxMs`.
+  - The inert rule replaces "never by age" (QA fix 1). A PID reused after a crash would otherwise
+    lock the slot forever. It is safe because a live claimer self-fences: it never deletes after
+    `claimHoldMaxMs` of its own monotonic time, and it drops its own claim within 1.5 × that time.
+  - Owner releases and the exit hook use the same claims. Loss detection is in QA-1.4-7, and the
+    header and QA notes are corrected.
+
+  Tests:
+  - A dead reaper's claim is cleared at once.
+  - A live claimer's claim survives one look and a +10.5 s clock. It is removed only once inert.
+  - P3 replay: a reaper held in EBUSY retries inside its claim keeps it against a stepped waiter.
+  - The multi-process tests of QA-1.4-11.
 
 ### QA-1.4-3 — major — A transient antivirus EPERM on the probe unlink silently switches to the in-process semaphore (exclusion lost); EBUSY rejects
 
@@ -180,6 +269,15 @@ The slot-file unlink retries EBUSY/EPERM and never treats a persistent failure a
      Retry `ENOENT` once, since the dir may have been removed concurrently.
   3. Cache the verdict per dir for the process, or at least never mix file and local holders for
      the same dir.
+- **Resolution:** `4d627ed`. `probeDir` judges the dir only from `mkdir`/`open(probe,"wx")` codes:
+  - EACCES, EPERM, EBUSY and ENOENT are retried twice (50/100 ms); EROFS, ENOTDIR and EEXIST are
+    final.
+  - Once the probe exists, the dir is writable. The probe is removed with the retrying unlink, and
+    a residual failure is logged only.
+  - The verdict is memoized per dir for the process. An unexpected error is not cached.
+
+  Test (P6 replay) against a real holder process: a transient EPERM or EBUSY on the probe delete
+  → busy (exclusion kept), no warning, no leaked probe. The probe runs once per dir.
 
 ### QA-1.4-4 — major — A sharing violation on the `.reap` file makes `release()`, `acquireSlot()` and `withSlot()` reject; the rejection is cached and the reap file leaks
 
@@ -199,6 +297,20 @@ The slot-file unlink retries EBUSY/EPERM and never treats a persistent failure a
   through `unlinkRetry` without reading it. `release()` must never reject: catch, warn, and leave the
   slot to stale detection. Do not cache a rejection. `withSlot` must not let a release failure mask
   `fn`'s value or error.
+- **Resolution:** `d2bdeef`.
+  - All lock and claim reads go through `readLock`, which reports EBUSY/EPERM/EACCES as
+    `unreadable`. Unreadable is retried on the unlink schedule and is never a verdict.
+  - The claim is dropped with a token re-check under the same retries. A crashed claimer no
+    longer blocks the slot for 10 s: its claim is removed by the PID rule.
+  - `release()` catches everything, and so never rejects. It shares only an in-flight attempt, so a
+    failure is not cached, and a later call starts a new attempt.
+  - An unconfirmed delete is deferred and retried in the background, with warnings.
+  - `withSlot` returns `fn`'s value or rethrows its error, because `release()` cannot reject.
+
+  Tests:
+  - EIO on unlink, or on every read → release resolves, twice.
+  - `withSlot(() => 42)` → `{value: 42}`, and `fn`'s throw is preserved.
+  - Transient EBUSY reads of the lock and the claim → deleted with no warnings.
 
 ### QA-1.4-5 — major — The multi-process tests cannot run on the Node 20 legs of CI
 
@@ -215,6 +327,11 @@ The slot-file unlink retries EBUSY/EPERM and never treats a persistent failure a
   is a maintainer decision. Last resort: `it.skipIf(!process.features.typescript)` with a visible
   reason. This keeps the Node 20 legs green, but it loses the plan-mandated multi-process coverage
   there.
+- **Resolution:** `25a7d4f`. `beforeAll` compiles the real `src/verify/slot.ts` to
+  `<tmp>/slot.mjs` with the installed vite's `transformWithOxc`. The repo's TypeScript is 7.0.2,
+  whose package exposes no `transpileModule` (checked). `holder.mjs` imports that build.
+  With `NODE_OPTIONS=--no-experimental-strip-types`, the Node 20 condition, the full file passes
+  (42/42).
 
 ### QA-1.4-6 — minor — `release()` silently abandons its own lock when a scanner blocks the read; the slot is unusable for 30 s
 
@@ -229,6 +346,19 @@ The slot-file unlink retries EBUSY/EPERM and never treats a persistent failure a
 - **Fix:** separate "unreadable" from "missing" and from "another token". Retry unreadable reads on
   the unlink schedule. If deletion cannot be confirmed, keep the `held` entry and the heartbeat, and
   retry the delete on an unref'd timer rather than abandoning the file. Warn when a release gives up.
+- **Resolution:** `d2bdeef`.
+  - `LockState` has four kinds: `missing`, `unreadable{code}`, `ok` and `corrupt`.
+  - Under the claim, the release retries unreadable reads on the unlink schedule, and only
+    `missing` or another token settles it.
+  - If the delete is not confirmed, the handle goes to `deferred`. The heartbeat and the `held`
+    entry (exit hook) stay, and the delete is retried on an unref'd timer every heartbeat, up to
+    `staleMs / heartbeatMs` times.
+  - It warns "release incomplete, retrying in the background" and, at the end, "release gave up,
+    slot left to stale detection".
+  - The heartbeat skips an unreadable tick instead of treating it as lost.
+
+  Test: a persistently unreadable lock → release resolves, the file stays and is still held, with a
+  warning. Once readable, the background retry deletes it, and the next acquirer gets the slot.
 
 ### QA-1.4-7 — minor — A holder never notices that it lost the slot
 
@@ -240,6 +370,16 @@ The slot-file unlink retries EBUSY/EPERM and never treats a persistent failure a
 - **Fix:** the first time the heartbeat sees the file missing or holding another token, warn once
   ("verification slot lost") and set `handle.lost = true` (additive) or call an `onLost` callback,
   so that Phase 2.x can record the over-commit. Retry `utimes` on the unlink schedule.
+- **Resolution:** `d05d95e`. The first time the heartbeat finds the lock gone (or `utimes` gets
+  ENOENT), or finds another token, the handle reacts once:
+  - it sets `handle.lost = true` (a readonly getter, additive);
+  - it calls `opts.onLost()` (additive; a throw is caught and logged);
+  - it logs one warning, "verification slot lost…";
+  - it stops the heartbeat.
+
+  The same observation during a pending release only completes that release. `utimes` is retried
+  on the unlink schedule (`d2bdeef`). Tests cover the taken-over and the deleted cases: `lost`,
+  exactly one `onLost` call and one warning, and a later `release()` leaves the path alone.
 
 ### QA-1.4-8 — minor — Clock step backward: long (but not permanent) lockouts; the wait deadline uses the wall clock
 
@@ -257,6 +397,17 @@ The slot-file unlink retries EBUSY/EPERM and never treats a persistent failure a
 - **Fix:** the observed-unchanged rule on the monotonic clock (QA-1.4-1) also covers future mtimes.
   Give the reap file PID-based reclaim (QA-1.4-2). Compute `deadline`/`remaining` from
   `performance.now()`, and keep `now` only for mtime comparisons.
+- **Resolution:** `d2bdeef`.
+  - Deadlines, observations and claim fencing use `deps.mono` (default `performance.now()`); `now`
+    is only compared with mtimes.
+  - A lock or claim seen unchanged for `staleMs` of monotonic time is stale whatever its mtime says,
+    so a future mtime no longer locks anyone out for the length of the correction.
+  - There is no `.reap` age lease any more. A claim is reclaimed by PID, or once inert on the
+    monotonic clock.
+
+  Tests:
+  - A foreign lock with an mtime 1 h in the future is reclaimed after `staleMs` of observation.
+  - A wall clock stepped +1 h or −1 h during a 600 ms wait neither cuts it short nor extends it.
 
 ### QA-1.4-9 — minor — Starvation: no fairness or hand-off between processes
 
@@ -271,6 +422,25 @@ The slot-file unlink retries EBUSY/EPERM and never treats a persistent failure a
   the slot rules. An acquirer defers to any older live ticket (FIFO), or at least a releaser that
   re-acquires within `backoffMaxMs` yields when an older ticket exists. Test: child A cycles
   acquire/release in a loop, and child B, waiting 5 s, must get the slot.
+- **Resolution:** `65df39a`. FIFO waiter tickets:
+  - A caller with `waitMs > 0` writes `wait-<startedAt:15>-<uuid>.ticket` (`{pid, hostname,
+    token}`) and refreshes its mtime on every wake-up.
+  - It tries the slots only while fewer than `max` live tickets sort before its own: strict FIFO
+    for max=1, and for max>1 the `max` oldest waiters compete. A `waitMs=0` caller defers while
+    `max` live tickets exist, so a releaser that re-acquires at once queues behind the waiters.
+  - A ticket is dead if its PID is dead (same host), if it is older than `staleMs`, or if it has
+    been seen unchanged for `staleMs` of monotonic time. Dead tickets are deleted; the names are
+    unique, so there is no ABA.
+  - Tickets only order the attempts: any ticket I/O failure lets the caller try (one warning per
+    dir). They are removed in `finally` and by the exit hook.
+  - Caveat: the ordering uses the wall-clock start time, so a backward clock step can let newer
+    waiters jump ahead until the clock catches up. Waits stay bounded by `waitMs`.
+
+  Tests:
+  - A child cycling acquire/release in a tight loop against an in-process waiter with production
+    backoff: the waiter gets the slot in < 5 s, with no overlap. With the gate disabled it starved.
+  - A live older ticket defers a `waitMs=0` caller even with a free slot, but not with `max=2`.
+    Aged and dead-PID tickets are ignored and removed.
 
 ### QA-1.4-10 — minor — The "stops the heartbeat" test is vacuous
 
@@ -284,6 +454,14 @@ The slot-file unlink retries EBUSY/EPERM and never treats a persistent failure a
 - **Fix:** after `release()`, rewrite the file with the released handle's **own** token and an old
   mtime, wait for more than 3 heartbeats, and assert that the mtime is unchanged. Alternatively,
   count heartbeat ticks through a seam.
+- **Resolution:** `0024c3b`. Both proposed fixes are in the test.
+  - It counts `utimes` calls through the new `deps.utimes` seam, and first checks that the
+    heartbeat does run.
+  - After `release()`, it writes the released handle's **own** lock back with a 10 s old mtime,
+    waits 250 ms (8 heartbeats of 30 ms), and asserts that the mtime and the call count are
+    unchanged.
+  - Mutation check: with the heartbeat left running after release (phase guard and
+    `clearInterval` removed), the test fails.
 
 ### QA-1.4-11 — minor — The multi-process tests never exercise concurrent reaping
 
@@ -296,6 +474,14 @@ The slot-file unlink retries EBUSY/EPERM and never treats a persistent failure a
      code 0.
   2. Run the same test with a leftover `.reap` aged more than `reapStaleMs`.
   3. In the crash test, start the waiter first and kill the holder while the waiter is in backoff.
+- **Resolution:** `d2bdeef` (1, 2) and `25a7d4f` (3).
+  1. A dead-PID lock is planted, and 6 `cycle` children start behind a barrier → 6/6 exit 0,
+     `maxOverlap ≤ 1`, and no claim file is left.
+  2. The same, plus a crashed reaper's claim for the planted token (dead PID, 11 s old) and the
+     legacy `slot-0.lock.reap` and `.reap.dead-0` files, which the new protocol ignores → the claim
+     chain clears the dead claim, with the same assertions.
+  3. The crash test starts its waiter first, with production backoff, and kills the holder 700 ms
+     later, during backoff → the slot is acquired < 3 s after the kill.
 
 ### QA-1.4-12 — minor — Deviation (2), the unwritable dir: the justification is inaccurate and the default-dir path is untested
 
@@ -311,6 +497,17 @@ The slot-file unlink retries EBUSY/EPERM and never treats a persistent failure a
   skipped as root), points `process.env.TEMP`/`TMPDIR` at it, and calls `acquireSlot` without
   `deps.dir`. It must assert the fallback and exactly one log line, and restore the ACL and env in
   `finally`.
+- **Resolution:** `4d627ed`. The new test runs on Windows with `icacls <dir> /deny
+  <USERDOMAIN\USERNAME>:(OI)(CI)(W)` (non-elevated) and on POSIX with `chmod 0o555` (skipped as
+  root).
+  - It sets `TEMP`/`TMP`/`TMPDIR` and asserts that `os.tmpdir()` is the read-only dir.
+  - It calls `acquireSlot` without `deps.dir`, so `defaultSlotDir()` is exercised.
+  - It asserts the fallback semantics, exactly one "in-process" log line, and that nothing was
+    created.
+  - It restores the env and the ACL (`icacls /remove:d`, `chmod 0755`) in `finally`.
+
+  The notes above now describe this. The ENOTDIR case is kept as an extra. After the runs, no
+  `omr-slot-*` dir was left, so the ACL was restored and the dir removed.
 
 ### QA-1.4-13 — minor — Flakiness risks on a loaded 2-worker CI runner
 
@@ -326,6 +523,13 @@ The slot-file unlink retries EBUSY/EPERM and never treats a persistent failure a
     the config. Hold ≥ 500 ms in the `max=2` case.
   - For the long hold, use a heartbeat of 100 ms, `staleMs` 2 000 and a wait of 6 000 ms (still 3×).
   - Make `deadPid()` loop until `!isPidAlive(pid)`.
+- **Resolution:** `25a7d4f`.
+  - Children print READY and wait for a `go` file, which the test writes once all are ready.
+  - `max=2` holds 500 ms (max=1 holds 150 ms).
+  - The long hold uses heartbeat 100 ms, `staleMs` 2 000 and a 6 000 ms wait.
+  - `deadPid()` is async and loops until `!isPidAlive(pid)`.
+  - Later tests that race a heartbeat use an observer heartbeat 5× the holder's (`d2bdeef`), so
+    the holder would need a ~1 s stall to be misjudged.
 
 ### QA-1.4-14 — nit — Deviation (1), corrupt/empty lock stale only after 2 s: accepted
 
@@ -336,6 +540,14 @@ later `writeFile` goes to an orphaned (POSIX) or delete-pending handle, which gi
 Optional fix, which also removes the need for the grace: publish atomically. Write
 `slot-<i>.lock.<uuid>.tmp` in full, then `fs.link(tmp, slot)` (EEXIST means the slot is taken), then
 unlink the tmp file. An empty or corrupt slot file can then only come from external damage.
+- **Resolution:** `d2bdeef`. The deviation is kept (`open(wx)` is the pre-flighted primitive; hard
+  links are not pre-flighted and fail on FAT and some shares). The residual risk is closed another
+  way: `createOwned` re-reads the lock after writing it and holds the slot only if its own token is
+  there, so a creator reaped while empty learns that it lost.
+
+  Reaping a corrupt file now also needs the observed-unchanged rule, keyed on (mtime, size), for
+  `corruptGraceMs`. Its claim is keyed the same way, so a file that is being written changes key
+  and cannot be reaped.
 
 ### QA-1.4-15 — nit — Deviation (3), no busy-wait at 1/10 timing: accepted
 
@@ -344,12 +556,22 @@ The back-off is scale-invariant, so the wake-up count at 25→200 ms over 1 s eq
 never checked, so a regression in `SLOT_DEFAULTS` (for example `backoffMinMs: 2`) passes.
 **Fix:** assert the `SLOT_DEFAULTS` values, or run one wait with the default back-off under
 `vi.useFakeTimers()`.
+- **Resolution:** `0024c3b`. A test asserts `SLOT_DEFAULTS` ⊇ `{heartbeatMs: 5000, staleMs: 30000,
+  backoffMinMs: 250, backoffMaxMs: 2000}`.
 
 ### QA-1.4-16 — nit — The jitter goes below the plan's 250 ms floor
 
 `slot.ts:462`: `base × (0.5 + random × 0.5)`, so the first wait is 125–250 ms. Plan 1.4.1.d says
 "250 ms → 2 s". **Fix:** use `min(backoffMaxMs, base × (1 + random × 0.5))`, or full jitter in
 `[backoffMinMs, base]`.
+- **Resolution:** `0024c3b`. The new exported `nextBackoffMs(k, r, min, max)` returns
+  `min(max, base × (1 + r/2))`. The wait loop cuts only the final wait, to the deadline.
+
+  Tests:
+  - Every attempt 0–11 × r ∈ {0, …, 0.999999} stays in [250, 2000]. Exact values: 250, 375, 500
+    and 2000.
+  - With `random = 0`, the loop's first wake-up is ≥ `backoffMinMs`.
+  - The old formula fails this test (mutation check).
 
 ### QA-1.4-17 — nit — In-flight heartbeat tick after release; the exit hook bypasses the reap lock
 
@@ -360,6 +582,18 @@ never checked, so a regression in `SLOT_DEFAULTS` (for example `backoffMinMs: 2`
   that is already stale while alive (QA-1.4-1).
 - **Fix:** add a `released` flag that the tick checks before `utimes`. Keep the exit-time delete
   token-checked, as it is now.
+- **Resolution:** `d2bdeef`.
+  - The handle has a phase (`held` / `releasing` / `deferred` / `done`). `release()` sets it before
+    doing anything else, awaits any tick in flight, and the tick re-checks the phase immediately
+    before each `utimes` attempt.
+  - `releaseAllSync` follows the claim protocol. It creates the claim synchronously, checks the
+    token, unlinks the lock and drops the claim. If our own async release holds the claim, it
+    proceeds under that claim. If another process holds it, it leaves the file to that process.
+
+  Tests:
+  - A tick blocked inside its read while `release()` starts → 0 `utimes` calls afterwards.
+  - The exit hook deletes its own lock, and leaves one whose token a live reaper has claimed, with
+    no exit failures.
 
 ### QA-1.4-18 — deferred by plan (Phase 2.1 / 2.2) — Nested acquisition in one process
 
