@@ -300,6 +300,13 @@
 //     ancestor of runnerCwd and the ancestor. Detection runs it with no arguments (det.xdist and
 //     friends) and with the path arguments (python_files). With tests/a/pytest.ini as the only
 //     config, `pytest tests/a tests/b` reads it and a plain `pytest` does not.
+//     QA-1.3-48: pytest picks its config before it loads plugins, so the path arguments of the
+//     lookup are its free arguments then: the positional paths plus the separate values of the
+//     plugin options in the table (PY_PLUGIN_VALUE_OPTIONS: --cov, --cov-config, --html, -n,
+//     --timeout, --dist, ...) that exist, "::" stripped, PYTEST_ADDOPTS first (9.1.1:
+//     parse_known_intermixed_args; 7.0-8.4: file_or_dir + unknown args). `pytest --cov src
+//     tests/unit` looks from the common ancestor of src and tests/unit; `--cov=src` is one option
+//     token and does not count.
 //     Spec pinning (QA-1.3-43). The spec passes its inputs as file arguments, so pytest alone
 //     would look from the inputs' common ancestor, where a nearer pytest.ini or a package's
 //     pyproject.toml wins over the user's config and its addopts (-m, -k, --deselect) and
@@ -316,8 +323,17 @@
 //         the user's run on every release. Otherwise (the releases read different files, a
 //         table-less pyproject.toml, or none) nothing is pinned, and the spawn's lookup from the
 //         inputs' ancestor must give every release the same inifile as the user's run (none
-//         included), else S6 unsupported-argument. That covers pytest.toml, which only pytest 9
-//         reads.
+//         included). That covers pytest.toml, which only pytest 9 reads. The spawn's free
+//         arguments include the existing values of the plugin options it keeps and of
+//         PYTEST_ADDOPTS (QA-1.3-48).
+//     QA-1.3-49, where the pins above fail (the releases pick different rootdirs, a rootdir with
+//     "$"/"%", or a different inifile from the inputs' ancestor): no pin at all when the spawn's
+//     own determine_setup (its free arguments, nothing pinned) gives every release the user's
+//     inifile and rootdir (`pytest packages/a` with a table-less packages/a/pyproject.toml);
+//     else "-c <pyproject.toml>" plus the --rootdir when the user's pytest >= 8.1 takes that
+//     table-less file as its inifile, the older releases read none, and no conftest.py lies
+//     above the rootdir (pytest < 8.1 cuts no conftests without an inifile, and cuts at the -c
+//     file's directory); else S6 unsupported-argument.
 //     pytest expands variables in --rootdir, so a rootdir with "$" (or "%" on win32) is S6.
 //     A false xdist match can only add "-n N" without xdist: pytest exit 4, readResult
 //     complete=false, unverifiable, never a false pass. Residual (P): a conftest.py or plugin
@@ -1253,6 +1269,26 @@ export interface PytestFacts {
   readonly pythonFiles?: readonly string[];
   /** The last `--rootdir` value on the command line. A non-empty one turns off pytest's per-argument config fallback (D.4, QA-1.3-40). */
   readonly rootdir?: string;
+  /**
+   * QA-1.3-48: every argument pytest's config lookup takes as a path argument, in order, when the
+   * command gives a plugin option a separate value (`--cov src`). Undefined: the path arguments
+   * (pathScopes) alone.
+   */
+  readonly freeArgs?: readonly PytestFreeArg[];
+}
+
+/**
+ * QA-1.3-48: pytest picks its config (determine_setup) before it loads plugins from entry points,
+ * so a plugin option's separate value (`--cov src`, `--cov-config .coveragerc`, `-n 4`) is a free
+ * argument there, and an existing one moves the arguments' common ancestor like a path argument.
+ */
+export interface PytestFreeArg {
+  /** Absolute, with a `::` node-id part removed. */
+  readonly path: string;
+  /** The value of a plugin option: it counts only when the path exists (get_dirs_from_args). */
+  readonly plugin: boolean;
+  /** The option stays in the spec's argv (--timeout, --dist), so the spawn's lookup sees it too. */
+  readonly kept: boolean;
 }
 
 /** What resolveEntry needs. DetectedRunner satisfies it. */
@@ -2012,6 +2048,16 @@ function parseCap(kind: ToolKind, raw: string): UserWorkerCap | undefined {
   return undefined;
 }
 
+/**
+ * QA-1.3-48: the PYTEST_ARGS options with a value that come from plugins (pytest-cov, pytest-html,
+ * pytest-json-report, xdist, pytest-timeout). pytest does not know them yet when it picks its
+ * config, so their separate values are free arguments there. Every other option with a value in
+ * PYTEST_ARGS is builtin (-k, -m, -c, --rootdir, -o, -p, --junitxml, --confcutdir, ...).
+ */
+const PY_PLUGIN_VALUE_OPTIONS: ReadonlySet<string> = new Set(
+  "--cov --cov-report --cov-config --cov-fail-under --cov-context --html --json-report-file -n --numprocesses --maxprocesses --timeout --dist".split(" "),
+);
+
 const PY_SCOPE_BAD_RE = /::|[*?[\]{}]/;
 const ESLINT_GLOB_RE = /[*?[\]{}]/;
 
@@ -2032,6 +2078,8 @@ interface ArgResult {
   readonly overridePythonFiles: string[];
   /** pytest: the last `--rootdir` value (QA-1.3-40: it turns off the per-argument config fallback). */
   readonly rootdir: string | undefined;
+  /** pytest: the free arguments of pytest's config lookup, in order (QA-1.3-48). */
+  readonly early: PytestFreeArg[];
   readonly notes: string[];
 }
 
@@ -2076,6 +2124,7 @@ async function processArgs(
   let overrideAddopts: string | undefined;
   const overridePythonFiles: string[] = [];
   let rootdir: string | undefined;
+  const early: PytestFreeArg[] = [];
   let firstPositional = true;
   const badArg = (t: string) => s6("unsupported-argument", `unsupported ${kind} argument "${t}" in ${where}`);
 
@@ -2127,6 +2176,12 @@ async function processArgs(
         if (value.startsWith("python_files=")) overridePythonFiles.push(value.slice("python_files=".length));
       }
       if (kind === "pytest" && m.name === "--rootdir" && value !== undefined) rootdir = value;
+      if (kind === "pytest" && PY_PLUGIN_VALUE_OPTIONS.has(m.name)) {
+        // QA-1.3-48: get_dirs_from_args skips option-like tokens and drops a node id's "::" part.
+        for (const v of values) {
+          if (!v.startsWith("-")) early.push({ path: ctx.P.resolve(runnerCwd, v.split("::")[0]), plugin: true, kept: m.entry.action === "keep" });
+        }
+      }
       switch (m.entry.action) {
         case "drop":
           break;
@@ -2189,6 +2244,7 @@ async function processArgs(
       const abs = ctx.P.resolve(runnerCwd, t);
       if (PY_SCOPE_BAD_RE.test(t) || !isInside(ctx, gitRoot, abs)) return badArg(t);
       pathScopes.push(abs);
+      if (kind === "pytest") early.push({ path: abs, plugin: false, kept: true });
     }
   }
   if (filters.length > 0) notes.add(`${kind} filters dropped: ${filters.join(", ")}`);
@@ -2197,7 +2253,7 @@ async function processArgs(
     userWorkers = parseCap(kind, capRaw);
     if (!userWorkers) notes.add(`invalid worker cap "${capRaw}" ignored`);
   }
-  return { kept, capRaw, userWorkers, pathScopes, noXdist, xdistArg, cov, configs, overrideAddopts, overridePythonFiles, rootdir, notes: [...notes] };
+  return { kept, capRaw, userWorkers, pathScopes, noXdist, xdistArg, cov, configs, overrideAddopts, overridePythonFiles, rootdir, early, notes: [...notes] };
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -2724,6 +2780,8 @@ interface PytestRun {
   /** A non-empty --rootdir (the command or PYTEST_ADDOPTS), which the spawn also sees. */
   readonly rootdirGiven: boolean;
   readonly ignore: ReadonlySet<string>;
+  /** QA-1.3-48: the existing plugin option values in the PYTEST_ADDOPTS the spawn sees: free arguments of its lookup too. */
+  readonly envArgs: readonly string[];
 }
 
 /**
@@ -2770,7 +2828,10 @@ async function pytestEvidence(
   if (facts.pythonFiles !== undefined || (seenEnv?.overridePythonFiles.length ?? 0) > 0) ignore.add("python_files");
   // pytest's `ns.rootdir or None`: an empty --rootdir is none (QA-1.3-40).
   const rootdirGiven = rootdir !== undefined && rootdir !== "";
-  const setups = await pytestSetups(ctx, fs, configFile, args, cwd, rootdirGiven, notes, ignore);
+  // QA-1.3-48: PYTEST_ADDOPTS comes first on the line pytest parses, and the spawn sees it as well.
+  const envArgs: string[] = [];
+  for (const x of seenEnv?.early ?? []) if (await existsCached(ctx, fs, x.path)) envArgs.push(await realOf(ctx, fs, x.path));
+  const setups = await pytestSetups(ctx, fs, configFile, [...envArgs, ...args], cwd, rootdirGiven, notes, ignore);
   if (isS6(setups)) return setups;
   const found = { configs: [] as PytestConfig[], everyLine: setups.every((s) => s.config !== undefined) };
   for (const { config: c } of setups) {
@@ -2829,7 +2890,7 @@ async function pytestEvidence(
     pythonFiles: [...pythonFiles],
     ...(configFile !== undefined ? { configFile } : {}),
   };
-  return { evidence, setups, explicit: configFile !== undefined, rootdirGiven, ignore };
+  return { evidence, setups, explicit: configFile !== undefined, rootdirGiven, ignore, envArgs };
 }
 
 /**
@@ -2844,33 +2905,105 @@ async function pytestEvidence(
  *   - -c <file>: added when every release reads the same accepted config (the rootdir, the ini
  *     values and the conftest cutoff, inifile's directory or rootdir, then match). Otherwise, when
  *     the releases differ or read no config, that locate_config must give every release the
- *     inifile the user's run has (none included), else S6.
+ *     inifile the user's run has (none included).
+ *   - QA-1.3-49, before any S6: (a) nothing at all, when the spawn's own determine_setup (its free
+ *     arguments `extra` and F in `cwd`, nothing pinned) gives every release the user's inifile and
+ *     rootdir; (b) -c <a table-less pyproject.toml> with the --rootdir, when that file is the
+ *     inifile of pytest >= 8.1 in the user's run and the older releases read none (bareProject).
+ * The spawn's free arguments include `extra`, the existing values of the plugin options it keeps
+ * and of its PYTEST_ADDOPTS (QA-1.3-48).
  * pytest applies os.path.expandvars to --rootdir, so a rootdir with "$" (or "%" on win32) is S6.
  */
-async function pytestPin(ctx: Ctx, fs: PlannerFs, run: PytestRun, F: readonly string[], notes: string[]): Promise<string[] | Unverifiable> {
+async function pytestPin(
+  ctx: Ctx,
+  fs: PlannerFs,
+  run: PytestRun,
+  F: readonly string[],
+  cwd: string,
+  extra: readonly string[],
+  notes: string[],
+): Promise<string[] | Unverifiable> {
   if (run.explicit) return [];
+  const same = (a: string | undefined, b: string | undefined) => ctx.key(a ?? "") === ctx.key(b ?? "");
+  // QA-1.3-49 (a): the spawn's own lookup, tried only where a pin cannot work.
+  const unpinned = async (why: Unverifiable): Promise<string[] | Unverifiable> => {
+    const own = await pytestSetups(ctx, fs, undefined, [...extra, ...F], cwd, run.rootdirGiven, [], run.ignore);
+    if (isS6(own)) return why;
+    return own.every((s, i) => same(s.inipath, run.setups[i].inipath) && same(s.rootdir, run.setups[i].rootdir)) ? [] : why;
+  };
   const pin: string[] = [];
+  let root: string | undefined;
   if (!run.rootdirGiven) {
     const roots = [...new Map(run.setups.map((s) => [ctx.key(s.rootdir ?? ""), s.rootdir ?? ""])).values()];
-    if (roots.length > 1) return s6("unsupported-argument", `unsupported pytest rootdir: the pytest releases pick ${roots.join(" or ")}`);
-    if (/\$/.test(roots[0]) || (ctx.win && roots[0].includes("%"))) {
-      return s6("unsupported-argument", `unsupported pytest rootdir: pytest expands variables in ${roots[0]}`);
+    if (roots.length > 1) return unpinned(s6("unsupported-argument", `unsupported pytest rootdir: the pytest releases pick ${roots.join(" or ")}`));
+    root = roots[0];
+    if (/\$/.test(root) || (ctx.win && root.includes("%"))) {
+      return unpinned(s6("unsupported-argument", `unsupported pytest rootdir: pytest expands variables in ${root}`));
     }
-    pin.push(`--rootdir=${roots[0]}`);
+    pin.push(`--rootdir=${root}`);
   }
   const inis = new Set(run.setups.map((s) => (s.config ? ctx.key(s.config.path) : "")));
   const first = run.setups[0].config;
   if (inis.size === 1 && first) return ["-c", first.path, ...pin];
-  const at = commonDir(ctx, F);
+  const at = extra.length > 0 ? commonPath(ctx, [commonDir(ctx, F), ...extra]) : commonDir(ctx, F);
   for (const [i, v] of PYTEST_SETUPS.entries()) {
     const got = await locateConfig(ctx, fs, v, [at], undefined, notes, run.ignore);
     if (isS6(got)) return got;
     const want = run.setups[i].inipath;
-    if (ctx.key(got.inipath ?? "") !== ctx.key(want ?? "")) {
-      return s6("unsupported-argument", `unsupported pytest config for the scoped inputs: ${got.inipath ?? "none"} instead of ${want ?? "none"}`);
+    if (!same(got.inipath, want)) {
+      const why = s6("unsupported-argument", `unsupported pytest config for the scoped inputs: ${got.inipath ?? "none"} instead of ${want ?? "none"}`);
+      const own = await unpinned(why);
+      if (!isS6(own)) return own;
+      const bare = await bareProject(ctx, fs, run.setups, root);
+      return bare === undefined ? why : ["-c", bare, ...pin];
     }
   }
   return pin;
+}
+
+/**
+ * QA-1.3-49 (b): the table-less pyproject.toml to pin with -c, or undefined. It must be the inifile
+ * of every release that has one (pytest >= 8.1 takes it with no ini values, and its directory as
+ * the rootdir, which every release agrees on: `root`), and no release may read an accepted config.
+ * With -c, every release reads no ini values from it, as the user's run does, and cuts conftests at
+ * its directory: pytest >= 8.1 does so in the user's run too (inifile's directory), but pytest < 8.1
+ * with no inifile cuts none, so a conftest.py above the rootdir makes it undefined.
+ */
+async function bareProject(ctx: Ctx, fs: PlannerFs, setups: readonly PytestSetup[], root: string | undefined): Promise<string | undefined> {
+  const p = setups.find((s) => s.inipath !== undefined)?.inipath;
+  if (root === undefined || p === undefined) return undefined;
+  if (!setups.every((s) => s.config === undefined && (s.inipath === undefined || ctx.key(s.inipath) === ctx.key(p)))) return undefined;
+  for (let d = root; ctx.P.dirname(d) !== d; ) {
+    d = ctx.P.dirname(d);
+    if (await existsCached(ctx, fs, ctx.P.join(d, "conftest.py"))) return undefined;
+  }
+  return p;
+}
+
+/**
+ * QA-1.3-48: the free arguments of the user's run for its config lookup (`user`: the path
+ * arguments and the existing plugin option values, in order) and those the spawn keeps (`kept`).
+ * `move` maps a detection-time path into the run's tree (a rerun). Without freeArgs: pathScopes.
+ */
+async function pytestLookupArgs(
+  ctx: Ctx,
+  fs: PlannerFs,
+  facts: PytestFacts | undefined,
+  pathScopes: readonly string[],
+  move: (p: string) => string,
+): Promise<{ user: string[]; kept: string[] }> {
+  if (!facts?.freeArgs) return { user: pathScopes.map(move), kept: [] };
+  const user: string[] = [];
+  const kept: string[] = [];
+  for (const a of facts.freeArgs) {
+    const p = move(a.path);
+    if (!a.plugin) user.push(p);
+    else if (await existsCached(ctx, fs, p)) {
+      user.push(p);
+      if (a.kept) kept.push(p);
+    }
+  }
+  return { user, kept };
 }
 
 /** The patterns of `-o python_files=<v>` values, split like pytest's shlex (QA-1.3-33). */
@@ -2914,10 +3047,11 @@ async function pytestAtInputs(
   const facts = det.pytestFacts ?? (await keptPytestFacts(ctx, fs, det, runnerCwd));
   if (isS6(facts)) return facts;
   const own: string[] = [];
-  const args = det.pathScopes.map((s) => ctx.P.resolve(runnerCwd, ctx.P.relative(det.runnerCwd, s)));
-  const run = await pytestEvidence(ctx, fs, facts, det.env, args, runnerCwd, det.gitRoot, own);
+  const move = (s: string) => ctx.P.resolve(runnerCwd, ctx.P.relative(det.runnerCwd, s));
+  const args = await pytestLookupArgs(ctx, fs, det.pytestFacts, det.pathScopes, move);
+  const run = await pytestEvidence(ctx, fs, facts, det.env, args.user, runnerCwd, det.gitRoot, own);
   if (isS6(run)) return run;
-  const pin = await pytestPin(ctx, fs, run, F, own);
+  const pin = await pytestPin(ctx, fs, run, F, runnerCwd, [...run.envArgs, ...args.kept], own);
   if (isS6(pin)) return pin;
   for (const n of own) if (!notes.includes(n)) notes.push(n);
   const ev = { ...run.evidence, pin };
@@ -3147,6 +3281,7 @@ async function finishDetection<K extends ToolKind>(
     const configFile = configFiles.at(-1);
     const pf = pythonFilesOverride(a.overridePythonFiles, where);
     if (isS6(pf)) return pf;
+    const freeArgs = a.early.some((x) => x.plugin) ? await Promise.all(a.early.map(async (x) => ({ ...x, path: await realOf(ctx, fs, x.path) }))) : undefined;
     pytestFacts = {
       xdist: a.xdistArg,
       noXdist: a.noXdist,
@@ -3155,6 +3290,7 @@ async function finishDetection<K extends ToolKind>(
       ...(a.overrideAddopts !== undefined ? { overrideAddopts: a.overrideAddopts } : {}),
       ...(a.overridePythonFiles.length > 0 ? { pythonFiles: pf } : {}),
       ...(a.rootdir !== undefined ? { rootdir: a.rootdir } : {}),
+      ...(freeArgs ? { freeArgs } : {}),
     };
     // Detection starts where pytest would with no file arguments.
     const run = await pytestEvidence(ctx, fs, pytestFacts, env, [], runnerCwd, gitRoot, allNotes);
@@ -3168,8 +3304,9 @@ async function finishDetection<K extends ToolKind>(
     // ancestor, so its python_files count as well, and (QA-1.3-40) the per-argument fallback
     // looks from each path argument in the user's order.
     const patterns = new Set(ev.pythonFiles);
-    if (pathScopes.length > 0) {
-      const scoped = await pytestEvidence(ctx, fs, pytestFacts, env, pathScopes, runnerCwd, gitRoot, allNotes);
+    const lookupArgs = (await pytestLookupArgs(ctx, fs, pytestFacts, pathScopes, (p) => p)).user;
+    if (lookupArgs.length > 0) {
+      const scoped = await pytestEvidence(ctx, fs, pytestFacts, env, lookupArgs, runnerCwd, gitRoot, allNotes);
       if (isS6(scoped)) return scoped;
       for (const p of scoped.evidence.pythonFiles) patterns.add(p);
     }

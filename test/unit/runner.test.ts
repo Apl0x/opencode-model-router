@@ -3257,13 +3257,19 @@ describe("QA-1.3-40: pytest's per-argument config fallback (determine_setup)", (
     expect([pinOf(empty), xdistArgs(empty)]).toEqual([["-c", "/r/tests/a/pytest.ini", "--rootdir=/r/tests/a"], ["-n", "2"]]);
   });
 
-  it("a table-less pyproject.toml stops pytest >= 8.1 only: when the releases then disagree it is S6", async () => {
+  it("a table-less pyproject.toml stops pytest >= 8.1 only: when the releases then disagree, the spawn's own lookup must agree (QA-1.3-49)", async () => {
     const toml = { "/r/tests/a/pytest.toml": '[pytest]\naddopts = ["-n", "3"]\n', "/r/tests/a/test_w.py": "", "/r/tests/b/test_b.py": "" };
     // pytest 9 falls back to tests/a/pytest.toml, which pytest 8 and 7 do not know: two rootdirs.
-    expectS6(await planPy(toml, TWO, { command: AB }), "unsupported-argument", "unsupported pytest rootdir: the pytest releases pick /r/tests/a or /r");
+    // The spawn's own arguments fall back the same way on every release, so nothing is pinned.
+    const own = spec(await planPy(toml, TWO, { command: AB }));
+    expect([pinOf(own), xdistArgs(own)]).toEqual([[], ["-n", "2"]]);
+    // With only tests/b as input, the spawn's pytest 9 would not reach tests/a/pytest.toml.
+    expectS6(await planPy(toml, ["tests/b/test_b.py"], { command: AB }), "unsupported-argument", "unsupported pytest rootdir: the pytest releases pick /r/tests/a or /r");
     const s = spec(await planPy({ ...toml, "/r/pyproject.toml": "[project]\n" }, TWO, { command: AB }));
     expect([pinOf(s), xdistArgs(s)]).toEqual([["--rootdir=/r"], []]);
-    expectS6(await planPy({ ...BASE, "/r/pyproject.toml": "[project]\n" }, TWO, { command: AB }), "unsupported-argument");
+    const base = { ...BASE, "/r/pyproject.toml": "[project]\n" };
+    expect(pinOf(spec(await planPy(base, TWO, { command: AB })))).toEqual([]);
+    expectS6(await planPy(base, ["tests/b/test_b.py"], { command: AB }), "unsupported-argument");
   });
 
   it("a bad config found by the fallback is S6", async () => {
@@ -3311,10 +3317,14 @@ describe("QA-1.3-43: the spec reads the config the user's run reads", () => {
     expectS6(await planPy({ "/r/tests/pyproject.toml": "[project]\n", "/r/tests/test_a.py": "" }, ["tests/test_a.py"]), "unsupported-argument", "unsupported pytest config for the scoped inputs: /r/tests/pyproject.toml instead of none");
   });
 
-  it("a table-less pyproject.toml the user's run also takes is not pinned with -c; the inputs' lookup must agree", async () => {
+  it("a table-less pyproject.toml the user's run also takes is not pinned with -c while the inputs' lookup agrees, else it is (QA-1.3-49)", async () => {
     const files = { "/r/pyproject.toml": "[project]\n", "/r/tests/test_a.py": "" };
     expect(pinOf(spec(await planPy(files, ["tests/test_a.py"])))).toEqual(["--rootdir=/r"]);
-    expectS6(await planPy({ ...files, "/r/tests/pyproject.toml": "[project]\n" }, ["tests/test_a.py"]), "unsupported-argument", "unsupported pytest config for the scoped inputs: /r/tests/pyproject.toml instead of /r/pyproject.toml");
+    const nested = { ...files, "/r/tests/pyproject.toml": "[project]\n" };
+    expect(pinOf(spec(await planPy(nested, ["tests/test_a.py"])))).toEqual(["-c", "/r/pyproject.toml", "--rootdir=/r"]);
+    // pytest < 8.1 reads no inifile there and so cuts no conftest.py; the -c pin would cut one above the rootdir.
+    const why = "unsupported pytest config for the scoped inputs: /r/tests/pyproject.toml instead of /r/pyproject.toml";
+    expectS6(await planPy({ ...nested, "/conftest.py": "" }, ["tests/test_a.py"]), "unsupported-argument", why);
   });
 
   it("pytest.toml (pytest 9 only): no single file to pin, the inputs' lookup agrees release by release", async () => {
@@ -3340,11 +3350,12 @@ describe("QA-1.3-43: the spec reads the config the user's run reads", () => {
     expectS6(await planRerun({ ...plain, keptArgs: ["--bogus", "x"] }, ["/r/tests/test_a.py"], "/r", { maxWorkers: 2 }, { fs: memFs(pyRepo(files)), host: { ...POSIX_HOST, pathEnv: "/usr/bin" } }), "ambiguous-option");
   });
 
-  it("a rootdir pytest would expand variables in is S6", async () => {
+  it("a rootdir pytest would expand variables in is never pinned: S6 unless the spawn's own lookup agrees (QA-1.3-49)", async () => {
     const files = { "/r$x/.git": "", "/usr/bin/pytest": "", "/r$x/tests/test_a.py": "" };
-    const r = await planScopedRun(input({ command: "pytest", cwd: "/r$x", files, changedFiles: changed("tests/test_a.py") }));
-    expectS6(r, "unsupported-argument", "unsupported pytest rootdir: pytest expands variables in /r$x");
-    const W = { "C:\\r%x%\\.git": "", "C:\\bin\\pytest.exe": "", "C:\\r%x%\\tests\\test_a.py": "" };
+    const plan = (f: Record<string, string>) => planScopedRun(input({ command: "pytest", cwd: "/r$x", files: f, changedFiles: changed("tests/test_a.py") }));
+    expect(pinOf(spec(await plan(files)))).toEqual([]);
+    expectS6(await plan({ ...files, "/r$x/tests/pyproject.toml": "[project]\n" }), "unsupported-argument", "unsupported pytest rootdir: pytest expands variables in /r$x");
+    const W = { "C:\\r%x%\\.git": "", "C:\\bin\\pytest.exe": "", "C:\\r%x%\\tests\\test_a.py": "", "C:\\r%x%\\tests\\pyproject.toml": "[project]\n" };
     const w = await planScopedRun(input({ win: true, command: "pytest", cwd: "C:\\r%x%", files: W, host: { ...WIN_HOST, pathEnv: "C:\\bin" }, changedFiles: changed("tests\\test_a.py") }));
     expectS6(w, "unsupported-argument", "unsupported pytest rootdir: pytest expands variables in C:\\r%x%");
   });
@@ -3456,5 +3467,114 @@ describe("QA-1.3-45: the jest --rootDir argument and scalar call values", () => 
     expect(spec(await planJest("jest", "module.exports = { globalSetup: `./src/${d}/bootstrap.js` };")).inputs).toEqual([`/r/${BOOT}`]);
     expect(spec(await planJest("jest", "module.exports = { globalSetup: require('x\n'), b: './src/testing/bootstrap.js' };")).inputs).toEqual([`/r/${BOOT}`]);
     expect(spec(await planJest("jest", "module.exports = { globalSetup: 'unterminated")).inputs).toEqual([`/r/${BOOT}`]);
+  });
+});
+
+describe("QA-1.3-48: plugin option values are path arguments of pytest's config lookup", () => {
+  const host = (pytestAddopts = ""): Partial<RunnerHost> => ({ ...POSIX_HOST, pathEnv: "/usr/bin", pytestAddopts });
+  const planPy = (files: Record<string, string>, command: string, over: Partial<PlanScopedRunInput> = {}) =>
+    planScopedRun(input({ command, files: pyRepo(files), changedFiles: changed("tests/unit/test_s.py"), ...over }));
+  const pinOf = (s: ScopedSpec) => s.args.slice(s.args.indexOf("--maxfail=0") + 1, s.args.indexOf("--"));
+  // The QA layout: root pytest.ini, tests/unit/pytest.ini with -m "not slow", .coveragerc and src/.
+  const FILES = {
+    "/r/pytest.ini": "[pytest]\naddopts = -ra\n",
+    "/r/tests/unit/pytest.ini": '[pytest]\naddopts = -m "not slow"\n',
+    "/r/.coveragerc": "[run]\n",
+    "/r/src": "",
+    "/r/tests/unit/test_s.py": "",
+  };
+  const ROOT = ["-c", "/r/pytest.ini", "--rootdir=/r"];
+  const UNIT = ["-c", "/r/tests/unit/pytest.ini", "--rootdir=/r/tests/unit"];
+
+  it.each([
+    ["pytest --cov src tests/unit", ROOT],
+    ["pytest --cov=src --cov-config .coveragerc tests/unit", ROOT],
+    ["pytest tests/unit --cov-report html --html src/r.html --cov src", ROOT],
+    ["pytest --cov=src --cov-config=.coveragerc tests/unit", UNIT],
+    ["pytest --cov missing tests/unit", UNIT],
+    ["pytest --timeout -1 tests/unit", UNIT],
+  ])("%s", async (command, pin) => {
+    expect(pinOf(spec(await planPy(FILES, command)))).toEqual(pin);
+  });
+
+  it("the free arguments are kept in order, with a node id's :: part removed", async () => {
+    const d = await detect("pytest --cov src::x tests/unit --timeout .coveragerc", pyRepo(FILES));
+    expect(d.pytestFacts?.freeArgs).toEqual([
+      { path: "/r/src", plugin: true, kept: false },
+      { path: "/r/tests/unit", plugin: false, kept: true },
+      { path: "/r/.coveragerc", plugin: true, kept: true },
+    ]);
+    expect(d.pathScopes).toEqual(["/r/tests/unit"]);
+    expect((await detect("pytest tests/unit --timeout=5", pyRepo(FILES))).pytestFacts?.freeArgs).toBeUndefined();
+  });
+
+  it("PYTEST_ADDOPTS values count, before the command's; planStaticScoping and planRerun agree", async () => {
+    expect(pinOf(spec(await planPy(FILES, "pytest tests/unit", { host: host("--cov-config .coveragerc") })))).toEqual(ROOT);
+    expect(pinOf(spec(await planPy(FILES, "pytest tests/unit", { host: host("--cov-config=.coveragerc") })))).toEqual(UNIT);
+    // The nested config is read only when src is not a free argument: its positional is S6 then.
+    const bad = pyRepo({ ...FILES, "/r/tests/unit/pytest.ini": "[pytest]\naddopts = tests\n" });
+    const st = (command: string) => {
+      const { search: _s, ...rest } = input({ command, files: bad, changedFiles: changed("tests/unit/test_s.py") });
+      return planStaticScoping(rest);
+    };
+    expect(await st("pytest --cov src tests/unit")).toMatchObject({ scopable: true });
+    expectS6(await st("pytest --cov=src tests/unit"), "unsupported-argument", 'unsupported pytest argument "tests" in addopts of /r/tests/unit/pytest.ini');
+    const det = await detect("pytest --cov src tests/unit", pyRepo(FILES));
+    const ref = Object.fromEntries(Object.entries(pyRepo(FILES)).map(([k, v]) => [k.replace(/^\/r\//, "/ref/"), v]));
+    const r = spec(await planRerun(det, ["/ref/tests/unit/test_s.py"], "/ref", { maxWorkers: 2 }, { fs: memFs(ref), host: host() }));
+    expect(pinOf(r)).toEqual(["-c", "/ref/pytest.ini", "--rootdir=/ref"]);
+    // The value is looked up in the reference tree: gone there, it does not count.
+    const { "/ref/src": _gone, ...noSrc } = ref;
+    const g = spec(await planRerun(det, ["/ref/tests/unit/test_s.py"], "/ref", { maxWorkers: 2 }, { fs: memFs(noSrc), host: host() }));
+    expect(pinOf(g)).toEqual(["-c", "/ref/tests/unit/pytest.ini", "--rootdir=/ref/tests/unit"]);
+  });
+
+  it("the spawn's lookup sees the values of the plugin options it keeps and of PYTEST_ADDOPTS", async () => {
+    // setup.py fixes the user's rootdir at /r with no inifile; from tests alone pytest >= 8.1 would take tests/pyproject.toml.
+    const files = { "/r/setup.py": "", "/r/tests/pyproject.toml": "[project]\n", "/r/lib": "", "/r/tests/test_a.py": "" };
+    const plan = (command: string, over: Partial<PlanScopedRunInput> = {}) => planScopedRun(input({ command, files: pyRepo(files), changedFiles: changed("tests/test_a.py"), ...over }));
+    expect(pinOf(spec(await plan("pytest --timeout lib tests")))).toEqual(["--rootdir=/r"]);
+    expect(pinOf(spec(await plan("pytest tests", { host: host("--cov lib") })))).toEqual(["--rootdir=/r", "--no-cov"]);
+    // --cov is dropped from the spec, so the spawn looks from tests and finds its pyproject.toml.
+    expectS6(await plan("pytest --cov lib tests"), "unsupported-argument", "unsupported pytest config for the scoped inputs: /r/tests/pyproject.toml instead of none");
+  });
+});
+
+describe("QA-1.3-49: a package pyproject.toml without a pytest table", () => {
+  const planPy = (files: Record<string, string>, command: string, paths: string[]) =>
+    planScopedRun(input({ command, files: pyRepo(files), changedFiles: changed(...paths) }));
+  const pinOf = (s: ScopedSpec) => s.args.slice(s.args.indexOf("--maxfail=0") + 1, s.args.indexOf("--"));
+  const UV = {
+    "/r/pyproject.toml": "[project]\nname = 'ws'\n\n[tool.uv.workspace]\nmembers = ['packages/*']\n",
+    "/r/packages/a/pyproject.toml": "[project]\nname = 'a'\n",
+    "/r/packages/a/tests/test_a.py": "",
+  };
+  const A = ["packages/a/tests/test_a.py"];
+  const BACKEND = { "/r/backend/pyproject.toml": "[project]\nname = 'backend'\n", "/r/backend/tests/test_a.py": "" };
+  const B = ["backend/tests/test_a.py"];
+
+  it("(i) uv workspace, `pytest`: the root pyproject.toml is pinned with -c", async () => {
+    expect(pinOf(spec(await planPy(UV, "pytest", A)))).toEqual(["-c", "/r/pyproject.toml", "--rootdir=/r"]);
+    const { search: _s, ...st } = input({ command: "pytest", files: pyRepo(UV), changedFiles: changed(...A) });
+    expect(await planStaticScoping(st)).toMatchObject({ scopable: true });
+    // A --rootdir the run gives leaves no rootdir to check the file's directory against.
+    expectS6(await planPy(UV, "pytest --rootdir=/r", A), "unsupported-argument", "unsupported pytest config for the scoped inputs: /r/packages/a/pyproject.toml instead of /r/pyproject.toml");
+  });
+
+  it("(ii) `pytest packages/a` and (iii) `pytest backend`: the spawn's own lookup matches, nothing is pinned", async () => {
+    expect(pinOf(spec(await planPy(UV, "pytest packages/a", A)))).toEqual([]);
+    expect(pinOf(spec(await planPy(BACKEND, "pytest backend", B)))).toEqual([]);
+    const det = await detect("pytest packages/a", pyRepo(UV));
+    const r = spec(await planRerun(det, ["/r/packages/a/tests/test_a.py"], "/r", { maxWorkers: 2 }, { fs: memFs(pyRepo(UV)), host: { ...POSIX_HOST, pathEnv: "/usr/bin" } }));
+    expect(pinOf(r)).toEqual([]);
+  });
+
+  it("(iv) `pytest` with only backend/pyproject.toml stays S6", async () => {
+    expectS6(await planPy(BACKEND, "pytest", B), "unsupported-argument", "unsupported pytest config for the scoped inputs: /r/backend/pyproject.toml instead of none");
+  });
+
+  it("no -c pin for a table-less pyproject.toml when a release reads an accepted config", async () => {
+    const files = { "/r/pytest.toml": "[pytest]\n", "/r/pyproject.toml": "[project]\n", "/r/tests/pytest.ini": "[pytest]\n", "/r/tests/test_a.py": "" };
+    expectS6(await planPy(files, "pytest", ["tests/test_a.py"]), "unsupported-argument", "unsupported pytest config for the scoped inputs: /r/tests/pytest.ini instead of /r/pytest.toml");
   });
 });
