@@ -293,13 +293,16 @@
 //      index lock whenever it is free, whatever GIT_OPTIONAL_LOCKS says.
 //   7b. Clean-file conversion (section 2e, QA-1.5-13), skipped when a ""
 //      "checkout-conversion" reason (core.autocrlf) is already recorded:
-//      `git ls-files --eol -z` at root and at dir (two calls, each reading
-//      every tracked file). A path in both lists, not in ref.tracked and not
-//      in the drift set of step 7, whose `w/` class differs adds
-//      "checkout-conversion" for it. The drift set is excluded because a
-//      file edited after capture differs by content, not by conversion (a
-//      normalizing diff hides exactly the conversion case, so what it does
-//      not list is clean). This is the last step, so these calls get the
+//      `git ls-files --eol -z -- ':(attr:text)' ':(attr:text=auto)'
+//      ':(attr:eol=crlf)' ':(attr:eol=lf)'` at root and at dir (QA-1.5-17:
+//      only attributed paths can convert without core.autocrlf, which the ""
+//      reason already covers). A path in both lists, not in ref.tracked and
+//      not in the drift set of step 7, whose `w/` class differs adds
+//      "checkout-conversion" for it. A path in the drift set but not in
+//      ref.tracked (edited after capture, QA-1.5-16) has unknown dispatch
+//      bytes, so it adds "checkout-conversion" when the reference's own `w/`
+//      class differs from its `i/` class (the checkout converted it). This is
+//      the last step, so these calls get the
 //      remaining budget with the caller's signal only: a budget that runs out
 //      here, or a failing call, adds "" instead of failing materialize; a
 //      caller abort returns ok:false "aborted".
@@ -509,9 +512,11 @@
 //        dead or this process released the dir (QA-1.5-5; an alive owner may
 //        still be checking out);
 //      - referenceLockReason(pid) (QA-1.5-12): every live reference carries
-//        it, so the step 3 rules apply as to an unlocked entry, except that a
-//        missing dir of an alive owner is kept (that owner may be between its
-//        fs.rm and its own unlock).
+//        it, so the step 3 rules apply as to an unlocked entry; a missing dir
+//        is collected whatever the owner's liveness (QA-1.5-15: a reused pid
+//        kept it forever). Racing an alive owner between its fs.rm and its own
+//        unlock is benign: both sides only lift our reason and remove an entry
+//        whose dir is gone, and the loser logs a warning.
 //      Such an entry is unlocked by the section 6 pipeline once its dir is
 //      gone. A dir in the in-use set (ACTIVE) is kept. ACTIVE lives on
 //      globalThis under Symbol.for("omr.reference.active"), so every copy of
