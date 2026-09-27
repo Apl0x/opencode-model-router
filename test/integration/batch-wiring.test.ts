@@ -418,6 +418,57 @@ describe("batch coordinator behind the verification wiring (2.2.3)", () => {
     expect(batched.map(verdictOf)).toEqual(alone.map(verdictOf));
   });
 
+  it("QA-2.2-20: with an exact reference, an introduced failure is rejected and a pre-existing one passes, batched as alone", async () => {
+    exactReference();
+    state.failing = { c: ["t2"], d: ["t1"] };
+    state.failingAtRef = { d: ["t1"] };
+    const { batched, alone, b, a } = await batchedAndAlone(() => ({ reference: captured() }));
+    expect(batched.map(r => [r.verdict.outcome, r.accepted])).toEqual([
+      ["pass", true],
+      ["pass", true],
+      ["fail", false],
+      ["pass", true],
+      ["pass", true],
+    ]);
+    expect(batched[2]?.verdict.reasons.join(" ")).toContain("test/c.test.ts > t2");
+    expect(batched[3]?.verdict.failures).toEqual(alone[3]?.verdict.failures);
+    expect(batched.map(verdictOf)).toEqual(alone.map(verdictOf));
+    // One shared recheck at the one reference, where alone each failing gate rechecks.
+    expect(b.materialized).toHaveLength(1);
+    expect(a.materialized).toHaveLength(2);
+  });
+
+  it("QA-2.2-20 (R2): failureRecheck off at the gate disables a captured reference, batched as alone", async () => {
+    // An exact reference: a batch that ignored the setting would recheck and reject c.
+    exactReference();
+    state.failing = { c: ["t2"] };
+    const { batched, alone, b } = await batchedAndAlone(() => ({ reference: captured() }), { failureRecheck: false });
+    expect(b.materialized).toHaveLength(0);
+    expect(batched[2]?.verdict.outcome).toBe("unverifiable");
+    expect(batched[2]?.verdict.reasons.join(" ")).toContain("failureRecheck is off");
+    expect(batched.map(verdictOf)).toEqual(alone.map(verdictOf));
+  });
+
+  it("QA-2.2-20: a config flip between two gates of one window: each keeps its own gate's failureRecheck", async () => {
+    exactReference();
+    state.failing = { c: ["t2"], d: ["t1"] };
+    let verify: Parameters<typeof config>[0] = { batchWindowMs: WINDOW_MS, failureRecheck: true };
+    const wiring = createVerificationWiring({ client: {}, directory: state.root, getConfig: () => config(verify), logger: { warn: () => {} }, batch: { maxBatchSize: 5 } });
+    void barrier(2);
+    // buildGateDeps reads the config when the gate starts, before its first await.
+    const on = gate(wiring, "c", { reference: captured() });
+    verify = { ...verify, failureRecheck: false };
+    const off = gate(wiring, "d", { reference: captured() });
+    const [rc, rd] = await Promise.all([on, off]);
+    await wiring.disposeVerification();
+    // One window: the union, then both own runs (mode B), then c's reference run only.
+    expect(state.runs).toHaveLength(1 + 2 + 1);
+    expect(state.acquires).toBe(1);
+    expect(rc.verdict.outcome).toBe("fail");
+    expect(rd.verdict.outcome).toBe("unverifiable");
+    expect(rd.verdict.reasons.join(" ")).toContain("failureRecheck is off");
+  });
+
   it("testScope full bypasses the window: the direct hook runs the command as written, once per gate", async () => {
     const { batched, alone, b, a } = await batchedAndAlone(() => ({}), { testScope: "full" });
     expect(b.runs).toHaveLength(0);
