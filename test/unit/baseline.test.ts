@@ -85,6 +85,9 @@ describe("reference-aware testsPass", () => {
     expect(r.verdict.outcome).toBe("unverifiable");
     expect(r.verdict.caveats?.join()).toContain("observed-test");
     expect(r.verdict.caveats?.join()).toContain("no reference");
+    const output = buildAcceptedSuffix(r.verdict.method, r.verdict.caveats, r.verdict.notes);
+    expect(output).toContain("Verification caveats — NOT verified");
+    expect(output).toContain("observed-test");
   });
   it("passes a green scoped run without a recheck, and never runs tests without a pipeline (G5)", async () => {
     const seen: TestsPassRequest[] = [];
@@ -241,6 +244,36 @@ describe("dispatch reference capture in the changed-file store", () => {
     expect(delta.changedFiles).toEqual([]);
     const prompt = buildGradingPrompt({ criteria: [], artefact: { ...artefact, ...delta }, producerTier: "medium", producerSessionID: "child" }).prompt;
     expect(prompt).toContain("snapshot unavailable"); expect(prompt).not.toContain(old);
+  });
+  it("read-only tools neither record a change nor contaminate a capture in flight", async () => {
+    const h = harness(); const held = deferred<DispatchReference | undefined>(); let signal: AbortSignal | undefined;
+    h.capture.mockImplementationOnce(async (_c, s) => { signal = s; return held.promise; });
+    const settled = h.start("child");
+    await vi.waitFor(() => expect(signal).toBeDefined());
+    h.store.record("child", "read", { filePath: "a.ts" });
+    h.store.observeEdit("grep", cwd);
+    expect(signal?.aborted).toBe(false);
+    expect(h.store.get("child")).toEqual([]);
+    expect(h.store.get("never-seen")).toEqual([]);
+    held.resolve(REF);
+    await settled;
+    expect(await h.get("child")).toEqual(captured);
+  });
+  it("a snapshot that rejects leaves the change baseline unavailable but still captures", async () => {
+    const h = harness();
+    h.deps.snapshot = async () => { throw new Error("git broke"); };
+    await h.start("child");
+    expect(h.store.delta("child", "child", tree()).changeBaseline).toBe("unavailable");
+    expect(await h.get("child")).toEqual(captured);
+  });
+  it("an already-spent gate signal returns gateBudget without waiting for the capture", async () => {
+    const h = harness(); const held = deferred<DispatchReference | undefined>();
+    h.capture.mockImplementationOnce(() => held.promise);
+    const settled = h.start("child"); const gate = new AbortController(); gate.abort();
+    expect(await h.store.reference("child", gate.signal)).toEqual({ kind: "none", reason: REFERENCE_NONE.gateBudget });
+    held.resolve(REF);
+    await settled;
+    expect(await h.store.reference("child", gate.signal)).toEqual(captured);
   });
   it("patch edit logs cover additions, updates, removals and rename destinations", () => {
     const h = harness();
