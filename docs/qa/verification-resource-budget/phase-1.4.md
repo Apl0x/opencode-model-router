@@ -2188,6 +2188,14 @@ Reviewer: adversarial QA, `[tier:heavy]` (CAP:none).
   - The alternative is a smaller step on the 700 ms side (400–500 ms, a 300–400 ms margin), which
     pins less.
 
+Resolution: efc70fa — the QA-1.4-34 test now takes `wall0 = Date.now()` and
+`mono0 = performance.now()` once and uses `now: () => wall0 + shift`, `mono: () => mono0 + shift`,
+so the gaps are exactly 700 and 900 ms whatever the load. Verified with `slot.ts` mutated
+temporarily (`-t "QA-1.4-34"`, unloaded): unpadded `at - old.last > maxGap` fails with
+`["BUSY","BUSY","HELD"]: expected false to be true`, and one-slack `> maxGap - slack` fails the
+same way; with `slot.ts` restored the test passes and `git diff` of `slot.ts` shows comment lines
+only.
+
 ### QA-1.4-40 — nit — "Both looks' slacks" is the view's slack in the code; one test comment is stale
 
 - **Where:**
@@ -2208,6 +2216,15 @@ Reviewer: adversarial QA, `[tier:heavy]` (CAP:none).
     do.
   - Correct `:708`'s comment. Optionally raise its bound to about 2 s.
   - Optionally rewrap `slot.ts:48`: at 139 characters, it is the longest line in the header.
+
+Resolution: efc70fa — `slot.ts` header (`:47-49`, rewrapped), the residual paragraph (`:78`) and the
+`Look.witnessed` doc (`:527`) now say "2 heartbeats minus this look's slack and the view's"; notes
+`:72` likewise. The comment at the test's 900 ms bound now says the claim is inert once witnessed
+for 2 × `claimHoldMaxMs` + the slacks (2.2 s), which decides with `claimHoldMaxMs` at 1 s, not
+`staleMs`; the bound stays 900 ms. `slot.ts` changes only in comments. Also, per the `:661`
+observation, that test's wait is raised from 5 s to 10 s, like `:707`.
+Verification: `npx vitest run --maxWorkers=2 test/unit/slot.test.ts` unloaded 62/62 (62.7 s);
+`npm run typecheck` clean.
 
 ### Observations (not findings)
 
