@@ -9,6 +9,8 @@ import {
   overridePath,
   localOverridePath,
   findProjectOverride,
+  resolveVerifyBudget,
+  warnDeprecatedVerifyKeys,
 } from "./router/config";
 import type { RouterConfig, TierConfig, Preset, ModeConfig } from "./router/config";
 import { buildAgentOptions, warnAgentOptionsEffortOnce } from "./router/agent-options";
@@ -80,7 +82,6 @@ import { createVerificationWiring, extractAssistantText } from "./verify/wiring"
 import { createDeadline } from "./verify/deterministic";
 import {
   DEFAULT_DELEGATE_PROMPT_TIMEOUT_MS,
-  DEFAULT_GATE_BUDGET_MS,
   RouterTimeoutError,
   timeoutMs,
   withTimeout,
@@ -372,6 +373,7 @@ const ModelRouterPlugin: Plugin = async (ctx: PluginInput) => {
   // from a plugin paints over the TUI. Falls back to console when the server
   // has no /log endpoint. See src/router/logger.ts.
   const logger = createPluginLogger(ctx.client);
+  warnDeprecatedVerifyKeys(cfg, logger);
 
   // Fetch and normalize opencode's live provider/model catalog. Best-effort:
   // returns null when the client call fails, e.g. the server is not ready yet.
@@ -473,6 +475,7 @@ const ModelRouterPlugin: Plugin = async (ctx: PluginInput) => {
             let activeCfg = cfg;
             try {
               activeCfg = loadConfig();
+              warnDeprecatedVerifyKeys(activeCfg, logger);
             } catch {
               activeCfg = cfg;
             }
@@ -591,10 +594,7 @@ const ModelRouterPlugin: Plugin = async (ctx: PluginInput) => {
                 producerTier: tier,
               };
 
-              const gateBudgetMs = timeoutMs(
-                activeCfg.enforcement?.verify?.gateBudgetMs,
-                DEFAULT_GATE_BUDGET_MS,
-              );
+              const { gateBudgetMs } = resolveVerifyBudget(activeCfg);
               // Grader sessions opened by THIS accept() call, and only those.
               const gateGraderSessions = new Set<string>();
               const completedFailures: string[] = [];
@@ -793,6 +793,7 @@ const ModelRouterPlugin: Plugin = async (ctx: PluginInput) => {
       // Re-read cfg so /preset switches take effect without restart
       try {
         cfg = loadConfig();
+        warnDeprecatedVerifyKeys(cfg, logger);
       } catch {}
       try {
         sweepIdleStores();
@@ -1123,10 +1124,7 @@ const ModelRouterPlugin: Plugin = async (ctx: PluginInput) => {
             // Same bound as the delegate gate: one deadline per invocation,
             // a withTimeout ceiling, and abort-on-reject so a hung check or
             // grader cannot hold the after-hook (and its process tree) open.
-            const gateBudgetMs = timeoutMs(
-              cfg.enforcement?.verify?.gateBudgetMs,
-              DEFAULT_GATE_BUDGET_MS,
-            );
+            const { gateBudgetMs } = resolveVerifyBudget(cfg);
             const gateGraderSessions = new Set<string>();
             const completedFailures: string[] = [];
             const gateDeadline = createDeadline(gateBudgetMs);
@@ -1456,6 +1454,7 @@ const ModelRouterPlugin: Plugin = async (ctx: PluginInput) => {
       if (bypassed) return;
       try {
         cfg = loadConfig(); // Returns cache unless invalidated
+        warnDeprecatedVerifyKeys(cfg, logger);
       } catch {
         // Use last known config if file read fails
       }
@@ -1521,6 +1520,7 @@ const ModelRouterPlugin: Plugin = async (ctx: PluginInput) => {
       if (input.command === "tiers") {
         try {
           cfg = loadConfig();
+          warnDeprecatedVerifyKeys(cfg, logger);
         } catch {}
         output.parts.push({
           type: "text" as const,
@@ -1531,6 +1531,7 @@ const ModelRouterPlugin: Plugin = async (ctx: PluginInput) => {
       if (input.command === "preset") {
         try {
           cfg = loadConfig();
+          warnDeprecatedVerifyKeys(cfg, logger);
         } catch {}
         output.parts.push({
           type: "text" as const,
@@ -1556,6 +1557,7 @@ const ModelRouterPlugin: Plugin = async (ctx: PluginInput) => {
       if (input.command === "budget") {
         try {
           cfg = loadConfig();
+          warnDeprecatedVerifyKeys(cfg, logger);
         } catch {}
         output.parts.push({
           type: "text" as const,
@@ -1566,6 +1568,7 @@ const ModelRouterPlugin: Plugin = async (ctx: PluginInput) => {
       if (input.command === "router") {
         try {
           cfg = loadConfig();
+          warnDeprecatedVerifyKeys(cfg, logger);
         } catch {}
         const args = (input.arguments ?? "").trim();
         const parts = args.split(/\s+/).filter(Boolean);
