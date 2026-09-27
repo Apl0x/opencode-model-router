@@ -57,10 +57,13 @@ interface DebugAgentResult {
 }
 
 /** Runs `opencode debug agent <name>` in the fixture, returning raw streams. */
-function debugAgent(name: string): DebugAgentResult {
+function debugAgent(
+  name: string,
+  extraEnv: NodeJS.ProcessEnv = {},
+): DebugAgentResult {
   const result = spawnSync("opencode", ["debug", "agent", name], {
     cwd: projectDir,
-    env: { ...process.env, HOME: homeDir },
+    env: { ...process.env, HOME: homeDir, ...extraEnv },
     encoding: "utf8",
     timeout: 120_000,
   });
@@ -131,7 +134,16 @@ beforeAll(() => {
 
 afterAll(() => {
   for (const dir of [projectDir, homeDir]) {
-    if (dir) fs.rmSync(dir, { recursive: true, force: true });
+    // Retries: on Windows a just-exited opencode child can hold the cwd open
+    // for a moment, which surfaces as EPERM on an immediate rmSync.
+    if (dir) {
+      fs.rmSync(dir, {
+        recursive: true,
+        force: true,
+        maxRetries: 10,
+        retryDelay: 300,
+      });
+    }
   }
 });
 
@@ -158,6 +170,28 @@ d("keyless registration smoke", () => {
       // paints over it. All plugin diagnostics must go through the logger's
       // SDK receiver, never stderr.
       expect(result.stderr).toBe("");
+    },
+    SMOKE_TIMEOUT_MS,
+  );
+
+  it(
+    "registers router_verify alongside delegate in the resolved tool map",
+    () => {
+      // `opencode debug agent <name>` prints the agent's resolved `tools`
+      // map (built-ins plus every plugin tool), keylessly. That is the only
+      // keyless tool listing opencode offers (`debug` has no tool subcommand).
+      // MODEL_ROUTER_VERIFIED_DELEGATE=1 opts the delegate tool in; the
+      // plugin registers router_verify whenever verify.require is not
+      // "never" and a verifying path exists, which the delegate tool always
+      // provides. `build` is the stock primary agent, the one that calls both.
+      const result = debugAgent("build", { MODEL_ROUTER_VERIFIED_DELEGATE: "1" });
+
+      expect(result.status).toBe(0);
+      const agent = JSON.parse(result.stdout) as {
+        tools?: Record<string, boolean>;
+      };
+      expect(agent.tools?.delegate).toBe(true);
+      expect(agent.tools?.router_verify).toBe(true);
     },
     SMOKE_TIMEOUT_MS,
   );
