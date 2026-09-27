@@ -24,6 +24,14 @@ export interface ShellResult {
 
 export interface RunOptions extends ExecOptions {
   /**
+   * Deadline in ms. Callers must bound every run with `timeoutMs` or `signal`;
+   * when both are absent the run gets DEFAULT_TIMEOUT_MS (120 s, the same
+   * default as `DeterministicDeps.timeoutMs`). `Infinity` explicitly means no
+   * deadline, `NaN` counts as absent, values <= 0 expire at once, and values
+   * above the 2^31-1 ms timer limit (~24.8 days) are clamped to it.
+   */
+  timeoutMs?: number;
+  /**
    * Per-stream cap in characters (UTF-16 code units). Output past it is
    * dropped and a `[stdout truncated at <n> chars]` line is appended to stderr.
    * Default 10 MB.
@@ -31,17 +39,19 @@ export interface RunOptions extends ExecOptions {
   maxBuffer?: number;
 }
 
+export const DEFAULT_TIMEOUT_MS = 120_000;
+const MAX_TIMER_MS = 2 ** 31 - 1;
 const DEFAULT_MAX_BUFFER = 10 * 1024 * 1024;
 
 const isWin = process.platform === "win32";
 
 /** Run `command` through the platform shell (`cmd.exe` / `/bin/sh`). */
 export function runShell(command: string, opts: RunOptions = {}): Promise<ShellResult> {
-  // POSIX low priority: `nice -n 10 /bin/sh -c <command>` is exactly what
+  // POSIX low priority: `nice -n 10 -- /bin/sh -c <command>` is exactly what
   // `shell: true` would spawn, just prefixed, so the command string keeps its
   // shell semantics and is never re-quoted. niceness is inherited by every
   // descendant from birth, so there is no startup race on POSIX.
-  if (opts.lowPriority && !isWin) return run("nice", ["-n", "10", "/bin/sh", "-c", command], false, opts);
+  if (opts.lowPriority && !isWin) return run("nice", ["-n", "10", "--", "/bin/sh", "-c", command], false, opts);
   return run(command, [], true, opts);
 }
 
@@ -52,7 +62,8 @@ export function runShell(command: string, opts: RunOptions = {}): Promise<ShellR
  * error (`code: 1`) — run batch files through `runShell` instead.
  */
 export function runArgv(file: string, args: readonly string[], opts: RunOptions = {}): Promise<ShellResult> {
-  if (opts.lowPriority && !isWin) return run("nice", ["-n", "10", file, ...args], false, opts);
+  // `--` keeps a target whose name starts with "-" from being read as a nice option.
+  if (opts.lowPriority && !isWin) return run("nice", ["-n", "10", "--", file, ...args], false, opts, file);
   return run(file, [...args], false, opts);
 }
 
@@ -60,8 +71,13 @@ export function runArgv(file: string, args: readonly string[], opts: RunOptions 
 export const execSeam: ExecSeam = runShell;
 export const argvSeam: ArgvSeam = runArgv;
 
-function run(file: string, args: string[], shell: boolean, opts: RunOptions): Promise<ShellResult> {
+/**
+ * @param niceTarget set when `file` is `nice` wrapping this argv target: nice
+ *   reports a target it cannot exec as exit 127/126 instead of a spawn error.
+ */
+function run(file: string, args: string[], shell: boolean, opts: RunOptions, niceTarget?: string): Promise<ShellResult> {
   if (opts.signal?.aborted) return Promise.resolve({ code: 1, stdout: "", stderr: "", timedOut: true });
+  const deadline = deadlineOf(opts);
   return new Promise((resolve) => {
     const limit = opts.maxBuffer === undefined || Number.isNaN(opts.maxBuffer) ? DEFAULT_MAX_BUFFER : Math.max(0, opts.maxBuffer);
     const out = capture(limit);
@@ -120,7 +136,7 @@ function run(file: string, args: string[], shell: boolean, opts: RunOptions): Pr
       if (exited && isWin) return;
       killTree(child);
     };
-    const timer = opts.timeoutMs === undefined ? undefined : setTimeout(kill, opts.timeoutMs);
+    const timer = deadline === undefined ? undefined : setTimeout(kill, deadline);
     opts.signal?.addEventListener("abort", kill, { once: true });
 
     const finish = (code: number | null, error?: unknown) => {
@@ -128,17 +144,32 @@ function run(file: string, args: string[], shell: boolean, opts: RunOptions): Pr
       settled = true;
       clearTimeout(timer);
       opts.signal?.removeEventListener("abort", kill);
+      let finalCode = killed ? code || 1 : code ?? 1;
       let stderr = err.text;
+      if (niceTarget && !killed && (code === 126 || code === 127) && stderr.startsWith("nice:")) {
+        // The same contract as a direct spawn: code 1 and the errno in stderr.
+        stderr = `exec failed: spawn ${niceTarget} ${code === 127 ? "ENOENT" : "EACCES"} (${stderr.trim()})`;
+        finalCode = 1;
+      }
       if (error) stderr += String(error);
       if (out.truncated) notes.push(`[stdout truncated at ${limit} chars]`);
       if (err.truncated) notes.push(`[stderr truncated at ${limit} chars]`);
       for (const note of notes) stderr += `${stderr && !stderr.endsWith("\n") ? "\n" : ""}${note}\n`;
-      resolve({ code: killed ? code || 1 : code ?? 1, stdout: out.text, stderr, timedOut: killed });
+      resolve({ code: finalCode, stdout: out.text, stderr, timedOut: killed });
     };
     child.on("exit", () => { exited = true; });
     child.on("error", (err) => finish(1, err));
     child.on("close", (code) => finish(code));
   });
+}
+
+/** The timer to arm, or undefined for none. */
+function deadlineOf(opts: RunOptions): number | undefined {
+  const t = opts.timeoutMs;
+  if (t === undefined || Number.isNaN(t)) return opts.signal ? undefined : DEFAULT_TIMEOUT_MS;
+  if (t === Infinity) return undefined;
+  // setTimeout treats anything above 2^31-1 as 1 ms, which would kill at once.
+  return Math.min(Math.max(t, 0), MAX_TIMER_MS);
 }
 
 /**

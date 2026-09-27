@@ -106,6 +106,18 @@ async function waitForFile(path: string): Promise<void> {
   throw new Error(`timed out waiting for ${path}`);
 }
 
+function overflowWarnings() {
+  const warnings: Error[] = [];
+  const onWarning = (w: Error) => warnings.push(w);
+  process.on("warning", onWarning);
+  return {
+    stop: () => {
+      process.off("warning", onWarning);
+      return warnings.filter(w => w.name === "TimeoutOverflowWarning");
+    },
+  };
+}
+
 describe("runArgv", () => {
   it("kills the whole process tree on timeout", async () => {
     const f = forkingFixture();
@@ -175,12 +187,34 @@ describe("runArgv", () => {
     expect(r.stdout === expected && r.stderr === expected).toBe(true);
   }, 30000);
 
-  it("resolves a spawn error as code 1 with the error in stderr, never rejecting", async () => {
-    const r = await runArgv("omr-no-such-executable-xyz", ["a"], { cwd: tmpdir(), timeoutMs: 20000 });
+  it.each([false, true])("resolves a spawn error as code 1 with the error in stderr, never rejecting (lowPriority %s)", async (lowPriority) => {
+    const r = await runArgv("omr-no-such-executable-xyz", ["a"], { cwd: tmpdir(), timeoutMs: 20000, lowPriority });
     expect(r.code).toBe(1);
     expect(r.timedOut).toBe(false);
     expect(r.stderr).toMatch(/ENOENT/);
-  });
+  }, 20000);
+
+  it.runIf(!isWin)("reports nice's exec failures (127, 126) as spawn errors and passes '--' before the target (POSIX-only: nice wraps the target only on POSIX)", async () => {
+    // A name starting with "-" would be read as a nice option without `--`.
+    for (const file of ["omr-no-such-executable-xyz", "-omr-dash-leading-name"]) {
+      const r = await runArgv(file, ["a"], { cwd: tmpdir(), timeoutMs: 20000, lowPriority: true });
+      expect(r).toMatchObject({ code: 1, stdout: "", timedOut: false });
+      expect(r.stderr).toMatch(new RegExp(`^exec failed: spawn ${file} ENOENT \\(nice: `));
+    }
+    const dir = scratch();
+    const notExecutable = join(dir, "not-executable");
+    writeFileSync(notExecutable, "#!/bin/sh\nexit 0\n", { mode: 0o644 });
+    const low = await runArgv(notExecutable, [], { cwd: dir, timeoutMs: 20000, lowPriority: true });
+    expect(low).toMatchObject({ code: 1, timedOut: false });
+    expect(low.stderr).toMatch(/^exec failed: spawn .* EACCES \(nice: /);
+    const direct = await runArgv(notExecutable, [], { cwd: dir, timeoutMs: 20000 });
+    expect(direct).toMatchObject({ code: 1, timedOut: false });
+    expect(direct.stderr).toMatch(/EACCES/);
+    // runShell keeps shell semantics: a missing command is the shell's 127 either way.
+    const shellMissing = await runShell("omr-no-such-executable-xyz", { cwd: dir, timeoutMs: 20000, lowPriority: true });
+    expect(shellMissing.code).toBe(127);
+    expect((await runShell("omr-no-such-executable-xyz", { cwd: dir, timeoutMs: 20000 })).code).toBe(127);
+  }, 30000);
 
   it.runIf(isWin)("refuses a .cmd target without a shell (Node EINVAL) as a spawn error; use runShell for batch files", async () => {
     const dir = scratch();
@@ -222,6 +256,23 @@ describe("runArgv", () => {
     expect(getEventListeners(controller.signal, "abort")).toHaveLength(0);
     expect(warnings.filter(w => w.name === "MaxListenersExceededWarning")).toEqual([]);
   }, 60000);
+});
+
+describe("timeoutMs", () => {
+  it.each([2 ** 31, Number.MAX_SAFE_INTEGER, Infinity])("lets a command finish normally with timeoutMs %s (no 32-bit timer overflow)", async (timeoutMs) => {
+    const warnings = overflowWarnings();
+    const r = await runArgv(process.execPath, ["-e", "setTimeout(() => process.stdout.write('done'), 700)"], { cwd: tmpdir(), timeoutMs });
+    expect(r).toEqual({ code: 0, stdout: "done", stderr: "", timedOut: false });
+    expect(warnings.stop()).toEqual([]);
+  }, 20000);
+
+  it("treats timeoutMs <= 0 as already expired", async () => {
+    const start = Date.now();
+    const r = await runArgv(process.execPath, ["-e", "setTimeout(() => {}, 15000)"], { cwd: tmpdir(), timeoutMs: -5 });
+    expect(r.timedOut).toBe(true);
+    expect(r.code).not.toBe(0);
+    expect(Date.now() - start).toBeLessThan(10000);
+  }, 20000);
 });
 
 describe("lowPriority", () => {
