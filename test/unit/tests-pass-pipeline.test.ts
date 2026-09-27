@@ -37,6 +37,7 @@ import {
   type RecheckSeams,
   ABORTED_BEFORE_RUN,
   ABORTED_DURING_RUN,
+  CLOSE_MARGIN_MS,
   createDirectTestsPassHook,
   createScopeOpener,
   SLOT_LOST_NOTE,
@@ -1003,7 +1004,7 @@ describe("createDirectTestsPassHook (2.1.2.4)", () => {
     const failing = (): Opts => ({ scoped: { kind: "ran", result: FAILING, exitCode: 1, spec: SPEC, notes: [] } });
     afterEach(() => { vi.useRealTimers(); });
 
-    it("is awaited while the deadline lasts, and the hook returns its run once the deadline is spent", async () => {
+    it("is awaited until CLOSE_MARGIN_MS before the deadline, and the hook returns its run then", async () => {
       vi.useFakeTimers();
       const s = setup(failing());
       let finish!: () => void;
@@ -1012,7 +1013,7 @@ describe("createDirectTestsPassHook (2.1.2.4)", () => {
       let out: Awaited<ReturnType<typeof s.hook>> | undefined;
       void s.hook(request({ deadline: d })).then(o => { out = o; });
       // Within the budget the close is awaited, so no later check's scope can nest with this hold.
-      await vi.advanceTimersByTimeAsync(999);
+      await vi.advanceTimersByTimeAsync(1_000 - CLOSE_MARGIN_MS - 1);
       expect(out).toBeUndefined();
       await vi.advanceTimersByTimeAsync(1);
       expect(out).toEqual({ scoped: { kind: "ran", result: FAILING, exitCode: 1, spec: SPEC, notes: [] }, recheck: EXACT });
@@ -1073,6 +1074,50 @@ describe("createDirectTestsPassHook (2.1.2.4)", () => {
       expect(res.verdict.outcome).toBe("fail");
       expect(res.verdict.reasons.join(" ")).toContain("test/a.test.ts > fails");
     });
+
+    it("QA-2.1-13: with real timers and index.ts's arming (withTimeout at remaining()), the failure wins every time", async () => {
+      const s = setup(failing());
+      s.close.mockImplementation(() => new Promise<void>(() => {}));
+      const BUDGET_MS = 200;
+      const dod: DoD = { kind: "deterministic", source: "explicit", criteria: [], deliverable: null, checks: [{ kind: "testsPass" }] };
+      const artefact: Artefact = { changedFiles: [], declaredOutputs: [], finalReturnText: "done", producerTier: "medium", producerSessionID: "child" };
+      const busy = (ms: number): void => {
+        const end = performance.now() + ms;
+        while (performance.now() < end) { /* synchronous work, as store.delta and buildGateDeps */ }
+      };
+      const outcomes: string[] = [];
+      for (let i = 0; i < 40; i++) {
+        // As index.ts: the deadline first, then async preparation and synchronous work, then the
+        // gate's withTimeout armed with the deadline's remaining time (the same end instant).
+        const gateDeadline = createDeadline(BUDGET_MS);
+        const completedFailures: string[] = [];
+        await new Promise(resolve => setTimeout(resolve, 20 + (i % 7)));
+        busy(i % 3);
+        let res: GateResult;
+        try {
+          res = await withTimeout(accept({ dod }, artefact, {
+            deterministic: {
+              cwd: ROOT,
+              exec: async () => { throw new Error("testsPass must never run its command through deps.exec"); },
+              fs: { fileExists: async () => false, readFile: async () => "" },
+              testsPass: s.hook,
+              deadline: gateDeadline,
+              reference: { kind: "captured", reference: REFERENCE },
+              changedFiles: [{ path: join(ROOT, "src", "a.ts"), status: "modified" }],
+              onFailure: reason => completedFailures.push(reason),
+            },
+            checker: { dispatchGrader: async () => ({ sessionID: "grader", text: "" }) },
+          }), gateDeadline.remaining(), "verification gate");
+        } catch (error) {
+          gateDeadline.abort("verification gate timed out");
+          res = unverifiableGateResult(`verification gate timed out: ${String(error)}`, dod.source, false, completedFailures);
+        } finally {
+          gateDeadline.dispose();
+        }
+        outcomes.push(res.verdict.outcome ?? "none");
+      }
+      expect(outcomes).toEqual(Array.from({ length: 40 }, () => "fail"));
+    }, 30_000);
   });
 
   it("keeps the scoped outcome when the Rechecker throws, and still closes", async () => {

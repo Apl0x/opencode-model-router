@@ -336,9 +336,9 @@ export function resolveRepoCommand(
 //   P7  The recheck runs only for "ran" with >= 1 failing id and >= 1 failing file (T4).
 //   P8  judgeScoped(scoped, recheck) -> TestsPassJudgement, returned as the check's CheckResult.
 //   P9  scope.close() waits for pending disposals, then releases the slot; never rejects. The
-//       testsPass hook waits for it only while the gate deadline lasts (closeWithinDeadline,
-//       QA-2.1-3): within the budget a close is awaited, so scopes never nest (T8); once the
-//       budget is spent the close carries on in the background (errors logged), still releasing
+//       testsPass hook waits for it only until CLOSE_MARGIN_MS before the gate deadline ends
+//       (closeWithinDeadline, QA-2.1-3, QA-2.1-13): within that a close is awaited, so scopes
+//       never nest (T8); after it the close carries on in the background (errors logged), still releasing
 //       the slot only after the disposal, and no later check of the gate can acquire one. A slow
 //       dispose never costs a verdict.
 //
@@ -1311,12 +1311,20 @@ export function createDirectTestsPassHook(deps: DirectTestsPassHookDeps): TestsP
 }
 
 /**
- * P9 (QA-2.1-3): waits for `scope.close()` only until `deadline` is spent (its abort, or its
- * remaining time), so a reference dispose (EBUSY retries) never outlasts the gate budget and turns
- * a verdict into a gate timeout. The close carries on in the background after that: it still
- * releases the slot only once every tracked disposal and killed tree has settled, and its failure
- * is logged. A spent deadline also bars every later scope of the gate from acquiring a slot
- * (acquireHold), so an unfinished close never nests with another hold. Never rejects.
+ * QA-2.1-13: how long before the gate deadline's end `closeWithinDeadline` stops waiting for a
+ * close. The gate's `withTimeout` is armed with the same deadline's `remaining()`, so a wait that
+ * ran to the exact end would race it, and a proven failure could become a gate timeout.
+ */
+export const CLOSE_MARGIN_MS = 100;
+
+/**
+ * P9 (QA-2.1-3): waits for `scope.close()` only until `CLOSE_MARGIN_MS` before `deadline` is spent
+ * (or its abort), so a reference dispose (EBUSY retries) never outlasts the gate budget and turns
+ * a verdict into a gate timeout (QA-2.1-13: the margin keeps the wait clear of the gate's own
+ * `withTimeout`, armed at the same end). The close carries on in the background after that: it
+ * still releases the slot only once every tracked disposal and killed tree has settled, and its
+ * failure is logged. A spent deadline also bars every later scope of the gate from acquiring a
+ * slot (acquireHold), so an unfinished close never nests with another hold. Never rejects.
  */
 export function closeWithinDeadline(scope: CheckScope, deadline: Deadline, logger?: Pick<PluginLogger, "warn">): Promise<void> {
   const warn = (err: unknown): void => logger?.warn(`verification scope close failed: ${errorText(err)}`);
@@ -1336,7 +1344,7 @@ export function closeWithinDeadline(scope: CheckScope, deadline: Deadline, logge
       settle();
     };
     void closing.then(done);
-    const left = deadline.remaining();
+    const left = deadline.remaining() - CLOSE_MARGIN_MS;
     if (deadline.signal.aborted || left <= 0) {
       done();
       return;
