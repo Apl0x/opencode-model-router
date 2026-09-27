@@ -24,8 +24,7 @@ CI's job. See `docs/adr/0003-affected-test-verification.md`.
   (default `"deferred"`), `captureWaitMs` (default 5 s, never more than
   `baselineTimeoutMs`), `background` (default `false`), `pendingTtlMs` (default 1 h),
   `slotWaitMs` (default 60 s), `batchWindowMs` (default 2 s), `failureRecheck` (default
-  `true`), `recheckTimeoutMs` (default 60 s), `baselineTimeoutMs` (default 15 s) and
-  `gateBudgetMs` (default 90 s). See `docs/CONFIG_REFERENCE.md`.
+  `true`) and `recheckTimeoutMs` (default 60 s). See `docs/CONFIG_REFERENCE.md`.
 
 - **`VERIFY:` and `VERIFY_WAIT:` dispatch directives.** `VERIFY:required` gates a
   delegation synchronously and keeps the escalation ladder. `VERIFY:deferred`, the
@@ -62,8 +61,17 @@ CI's job. See `docs/adr/0003-affected-test-verification.md`.
   caveat, which is accepted unless `strictUnverifiable` is set.
 
 - **Deferred verification is the default.** A delegation with no `VERIFY:` directive
-  returns immediately as unverified. The synchronous cost is the git-only reference
-  snapshot: at most 2 s, measured at about 0.4–0.5 s.
+  returns immediately as unverified. The synchronous cost is up to `VERIFY_WAIT`
+  (default `captureWaitMs`, 5 s) at dispatch for the reference capture, paid in either
+  mode, plus at most 2 s at return for the git-only snapshot of the producer's changes
+  (measured at about 0.4–0.5 s).
+
+- **`enforcement.verify.baselineTimeoutMs` now bounds the git-only reference capture.**
+  It used to bound the dispatch-time baseline test run. Its default changed from 60 s to
+  15 s.
+
+- **The bundled `tiers.json` no longer sets `gateBudgetMs`.** The key is still supported;
+  its in-code default of 90 s (90000 ms) applies.
 
 - **Verification runs at low priority, through a machine-wide slot, in batches.**
   Commands run at below-normal OS priority with the runner's worker cap. A cross-process
@@ -74,7 +82,7 @@ CI's job. See `docs/adr/0003-affected-test-verification.md`.
 
 - **Deprecations.** `enforcement.verify.testBaseline` is deprecated in favour of
   `failureRecheck`. Any value logs a once-per-process warning, and `testBaseline: false`
-  still turns the recheck off. The `gateBudgetMs` key is removed from `tiers.json`.
+  still turns the recheck off.
 
 ### Fixed
 

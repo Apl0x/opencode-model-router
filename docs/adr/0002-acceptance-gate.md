@@ -76,6 +76,7 @@ interface Artefact {
 - Producer and verifier operate on the **single shared OpenCode workspace** (`directory`/`worktree`).
 - Deterministic checks run behind an **injected exec/fs seam** (production adapter wraps `$`/node `child_process` + `fs`; tests inject fakes — no live commands in CI), with a **command allowlist** and **timeouts**.
 - **Concurrency:** all gate state keyed by `sessionID`; whole-repo deterministic checks (`testsPass`/`buildPasses`) serialize behind a **per-workspace mutex**; prefer **artefact-scoped** checks (file/schema on declared paths) when concurrency is detected; changed-file attribution uses the session's own edit calls (never a global diff).
+  - _Superseded in part by [ADR 0003](./0003-affected-test-verification.md):_ `testsPass` no longer runs behind the per-workspace mutex. `buildPasses` and `run` keep the mutex.
 
 ### D7 — Token budget (M6/GA-7)
 

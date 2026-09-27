@@ -130,15 +130,25 @@ Each dispatch carries `VERIFY:required` or `VERIFY:deferred` (default: `defaultV
 - **`unverifiable` is accepted with a caveat** unless `strictUnverifiable` is set, in which case it
   is rejected. This covers scoping failures, a busy slot, a capture that did not finish, and pytest
   failures.
-- **The deferred return costs up to 2 s** for the git-only reference snapshot (measured at about
-  0.4–0.5 s). That is the whole synchronous price of a deferred delegation.
+- **The synchronous price of a deferred delegation** is up to `VERIFY_WAIT` (default
+  `captureWaitMs`, 5 s) at dispatch, waiting for the reference capture before the producer starts
+  (paid in either mode), plus up to 2 s at return for the git-only snapshot of the producer's
+  changes (measured at about 0.4–0.5 s).
 - **Windows limits.**
   - `node_modules` is linked into the reference worktree as a directory junction, not copied.
     Cleanup must remove the junction without following it.
-  - An 8.3 short path to the plugin (for example `C:\Users\MARQUI~1\…`) can prevent the rerun
-    command from being planned. The recheck then reports `unverifiable`.
+  - When the project directory opencode hands the plugin (`ctx.directory`) is an 8.3 short path
+    (for example `C:\Users\MARQUI~1\…`), every reference rerun is unplannable (QA-2.4-23). Scoped
+    failures then always stay `unverifiable`, so `testsPass` cannot reject an introduced failure on
+    such a setup. The Phase 3.1 live check will confirm whether the host passes short paths.
   - Tree kill uses `taskkill /T /F`. A descendant that has already been orphaned, because its
     parent exited before the kill, is outside the tree and can survive it.
+  - The orphan sweeper needs PowerShell in FullLanguage mode; under Constrained Language Mode
+    (AppLocker/WDAC) it exits at once and kills nothing.
+  - `taskkill` slowed by CPU saturation can leave part of a tree running.
+  - Death of opencode by an unhandled signal skips the exit hook, so in-flight runs are not killed.
+  - `lowPriority` is applied just after spawn; a descendant spawned before that call (a narrow
+    race) runs at normal priority.
 - **Deprecations.** `enforcement.verify.testBaseline` logs a once-per-process warning and maps onto
   `failureRecheck`. The `gateBudgetMs` key is removed from `tiers.json`.
 

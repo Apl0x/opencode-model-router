@@ -199,7 +199,7 @@ may contain instruction text or paths.
 | `slotWaitMs` | `integer ≥ 0` | `60000` (60 s) | Maximum wait for a verification slot (`0` = no wait); a verification that gets no slot in time is `unverifiable`. **Residual (QA-1.4-21):** a lock whose owner is not provably dead is reclaimed only by a caller that waits or stays alive through ~8 s of observation, so a very short wait may give up on a slot that a longer one would reclaim. |
 | `baselineTimeoutMs` | `integer ≥ 1` | `15000` (15 s) | Bounds the whole git-only reference capture taken at dispatch. It runs no tests. |
 | `captureWaitMs` | `integer ≥ 0` | `5000` (5 s) | Longest wait for the reference capture before the producer starts (`0` = never wait). **Clamped to `baselineTimeoutMs`.** A `VERIFY_WAIT:` directive overrides it per dispatch. |
-| `failureRecheck` | `boolean` | `true` | Capture a dispatch-time reference and recheck scoped failures against it. `false` = no reference; a failing scoped run then counts as a failure without a recheck. |
+| `failureRecheck` | `boolean` | `true` | Capture a dispatch-time reference and recheck scoped failures against it. `false` = no reference and no recheck; any scoped failure is then `unverifiable` (accepted with a caveat unless `strictUnverifiable`), never a fail. |
 | `recheckTimeoutMs` | `integer ≥ 1` | `60000` (60 s) | Budget for the reference rerun (the recheck). |
 | `batchWindowMs` | `integer ≥ 0` | `2000` (2 s) | Coalescing window for concurrent gates (`0` = no batching). The effective window is `min(batchWindowMs, gateBudgetMs / 10)`. |
 | `defaultVerify` | `"deferred" \| "required"` | `"deferred"` | Mode for dispatches without a `VERIFY:` directive. See [Deferred verification](#deferred-verification). |
@@ -261,9 +261,13 @@ editable install imports the live tree rather than the reference worktree, so th
 rerun could not prove anything.
 
 **Windows.** The reference worktree links `node_modules` with directory junctions,
-which need no elevation. When the plugin directory is reached through an 8.3 short
-path (for example `C:\Users\ABCDEF~1\…`), a rerun can be unplannable, which makes
-the check `unverifiable` (QA-2.4-23).
+which need no elevation. When the project directory opencode hands the plugin
+(`ctx.directory`) is an 8.3 short path (for example `C:\Users\ABCDEF~1\…`), every
+reference rerun is unplannable (`rerun-unplannable`, QA-2.4-23). Scoped failures are
+then always `unverifiable` (accepted with a caveat unless `strictUnverifiable`), so
+`testsPass` cannot reject an introduced failure on such a setup. Open the project
+through its long path. Whether the host actually passes short paths is still to be
+confirmed by the Phase 3.1 live check.
 
 **Deprecations.** `testBaseline` is deprecated (`false` maps to
 `failureRecheck: false`; a one-time warning is logged). `gateBudgetMs` is no
@@ -312,15 +316,29 @@ once, marked unverified, with a handle the orchestrator can verify later.
 
 ### Which delegations defer
 
-All of these must hold. Everything else runs the required (synchronous) gate:
+All of these must hold:
 
+- the mode is `deferred`: `defaultVerify` is `"deferred"` and the dispatch carries no
+  `VERIFY:required`, or the dispatch carries `VERIFY:deferred`;
+- `verify.require` is not `"never"`;
+- `router_verify` is registered. This is fixed once at plugin start: `verify.require`
+  is not `"never"` **and** (the start-time enforcement mode is not `off` **or** the
+  `delegate` tool is enabled);
 - the caller is a proven root orchestrator (a subagent cannot defer its own work);
-- the DoD carries a `testsPass` check;
-- the producer changed files.
+- the DoD carries a `testsPass` check, and the dispatch is not a trivial dispatch with
+  an inferred DoD;
+- on the `delegate` path, the producer did not error;
+- the producer changed files. Only an attributed, empty change set falls back; a change
+  set that cannot be attributed still defers, with risk `high`.
+
+Otherwise the dispatch is handled as before deferred verification: the required
+(synchronous) gate, or no gate when `require` is `"never"`.
 
 When registration fails (for example a handle collision), the delegation falls
 back to the required gate. It is never marked accepted or verified by that failure.
-The deferred return adds up to 2 s (typically ~0.4–0.5 s) for a git-only snapshot
+In either mode, the dispatch first waits up to `VERIFY_WAIT` (default
+`captureWaitMs`, 5 s) for the reference capture before the producer starts. The
+deferred return then adds up to 2 s (typically ~0.4–0.5 s) for a git-only snapshot
 of the producer's changes.
 
 ### Directives
@@ -333,8 +351,9 @@ of the producer's changes.
 
 Write the keys in upper case. Lower-case keys go through a prose guard and are
 often ignored. Directives are parsed **only from the orchestrator's own dispatch
-prompt** (the `task`/`delegate` prompt argument), never from tool results or a
-subagent's text. Because the **first valid occurrence wins**, put the directives
+arguments**, never from tool results or a subagent's text: on the native `task` path,
+from `prompt`, or from `description` when `prompt` is missing or blank (never both);
+on the `delegate` path, from the `task` argument. Because the **first valid occurrence wins**, put the directives
 before any quoted text: a quoted `VERIFY:deferred` that appears earlier would win.
 
 ### The footer
