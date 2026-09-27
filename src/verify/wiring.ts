@@ -474,7 +474,13 @@ export function createVerificationWiring(deps: {
   ): GateDeps => {
     const cfg = getConfig();
     const budget = resolveVerifyBudget(cfg);
-    const openScope = createScopeOpener({ argv: argvSeam, exec: execSeam, fs: fsSeam, budget, checkTimeoutMs: CHECK_TIMEOUT_MS });
+    // QA-2.1-5: the recheck's git processes (GC, materialize, dispose) run at the configured
+    // priority too, like the capture and the start-up GC (QA-1.2-13).
+    const referenceArgv: ArgvSeam = (file, args, opts) => argvSeam(file, args, { ...opts, lowPriority: budget.lowPriority });
+    const openScope = createScopeOpener({
+      argv: argvSeam, exec: execSeam, fs: fsSeam, budget, checkTimeoutMs: CHECK_TIMEOUT_MS,
+      reference: { argv: referenceArgv },
+    });
     const testsPass = createDirectTestsPassHook({
       openScope,
       plannerFs: fsSeam,

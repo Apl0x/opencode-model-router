@@ -534,6 +534,17 @@ describe("dispatch reference wiring", () => {
     expect(state.commands).toEqual(["git rev-parse HEAD"]);
     expect(state.execOpts[0]).toMatchObject({ cwd, lowPriority: resolveVerifyBudget(cfg).lowPriority });
   });
+  it("QA-2.1-5: the recheck's reference argv seam (GC, materialize, dispose) runs at the configured priority", async () => {
+    const { cfg, wiring } = harness();
+    wiring.buildGateDeps();
+    const refArgv = state.scopeDeps?.reference?.argv;
+    expect(refArgv).toBeDefined();
+    expect(refArgv).not.toBe(state.scopeDeps?.argv);
+    await refArgv!("git", ["worktree", "prune"], { cwd, timeoutMs: 9 });
+    expect(state.commands).toEqual(["git worktree prune"]);
+    expect(resolveVerifyBudget(cfg).lowPriority).toBe(true);
+    expect(state.execOpts[0]).toMatchObject({ cwd, timeoutMs: 9, lowPriority: true });
+  });
   it("a config that throws still snapshots and records why there is no reference", async () => {
     const store = createChangedFileStore();
     const wiring = createVerificationWiring({ client: {}, directory: cwd, getConfig: () => { throw new Error("config broke"); }, logger: { warn: () => {} } });
