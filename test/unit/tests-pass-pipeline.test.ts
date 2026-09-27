@@ -1,14 +1,37 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { join } from "node:path";
 import type { VerifyBudget } from "../../src/router/config";
-import type { DetectedRunner, ResolvedEntry, RunResult, RunnerFs, ScopedSpec } from "../../src/verify/runner";
+import type {
+  DetectedRunner,
+  PlannerFs,
+  PlanScopedRunInput,
+  ResolvedEntry,
+  RunResult,
+  RunnerFs,
+  ScopedSpec,
+  ScopingPlan,
+  TestSearchSeam,
+} from "../../src/verify/runner";
 import type { DispatchReference, MaterializeResult, ReferenceFs, ReferenceStats } from "../../src/verify/reference";
 import type { acquireSlot } from "../../src/verify/slot";
-import type { ArgvSeam, Deadline, ExecSeam, RecheckOutcome, RecheckUnusableCause } from "../../src/verify/types";
+import type {
+  ArgvSeam,
+  Deadline,
+  ExecSeam,
+  RecheckOutcome,
+  RecheckUnusableCause,
+  Rechecker,
+  ScopedOutcome,
+  TestsPassRequest,
+} from "../../src/verify/types";
+import type { TreeSnapshot } from "../../src/verify/dispatch";
 import {
+  type CheckScope,
+  type CommandOutcome,
   type RecheckSeams,
   ABORTED_BEFORE_RUN,
   ABORTED_DURING_RUN,
+  createDirectTestsPassHook,
   createScopeOpener,
   SLOT_LOST_NOTE,
   createDeadline,
@@ -571,6 +594,17 @@ describe("scope.rechecker (T4)", () => {
     expect(s.argv).not.toHaveBeenCalled();
   });
 
+  it("forwards the current tree snapshot to materialize, and undefined when none is given", async () => {
+    const tree: TreeSnapshot = { cwd: ROOT, head: "a".repeat(40), fingerprint: "fp", dirty: true, files: [] };
+    const s = setup();
+    await s.scope.rechecker("npx vitest run", ROOT, tree)(REFERENCE, [FAIL_A], deadline(300_000));
+    await s.recheck(REFERENCE, [FAIL_A], deadline(300_000));
+    expect(s.materialize).toHaveBeenCalledTimes(2);
+    expect(s.materialize.mock.calls[0][1]).toBe(tree);
+    expect(s.materialize.mock.calls[1][1]).toBeUndefined();
+    await s.scope.close();
+  });
+
   it("reports pytest as runner-unsupported without materializing or rerunning", async () => {
     const s = setup({ recheck: { detectRunner: async () => ({ ...RUNNER, kind: "pytest" }) } });
     const out = await s.recheck(REFERENCE, [FAIL_A], deadline(200_000));
@@ -719,5 +753,232 @@ describe("scope.rechecker (T4)", () => {
     expect((await s.recheck(REFERENCE, [FAIL_A], d)).kind).toBe("skipped-deadline");
     expect(s.argv).not.toHaveBeenCalled();
     expect(s.dispose).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("createDirectTestsPassHook (2.1.2.4)", () => {
+  const TMP = process.platform === "win32" ? "C:\\omr-tmp" : "/omr-tmp";
+  const ROOT = join(TMP, "repo");
+  const FILE_A = join(ROOT, "test", "a.test.ts");
+  const FILE_B = join(ROOT, "test", "b.test.ts");
+  const REFERENCE: DispatchReference = {
+    root: ROOT,
+    head: "a".repeat(40),
+    commit: "b".repeat(40),
+    untracked: new Map(),
+    tracked: new Map(),
+    captureReasons: [],
+    capturedAt: 0,
+  };
+  const TREE: TreeSnapshot = { cwd: ROOT, head: "a".repeat(40), fingerprint: "fp", dirty: true, files: [] };
+  const SPEC: ScopedSpec = {
+    runner: "vitest",
+    mode: "related",
+    file: "node",
+    args: ["vitest.mjs", "related", "--run", FILE_A],
+    cwd: ROOT,
+    env: {},
+    reportPath: join(TMP, "report.json"),
+    gitRoot: ROOT,
+    entry: join(ROOT, "node_modules", "vitest", "vitest.mjs"),
+    inputs: [FILE_A],
+    inputsAreTests: false,
+    workers: 2,
+    notes: [],
+  };
+  const GREEN: RunResult = { failingIds: [], failingFiles: [], collectionError: false, total: 4, complete: true, source: "report" };
+  const FAILING: RunResult = {
+    failingIds: ["test/a.test.ts > fails"],
+    failingFiles: [FILE_A],
+    collectionError: false,
+    total: 4,
+    complete: true,
+    source: "report",
+  };
+  const EXACT: RecheckOutcome = { kind: "exact", result: undefined, ranFiles: [], absentFiles: ["test/a.test.ts"], notes: [] };
+
+  function deadline(left: number): Deadline {
+    const controller = new AbortController();
+    return { budgetMs: left, remaining: () => left, bound: ms => Math.min(ms, left), signal: controller.signal };
+  }
+
+  interface Opts {
+    plan?: ScopingPlan | Error;
+    scoped?: ScopedOutcome | Error;
+    shell?: CommandOutcome;
+    live?: string[];
+    failureRecheck?: boolean;
+  }
+
+  function setup(opts: Opts = {}) {
+    const rechecker = vi.fn<Rechecker>(async () => EXACT);
+    const execute = vi.fn<CheckScope["execute"]>(async () => {
+      if (opts.scoped instanceof Error) throw opts.scoped;
+      return opts.scoped ?? { kind: "ran", result: GREEN, exitCode: 0, spec: SPEC, notes: [] };
+    });
+    const runShell = vi.fn<CheckScope["runShell"]>(async () => opts.shell ?? { kind: "ran", exec: { code: 0, stdout: "", stderr: "" }, notes: [] });
+    const runLint = vi.fn<CheckScope["runLint"]>(async () => ({ kind: "error", reason: "unused" }));
+    const makeRechecker = vi.fn((_command: string, _cwd: string, _tree?: TreeSnapshot): Rechecker => rechecker);
+    const close = vi.fn(async (): Promise<void> => {});
+    const scope: CheckScope = { execute, rechecker: makeRechecker, runShell, runLint, close };
+    const openScope = vi.fn((_meta: { readonly cwd: string; readonly command: string }): CheckScope => scope);
+    const plan = vi.fn(async (_input: PlanScopedRunInput): Promise<ScopingPlan> => {
+      if (opts.plan instanceof Error) throw opts.plan;
+      return opts.plan ?? SPEC;
+    });
+    const live = new Set(opts.live ?? [FILE_A, FILE_B]);
+    const plannerFs: PlannerFs = {
+      fileExists: async p => live.has(p),
+      readFile: async (p: string) => { throw new Error(`ENOENT: ${p}`); },
+    };
+    const search: TestSearchSeam = { findByName: async () => [], findByContent: async () => [] };
+    const hook = createDirectTestsPassHook({
+      openScope, plannerFs, search, plan, currentTree: TREE,
+      budget: { maxWorkers: 2, failureRecheck: opts.failureRecheck ?? true },
+      host: { platform: process.platform },
+    });
+    return { hook, openScope, plan, execute, runShell, makeRechecker, rechecker, close };
+  }
+
+  function request(over: Partial<TestsPassRequest> = {}): TestsPassRequest {
+    return {
+      command: "npx vitest run",
+      cwd: ROOT,
+      testScope: "affected",
+      changedFiles: [{ path: join(ROOT, "src", "a.ts"), status: "modified" }],
+      reference: { kind: "captured", reference: REFERENCE },
+      deadline: deadline(300_000),
+      ...over,
+    };
+  }
+
+  it("returns no-affected without opening a scope or spawning", async () => {
+    const s = setup({ plan: { noAffected: true, note: "no changed files, no affected tests" } });
+    expect(await s.hook(request())).toEqual({ scoped: { kind: "no-affected", note: "no changed files, no affected tests" }, recheck: undefined });
+    expect(s.openScope).not.toHaveBeenCalled();
+    expect(s.execute).not.toHaveBeenCalled();
+    expect(s.runShell).not.toHaveBeenCalled();
+  });
+
+  it("returns an S6 outcome as unverifiable without opening a scope or spawning", async () => {
+    const s = setup({ plan: { unverifiable: true, code: "composite", reason: "composite script" } });
+    expect(await s.hook(request())).toEqual({ scoped: { kind: "unverifiable", code: "composite", reason: "composite script" }, recheck: undefined });
+    expect(s.openScope).not.toHaveBeenCalled();
+    expect(s.execute).not.toHaveBeenCalled();
+  });
+
+  it("plans with the injected fs, search, changed files and worker cap", async () => {
+    const s = setup();
+    const req = request();
+    await s.hook(req);
+    expect(s.plan).toHaveBeenCalledTimes(1);
+    expect(s.plan.mock.calls[0][0]).toMatchObject({ command: req.command, cwd: ROOT, changedFiles: req.changedFiles, budget: { maxWorkers: 2 } });
+  });
+
+  it("runs a green scoped spec under one scope without a recheck, then closes", async () => {
+    const s = setup();
+    const req = request();
+    const out = await s.hook(req);
+    expect(out.scoped.kind).toBe("ran");
+    expect(out.recheck).toBeUndefined();
+    expect(s.openScope).toHaveBeenCalledTimes(1);
+    expect(s.openScope).toHaveBeenCalledWith({ cwd: ROOT, command: "npx vitest run" });
+    expect(s.execute).toHaveBeenCalledWith(SPEC, req.deadline);
+    expect(s.makeRechecker).not.toHaveBeenCalled();
+    expect(s.rechecker).not.toHaveBeenCalled();
+    expect(s.close).toHaveBeenCalledTimes(1);
+  });
+
+  it("rechecks only the failing files at a captured reference, forwarding the current tree", async () => {
+    const s = setup({ scoped: { kind: "ran", result: FAILING, exitCode: 1, spec: SPEC, notes: [] } });
+    const req = request();
+    const out = await s.hook(req);
+    expect(out.recheck).toBe(EXACT);
+    expect(s.makeRechecker).toHaveBeenCalledWith("npx vitest run", ROOT, TREE);
+    expect(s.rechecker).toHaveBeenCalledTimes(1);
+    expect(s.rechecker).toHaveBeenCalledWith(REFERENCE, [FILE_A], req.deadline);
+    expect(s.close).toHaveBeenCalledTimes(1);
+  });
+
+  it("reports reference none as unusable no-reference without a Rechecker call", async () => {
+    const s = setup({ scoped: { kind: "ran", result: FAILING, exitCode: 1, spec: SPEC, notes: [] } });
+    const out = await s.hook(request({ reference: { kind: "none", reason: "the dispatch was not tracked" } }));
+    expect(out.recheck).toEqual({ kind: "unusable", cause: "no-reference", reason: "the dispatch was not tracked" });
+    expect(s.makeRechecker).not.toHaveBeenCalled();
+    expect(s.rechecker).not.toHaveBeenCalled();
+  });
+
+  it("reports a disabled reference, or failureRecheck off, as disabled without a Rechecker call", async () => {
+    const ran: ScopedOutcome = { kind: "ran", result: FAILING, exitCode: 1, spec: SPEC, notes: [] };
+    const a = setup({ scoped: ran });
+    expect((await a.hook(request({ reference: { kind: "disabled" } }))).recheck).toEqual({ kind: "disabled" });
+    const b = setup({ scoped: ran, failureRecheck: false });
+    expect((await b.hook(request())).recheck).toEqual({ kind: "disabled" });
+    expect(a.rechecker).not.toHaveBeenCalled();
+    expect(b.rechecker).not.toHaveBeenCalled();
+  });
+
+  it("does not recheck failing ids without an identified failing file, nor non-ran outcomes", async () => {
+    const a = setup({ scoped: { kind: "ran", result: { ...FAILING, failingFiles: [] }, exitCode: 1, spec: SPEC, notes: [] } });
+    expect((await a.hook(request())).recheck).toBeUndefined();
+    const b = setup({ scoped: { kind: "slot-busy", waitedMs: 5, deadlineCut: false } });
+    expect(await b.hook(request())).toEqual({ scoped: { kind: "slot-busy", waitedMs: 5, deadlineCut: false }, recheck: undefined });
+    expect(a.rechecker).not.toHaveBeenCalled();
+    expect(b.rechecker).not.toHaveBeenCalled();
+    expect(b.close).toHaveBeenCalledTimes(1);
+  });
+
+  it("full mode runs the resolved command once through runShell, never plans or spawns a spec", async () => {
+    const stdout = "FAIL test/a.test.ts > suite > fails\nFAIL test/gone.test.ts > x\n Tests  2 failed | 2 passed (4)\n";
+    const s = setup({ shell: { kind: "ran", exec: { code: 1, stdout, stderr: "" }, notes: [] } });
+    const req = request({ testScope: "full" });
+    const out = await s.hook(req);
+    expect(s.runShell).toHaveBeenCalledTimes(1);
+    expect(s.runShell).toHaveBeenCalledWith("npx vitest run", ROOT, req.deadline);
+    expect(s.plan).not.toHaveBeenCalled();
+    expect(s.execute).not.toHaveBeenCalled();
+    expect(out.scoped).toEqual({
+      kind: "ran",
+      exitCode: 1,
+      notes: [],
+      result: {
+        failingIds: ["test/a.test.ts > suite > fails", "test/gone.test.ts > x"],
+        failingFiles: [FILE_A],
+        collectionError: false,
+        total: undefined,
+        complete: true,
+        source: "text",
+      },
+    });
+    // S2 applies to full too: only the failing files that exist in the live tree are rechecked.
+    expect(s.rechecker).toHaveBeenCalledWith(REFERENCE, [FILE_A], req.deadline);
+    expect(s.close).toHaveBeenCalledTimes(1);
+  });
+
+  it("full mode marks an unconfident parse incomplete and maps shell outcomes", async () => {
+    const a = setup({ shell: { kind: "ran", exec: { code: 1, stdout: "boom", stderr: "" }, notes: [] } });
+    const out = await a.hook(request({ testScope: "full" }));
+    expect(out.scoped.kind === "ran" && out.scoped.result).toMatchObject({ complete: false, collectionError: true, failingIds: [] });
+    expect(out.recheck).toBeUndefined();
+    const b = setup({ shell: { kind: "timed-out", boundMs: 100, exec: { code: -1, stdout: "", stderr: "", timedOut: true } } });
+    expect((await b.hook(request({ testScope: "full" }))).scoped).toEqual({ kind: "timed-out", boundMs: 100 });
+  });
+
+  it("never rejects: a throwing planner or executor becomes an error, and an opened scope is closed", async () => {
+    const a = setup({ plan: new Error("planner exploded") });
+    expect(await a.hook(request())).toEqual({ scoped: { kind: "error", reason: "testsPass hook errored: planner exploded" }, recheck: undefined });
+    expect(a.openScope).not.toHaveBeenCalled();
+    const b = setup({ scoped: new Error("executor exploded") });
+    expect(await b.hook(request())).toEqual({ scoped: { kind: "error", reason: "testsPass hook errored: executor exploded" }, recheck: undefined });
+    expect(b.close).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps the scoped outcome when the Rechecker throws, and still closes", async () => {
+    const s = setup({ scoped: { kind: "ran", result: FAILING, exitCode: 1, spec: SPEC, notes: [] } });
+    s.rechecker.mockImplementation(async () => { throw new Error("recheck exploded"); });
+    const out = await s.hook(request());
+    expect(out.scoped.kind).toBe("ran");
+    expect(out.recheck).toEqual({ kind: "unusable", cause: "error", reason: "the reference recheck errored: recheck exploded" });
+    expect(s.close).toHaveBeenCalledTimes(1);
   });
 });

@@ -19,17 +19,30 @@ import type {
   Rechecker,
   ScopedExecutor,
   ScopedOutcome,
+  TestsPassHook,
+  TestsPassRequest,
+  TestsPassRun,
   VerificationScope,
 } from "./types";
-import type { DetectedRunner, LintSpec, RunnerFs, RunnerHost, RunResult } from "./runner";
+import type {
+  DetectedRunner,
+  LintSpec,
+  PlannerFs,
+  RunnerFs,
+  RunnerHost,
+  RunResult,
+  TestSearchSeam,
+} from "./runner";
 import type { DispatchReference, MaterializedReference, ReferenceDeps } from "./reference";
+import type { TreeSnapshot } from "./dispatch";
 import type { VerifyBudget } from "../router/config";
 import type { PluginLogger } from "../router/logger";
 import { scrubText } from "../guard/scrub";
 import { resolveAgainst } from "./paths";
 import { isAbsolute, posix as pathPosix, win32 as pathWin32 } from "node:path";
 import { compareTests, observeTests } from "./baseline";
-import { detectRunner, isUnverifiable, planRerun, readResult, resolveEntry } from "./runner";
+import { detectRunner, isNoAffected, isUnverifiable, planRerun, planScopedRun, readResult, resolveEntry } from "./runner";
+import { fileKeyOfId } from "./baseline";
 import { DEFAULT_MATERIALIZE_TIMEOUT_MS, gcStaleReferences, materialize, nodeReferenceFs } from "./reference";
 import { acquireSlot, type SlotHandle } from "./slot";
 
@@ -762,6 +775,11 @@ export interface CheckScope extends VerificationScope {
   runShell(command: string, cwd: string, deadline: Deadline): Promise<CommandOutcome>;
   /** A scoped eslint spec through the argv seam. Never rejects. */
   runLint(spec: LintSpec, deadline: Deadline): Promise<CommandOutcome>;
+  /**
+   * VerificationScope.rechecker plus the current tree snapshot, forwarded to materialize so it can
+   * detect drift since the snapshot (T4.d). Omitted -> materialize gets undefined.
+   */
+  rechecker(command: string, cwd: string, currentTree?: TreeSnapshot): Rechecker;
 }
 
 export type OpenCheckScope = (meta: Parameters<OpenVerificationScope>[0]) => CheckScope;
@@ -1048,6 +1066,7 @@ export function createScopeOpener(deps: ScopeOpenerDeps): OpenCheckScope {
       reference: DispatchReference,
       failingFiles: readonly string[],
       deadline: Deadline,
+      currentTree: TreeSnapshot | undefined,
     ): Promise<RecheckOutcome> => {
       const remainingMs = deadline.remaining();
       if (remainingMs < RECHECK_MIN_REMAINING_MS) return { kind: "skipped-deadline", remainingMs };
@@ -1071,7 +1090,7 @@ export function createScopeOpener(deps: ScopeOpenerDeps): OpenCheckScope {
           logger?.warn(`reference GC removed ${gc.removed.length}, failed ${gc.failed.length}`);
         }
         if (rd.signal.aborted || rd.remaining() === 0) return { kind: "skipped-deadline", remainingMs: rd.remaining() };
-        const m = await seams.materialize(reference, undefined, rd.signal, {
+        const m = await seams.materialize(reference, currentTree, rd.signal, {
           ...refDeps,
           timeoutMs: rd.bound(DEFAULT_MATERIALIZE_TIMEOUT_MS),
         });
@@ -1092,9 +1111,9 @@ export function createScopeOpener(deps: ScopeOpenerDeps): OpenCheckScope {
       }
     };
 
-    const rechecker = (command: string, liveCwd: string): Rechecker => (reference, failingFiles, deadline) =>
+    const rechecker = (command: string, liveCwd: string, currentTree?: TreeSnapshot): Rechecker => (reference, failingFiles, deadline) =>
       track(
-        recheck(command, liveCwd, reference, failingFiles, deadline).catch(
+        recheck(command, liveCwd, reference, failingFiles, deadline, currentTree).catch(
           (err: unknown): RecheckOutcome => unusable("error", `the reference recheck errored: ${errorText(err)}`),
         ),
       );
@@ -1124,6 +1143,121 @@ export function createScopeOpener(deps: ScopeOpenerDeps): OpenCheckScope {
         track(runCommand(deadline, opts => argv(spec.file, spec.args, { ...opts, cwd: spec.cwd, env: { ...spec.env } }))),
       close,
     };
+  };
+}
+
+// -----------------------------------------------------------------------------------------------
+// The direct testsPass hook (2.1.2.4): P2, P3, P4-P6/P5f, the T4 pre-decisions, P7, P9
+// -----------------------------------------------------------------------------------------------
+
+export interface DirectTestsPassHookDeps {
+  openScope: OpenCheckScope;
+  /** Built in wiring.ts (2.1.3, T9). */
+  plannerFs: PlannerFs;
+  search: TestSearchSeam;
+  budget: Pick<VerifyBudget, "maxWorkers" | "failureRecheck">;
+  host?: Partial<RunnerHost>;
+  /** The gate's current tree snapshot, forwarded to materialize for drift detection (T4.d). */
+  currentTree?: TreeSnapshot;
+  /** Planner seam; default planScopedRun. */
+  plan?: typeof planScopedRun;
+  logger?: Pick<PluginLogger, "warn">;
+}
+
+/** P5f: the note on a full-suite result whose text parse was not confident. */
+export const FULL_OUTPUT_INCOMPLETE_NOTE = "the full test output could not be parsed into a complete failure inventory";
+
+/**
+ * P5f: a RunResult from the full command's text output (observeTests). Failing files are the id
+ * file parts resolved against cwd, kept only when they exist in the live tree: a key that is not a
+ * real file must never reach the recheck, where a missing file would read as "added since dispatch".
+ */
+async function synthesizeFullResult(
+  exec: ExecResult,
+  cwd: string,
+  fs: PlannerFs,
+  host: Partial<RunnerHost> | undefined,
+): Promise<RunResult> {
+  const obs = observeTests(exec);
+  const P = (host?.platform ?? process.platform) === "win32" ? pathWin32 : pathPosix;
+  const failingIds = [...new Set(obs.failures)].sort();
+  const files = new Set<string>();
+  for (const id of failingIds) {
+    const abs = P.resolve(cwd, fileKeyOfId(id));
+    if (await fs.fileExists(abs)) files.add(abs);
+  }
+  return {
+    failingIds,
+    failingFiles: [...files].sort(),
+    collectionError: exec.code !== 0 && failingIds.length === 0,
+    total: undefined,
+    complete: obs.complete,
+    source: "text",
+    ...(obs.complete ? {} : { note: FULL_OUTPUT_INCOMPLETE_NOTE }),
+  };
+}
+
+/**
+ * S5 as a direct call (2.1.2.4; 2.2 swaps in the batch coordinator): plan, run under ONE scope,
+ * recheck the failing files at the dispatch reference, close the scope. Never rejects.
+ */
+export function createDirectTestsPassHook(deps: DirectTestsPassHookDeps): TestsPassHook {
+  const plan = deps.plan ?? planScopedRun;
+
+  // P5f: the resolved command as written, through the scope's shell seam (low priority, deadline-bound).
+  const runFull = async (req: TestsPassRequest, scope: CheckScope): Promise<ScopedOutcome> => {
+    const out = await scope.runShell(req.command, req.cwd, req.deadline);
+    if (out.kind === "timed-out") return { kind: "timed-out", boundMs: out.boundMs };
+    if (out.kind !== "ran") return out;
+    const result = await synthesizeFullResult(out.exec, req.cwd, deps.plannerFs, deps.host);
+    const notes = [...out.notes, ...(result.note !== undefined ? [result.note] : [])];
+    return { kind: "ran", result, exitCode: out.exec.code, notes };
+  };
+
+  const recheckFor = async (req: TestsPassRequest, scope: CheckScope, scoped: ScopedOutcome): Promise<RecheckOutcome | undefined> => {
+    // P7: only a run with >= 1 failing id and >= 1 failing file (T4).
+    if (scoped.kind !== "ran" || scoped.result.failingIds.length === 0 || scoped.result.failingFiles.length === 0) return undefined;
+    const ref = req.reference;
+    if (ref.kind === "disabled" || !deps.budget.failureRecheck) return { kind: "disabled" };
+    if (ref.kind === "none") return { kind: "unusable", cause: "no-reference", reason: ref.reason };
+    return scope.rechecker(req.command, req.cwd, deps.currentTree)(ref.reference, scoped.result.failingFiles, req.deadline);
+  };
+
+  return async (req): Promise<TestsPassRun> => {
+    let scope: CheckScope | undefined;
+    let scoped: ScopedOutcome | undefined;
+    try {
+      if (req.testScope === "full") {
+        scope = deps.openScope({ cwd: req.cwd, command: req.command });
+        scoped = await runFull(req, scope);
+      } else {
+        // P2/P3: planning outcomes take no slot and spawn nothing.
+        const planned = await plan({
+          command: req.command,
+          cwd: req.cwd,
+          changedFiles: req.changedFiles,
+          budget: { maxWorkers: deps.budget.maxWorkers },
+          fs: deps.plannerFs,
+          search: deps.search,
+          ...(deps.host !== undefined ? { host: deps.host } : {}),
+        });
+        if (isNoAffected(planned)) return { scoped: { kind: "no-affected", note: planned.note }, recheck: undefined };
+        if (isUnverifiable(planned)) {
+          return { scoped: { kind: "unverifiable", code: planned.code, reason: planned.reason }, recheck: undefined };
+        }
+        scope = deps.openScope({ cwd: req.cwd, command: req.command });
+        scoped = await scope.execute(planned, req.deadline);
+      }
+      return { scoped, recheck: await recheckFor(req, scope, scoped) };
+    } catch (err) {
+      const reason = errorText(err);
+      if (scoped !== undefined) return { scoped, recheck: { kind: "unusable", cause: "error", reason: `the reference recheck errored: ${reason}` } };
+      return { scoped: { kind: "error", reason: `testsPass hook errored: ${reason}` }, recheck: undefined };
+    } finally {
+      if (scope !== undefined) {
+        await scope.close().catch((err: unknown) => deps.logger?.warn(`verification scope close failed: ${errorText(err)}`));
+      }
+    }
   };
 }
 
