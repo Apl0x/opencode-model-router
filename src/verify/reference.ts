@@ -142,6 +142,12 @@
 //      snapshotTree makes (tree.ts). Then `git ls-files -v -z`: the first
 //      assume-unchanged or skip-worktree path adds "index-flags" to
 //      captureReasons (section 2f).
+//      Scale limit (QA-1.5-24): a listing cut at the seam's output cap is a
+//      failed call (QA-1.5-21), so capture returns undefined. `ls-files
+//      --stage` costs 51 + path chars per entry (75 under SHA-256), more than
+//      `--eol`, so at the default 10 M-char cap it fails first: a repository
+//      with more than ~95-150k tracked paths gets NO reference (fail closed:
+//      the recheck is unverifiable), not the "" fallback of step 7b.
 //   3. `git rev-parse --verify HEAD^{commit}` -> head. Failure (e.g. an unborn
 //      branch) returns undefined.
 //   4. `git stash create` on a PRIVATE INDEX (QA-1.5-1/2) -> trimmed stdout.
@@ -654,6 +660,14 @@
 //     reference inexact. Avoiding it needs each path's `w/` class at capture,
 //     i.e. a full `ls-files --eol` inside the capture budget; not done, since
 //     the error only yields "unverifiable", never a wrong excuse.
+//   - Output cap (QA-1.5-24, owner 2.1): the seam caps each stream (p12
+//     runArgv default 10 M chars) and a cut listing is a failed call. Capture's
+//     `ls-files --stage` hits the cap first, at ~95-150k tracked paths (path
+//     length 60-20), so such a repository gets no reference at all (fail
+//     closed, recheck unverifiable). The "" fallback of materialize step 7b
+//     applies only when the `--eol` listing alone overflows (an index grown
+//     after capture, long `attr/` fields). If 2.1 needs large monorepos, pass
+//     a per-call maxBuffer through the seam for the listing calls.
 //   - An ignored file that tests need (.env, generated code) is absent at the
 //     reference. The recheck must classify the resulting failure as a setup
 //     failure (§1.5-8). `unreproduced` supports that decision but cannot make
