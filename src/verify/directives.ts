@@ -13,9 +13,14 @@
  *   after the colon and `VERIFY:maybe,VERIFY:required` → required, like `CAP:abc,CAP:3` → 3 (QA-1.6-19);
  * - prose guard (QA-1.6-18): when the key is NOT written as upper-case `VERIFY`/`VERIFY_WAIT`,
  *   the value counts only if it ends the line (optionally followed by closing quotes, `*`, `_`,
- *   `)`/`]` or punctuation). So `verify: required` alone on a line → required (decision), but
+ *   `)`/`]`, a table pipe or punctuation) or is followed by another directive key
+ *   (`VERIFY:`/`VERIFY_WAIT:`/`CAP:`, any case; QA-1.6-27). So `verify: required` alone on a line,
+ *   `verify:required verify_wait:2s` and `| verify:required |` → required (decision), but
  *   `Things to verify: deferred loading works` and `Please verify: "deferred" state…` are prose
- *   and ignored silently. Upper-case keys keep the word-boundary rule below;
+ *   and ignored silently; so are `verify: required (per QA)`, `verify: required -- …` and
+ *   `<!-- verify: required -->` (decision, QA-1.6-27). Upper-case keys keep the word-boundary rule below.
+ *   DEVIATION (QA-1.6-33): §1.5-15 says "same rules as `CAP:`", whose key is case-insensitive with
+ *   no prose guard (`| cap:3 |` → 3); this guard is deliberate and applies to VERIFY keys only;
  * - the value ends at a word boundary, like `CAP:`'s `(none|\d+)\b`:
  *   `VERIFY:([a-z]+)\b`, `VERIFY_WAIT:(\d+)(ms|s)\b`. So `**VERIFY:required**`,
  *   `` `VERIFY:required` `` and `VERIFY:required.` all parse;
@@ -46,8 +51,8 @@
  * the mode came from a `VERIFY:` directive, `waitSource` whether the wait came from `VERIFY_WAIT:`.
  *
  * Pure: no imports, no process, filesystem or network access. Logging goes through the injected
- * `log` seam; logged values are truncated to 32 characters; control, bidi and other format characters are
- * escaped (QA-1.6-24).
+ * `log` seam; logged values are truncated to 32 characters and everything outside printable ASCII
+ * is escaped as `\uXXXX` / `\u{…}` (QA-1.6-24, QA-1.6-29).
  */
 
 export type VerifyMode = "required" | "deferred";
@@ -83,21 +88,26 @@ const HWS = "[^\\S\\r\\n\\u2028\\u2029]*";
 const VERIFY_RE = new RegExp(`\\bVERIFY${HWS}:${HWS}`, "gi");
 const WAIT_RE = new RegExp(`\\bVERIFY_WAIT${HWS}:${HWS}`, "gi");
 const TOKEN = /\S*/y;
-const LEAD = /^["'`*_]?/;
-const MODE_VALUE = /^([a-z]+)\b/i;
-const WAIT_VALUE = /^(\d+)(ms|s)\b/i;
-/** After a non-upper-case key the value must end the line, bar closing marks (QA-1.6-18). */
-const LINE_TAIL = /^["'`*_.,;:!?)\]]*[^\S\r\n\u2028\u2029]*(?:[\r\n\u2028\u2029]|$)/;
+const LEAD_CHARS = "\"'`*_";
+const MODE_VALUE = /([a-z]+)\b/iy;
+const WAIT_VALUE = /(\d+)(ms|s)\b/iy;
+/**
+ * After a non-upper-case key the value must end the line (QA-1.6-18), bar closing marks and a
+ * table pipe, or be followed by another directive key (QA-1.6-27). Tested with a sticky regex on
+ * the text itself (no slice, no length limit); linear: one character class, then a fixed alternative.
+ */
+const LINE_TAIL = new RegExp(
+  `(?:["'\`*_.,;:!?)\\]|]|[^\\S\\r\\n\\u2028\\u2029])*(?:[\\r\\n\\u2028\\u2029]|$|(?:VERIFY(?:_WAIT)?|CAP)${HWS}:)`,
+  "iy",
+);
 const MAX_LOGGED = 32;
-/** C1/DEL, soft hyphen, bidi controls, zero-width and other format characters (QA-1.6-24). */
-const UNSAFE = /[\u007f-\u009f\u00ad\u061c\u180e\u200b-\u200f\u2028-\u202e\u2060-\u206f\ufeff\ufff9-\ufffb]/g;
 
-/** Bounded, escaped rendering of an untrusted value for a log line. */
+/** Bounded rendering of an untrusted value: everything outside printable ASCII is escaped (QA-1.6-29). */
 function safe(value: string): string {
-  return JSON.stringify(value.slice(0, MAX_LOGGED)).replace(
-    UNSAFE,
-    (c) => `\\u${c.charCodeAt(0).toString(16).padStart(4, "0")}`,
-  );
+  return JSON.stringify(value.slice(0, MAX_LOGGED)).replace(/[^\x20-\x7e]/gu, (c) => {
+    const cp = c.codePointAt(0) ?? 0;
+    return cp > 0xffff ? `\\u{${cp.toString(16)}}` : `\\u${cp.toString(16).padStart(4, "0")}`;
+  });
 }
 
 interface Scan<T> {
@@ -105,6 +115,11 @@ interface Scan<T> {
   firstInvalid: string | null;
 }
 
+/**
+ * Linear scan (QA-1.6-28): the end of each whitespace-free run is computed once and reused by
+ * every key inside it, values are matched in place with sticky regexes, and only the ≤ 32-char
+ * logged value is ever sliced.
+ */
 function scan<T>(
   text: string,
   keyRe: RegExp,
@@ -115,23 +130,36 @@ function scan<T>(
   let firstInvalid: string | null = null;
   const re = new RegExp(keyRe.source, keyRe.flags);
   const token = new RegExp(TOKEN.source, TOKEN.flags);
+  const value = new RegExp(valueRe.source, valueRe.flags);
+  const tail = new RegExp(LINE_TAIL.source, LINE_TAIL.flags);
+  let tokEnd = -1;
+  let tailAt = -1;
+  let tailOk = false;
   for (let m = re.exec(text); m !== null; m = re.exec(text)) {
     const start = m.index + m[0].length;
-    token.lastIndex = start;
-    const raw = token.exec(text)?.[0] ?? "";
-    if (raw === "") continue;
-    const body = raw.replace(LEAD, "");
-    if (body.startsWith("<")) continue; // placeholder
-    const v = valueRe.exec(body);
-    if (v && body.charAt(v[0].length) === "|") continue; // placeholder
+    if (start >= tokEnd) {
+      token.lastIndex = start;
+      tokEnd = start + (token.exec(text)?.[0].length ?? 0);
+    }
+    if (start === tokEnd) continue;
+    const pos = start + (LEAD_CHARS.includes(text.charAt(start)) ? 1 : 0);
+    if (text.charAt(pos) === "<") continue; // placeholder
+    value.lastIndex = pos;
+    const v = pos < tokEnd ? value.exec(text) : null;
+    if (v && text.charAt(pos + v[0].length) === "|") continue; // placeholder
     if (!m[0].startsWith(upperKey)) {
       // Prose guard: `Things to verify: deferred loading works` is not a directive.
-      const end = v ? start + (raw.length - body.length) + v[0].length : start + raw.length;
-      if (!LINE_TAIL.test(text.slice(end, end + 256).split(/[\r\n\u2028\u2029]/)[0] ?? "")) continue;
+      const end = v ? pos + v[0].length : tokEnd;
+      if (end !== tailAt) {
+        tail.lastIndex = end;
+        tailAt = end;
+        tailOk = tail.test(text);
+      }
+      if (!tailOk) continue;
     }
     const accepted = v ? accept(v) : null;
     if (accepted !== null) return { value: accepted, firstInvalid };
-    firstInvalid ??= raw;
+    firstInvalid ??= text.slice(start, Math.min(tokEnd, start + MAX_LOGGED));
   }
   return { value: null, firstInvalid };
 }

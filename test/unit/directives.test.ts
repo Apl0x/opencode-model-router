@@ -153,7 +153,47 @@ describe("parseVerifyDirectives", () => {
   it("QA-1.6-16: directives.ts imports nothing (no process, fs or network)", () => {
     const src = readFileSync(new URL("../../src/verify/directives.ts", import.meta.url), "utf8");
     expect(src.match(/^import .*$/gm)).toBeNull();
-    expect(src).not.toMatch(/child_process|\brequire\(|\bimport\(|node:|\bprocess\.|\bfetch\(|\bWebSocket\b|\bXMLHttpRequest\b|^export .* from/m);
+    // QA-1.6-30: comments stripped first; spaced calls, optional chains and more globals caught.
+    const code = src.replace(/\/\*[\s\S]*?\*\//g, "").replace(/(^|[^:\\])\/\/.*$/gm, "$1");
+    expect(code).not.toMatch(
+      /child_process|\brequire\s*\(|\bimport\s*\(|\bimport\b|node:|\bprocess\b|\bfetch\b|\bWebSocket\b|\bXMLHttpRequest\b|^\s*export\b.*\bfrom\b|export\s*\*|\bWorker\b|\bEventSource\b|sendBeacon|\bBun\.|\bDeno\./m,
+    );
+  });
+
+  it("QA-1.6-27: lower-case directive followed by another key, a pipe or closing marks", () => {
+    expect(parseVerifyDirectives("verify:required verify_wait:2s", D)).toEqual({ ...REQUIRED, waitMs: 2000, waitSource: "directive" });
+    expect(parseVerifyDirectives("verify: required, VERIFY_WAIT:2s", D)).toEqual({ ...REQUIRED, waitMs: 2000, waitSource: "directive" });
+    expect(parseVerifyDirectives("verify:required cap:none", D)).toEqual(REQUIRED);
+    expect(parseCapDirective("verify:required cap:none")).toBe("none");
+    expect(parseVerifyDirectives("| verify:required |", D)).toEqual(REQUIRED);
+    expect(parseVerifyDirectives("verify: required*) ", D)).toEqual(REQUIRED);
+    for (const t of [
+      `verify: required${" ".repeat(300)}fields are validated`,
+      `verify: required${".".repeat(300)}fields`,
+      "verify: required (per QA)",
+      "verify: required -- tests must pass",
+    ]) {
+      expect(parseVerifyDirectives(t, D)).toEqual(DEFAULT);
+    }
+  });
+
+  it("QA-1.6-28: whitespace-free runs of keys are scanned in linear time", () => {
+    for (const k of ["VERIFY:", "VERIFY_WAIT:", "verify:", "VERIFY:a,"]) {
+      const t = k.repeat(Math.ceil(1_000_000 / k.length));
+      const t0 = performance.now();
+      parseVerifyDirectives(t, D);
+      expect(performance.now() - t0).toBeLessThan(500);
+    }
+  });
+
+  it("QA-1.6-29: logged values escape everything outside printable ASCII", () => {
+    const log = vi.fn();
+    parseVerifyDirectives("VERIFY:x\u{E0049}\u034f\u202e", D, log);
+    expect(log).toHaveBeenCalledTimes(1);
+    const line = String(log.mock.calls[0]?.[0]);
+    expect(line).toMatch(/^[\x20-\x7e]*$/);
+    expect(line).toContain("\\u{e0049}");
+    expect(line).toContain("\\u034f");
   });
 
   it("QA-1.6-18: lower/mixed-case key in prose is not a directive; upper case unchanged", () => {
