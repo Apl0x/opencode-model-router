@@ -74,7 +74,7 @@ kind: <enum>                                       # parsed; always re-derived �
 | `buildPasses` | — | `command` (default `npm run build`) |
 | `lintClean` | — | `command` (default `npm run lint`) |
 
-`run` commands must be on the allowlist (`npm` / `npx` / `pnpm` / `yarn` / `bun` / `node` / `tsc` / `tsx` / `vitest` / `jest` / `eslint` / `prettier`) and must not contain shell metacharacters. Per-check timeout applies to all `run` calls.
+`run` commands must be on the allowlist (`npm` / `npx` / `pnpm` / `yarn` / `bun` / `node` / `tsc` / `tsx` / `vitest` / `jest` / `eslint` / `prettier` / `pytest`, plus `uv run pytest …` only) and must not contain shell metacharacters. Per-check timeout applies to all `run` calls.
 
 ### Normalization
 
@@ -145,8 +145,94 @@ The gate verifies the artefact attributed to the producer session:
 Runs checks via an injected exec/fs seam. Key invariants:
 
 - Command allowlist enforced; shell metacharacters rejected; per-check timeout applied.
-- Whole-repo checks (`testsPass`, `buildPasses`, `lintClean`) run under a per-workspace mutex — concurrent verifications on the same repo cannot race.
+- Every command check (`testsPass`, `buildPasses`, `lintClean`, `run`) takes a machine-wide verification slot, runs at low priority and is bounded by the gate deadline. Checks of one gate run one after another and never hold two slots at once.
+- `buildPasses` and `run` also keep the per-workspace mutex. `testsPass` does **not** use it, because that lock would serialize exactly the concurrent gates that [batching](#batching) merges.
 - Empty checks array → SKIPPED (never PASS).
+
+## `testsPass`: affected tests, not the whole suite
+
+`testsPass` runs only the tests the change can affect. It then judges any failures against the tree as it was when the delegation was dispatched. The design lives in the `testsPass PIPELINE` header of `src/verify/deterministic.ts` (T1–T11). The flow diagrams are in `docs/FLOW_DIAGRAMS.md` §9–§11.
+
+### Required path (the gate)
+
+A `VERIFY:required` delegation, and every `router_verify` or background run, goes through these steps:
+
+1. **Gate and deadline.** Each gate invocation, and each `router_verify` call, creates one deadline of `gateBudgetMs` with its own `AbortController`. Every later step is bounded by the time that remains. A step whose bound is 0 is not started.
+2. **Changed files.** The files come from the tool edits the router observed for the producer session. On a retry or escalation this is the **union of every attempt** in the lineage, all judged against the one dispatch reference. The set also includes:
+   - files that were already dirty at dispatch and whose per-file content digest has changed since then;
+   - the files of commits made since the dispatch snapshot's head.
+
+   When attribution fails, the set is `"unavailable"`, never `[]`, and the check is unverifiable.
+3. **Static scoping.** `planScopedRun` turns the command and the changed files into a scoped spec (vitest `related <files>`, or the affected test files). If no test is affected, the check passes with a note. If scoping is impossible, the check is unverifiable. It never falls back to an unscoped run. Only an explicit `testScope: "full"` runs the resolved command as written.
+4. **Slot.** `acquireSlot` waits for a machine-wide slot (`maxConcurrentVerifications`), for at most `slotWaitMs` capped by the deadline. One hold covers the scoped run **and** its recheck.
+5. **Scoped run.** The spec runs as argv, never through a shell. It runs at low priority with the `maxWorkers` cap and the deadline's abort signal. Its result is read from the runner's report on every path, including timeout, abort and spawn errors.
+6. **Recheck on failure.** If the run has failing tests, their test files are rerun in a temporary worktree materialized at the dispatch reference. The recheck is skipped with fewer than 10 s left (`RECHECK_MIN_REMAINING_MS`). GC, materialization and the rerun share one `recheckTimeoutMs` sub-deadline. A reference that is not **exact** (see [Unverifiable](#unverifiable)) is never rerun.
+7. **Verdict.** `judgeScoped(scoped, recheck)` produces the verdict:
+
+| outcome | when | gate result |
+|---|---|---|
+| **pass** | the scoped run is complete, has no collection error and no failing test; or no test is affected | accepted |
+| **pass — "no worse than before"** | every failing test id also fails at an **exact** reference, and the scoped inventory is complete | accepted, with the note `no worse than before; pre-existing failures: …; suite is NOT green` |
+| **fail** | at least one failing id is **proven** introduced against an exact recheck: it fails now and passed at the reference, or its test file did not exist at dispatch | rejected; only the introduced ids are named |
+| **unverifiable** | anything else (below) | accepted **with a caveat**, or rejected when `strictUnverifiable` is on |
+
+A fail is always backed by a proven id. A result that cannot be decided either way is unverifiable, never fail and never pass.
+
+8. **Escalation.** A rejection follows the existing `onFailure` handling and the escalation ladder (`docs/ESCALATION.md`). The `delegate` tool retries up the ladder. The native `task` path appends a forcing note.
+
+### Deferred path (the default)
+
+The mode is chosen by directives in the orchestrator's dispatch prompt. A subagent cannot select its own mode.
+
+- `VERIFY:required`, or `VERIFY:deferred` (the default).
+- `VERIFY_WAIT:<n>s` or `VERIFY_WAIT:<n>ms`: `0` is allowed, and the value is capped at `baselineTimeoutMs`. A malformed value falls back to `captureWaitMs` and is logged.
+
+Deferral applies to delegations whose DoD has a `testsPass` check.
+
+1. **Dispatch.** When the DoD has `testsPass` and `failureRecheck` is on, the router starts a **git-only** reference capture of the working tree. It never runs the test command at dispatch time. The dispatch waits for the capture for at most `VERIFY_WAIT` (default `captureWaitMs`), then starts the producer anyway. The capture keeps running for up to `baselineTimeoutMs`. A capture that fails or times out means "no reference". It never blocks or fails the dispatch.
+2. **Producer returns.** The deferred finish takes a git-only tree snapshot, bounded at 2 s (`DEFERRED_FINISH_MS`). From that snapshot it computes:
+   - the changed files;
+   - static scoping (no spawn);
+   - a **risk** level (`low` / `medium` / `high`). Unattributed changes are `high`, and a capture still in flight raises the risk one step.
+
+   It then **registers** a pending entry (TTL `pendingTtlMs`) and returns the producer's result **at once** with a footer shaped like `[router] unverified · vrf_<id> · risk <level>`. No tests run. A deferred result is never labelled verified or accepted.
+3. **Later, `router_verify`** (`["vrf_<id>", …]` or `pending: true`), called only if the orchestrator decides to, runs the **same required path** on the **current** tree against the stored reference. It returns a verdict per handle and never dispatches a retry. Per-file digests taken right after the producer returned let it add a **drift** notice when those files changed since then. A settled verdict is cached: a second call replays it and runs nothing.
+4. **`background: true`** (off by default; when off, no queue or timer exists) queues the same run automatically once the settle delay has passed. A fail or unverifiable result becomes a one-time late notice in the orchestrator's system prompt. A pass is silent.
+
+Open handles are listed in the orchestrator's system prompt, newest first, capped at 5. Handles are scoped to the orchestrator session and live in memory: a restarted opencode process loses them (`unknown handle`).
+
+**Lineage caveat.** A native `task` re-dispatch after a rejection captures a reference that already contains the failed attempt. A test that attempt broke would read as pre-existing. The router keeps a per-session ledger of proven-introduced ids and downgrades such a pass to **unverifiable**, with a caveat naming the earlier delegation. The ledger matches ids only, so a renamed test escapes it.
+
+### Batching
+
+Concurrent `testsPass` checks that would run the same program, in the same directory, with the same options and environment, share one **window** of `batchWindowMs`. The window is capped at `gateBudgetMs / 10`, and `0` disables batching.
+
+- The window closes at its deadline, or at once when it holds `maxBatchSize` requests. Arrivals never extend it.
+- It also closes **early** when nothing else could join, for example when the gate is alone. A lone request never waits.
+- It also closes early before any member's reserve (recheck threshold plus a margin, scaled by the last measured run time) would be eaten.
+- Members are **pooled** into one scoped run over the union of their files, one slot hold per batch, only when **every** member's remaining budget covers the batched schedule. Otherwise every member runs **solo**, exactly as it would without batching.
+- Each member receives the verdict it would have had solo: failures are attributed back per request and each is rechecked for its own reference. The one exception is a flaky runner, which can turn a would-be pass into unverifiable in a batch. A batch never creates a pass.
+
+### Unverifiable
+
+Unverifiable means the router could not tell whether the change broke tests. It occurs when:
+
+- **the slot is busy**: no verification slot within `slotWaitMs`, or the deadline ran out while waiting;
+- **the budget is exhausted**: the scoped run timed out or was aborted, fewer than 10 s were left for the recheck, or the reference rerun timed out;
+- **there is no reference**: the capture failed or timed out, had not resolved within the gate budget, the dispatch was not tracked, `failureRecheck` is off, or the reference vanished or could not be materialized;
+- **the reference is approximate**: files differ from the dispatch state in a way the reference cannot reproduce. Only inert files such as `coverage/`, `*.log` and caches are ignored;
+- **the tests are pytest failures**: a pytest reference rerun is never attempted (`runner-unsupported`), because an editable install imports the live tree's sources. Green pytest runs still pass;
+- **a run is incomplete**: a missing or partial report, a collection error without identifiable test files, a zero-test rerun, or failing ids that cannot be matched to a reference result;
+- **scoping is impossible**: changed files are unavailable, or no planner exists for the command (S6);
+- the command is not allowlisted, the check errored, or the lineage caveat applies.
+
+By default an unverifiable result is **accepted with a caveat** that names the reason. Set `verify.strictUnverifiable: true` to reject it instead. Unverifiable never counts as verified. It is not proof that the tests pass.
+
+### Windows limits
+
+- **Junction-based `node_modules` at the reference.** The reference worktree links the live tree's `node_modules` with directory junctions. A reference rerun therefore uses today's installed dependencies, not the dependencies from dispatch time. Cleanup takes care not to follow those junctions into the live tree.
+- **8.3 short paths.** Change sets compare canonical paths, so a short name (`C:\Users\MARQUI~1\…`) and its long form are the same file. Rerun planning is less forgiving: when the plugin or runner path resolves through an 8.3 short name, planning the reference rerun can fail (`rerun-unplannable`). The result is then unverifiable, not a fail.
+- **Orphan processes.** Abort kills the whole process tree. A descendant whose parent died before it was pinned, such as a detached grandchild of a short-lived middle process, cannot be attributed safely and is **not** killed. The run still resolves within the 2 s kill grace (`KILL_GRACE_MS`), and the report notes any force-closed output streams.
 
 ## Checker (Independent Grader) Verifier
 
@@ -210,6 +296,9 @@ An absolute check path bypasses the base directory entirely, and the failure rea
 | `delegateTimeoutMs` | `600000` | Producer turn ceiling — see [Time-boxes](#time-boxes) |
 | `graderTimeoutMs` | `60000` | Grader turn ceiling |
 | `gateBudgetMs` | `90000` | Whole-gate ceiling |
+| `strictUnverifiable` | `false` | `true` rejects an unverifiable verdict instead of accepting it with a caveat |
+
+Resource-budget keys used by `testsPass` and the deferred path: `failureRecheck`, `baselineTimeoutMs`, `captureWaitMs`, `recheckTimeoutMs`, `slotWaitMs`, `maxConcurrentVerifications`, `lowPriority`, `maxWorkers`, `batchWindowMs`, `pendingTtlMs` and `background`. Their defaults and bounds are in `docs/CONFIG_REFERENCE.md`.
 
 Full schema: see `docs/CONFIG_REFERENCE.md`.
 
