@@ -503,7 +503,11 @@ interface PluginHarness {
   run(path: DispatchPath, prompt: string, reply?: string, tier?: string, sessionID?: string): Promise<string>;
 }
 
-async function makePlugin(home: string): Promise<PluginHarness> {
+/**
+ * `parents`: session id -> parentID that session.get reports (default: none, a root session);
+ * `lookupFails`: session ids whose session.get throws (QA-2.4-2).
+ */
+async function makePlugin(home: string, sessions: { parents?: Record<string, string>; lookupFails?: string[] } = {}): Promise<PluginHarness> {
   let counter = 0;
   const h: PluginHarness = {
     hooks: undefined,
@@ -535,7 +539,11 @@ async function makePlugin(home: string): Promise<PluginHarness> {
     $: () => undefined,
     client: {
       session: {
-        get: async () => ({ data: {} }),
+        get: async (req: { path: { id: string } }) => {
+          if (sessions.lookupFails?.includes(req.path.id) === true) throw new Error("session.get failed");
+          const parentID = sessions.parents?.[req.path.id];
+          return { data: parentID !== undefined ? { parentID } : {} };
+        },
         create: async () => {
           const id = `sess_${h.created.length + 1}`;
           h.created.push(id);
@@ -666,6 +674,24 @@ describe("the plugin routes by mode on both dispatch paths", () => {
       producerChanges();
       const deferred = await h.run(p, `VERIFY:deferred\nImplement it.\n${ACCEPT_TESTS}`);
       expect(deferred).toMatch(FOOTER_LINE);
+    });
+
+    it("QA-2.4-2: a subagent's (or an unknown session's) dispatch is gated synchronously and registers nothing", async () => {
+      const h = await makePlugin(home, { parents: { sub: "orch" }, lookupFails: ["flaky"] });
+      producerChanges();
+      // A tracked tier subagent too (chat.message registers it), whatever session.get says.
+      await h.hooks["chat.message"]({ sessionID: "tracked", agent: "fast" }, { parts: [{ type: "text", text: "implement the parser and its tests" }] });
+      for (const sid of ["sub", "flaky", "tracked"]) {
+        const out = await h.run(p, `VERIFY:deferred\nImplement it.\n${ACCEPT_TESTS_AND_MISSING}`, undefined, undefined, sid);
+        expect(out).not.toMatch(FOOTER_LINE);
+        // Today's gate ran and rejected (its fileExists check fails).
+        expect(out).toMatch(p === "task" ? /NOT ACCEPTED/ : /\[router status: unmet\]/);
+        expect(pendingOf(sid)).toEqual([]);
+      }
+      expect(pendingOf("orch")).toEqual([]);
+      // Control: the proven root orchestrator still defers.
+      expect(await h.run(p, `Implement it.\n${ACCEPT_TESTS}`)).toMatch(FOOTER_LINE);
+      expect(pendingOf("orch")).toHaveLength(1);
     });
 
     it("QA-2.4-10: a producer that changed no file is gated exactly as the required path: same outcome, no footer, no entry", async () => {

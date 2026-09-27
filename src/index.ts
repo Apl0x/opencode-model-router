@@ -276,7 +276,15 @@ const ModelRouterPlugin: Plugin = async (ctx: PluginInput) => {
    * still cover the common cases, so the exposure is a rare, transient re-run of
    * the old behaviour rather than a permanent loss of function.
    */
-  const resolveIsRootSession = async (sessionID: string): Promise<boolean> => {
+  const resolveIsRootSession = async (sessionID: string): Promise<boolean> =>
+    (await lookupRootSession(sessionID)) ?? true;
+
+  /**
+   * The lookup behind resolveIsRootSession: true (no parentID), false (a parentID), or undefined
+   * when it is not known (the lookup failed, or failed recently and is throttled). QA-2.4-2 treats
+   * undefined as NOT root (isProvenRootCaller), where the protocol injection treats it as root.
+   */
+  const lookupRootSession = async (sessionID: string): Promise<boolean | undefined> => {
     const memo = sessionRootMemo.get(sessionID);
     if (memo !== undefined) {
       if (!memo) sessionStore.markChildSession(sessionID);
@@ -284,7 +292,7 @@ const ModelRouterPlugin: Plugin = async (ctx: PluginInput) => {
     }
     const failedAt = sessionLookupFailedAt.get(sessionID);
     if (failedAt !== undefined && Date.now() - failedAt < SESSION_LOOKUP_RETRY_MS) {
-      return true;
+      return undefined;
     }
     try {
       const res = await ctx.client.session.get({ path: { id: sessionID } });
@@ -310,7 +318,7 @@ const ModelRouterPlugin: Plugin = async (ctx: PluginInput) => {
         sessionLookupFailedAt.delete(oldest);
       }
       warnSessionLookupFailedOnce();
-      return true;
+      return undefined;
     }
   };
 
@@ -460,6 +468,19 @@ const ModelRouterPlugin: Plugin = async (ctx: PluginInput) => {
    * synchronous gate (never weaker).
    */
   const isDeferred: typeof wiringIsDeferred = (dod, directives, trivial) => routerVerifyEnabled && wiringIsDeferred(dod, directives, trivial);
+  /**
+   * QA-2.4-2: a deferred entry is keyed to the dispatching session (pending.ts R6), and only a root
+   * orchestrator ever sees a pending list (the system transform returns early for every child). So
+   * only a PROVEN root orchestrator session may defer. A subagent dispatching `task` or `delegate`
+   * (a grader, a tracked subagent, a session with a parentID) gets today's synchronous gate and
+   * registers nothing, whatever its directives say; so does an unknown session (no id, or a failed
+   * lookup: fail safe).
+   */
+  const isProvenRootCaller = async (sessionID: unknown): Promise<boolean> => {
+    if (typeof sessionID !== "string" || sessionID === "") return false;
+    if (graderSessions.has(sessionID) || sessionStore.isSubagent(sessionID)) return false;
+    return (await lookupRootSession(sessionID)) === true;
+  };
 
   return {
     // Warnings post to /log fire-and-forget, which loses the message when the
@@ -647,7 +668,8 @@ const ModelRouterPlugin: Plugin = async (ctx: PluginInput) => {
               // 2.4.2c, section 1.5-16: a deferred delegation runs no gate and no ladder. A producer
               // that failed outright produced nothing to verify later; it keeps today's
               // failed-attempt path, which runs no verification process either.
-              const finish = dispatchStart !== undefined && producerError === null && isDeferred(dod, dispatchStart.directives)
+              const finish = dispatchStart !== undefined && producerError === null && isDeferred(dod, dispatchStart.directives) &&
+                await isProvenRootCaller(toolCtx?.sessionID)
                 ? await finishDeferred(changedFileStore, {
                     dispatchID: baselineID,
                     orchestratorSessionID: toolCtx?.sessionID ?? "",
@@ -1264,8 +1286,8 @@ const ModelRouterPlugin: Plugin = async (ctx: PluginInput) => {
               ? sessionStore.isTrivial(childSessionID)
               : false;
             // QA-2.4-10: `trivial` as the gate sees it below; a dispatch the gate would skip is not
-            // deferred (isDeferred).
-            if (isDeferred(dod, start.directives, trivial)) {
+            // deferred (isDeferred). QA-2.4-2: only a proven root orchestrator defers.
+            if (isDeferred(dod, start.directives, trivial) && await isProvenRootCaller(orchestratorSessionID)) {
               // Section 1.5-16: no gate, no test process; the result goes back now with the
               // footer, which is appended last and never says accepted or verified.
               const finish = await finishDeferred(changedFileStore, {
