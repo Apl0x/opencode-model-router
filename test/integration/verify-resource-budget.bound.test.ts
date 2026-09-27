@@ -92,6 +92,11 @@ const GATE_BUDGET_MS = 6000;
  */
 const NEUTRAL_START_DELAY_MS = 3500;
 const SLOW_TEST = `\nit("slow", async () => { await new Promise(r => setTimeout(r, 120000)); }, 200000);\n`;
+/**
+ * How far a snapshot's `t` may sit from the moment its process list was read: win32 stamps it
+ * before the CIM query (~100 ms), POSIX when the parent reads the `@@T` frame, possibly after `ps`.
+ */
+const SNAPSHOT_SKEW_MS = 250;
 
 /** Logs the measured numbers; with OMR_E2E_REPORT=<file> also appends them there (vitest may hide a passing test's console). */
 function emit(text: string): void {
@@ -419,23 +424,30 @@ suite("verify resource budget: machine-wide bound (3.1.2.b-e)", () => {
       ].join("\n"),
     );
 
-    /** Runner mains of this child, in its repo, whose args name module m's source or one of its test files. */
-    const mainsFor = (childPid: number, repoDir: string, m: number): ProcSample[] => {
+    /**
+     * Runner mains of this child, in its repo, whose args name module m's source or one of its test
+     * files, seen in the snapshots taken within [from, to] (widened by SNAPSHOT_SKEW_MS).
+     */
+    const mainsFor = (childPid: number, repoDir: string, m: number, from = -Infinity, to = Infinity): ProcSample[] => {
       const nn = String(m).padStart(2, "0");
       const names = new RegExp(`(src/m${nn}\\.js|test/m${nn}-\\d+\\.test\\.js)`);
       const repoSpellings = pathSpellings(repoDir);
-      return seen(snapshots, childPid, excl, p => isMain(p) && mentionsAny(p.args, repoSpellings) && names.test(norm(p.args)));
+      const within = snapshots.filter(s => s.t >= from - SNAPSHOT_SKEW_MS && s.t <= to + SNAPSHOT_SKEW_MS);
+      return seen(within, childPid, excl, p => isMain(p) && mentionsAny(p.args, repoSpellings) && names.test(norm(p.args)));
     };
     const perDispatch = children.flatMap((c, ci) =>
       c.mods.map((m, di) => {
         const s = summaries[ci];
         const d = s?.dispatches[di];
-        return { tag: c.tag, m, broken: m === c.broken, d, mains: s === undefined ? [] : mainsFor(s.pid, c.repo.dir, m) };
+        const mains = s === undefined ? [] : mainsFor(s.pid, c.repo.dir, m);
+        // This dispatch's own gate: its after hook, from its start to its return.
+        const gateMains = s === undefined || d === undefined ? [] : mainsFor(s.pid, c.repo.dir, m, d.returnedAt - d.afterMs, d.returnedAt);
+        return { tag: c.tag, m, broken: m === c.broken, d, mains, gateMains };
       }),
     );
     emit(
       perDispatch
-        .map(x => `[3.1.2.c] ${x.tag} ${mod(x.m)}${x.broken ? " (broken)" : ""}: after=${x.d?.afterMs.toFixed(0) ?? "?"}ms runner mains naming it=${x.mains.length} ${x.mains.map(p => p.pid).join(",")}`)
+        .map(x => `[3.1.2.c] ${x.tag} ${mod(x.m)}${x.broken ? " (broken)" : ""}: after=${x.d?.afterMs.toFixed(0) ?? "?"}ms runner mains naming it=${x.mains.length} ${x.mains.map(p => p.pid).join(",")}; during its gate=${x.gateMains.length} ${x.gateMains.map(p => p.pid).join(",")}`)
         .join("\n"),
     );
 
@@ -457,9 +469,11 @@ suite("verify resource budget: machine-wide bound (3.1.2.b-e)", () => {
         // A clean required-mode pass leaves the output untouched: no rejection, no caveat.
         expect(out.includes(REJECTED_MARK), label).toBe(false);
         expect(out.includes(CAVEAT_MARK), label).toBe(false);
-        // Non-vacuity: verification really ran for this dispatch.
-        expect(x.d?.afterMs ?? 0, label).toBeGreaterThanOrEqual(1000);
-        expect(x.mains.length, label).toBeGreaterThanOrEqual(1);
+        // Non-vacuity: verification really ran for this dispatch. The direct evidence is a runner
+        // main of this child, in its repo, naming this module and alive during this dispatch's own
+        // gate. (CI round 1: a duration floor is no proof; a batched 2-file run on Linux finished
+        // its gate in 587-686 ms.)
+        expect(x.gateMains.map(p => p.pid), label).not.toEqual([]);
       }
     }
     expect(peakWorkers).toBeGreaterThanOrEqual(1);
