@@ -31,9 +31,25 @@ function forkingFixture() {
 function alive(pid: number): boolean {
   try {
     process.kill(pid, 0);
-    return true;
   } catch (err) {
     return (err as NodeJS.ErrnoException).code === "EPERM";
+  }
+  return !zombieOrReaped(pid);
+}
+
+/**
+ * Linux: a killed process whose parent already exited is re-parented, and
+ * stays a zombie until its new parent reaps it. It is dead (it holds no CPU,
+ * memory or fds), but `kill(pid, 0)` still succeeds on it.
+ */
+function zombieOrReaped(pid: number): boolean {
+  if (process.platform !== "linux") return false;
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+    return stat.slice(stat.lastIndexOf(")") + 2).startsWith("Z");
+  } catch (err) {
+    // Reaped between the signal probe and the read.
+    return (err as NodeJS.ErrnoException).code === "ENOENT";
   }
 }
 
