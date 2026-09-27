@@ -261,13 +261,10 @@ editable install imports the live tree rather than the reference worktree, so th
 rerun could not prove anything.
 
 **Windows.** The reference worktree links `node_modules` with directory junctions,
-which need no elevation. When the project directory opencode hands the plugin
-(`ctx.directory`) is an 8.3 short path (for example `C:\Users\ABCDEF~1\…`), every
-reference rerun is unplannable (`rerun-unplannable`, QA-2.4-23). Scoped failures are
-then always `unverifiable` (accepted with a caveat unless `strictUnverifiable`), so
-`testsPass` cannot reject an introduced failure on such a setup. Open the project
-through its long path. Whether the host actually passes short paths is still to be
-confirmed by the Phase 3.1 live check.
+which need no elevation. A project directory (`ctx.directory`) or `%TEMP%` spelled as
+an 8.3 short path (for example `C:\Users\ABCDEF~1\…`) is supported: the recheck
+resolves the runner and maps paths with the native realpath. Before Phase 3.1
+(QA-2.4-23, E2E-2), every reference rerun on such a setup was unplannable.
 
 **Deprecations.** `testBaseline` is deprecated (`false` maps to
 `failureRecheck: false`; a one-time warning is logged).
