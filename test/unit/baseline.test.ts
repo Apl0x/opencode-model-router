@@ -187,6 +187,55 @@ describe("dispatch reference capture in the changed-file store", () => {
     expect(h.store.delta("child", "child", tree()).changeBaseline).toBe("unavailable");
     expect(await h.get("child")).toEqual({ kind: "none", reason: REFERENCE_NONE.contaminated });
   });
+  // E2E-3: opencode fires tool.execute.before for MCP tools (`<server>_<tool>`) and custom tools
+  // too. An edit by one of them that lands while the dispatch snapshot is still in flight
+  // (VERIFY_WAIT:0s) used to seed the baseline: the change set came out empty and available, so the
+  // gate passed "no changed files" without running anything.
+  it.each(["filesystem_write_file", "morph_edit", "batch", "Serena_replace_symbol_body"])(
+    "a tool not known to be non-writing (%s) mid-snapshot leaves no change baseline and no reference (E2E-3)",
+    async tool => {
+      const h = harness();
+      const snap = deferred<TreeSnapshot>();
+      const ref = deferred<DispatchReference | undefined>();
+      let signal: AbortSignal | undefined;
+      h.deps.snapshot = () => snap.promise;
+      h.capture.mockImplementationOnce(async (_c, s) => { signal = s; return ref.promise; });
+      const settled = h.start("child");
+      await vi.waitFor(() => expect(signal).toBeDefined());
+      // No cwd: MCP and custom tools carry none, so the edit overlaps every dispatch.
+      h.store.observeEdit(tool);
+      expect(signal?.aborted).toBe(true);
+      // Both settle AFTER the edit and so already contain it.
+      const edited = tree({ fingerprint: "after-edit", dirty: true, files: [{ path: resolve(cwd, "src", "a.ts"), status: " M" }] });
+      snap.resolve(edited);
+      ref.resolve(REF);
+      await settled;
+      const delta = h.store.delta("child", "child", edited);
+      expect(delta.changeBaseline).toBe("unavailable");
+      expect(h.store.baselineSnapshot("child")).toBeUndefined();
+      expect(await h.get("child")).toEqual({ kind: "none", reason: REFERENCE_NONE.contaminated });
+    },
+  );
+  it.each(["read", "glob", "grep", "task", "delegate", "router_verify", "todowrite", "webfetch", "read_mcp_resource", "skill"])(
+    "a non-writing tool (%s) mid-snapshot keeps the change baseline and the reference",
+    async tool => {
+      const h = harness();
+      const snap = deferred<TreeSnapshot>();
+      const ref = deferred<DispatchReference | undefined>();
+      let signal: AbortSignal | undefined;
+      h.deps.snapshot = () => snap.promise;
+      h.capture.mockImplementationOnce(async (_c, s) => { signal = s; return ref.promise; });
+      const settled = h.start("child");
+      await vi.waitFor(() => expect(signal).toBeDefined());
+      h.store.observeEdit(tool);
+      expect(signal?.aborted).toBe(false);
+      snap.resolve(tree());
+      ref.resolve(REF);
+      await settled;
+      expect(h.store.delta("child", "child", tree()).changeBaseline).toBe("available");
+      expect(await h.get("child")).toEqual(captured);
+    },
+  );
   it("editing a different known directory does not contaminate capture", async () => {
     const h = harness(); const held = deferred<DispatchReference | undefined>();
     h.capture.mockImplementationOnce(() => held.promise);

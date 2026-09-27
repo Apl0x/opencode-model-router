@@ -97,9 +97,24 @@ export interface ChangedFileStoreOptions {
 
 /** Tools that mutate the workspace (mirrors the guard taxonomy). */
 const WRITE_TOOLS = new Set(["write", "edit", "patch", "multiedit", "apply_patch"]);
-// Shell commands can edit too. Without a command-level proof of read-onlyness,
-// discarding a capture is safer than allowing an unobserved shell edit to seed it.
-const MAY_WRITE_TOOLS = new Set([...WRITE_TOOLS, "bash", "shell", "powershell", "exec"]);
+/**
+ * E2E-3: the tools known never to write the workspace themselves. observeEdit treats EVERY other
+ * tool as a possible write: the shells (no command-level proof of read-onlyness), the write tools,
+ * and any tool it does not know. opencode fires tool.execute.before for MCP tools too (named
+ * `<server>_<tool>`) and for plugin and custom tools, so an MCP `write_file`, a custom editor or
+ * `batch` reach the plugin under names no allowlist of writers can list. Such an edit landing
+ * while a dispatch snapshot or capture is still in flight (VERIFY_WAIT:0s, or a snapshot slower
+ * than the wait) would seed the change baseline, which then hides it ("no changed files": a clean
+ * pass), or the reference, where the failure it causes looks pre-existing and is excused.
+ * `task` and `delegate` start producer sessions whose own tool calls are observed; `router_verify`
+ * only runs checks.
+ */
+const NON_WRITING_TOOLS = new Set([
+  "read", "glob", "grep", "list", "ls", "codesearch", "webfetch", "websearch", "lsp",
+  "todoread", "todowrite", "question", "skill", "plan_enter", "plan_exit", "invalid", "task",
+  "list_mcp_resources", "list_mcp_resource_templates", "read_mcp_resource",
+  "delegate", "router_verify",
+]);
 
 export interface ChangedFile {
   path: string;
@@ -166,7 +181,8 @@ export function createChangedFileStore(options: ChangedFileStoreOptions = {}) {
   const dispatches = new Map<string, DispatchRecord>();
 
   function observeEdit(tool: string, cwd?: string): void {
-    if (!MAY_WRITE_TOOLS.has(tool.toLowerCase())) return;
+    // E2E-3: fail closed. Only a tool known not to write leaves an in-flight snapshot or capture alone.
+    if (NON_WRITING_TOOLS.has(tool.toLowerCase())) return;
     // Unknown directory is conservatively treated as overlapping every capture.
     const overlaps = (other: string) => !cwd || pathKey(cwd) === pathKey(other)
       || pathKey(cwd).startsWith(pathKey(other) + "/") || pathKey(other).startsWith(pathKey(cwd) + "/");
