@@ -402,7 +402,7 @@ Resolution: `c041ad6` (with `5827256`) — B12 was rebuilt.
 - The real `judgeScoped` oracle stays deferred by plan (2.2.3).
 
 **QA-2.2-7** (minor)
-Resolution: this commit — see "Task 2.2.2 record" above: commits, test counts, `batch.ts`
+Resolution: `735e110` — see "Task 2.2.2 record" above: commits, test counts, `batch.ts`
 coverage (lines 98.35%, branches 92.85%), and the mutation re-run. Both open questions are marked
 as decided, with the approval.
 
