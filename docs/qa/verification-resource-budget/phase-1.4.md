@@ -1739,3 +1739,266 @@ Resolution: f3fc392 — padded: `observe` restarts `from` when `at − old.last 
 - **QA-1.4-21 residual** (Phase 1.1 / 2.1): state it next to `slotWaitMs`.
 
 **Open, not deferred:** QA-1.4-32, -33 and -34. Phase 1.4 QA is **not** clean.
+
+## QA re-review (round 5)
+
+Reviewer: adversarial QA, `[tier:heavy]` (CAP:none).
+
+- **Scope:** `git diff fc8b09d..a8c76e7` (`f3fc392`, `a8c76e7`), checked against the round-4
+  findings. Line numbers refer to `src/verify/slot.ts` and `test/unit/slot.test.ts` at `a8c76e7`.
+- **Environment:** Windows 11, NTFS, 16 logical CPUs, Node v24.21.0, Bun 1.3.14. No POSIX host and
+  no Node 20 binary were available.
+- **Repros:** `%TEMP%\omr-qa14r5\` held `claimhold.mjs`, `watchleak.mjs` and three scratch copies of
+  the slot sources and tests. The dir was deleted after the review.
+  - **Copies:** A is `a8c76e7`. B has the gap rule unpadded (`at − old.last > maxGap`, `:564`). C has
+    no exit fence (the `.filter` at `:912` removed). Each copy linked the worktree's
+    `node_modules` through a junction; the junctions were removed before the dir was deleted.
+  - **Scripts:** they load the real `src/verify/slot.ts` through Node type stripping.
+- **Cleanup:** afterwards no `omr-qa14r5` or `omr-slot-*` dir was left, and no `node.exe` or
+  `bun.exe` running a busy loop, a repro, `holder.mjs` or vitest. Every busy loop was killed by PID
+  (0 alive after each loaded run). The `omr-repro-omueof` dir (01:19) predates this review (see
+  round 4) and was left alone.
+
+**Test runs** (`npx vitest run --maxWorkers=2 test/unit/slot.test.ts`):
+
+| run | result | duration |
+|---|---|---|
+| Node v24.21.0, unloaded | 61/61 | 56.3 s |
+| under load 1: 14 `node -e "for(;;){}"` processes, killed afterwards | **50/61** (see below) | 238.6 s |
+| under load 2, same setup | **59/61** (QA-1.4-35) | 112.5 s |
+
+- **Load 1 is not comparable to round 4.** Before the loops started, other sessions were already
+  using about 8 of the 16 logical CPUs (per-process CPU sampled over 3 s: a `node` 1.6 cores, three
+  opencode `bun` 1.4 + 0.5 + 0.5, Edge about 4). The run took 238.6 s, against 75–93 s for round 4's
+  loaded runs. Its 11 failures:
+  - **Fixed timing budgets:**
+    - `:1012`: 504 ms against < 200 ms;
+    - `:1072`: the first attempt outlasted the 300 ms wait;
+    - `:1162` and `:1203`: vitest's default 5 s timeout.
+
+    These pass in load 2 and in round 4's loaded runs, and no scaling of the gap or the claims can
+    help them.
+  - **`:310` wrong shape:** the default 5 s timeout (QA-1.4-36).
+  - **The two claim tests `:660` and `:705`:** QA-1.4-35.
+  - **Confirm by watching:**
+    - `:277`, `:439` (b3, per-process clocks) and `:528` (heartbeat 200 ms) ended busy.
+    - `:484` held where busy was expected: its three anchored calls took more than 1.2 s, so the
+      shared view confirmed, as it should.
+
+    All four pass in load 2 and in every A/B round below.
+- **Load 2:** only the two claim tests failed (QA-1.4-35). The ticket test (QA-1.4-33) passed in
+  both loaded runs.
+
+Other agents were running on this machine at the same time.
+
+**A/B under the same load:** the 14 gap-sensitive tests (`-t` on the watch, claim and observation
+tests). A and B ran at the same time, with 14 busy loops.
+
+| round | A (`a8c76e7`) | B (gap unpadded) |
+|---|---|---|
+| 1 | 12/14: `:662` (a claim left behind), `:705` busy | 13/14: `:662` (a claim left behind) |
+| 2 | 14/14 (35.3 s) | 14/14 (33.5 s) |
+
+No failure is specific to the padded gap rule. The failures in both copies are the claim tests
+(QA-1.4-35).
+
+**Mutations** (the scratch copies):
+
+| mutation | result |
+|---|---|
+| C: no exit fence (`:912`) | The QA-1.4-32 test fails: `AssertionError: expected false to be true` (the past-the-fence side). A passes it. |
+| B: gap rule unpadded (`:564`) | 61/61 unloaded (57.8 s). No test depends on the padded, or a negative, allowed gap; no test pins QA-1.4-34 either. |
+
+**Committed repro** (`test/fixtures/slot/runtime-repro.mjs src/verify/slot.ts`, at `a8c76e7`,
+production clocks and constants; Bun and Node ran at the same time, with no busy loops):
+
+| runtime | b1 | b2 (fresh `waitMs: 0` processes, 3 s apart) | b3 (two watchers started 30 s apart) |
+|---|---|---|---|
+| `bun` 1.3.14 | origins 8 226 ms apart; Y busy twice, O busy 4 747 ms after a beat; H not lost | 0.5–9.3 s busy, 13.1 s held | reclaimed after 15.2 s |
+| `node` v24.21.0 | origins 1 ms apart; O busy 4 567 ms after a beat; H not lost | 0.3–9.3 s busy, 12.4 s held | reclaimed after 15.2 s |
+
+These are the same as round 4, with the padded gap: b3 within 3 watch steps on both runtimes
+(round 4: 15.2 s on Bun, 20.1 s on Node), and no two holders.
+
+**Summary (round 5):**
+- QA-1.4-32 and QA-1.4-34 are verified.
+- QA-1.4-33 is verified for the ticket test and for `:645`'s view slack. Two gaps remain:
+  - the two claim tests still fail under load, from a cause the round-4 finding did not identify
+    (QA-1.4-35);
+  - one 5 s test has no explicit timeout (QA-1.4-36).
+- **The implementer's side effect** (a negative allowed gap): it cannot happen with the production
+  constants, it is safe where it can happen, and no test depends on it. The analysis is below.
+- New findings: 0 critical, 0 major, 1 minor and 3 nits (QA-1.4-35…38). None is a product
+  defect: QA-1.4-35, -36 and -38 are test issues, and QA-1.4-37 is documentation.
+
+### Verification of QA-1.4-32…34
+
+| finding | status | evidence |
+|---|---|---|
+| QA-1.4-32 | verified | **Code:** the entry keeps the clock its `dropBy` is on (`:672`, `:684`). The exit hook keeps an unconfirmed claim only while `u.mono() <= u.dropBy` (`:912`), the same fence as `dropUnconfirmed` (`:695`, `:700`). The check and the unlinks run in one synchronous loop (at most `activeClaims` plus 64 entries), so the check-to-unlink window is milliseconds against the 22.5 s margin. A claim past its fence keeps the dead PID of the exited process, so same-host reapers clear it at once (`ownerDead`, `:589-591`).<br>**Test:** `:887-908` covers both sides and fails with mutation C.<br>**Side note:** its first iteration leaves a background watch running (QA-1.4-38). |
+| QA-1.4-33 | partly verified | **Ticket test** (`:934-954`): a 500 ms heartbeat and `setAge(live, 1_500)`; it passed in both loaded runs.<br>**`:645`:** one set of deps (`:653`). Without it, the first look's 1 s slack would make the observer's allowed gap 1 000 − 1 100 < 0.<br>**Timeouts:** 20 s added, except the `it.each` at `:310-319` (QA-1.4-36).<br>**Still failing:** the two claim tests, in 4 of 5 loaded runs of the `a8c76e7` code (load 1, load 2, A/B round 1, the instrumented run; A/B round 2 passed). Instrumenting found the cause (QA-1.4-35). |
+| QA-1.4-34 | verified | **Code:** `:564` restarts `from` when `at − old.last > maxGap − (slack + old.slack)`. With the production constants every look's slack is `min(1 s, heartbeat / 5)` = 1 s, so the allowed gap is 10 − 2 = 8 s for every look.<br>**Tests:** mutation B passes 61/61, so no test pins the padding. The resolution claims none, and for a nit that is acceptable.<br>**Documentation:** the texts still say 2 heartbeats (QA-1.4-37). |
+
+### The side effect: a negative allowed gap
+
+- **When it is negative.**
+  - The allowed gap is `2 × heartbeat − slack − view.slack`, with `slack = min(1 000, heartbeat /
+    5)` (`:533-535`).
+  - `view.slack` is the largest slack of the view's writers (`:564`), so at most 1 000 ms.
+  - So the gap is negative only when `view.slack > 1.8 × heartbeat`: a look whose heartbeat is under
+    556 ms, in a view that a 1 s-slack writer shares.
+- **Production.**
+  - The heartbeat is fixed at 5 s (`SLOT_DEFAULTS`, `:229-238`). The plan exposes only `slotWaitMs`
+    (plan `:259`).
+  - So every production look has an allowed gap of 8 s, and the negative case cannot happen.
+  - Only this code writes sidecars. A torn or interleaved write leaves trailing bytes and does not
+    parse, so a view cannot get a foreign `slack`.
+- **Where it can happen, it is safe.**
+  - Every look restarts `from`, so `witnessed` stays 0 and nothing is confirmed by observation. A
+    dead same-host PID and this process's strays are still reaped at once.
+  - `from` can then move back to an `at` below `old.last`, but that `at` is a real look within
+    1.8 heartbeats of the latest one, so it adds no false continuity.
+  - What it costs is liveness, and only for locks whose owner is not provably dead.
+- **Tests.**
+  - Only `:252` → `:254` puts two heartbeats in one view: a `fast()` look first, then a production
+    look. The production look's allowed gap is 10 000 − 1 000 − 20 = 8 980 ms, and the lock is
+    reclaimed by its dead PID anyway.
+  - Mutation B (no padding at all) passes 61/61. So no test depends on the negative case.
+- **Version skew (note, not a finding).**
+  - A sidecar's name carries no version, so a later version with a shorter heartbeat or a larger
+    slack would share views.
+  - Its looks could get an allowed gap of 0 or less. That is safe, but it would delay reclaims of
+    locks whose owner is not provably dead.
+  - Whoever changes these constants should version the sidecar name.
+- **Liveness cost in production.**
+  - The watch looks every 5 s plus one pass (`:1330-1349`). The margin to the allowed gap drops from
+    5 s to 3 s.
+  - A pass or a timer delay longer than 3 s costs one watch step, and a watch lasts 50 s. b3
+    reclaims after 15.2 s on both runtimes.
+  - The wait loop looks at least every 2 s.
+
+### Answers to the round-5 focus questions
+
+- **Two holders.** No new path.
+  - The padding only adds restarts, and the exit fence only removes deletes.
+  - The committed repro's b1 has no two holders on either runtime.
+- **Deadlocks.** No new wait, lock or await.
+- **Unbounded lockouts.**
+  - None with the production constants: the allowed gap is 8 s for every look, against a 5 s watch
+    and waits of at most 2 s. b2 and b3 reclaim on both runtimes.
+  - A claim that the exit hook now keeps (past its fence) carries a dead PID, so same-host reapers
+    clear it at once.
+- **Rejections.**
+  - `acquireSlot` is unchanged.
+  - The exit hook calls `u.mono()` outside its `try` (`:912`). The production clock cannot throw;
+    only a throwing test seam would skip the rest of the hook.
+- **Timers.** The production code adds none. The new test leaves one running (QA-1.4-38).
+
+### New findings
+
+| ID | severity | finding | evidence | fix |
+|---|---|---|---|---|
+| QA-1.4-35 | minor | The two claim tests still fail under CPU load: with `claimHoldMaxMs: 100` a claimed delete must finish within 100 ms and drop its claim within 150 ms, less than one claimed delete takes in a loaded worker. The own claims left behind then block the next attempts. | Load 2: 59/61, only `:660` and `:705`. A/B round 1: they fail in A and in B. Instrumented: both log "claim held too long, delete abandoned" and leave claims with the worker's live PID. | Raise `claimHoldMaxMs` in these two tests (for example 1 s, drop fence 1.5 s) and scale `:702`. |
+| QA-1.4-36 | nit | The `it.each` at `:310-319` waits up to 5 s under vitest's default 5 s timeout (no `testTimeout` is configured), although the QA-1.4-33 resolution says every such test has 20 s. | Load 1: `Error: Test timed out in 5000ms.` (`:310`, wrong shape). | Pass `20_000` to the `it.each`. |
+| QA-1.4-37 | nit | The texts still say that a gap of more than 2 heartbeats restarts the witness. With the padding it is 2 heartbeats minus both slacks: 8 s in production, and 1.6 s, 800 ms and 320 ms in the tests. | `slot.ts:47`, `:80`, `:525`. Notes `:72`, `:113`, `:115`. Test comments `:499` (says 2 s, is 1.6 s) and `:521` (says 400 ms, is 320 ms). | Correct the texts. The QA-1.4-21 residual that Phase 1.1/2.1 will state is 8 s, not 10 s. |
+| QA-1.4-38 | nit | The QA-1.4-32 test leaves a background watch running. In the first iteration the seam clock is 1e6 ms behind, so the watch never reaches its `until`. It polls every 100 ms and re-creates the claim until `afterAll` removes the dir. | `watchleak.mjs`, the same steps: `{"first":"busy","claimAfterExitHook":false,"lockReadsIn3sAfter":20,"claimRecreatedByWatch":true,"lockReadsAfterClockPastUntil":0}`. | After the assertion, move the seam clock past the watch's end in both iterations (for example `shift = 1_000_000`). |
+
+### QA-1.4-35 — minor — The two claim tests still fail under CPU load: `claimHoldMaxMs: 100` is shorter than one claimed delete
+
+- **Where:**
+  - `slot.test.ts:645-663` (a live claimer's claim) and `:688-708` (an unconfirmed claim). Both
+    use `claimHoldMaxMs: 100` (`:653`, `:697`).
+  - `unlinkWhile` gives up after the deadline (`:715-720`, `:725`). The target's deadline is
+    `since + claimHoldMaxMs` (`:782`), and the claim's own drop is `since + 1.5 × claimHoldMaxMs`
+    (`:787`).
+- **Evidence:**
+  - Load 2: 59/61, with only these two failing. Both ended busy (`:660`, `:705`).
+  - A/B round 1: `:662` failed in A and in B, and `:705` in A. At `:662` the slot was held but a
+    claim was left: `expected [ Array(1) ] to deeply equal []`.
+  - **Instrumented run** (copy A, a warning logger on both tests, 14 busy loops): both failed.
+    - `:660`: `QA busy; warns=["verification slot: claim held too long, delete abandoned"]`. Left
+      behind: our meta-claim (`"pid":59896` = the worker, `"victim":"live-claimer"`) and the live
+      claimer's claim.
+    - `:705`: the same warning. Left behind: our meta-claim (its victim is our own claim's token)
+      and our own claim on `slot-0.lock` (`"victim":"dead-holder"`), both with the worker's live
+      PID.
+  - **A fresh process** with the same deps and a dead-PID lock (`claimhold.mjs`) held in 7–16 ms
+    unloaded and 6–64 ms loaded, with no warning. So it takes the loaded vitest worker to exceed
+    100 ms; that worker also runs the background watches of earlier tests (analysis).
+- **Mechanism:**
+  - A claimed delete is about 10 file-system calls: create, write, close, re-read the claim, re-read
+    the target, unlink, then the drop's re-read and unlink.
+  - Under load that takes more than 100 ms, so the target's delete is abandoned. It takes more than
+    150 ms too, so the claim's own drop is abandoned as well.
+  - The claims left behind carry the live PID. Each blocks the next attempt until it is inert (span
+    1.2 s, witnessed 0.4 s). The next reap of it faces the same 100 ms, so the 5 s wait runs out.
+  - The round-4 finding blamed the view slack in `:645` (fixed) and did not identify this cause.
+- **Production (analysis):**
+  - With `claimHoldMaxMs` 5 s, the same abandon needs one claimed delete to take more than 5 s.
+  - A claim left behind then blocks until it is inert (32 s span, 12 s witnessed), or at once once
+    its owner is dead.
+  - That is a bounded delay, not a lockout, and exclusion is unaffected.
+- **Fix:**
+  - In both tests use `claimHoldMaxMs: 1_000` (drop fence 1.5 s), or at least 500 ms.
+  - In `:688`, sleep past the owner's drop fence (1.5 s instead of 200 ms at `:702`).
+  - The inert rule then needs `witnessed ≥ 2.2 s`, which fits the 5 s waits. The `≥ 950 ms`
+    lower bounds still hold.
+  - `:665` exceeds its 100 ms on purpose and the new exit test does not depend on timing: leave
+    both.
+
+### QA-1.4-36 — nit — One 5 s wait still runs under vitest's default 5 s timeout
+
+- **Where:** `slot.test.ts:310-319`, the `it.each` for an empty, corrupt or wrong-shape lock.
+  - It waits up to 5 s (`:317`), and the `it.each` has no timeout argument.
+  - `vitest.config.ts` sets no `testTimeout`, so the default is 5 s.
+  - The QA-1.4-33 resolution says "every test that can wait 5 s or more has a 20 s timeout".
+- **Evidence:** load 1, `Error: Test timed out in 5000ms.` for "a wrong shape lock file is stale".
+- **Fix:** pass `20_000` as the `it.each` timeout.
+
+### QA-1.4-37 — nit — The gap rule is described as 2 heartbeats; the padded rule restarts sooner
+
+- **Where:**
+  - `slot.ts:47-48`: "the first look after the latest gap of more than 2 heartbeats".
+  - `:77-78`: "less than 2 heartbeats apart".
+  - `:80`: "looks further apart than 2 heartbeats".
+  - `:525`: the `witnessed` doc comment.
+  - Notes `:72`, `:113`, `:115`.
+  - Test comments `:499` ("less than 2 heartbeats (2 s) apart"; the limit is 1.6 s) and `:521` ("a
+    gap over 400 ms"; it is 320 ms).
+- **Effect:**
+  - Since `f3fc392` the witness restarts after a gap of more than `2 × heartbeat − (slack +
+    view.slack)`. That is 8 s in production, not 10 s.
+  - So the QA-1.4-21 residual (short-lived processes that each look once) starts at looks 8 s apart.
+  - The test margins shrank with it: `:528` has 120 ms between its 200 ms watch and the 320 ms limit
+    (it was 200 ms). It failed only in load 1.
+- **Fix:**
+  - Correct these texts.
+  - When Phase 1.1/2.1 documents the residual next to `slotWaitMs` (deferred), use 8 s.
+  - Optionally, move `:516-532` to `WATCHER_HEARTBEAT_MS` with calls 1.2 s or more apart, as
+    QA-1.4-30 did for the others.
+
+### QA-1.4-38 — nit — The QA-1.4-32 test leaves a background watch running for the rest of the file
+
+- **Where:**
+  - `slot.test.ts:887-908`: the `waitMs: 0` call ends busy with the reap contended (the scanner
+    seam), so `watchAged` (`:1330-1349`) starts a watch on the seam clock.
+  - Its `until` is 1.4 s ahead on that clock (`:1333`).
+  - The first iteration then sets `shift = -1_000_000` and never moves it back.
+- **Evidence** (`watchleak.mjs`, the same steps in a fresh Node process):
+  - After the exit hook the claim is gone. The watch then read the lock 20 times in the next 3 s
+    and re-created the claim.
+  - Once the seam clock passed `until` it stopped (0 reads in the next second).
+  - In vitest it runs until `afterAll` removes the dir. It holds no process open (the timer is
+    unref'd), but it is a 10 Hz loop for the rest of the file.
+- **Fix:** after `expect(existsSync(claim)).toBe(past)`, set `shift = 1_000_000` in both iterations.
+
+### Deferred by plan (round 5)
+
+- **QA-1.4-18** (Phase 2.1 / 2.2), nested acquisition: unchanged.
+- **QA-1.4-19** (Phase 1.1 schema, Phase 2.1 wiring), non-finite `max`: unchanged.
+- **QA-1.4-31** (Phase 1.1): the clamp is in the code; validating `slotWaitMs` stays with Phase 1.1.
+- **QA-1.4-21 residual** (Phase 1.1 / 2.1): state it next to `slotWaitMs`, with looks 8 s apart
+  (QA-1.4-37).
+
+**Open, not deferred:** QA-1.4-35 (minor), and QA-1.4-36, -37 and -38 (nits). Phase 1.4 QA is
+**not** clean.
