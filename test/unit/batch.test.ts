@@ -1707,3 +1707,287 @@ describe("createBatchCoordinator: attribution and rechecks", () => {
     expect(calls.closes).toEqual([0]);
   });
 });
+
+// ---------------------------------------------------------------------------------------------
+// B12: the equivalence property. Batched verdicts equal solo verdicts over seeded random cases.
+// ---------------------------------------------------------------------------------------------
+
+/** mulberry32: a small deterministic PRNG (as in test/unit/guards.test.ts). */
+function mulberry32(seed: number): () => number {
+  let a = seed >>> 0;
+  return () => {
+    a = (a + 0x6d2b79f5) >>> 0;
+    let t = a;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+type VerdictKind = "pass" | "fail" | "unverifiable";
+
+interface Verdict {
+  readonly verdict: VerdictKind;
+  readonly introduced: readonly string[];
+  readonly preexisting: readonly string[];
+  readonly unknown: readonly string[];
+}
+
+/**
+ * Stand-in for 2.1's judgeScoped (plugged in at 2.2.3): the truth-table essentials of 2.1-T5/T6.
+ * green -> pass; any introduced failure -> fail; every failure pre-existing at an exact reference
+ * -> pass; otherwise unverifiable.
+ */
+function judgeStandIn(run: TestsPassRun): Verdict {
+  const bare = (verdict: VerdictKind): Verdict => ({ verdict, introduced: [], preexisting: [], unknown: [] });
+  const s = run.scoped;
+  if (s.kind === "no-affected") return bare("pass");
+  if (s.kind !== "ran") return bare("unverifiable");
+  const r = s.result;
+  if (!r.complete || r.collectionError || r.source !== "report") return bare("unverifiable");
+  if (r.failingIds.length === 0) return bare("pass");
+  const rc = run.recheck;
+  const introduced: string[] = [];
+  const preexisting: string[] = [];
+  const unknown: string[] = [];
+  for (const id of r.failingIds) {
+    const k = keyOfId(id);
+    if (rc?.kind !== "exact") unknown.push(id);
+    else if (rc.absentFiles.includes(k)) introduced.push(id);
+    else if (!rc.ranFiles.includes(k) || rc.result === undefined || !rc.result.complete) unknown.push(id);
+    else if (rc.result.failingIds.includes(id)) preexisting.push(id);
+    else introduced.push(id);
+  }
+  const verdict: VerdictKind = introduced.length > 0 ? "fail" : unknown.length > 0 ? "unverifiable" : "pass";
+  return { verdict, introduced: introduced.sort(), preexisting: preexisting.sort(), unknown: unknown.sort() };
+}
+
+/** 2.1's one-request path over the same seams: plan, one scope, one run, one recheck of the failing files. */
+async function directOver(rt: BatchRuntime, request: TestsPassRequest): Promise<TestsPassRun> {
+  const plan = await rt.plan({ command: request.command, cwd: request.cwd, changedFiles: request.changedFiles }, request.deadline);
+  if ("noAffected" in plan) return { scoped: { kind: "no-affected", note: plan.note }, recheck: undefined };
+  if ("unverifiable" in plan) return { scoped: { kind: "unverifiable", code: plan.code, reason: plan.reason }, recheck: undefined };
+  const scope = await rt.openScope({ cwd: request.cwd, command: request.command });
+  try {
+    const scoped = await scope.execute(plan, request.deadline);
+    if (scoped.kind !== "ran" || scoped.result.failingIds.length === 0) return { scoped, recheck: undefined };
+    const ref = request.reference;
+    if (ref.kind === "disabled") return { scoped, recheck: { kind: "disabled" } };
+    if (ref.kind === "none") return { scoped, recheck: { kind: "unusable", cause: "no-reference", reason: ref.reason } };
+    const recheck = await scope.rechecker(request.command, request.cwd)(ref.reference, scoped.result.failingFiles, request.deadline);
+    return { scoped, recheck };
+  } finally {
+    await scope.close();
+  }
+}
+
+const PY = "/p";
+const REF_B: DispatchReference = { ...REF, commit: "c2", head: "h2" };
+
+interface CaseRequest {
+  readonly command: string;
+  readonly cwd: string;
+  readonly files: readonly string[] | "unavailable";
+  readonly reference: TestsPassRequest["reference"];
+}
+
+interface PropertyCase {
+  readonly model: Model;
+  readonly atRefs: Readonly<Record<string, Readonly<Record<string, readonly string[]>>>>;
+  readonly requests: readonly CaseRequest[];
+  readonly flaky: boolean;
+}
+
+function genCase(seed: number): PropertyCase {
+  const rnd = mulberry32(seed);
+  const chance = (p: number) => rnd() < p;
+  const pickFrom = <T,>(xs: readonly T[], fallback: T): T => xs[Math.floor(rnd() * xs.length)] ?? fallback;
+  const vt = [..."abcdef"].map((x) => `test/${x}.test.ts`);
+  const vs = [..."abcdef"].map((x) => `src/${x}.ts`);
+  const pt = [..."abcd"].map((x) => `tests/test_${x}.py`);
+  const related: Record<string, readonly string[]> = Object.fromEntries(vs.map((s) => [s, vt.filter(() => chance(0.35))]));
+  const tests: Record<string, number> = {};
+  const failing: Record<string, readonly string[]> = {};
+  for (const t of [...vt, ...pt]) {
+    tests[t] = chance(0.15) ? 0 : 1 + Math.floor(rnd() * 3);
+    if ((tests[t] ?? 0) > 0 && chance(0.3)) {
+      const names = ["t1", "t2"].filter(() => chance(0.6));
+      failing[t] = names.length > 0 ? names : ["t1"];
+    }
+  }
+  const atRefs: Record<string, Record<string, readonly string[]>> = {};
+  for (const commit of [REF.commit, REF_B.commit]) {
+    const at: Record<string, readonly string[]> = {};
+    for (const t of [...vt, ...pt]) {
+      if (chance(0.2)) continue; // absent at this reference
+      at[t] = (failing[t] ?? []).filter(() => chance(0.6));
+    }
+    atRefs[commit] = at;
+  }
+  const model: Model = { related, tests, failing, counts: !chance(0.2) };
+  const refs: TestsPassRequest["reference"][] = [
+    { kind: "captured", reference: REF },
+    { kind: "captured", reference: REF },
+    { kind: "captured", reference: REF_B },
+    { kind: "none", reason: "no reference captured" },
+    { kind: "disabled" },
+  ];
+  const n = 1 + Math.floor(rnd() * 6);
+  const requests: CaseRequest[] = [];
+  for (let i = 0; i < n; i++) {
+    const reference = pickFrom(refs, { kind: "disabled" });
+    if (chance(0.03)) {
+      requests.push({ command: "npx vitest run", cwd: ROOT, files: "unavailable", reference });
+      continue;
+    }
+    const count = Math.floor(rnd() * 4);
+    if (chance(0.35)) {
+      const files = [...new Set(Array.from({ length: count }, () => pickFrom(pt, "tests/test_a.py")))];
+      requests.push({ command: "pytest", cwd: PY, files, reference });
+    } else {
+      const pool = [...vs, ...vt];
+      const files = [...new Set(Array.from({ length: count }, () => pickFrom(pool, "src/a.ts")))];
+      if (chance(0.05)) files.push("src/untestable.ts");
+      const command = chance(0.2) ? "npx vitest run -t smoke" : "npx vitest run";
+      requests.push({ command, cwd: ROOT, files, reference });
+    }
+  }
+  return { model, atRefs, requests, flaky: chance(0.15) };
+}
+
+function toRequest(c: CaseRequest): TestRequest {
+  return c.files === "unavailable"
+    ? req([], { command: c.command, cwd: c.cwd, changedFiles: "unavailable", reference: c.reference })
+    : req(c.files, { command: c.command, cwd: c.cwd, reference: c.reference });
+}
+
+/** The model rechecker per reference: pytest failing files are runner-unsupported, vitest reruns at that reference. */
+function caseRechecker(pc: PropertyCase) {
+  return (reference: DispatchReference, files: readonly string[]): RecheckOutcome => {
+    const py = files.some((f) => f.endsWith(".py"));
+    return recheckModel({ ...pc.model, atRef: pc.atRefs[reference.commit] ?? {} }, py ? "pytest" : "npx vitest run", py ? PY : ROOT, files);
+  };
+}
+
+/** A failure that appears only in the first union run (B-G2). */
+function flakyExecute(model: Model) {
+  return (spec: ScopedSpec, _deadline: Deadline, n: number): ScopedOutcome => {
+    const out = ranModel(model, spec);
+    if (n !== 0 || out.kind !== "ran") return out;
+    const key = spec.runner === "pytest" ? "tests/test_zz.py" : "test/zz.test.ts";
+    const id = idOf(spec.runner, key, "flaky");
+    const result: RunResult = {
+      ...out.result,
+      failingIds: [...out.result.failingIds, id].sort(),
+      failingFiles: [...out.result.failingFiles, posix.join(spec.cwd, key)].sort(),
+    };
+    return { ...out, result, exitCode: 1 };
+  };
+}
+
+const PROPERTY_CASES = 300;
+const PROPERTY_CHUNK = 50;
+const PROPERTY_SEED = 0x2b12;
+/** What the property cases exercised, so a vacuous generator cannot pass silently. */
+const propertyTally = { pass: 0, fail: 0, unverifiable: 0, sharedRuns: 0, flakyMembers: 0 };
+
+describe("createBatchCoordinator: B12 batched verdicts equal solo verdicts", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  async function runCase(seed: number): Promise<void> {
+    const pc = genCase(seed);
+    const rechecker = caseRechecker(pc);
+
+    // Solo: every request alone, through runtime.direct (batchWindowMs 0).
+    const soloVerdicts: Verdict[] = [];
+    let soloExecutes = 0;
+    for (const cr of pc.requests) {
+      const holder: { runtime?: BatchRuntime } = {};
+      const solo = harness(pc.model, {
+        rechecker,
+        runtime: {
+          batchWindowMs: 0,
+          direct: (r) => {
+            if (holder.runtime === undefined) throw new Error("solo runtime not wired");
+            return directOver(holder.runtime, r);
+          },
+        },
+      });
+      holder.runtime = solo.runtime;
+      const c = createBatchCoordinator({ platform: "linux" });
+      soloVerdicts.push(judgeStandIn(await c.hook(solo.runtime)(toRequest(cr))));
+      await c.dispose();
+      expect(solo.calls.closes.length, `seed ${seed}: solo scopes closed`).toBe(solo.calls.opens.length);
+      soloExecutes += solo.calls.executes.length;
+    }
+
+    // Batched: every request in one window.
+    const batched = harness(pc.model, { rechecker, ...(pc.flaky ? { execute: flakyExecute(pc.model) } : {}) });
+    const c = createBatchCoordinator({ platform: "linux" });
+    const hook = c.hook(batched.runtime);
+    const outs = pc.requests.map((cr) => hook(toRequest(cr)));
+    await vi.advanceTimersByTimeAsync(WINDOW);
+    const runs = await Promise.all(outs);
+    await c.dispose();
+    expect(batched.calls.closes.length, `seed ${seed}: batched scopes closed`).toBe(batched.calls.opens.length);
+    expect(vi.getTimerCount(), `seed ${seed}: leaked timers`).toBe(0);
+    if (batched.calls.executes.length < soloExecutes) propertyTally.sharedRuns++;
+
+    const flakySpec = pc.flaky ? batched.calls.executes[0]?.spec : undefined;
+    const flakyKey = flakySpec === undefined ? undefined : batchKey(flakySpec, "linux");
+    runs.forEach((run, i) => {
+      const got = judgeStandIn(run);
+      propertyTally[got.verdict]++;
+      const solo = soloVerdicts[i];
+      const cr = pc.requests[i];
+      const where = `seed ${seed}, request ${i}: ${JSON.stringify(cr)}`;
+      // B-G2 (never a false pass), on every case.
+      if (got.verdict === "pass" && solo?.verdict !== "pass") throw new Error(`false pass (${where}): solo ${JSON.stringify(solo)}`);
+      if (flakyKey !== undefined && cr !== undefined && cr.files !== "unavailable") {
+        const plan = planModel({ command: cr.command, cwd: cr.cwd, changedFiles: cr.files.map((path) => ({ path, status: "M" })) });
+        const inFlakyBatch = !("noAffected" in plan) && !("unverifiable" in plan) && batchKey(plan, "linux") === flakyKey;
+        if (inFlakyBatch) {
+          propertyTally.flakyMembers++;
+          expect(got.verdict, `${where}: a member of the flaky batch judged ok`).not.toBe("pass");
+          return;
+        }
+      }
+      expect(got, where).toEqual(solo);
+    });
+  }
+
+  for (let start = 0; start < PROPERTY_CASES; start += PROPERTY_CHUNK) {
+    it(`seeds ${start}..${start + PROPERTY_CHUNK - 1}`, async () => {
+      for (let i = start; i < start + PROPERTY_CHUNK; i++) await runCase(PROPERTY_SEED + i);
+    }, 20_000);
+  }
+
+  it("the property cases reached every verdict, shared runs and flaky members", () => {
+    for (const n of Object.values(propertyTally)) expect(n).toBeGreaterThan(10);
+  });
+
+  it("the generator covers the interesting shapes", () => {
+    let flaky = 0;
+    let pytest = 0;
+    let multi = 0;
+    let distinctRefs = 0;
+    let guardSensitive = 0;
+    let zeroTest = 0;
+    for (let i = 0; i < PROPERTY_CASES; i++) {
+      const pc = genCase(PROPERTY_SEED + i);
+      if (pc.flaky) flaky++;
+      if (pc.requests.some((r) => r.command === "pytest")) pytest++;
+      if (pc.requests.length > 1) multi++;
+      const commits = new Set(pc.requests.flatMap((r) => (r.reference.kind === "captured" ? [r.reference.reference.commit] : [])));
+      if (commits.size > 1) distinctRefs++;
+      if (pc.requests.some((r) => r.command !== "pytest" && r.files !== "unavailable" && r.files.some(isTestKey))) guardSensitive++;
+      if (Object.values(pc.model.tests ?? {}).some((n) => n === 0)) zeroTest++;
+    }
+    for (const n of [flaky, pytest, multi, distinctRefs, guardSensitive, zeroTest]) expect(n).toBeGreaterThan(10);
+  });
+});
