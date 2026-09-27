@@ -718,8 +718,8 @@ describe("planScopedRun: vitest", () => {
   });
 
   it("docs-only change needs no runner at all", async () => {
-    const files = { "/r/.git": "", "/r/README.md": "", "/r/LICENSE": "", "/r/.github/workflows/ci.yml": "", "/r/pnpm-lock.yaml": "" };
-    expect(await planScopedRun(input({ files, changedFiles: changed("README.md", "LICENSE", ".github/workflows/ci.yml", "pnpm-lock.yaml") }))).toEqual({
+    const files = { "/r/.git": "", "/r/README.md": "", "/r/LICENSE": "", "/r/.github/workflows/ci.yml": "" };
+    expect(await planScopedRun(input({ files, changedFiles: changed("README.md", "LICENSE", ".github/workflows/ci.yml") }))).toEqual({
       noAffected: true,
       note: "no affected tests: no changed file is a test input",
     });
@@ -1371,10 +1371,11 @@ function expectUnscoped(x: object, reason: string): void {
 }
 
 describe("planScopedLint", () => {
-  it("plain eslint: only changed lintable files, absolute, with --no-warn-ignored on v9", async () => {
+  it("plain eslint v9: every existing changed file, absolute, with --no-warn-ignored (QA-1.3-9)", async () => {
     const r = lintSpec(await lint("eslint --fix --cache .", changed("src/a.ts", "README.md", "src/b.vue", "src/gone.ts", "../out.ts")));
-    expect(r.args).toEqual([ESLINT_ENTRY, "--cache", "--no-warn-ignored", "/r/src/a.ts"]);
-    expect(r).toMatchObject({ runner: "eslint", file: "/usr/bin/node", cwd: "/r", gitRoot: "/r", entry: ESLINT_ENTRY, inputs: ["/r/src/a.ts"], workers: null });
+    const all = ["/r/README.md", "/r/src/a.ts", "/r/src/b.vue"];
+    expect(r.args).toEqual([ESLINT_ENTRY, "--cache", "--no-warn-ignored", ...all]);
+    expect(r).toMatchObject({ runner: "eslint", file: "/usr/bin/node", cwd: "/r", gitRoot: "/r", entry: ESLINT_ENTRY, inputs: all, workers: null });
     expect(r.notes).toEqual(["dropped outside the git root: ../out.ts"]);
   });
 
@@ -1387,14 +1388,16 @@ describe("planScopedLint", () => {
 
   it("--ext= form, --concurrency off kept, --concurrency=auto", async () => {
     const a = lintSpec(await lint("eslint --ext=vue --concurrency off", changed("src/a.ts", "src/b.vue")));
-    expect(a.args).toEqual([ESLINT_ENTRY, "--ext=vue", "--concurrency", "off", "--no-warn-ignored", "/r/src/b.vue"]);
+    expect(a.args).toEqual([ESLINT_ENTRY, "--ext=vue", "--concurrency", "off", "--no-warn-ignored", "/r/src/a.ts", "/r/src/b.vue"]);
     expect(a.workers).toBeNull();
     expect(lintSpec(await lint("npx eslint --concurrency=auto", changed("src/a.ts"))).args).toContain("--concurrency=2");
   });
 
-  it("eslint < 9: no --no-warn-ignored; --max-warnings -> Unscoped", async () => {
-    const r = lintSpec(await lint("pnpm exec eslint", changed("src/a.ts"), lintRepo("8.57.0")));
+  it("eslint < 9: extension filter, no --no-warn-ignored; --max-warnings -> Unscoped", async () => {
+    const r = lintSpec(await lint("pnpm exec eslint", changed("src/a.ts", "src/b.vue", "README.md"), lintRepo("8.57.0")));
     expect(r.args).toEqual([ESLINT_ENTRY, "/r/src/a.ts"]);
+    expect(await lint("eslint", changed("README.md", "src/b.vue"), lintRepo("8.57.0"))).toEqual({ noAffected: true, note: "no changed lintable files" });
+    expect(lintSpec(await lint("eslint --ext .vue", changed("src/a.ts", "src/b.vue"), lintRepo("8.57.0"))).inputs).toEqual(["/r/src/b.vue"]);
     expectUnscoped(await lint("eslint --max-warnings 0", changed("src/a.ts"), lintRepo("8.57.0")), "eslint <9 cannot scope ignored files under --max-warnings");
     expectUnscoped(await lint("eslint --max-warnings=0", changed("src/a.ts"), lintRepo("8.57.0")), "eslint <9 cannot scope ignored files under --max-warnings");
   });
@@ -2015,11 +2018,93 @@ describe("QA-1.3-13: a positional in addopts or PYTEST_ADDOPTS is S6", () => {
     expectS6(await detectRunner("pytest", "/r", memFs(pyRepo()), { ...POSIX_HOST, pytestAddopts: '-k "x' }), "unterminated-quote", "unterminated quote in PYTEST_ADDOPTS");
   });
 
-  it("the spec-time lookup applies the same rule", async () => {
+  it("the spec-time lookup applies the same rule (see also QA-1.3-3c)", async () => {
     const files = { "/r/tests/unit/pytest.ini": "[pytest]\naddopts = more_tests\n", "/r/tests/unit/test_u.py": "" };
     expect(await detect("pytest", pyRepo(files))).toMatchObject({ xdist: false });
     expectS6(await planScopedRun(input({ command: "pytest", files: pyRepo(files), changedFiles: changed("tests/unit/test_u.py") })), "unsupported-argument");
     const det = await detect("pytest", pyRepo(files));
     expectS6(await planRerun(det, ["/r/tests/unit/test_u.py"], "/r", { maxWorkers: 2 }, { fs: memFs(pyRepo(files)), host: { ...POSIX_HOST, pathEnv: "/usr/bin" } }), "unsupported-argument");
+  });
+});
+
+describe("QA-1.3-4/8/15: config triggers", () => {
+  it.each([".pytest.ini", "pytest.toml", ".pytest.toml", "sub/pytest.toml", "uv.lock", "poetry.lock", "pdm.lock", "Pipfile.lock", "requirements.txt", "requirements-dev.txt"])(
+    "pytest: %s -> config-changed",
+    async (f) => {
+      expectS6(await planScopedRun(input({ command: "pytest", files: pyRepo(), changedFiles: changed("tests/test_a.py", f) })), "config-changed", `config file changed: ${f}`);
+    },
+  );
+
+  it.each(["package-lock.json", "npm-shrinkwrap.json", "pnpm-lock.yaml", "yarn.lock", "bun.lock", "bun.lockb", "pnpm-workspace.yaml", ".npmrc", ".yarnrc", ".yarnrc.yml", ".pnpmfile.cjs"])(
+    "vitest and jest: lockfile or workspace file %s -> config-changed",
+    async (f) => {
+      for (const command of ["vitest", "jest"]) {
+        expectS6(await planScopedRun(input({ command, changedFiles: changed(f) })), "config-changed", `config file changed: ${f}`);
+      }
+      expectUnscoped(await lint("eslint", changed("src/a.ts", f)), `eslint config changed: ${f}`);
+    },
+  );
+
+  it.each(["test/setup.ts", "vitest.setup.ts", "setupTests.ts", "src/setup-tests.js", "global-setup.ts", "globalSetup.mts", "jest.setup.js", "jest.setupAfterEnv.js", "test-setup.tsx"])(
+    "vitest and jest: setup file %s -> config-changed",
+    async (f) => {
+      for (const command of ["vitest", "jest"]) {
+        expectS6(await planScopedRun(input({ command, changedFiles: changed(f) })), "config-changed", `config file changed: ${f}`);
+      }
+    },
+  );
+
+  it("a test named like a setup file, and other names, are ordinary inputs", async () => {
+    const files = jsRepo({}, { "/r/src/setup.test.ts": "", "/r/src/setupHelper.ts": "", "/r/src/__tests__/setup.ts": "" });
+    const s = spec(await planScopedRun(input({ files, changedFiles: changed("src/setup.test.ts", "src/setupHelper.ts", "src/__tests__/setup.ts") })));
+    expect(s.inputs).toEqual(["/r/src/__tests__/setup.ts", "/r/src/setup.test.ts", "/r/src/setupHelper.ts"]);
+    expect(isNoAffected(await planScopedRun(input({ command: "pytest", files: pyRepo(), changedFiles: changed("tests/setup.ts") })))).toBe(true);
+  });
+});
+
+describe("QA-1.3-5: a --config / -c file is a config trigger", () => {
+  const files = jsRepo({}, { "/r/cfg/unit.config.mjs": "", "/r/src/a.ts": "" });
+
+  it.each([
+    ["vitest run --config cfg/unit.config.mjs", "cfg/unit.config.mjs"],
+    ["vitest -c=cfg/unit.config.mjs", "cfg/unit.config.mjs"],
+    ["vitest --config=./cfg/../cfg/unit.config.mjs", "cfg/unit.config.mjs"],
+    ["jest --config cfg/j.json", "cfg/j.json"],
+    ["jest -c=cfg/j.json", "cfg/j.json"],
+  ])("%s: %s changed -> config-changed", async (command, f) => {
+    expectS6(await planScopedRun(input({ command, files, changedFiles: changed("src/a.ts", f) })), "config-changed", `config file changed: ${f}`);
+  });
+
+  it("pytest -c / --config-file and eslint -c / --config", async () => {
+    expectS6(await planScopedRun(input({ command: "pytest -c cfg/unit.ini", files: pyRepo(), changedFiles: changed("cfg/unit.ini") })), "config-changed", "config file changed: cfg/unit.ini");
+    expectS6(await planScopedRun(input({ command: "pytest --config-file cfg/u.cfg", files: pyRepo(), changedFiles: changed("cfg/u.cfg") })), "config-changed");
+    expectUnscoped(await lint("eslint -c cfg/lint.mjs", changed("src/a.ts", "cfg/lint.mjs")), "eslint config changed: cfg/lint.mjs");
+    expectUnscoped(await lint("eslint --config=cfg/lint.mjs", changed("cfg/lint.mjs")), "eslint config changed: cfg/lint.mjs");
+  });
+
+  it("the value resolves against the runner's cwd (a package script) and through realpath", async () => {
+    const pkg = jsRepo({}, { "/r/pkg/package.json": JSON.stringify({ scripts: { test: "vitest --config conf/v.mjs" } }), "/r/pkg/conf/v.mjs": "" });
+    const d = await detect("npm test", pkg, POSIX_HOST, "/r/pkg");
+    expect(d.configFiles).toEqual(["/r/pkg/conf/v.mjs"]);
+    expectS6(await planScopedRun(input({ command: "npm test", cwd: "/r/pkg", files: pkg, changedFiles: changed("conf/v.mjs") })), "config-changed", "config file changed: pkg/conf/v.mjs");
+    const fs = aliasFs({ ...files, "/r/real/cfg.mjs": "" }, false, { "/r/cfg/link.mjs": "/r/real/cfg.mjs" });
+    expectS6(await planScopedRun(input({ command: "vitest --config cfg/link.mjs", fs, changedFiles: changed("real/cfg.mjs") })), "config-changed", "config file changed: real/cfg.mjs");
+  });
+
+  it("an unrelated change still plans normally", async () => {
+    expect(isScopedSpec(await planScopedRun(input({ command: "vitest --config cfg/unit.config.mjs", files, changedFiles: changed("src/a.ts") })))).toBe(true);
+  });
+});
+
+describe("QA-1.3-9: eslint >= 9 lints what its flat config matches", () => {
+  it("a .vue change is passed on (the QA repro: eslint ., src/App.vue)", async () => {
+    const r = lintSpec(await lint("eslint .", changed("src/App.vue"), lintRepo("9.1.0", {}, { "/r/src/App.vue": "" })));
+    expect(r.inputs).toEqual(["/r/src/App.vue"]);
+    expect(r.args.slice(-2)).toEqual(["--no-warn-ignored", "/r/src/App.vue"]);
+  });
+
+  it("an unknown version counts as < 9", async () => {
+    const files = jsRepo({}, { "/r/node_modules/eslint/package.json": JSON.stringify({ name: "eslint", bin: { eslint: "./bin/eslint.js" } }), [ESLINT_ENTRY]: "", "/r/src/App.vue": "" });
+    expect(await lint("eslint", changed("src/App.vue"), files)).toEqual({ noAffected: true, note: "no changed lintable files" });
   });
 });

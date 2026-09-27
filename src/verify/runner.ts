@@ -367,14 +367,28 @@
 //      "written"/"modified" and porcelain codes differ. tree.ts records only rename
 //      destinations, so 2.1 should pass previousPath.
 //   7. Config triggers are checked on every canonical path, gone or not. The first hit in sorted
-//      order -> S6 config-changed. Matching is by basename, anywhere under gitRoot:
+//      order -> S6 config-changed. Matching is by basename (real or lexical, 3a), anywhere
+//      under gitRoot:
 //        vitest  package.json, vitest.config.*, vite.config.*, vitest.workspace.*,
 //                vitest.projects.*, tsconfig*.json.
 //                Evidence (R): `vitest related package.json` ran every test file.
 //        jest    package.json, jest.config.*, babel.config.*, .babelrc, .babelrc.*, tsconfig*.json
-//        pytest  conftest.py, pyproject.toml, pytest.ini, setup.cfg, tox.ini (section 1.5-3,
-//                exactly)
-//        all     the package.json that supplied the script (DetectedRunner.source)
+//        vitest and jest, also (QA-1.3-8): package-lock.json, npm-shrinkwrap.json,
+//                pnpm-lock.yaml, yarn.lock, bun.lock, bun.lockb, pnpm-workspace.yaml, .npmrc,
+//                .yarnrc, .yarnrc.yml, .pnpmfile.cjs (a lockfile-only change can upgrade a
+//                dependency within its range); and conventional setup files that are not test
+//                files, /^(?:(?:vitest|jest|test)[.-])?(?:global[.-]?)?setup(?:[.-]?(?:tests?|
+//                files?|after[.-]?env|env))?\.[cm]?[jt]sx?$/i (QA-1.3-15: vitest adds setupFiles
+//                to forceRerunTriggers and reran every test file; jest's related graph never
+//                reaches a setup file). A setup file under another name is the P residual.
+//        pytest  conftest.py, pyproject.toml, pytest.ini, setup.cfg, tox.ini (section 1.5-3),
+//                plus .pytest.ini, pytest.toml, .pytest.toml (QA-1.3-4: pytest 9 reads them;
+//                plan amendment to section 1.5-3, fixtures in 3.2) and uv.lock, poetry.lock,
+//                pdm.lock, Pipfile.lock, requirements*.txt (QA-1.3-8)
+//        all     the package.json that supplied the script (DetectedRunner.source), and every
+//                file named by a config option (DetectedRunner.configFiles: vitest/jest
+//                --config -c, pytest -c --config-file, eslint -c --config), resolved against
+//                runnerCwd and canonicalized (QA-1.3-5)
 //        eslint  (K)
 //   8. Classification:
 //        test file (JS): /\.(test|spec)\.[cm]?[jt]sx?$/ or a "__tests__" segment.
@@ -383,9 +397,7 @@
 //          - extensions .md .mdx .markdown .rst .adoc .txt;
 //          - any path with a ".github" segment;
 //          - basenames LICENSE, LICENCE, .gitignore, .gitattributes, .editorconfig, .npmignore,
-//            .prettierignore;
-//          - lockfiles package-lock.json, npm-shrinkwrap.json, pnpm-lock.yaml, yarn.lock,
-//            bun.lockb, bun.lock.
+//            .prettierignore. (Lockfiles are triggers now, 7.)
 //        vitest/jest:
 //          - an existing file becomes an input. A changed test file runs itself (evidence R).
 //          - a gone test file adds the note `deleted test file not run: <rel>`; the risk signal
@@ -558,11 +570,16 @@
 //   - Arguments follow D.1 and D.5. Positionals are path scopes, and there are none by default,
 //     meaning runnerCwd. A positional containing * ? [ ] { } -> Unscoped
 //     `eslint glob pattern in <where>: "<p>"`.
-//   - A lintable file exists, lies inside gitRoot and inside a path scope, and has an extension
-//     from --ext (comma-separated, leading dots optional). Without --ext the extensions are
-//     .js .mjs .cjs .jsx .ts .mts .cts .tsx.
+//   - A lintable file exists and lies inside gitRoot and inside a path scope. eslint >= 9: that
+//     is all (QA-1.3-9): the flat config decides what it lints and --no-warn-ignored silences
+//     the rest, so a .vue or .md file the config covers is not skipped. eslint < 9 or an
+//     unknown version: it must also have an extension from --ext (comma-separated, leading dots
+//     optional), by default .js .mjs .cjs .jsx .ts .mts .cts .tsx, because eslintrc lints every
+//     explicitly passed file. The entry is resolved before this filter, so "no changed lintable
+//     files" before resolution means no existing in-scope file at all.
 //   - Config triggers (basename): eslint.config.*, .eslintrc, .eslintrc.*, .eslintignore,
-//     package.json, tsconfig*.json -> Unscoped `eslint config changed: <rel>`.
+//     package.json, tsconfig*.json, the JS lockfiles and workspace files of G.7, and the
+//     --config/-c file -> Unscoped `eslint config changed: <rel>`.
 //   - "unavailable" -> Unscoped "change attribution unavailable".
 //   - No lintable files -> NoAffected "no changed lintable files".
 //   - Entry: node_modules/eslint (F). Missing -> Unscoped "runner not installed: eslint".
@@ -699,7 +716,10 @@
 //   - vitest behaves consistently with "--no-file-parallelism" plus "--maxWorkers=1".
 //   - Custom vitest forceRerunTriggers in the user's config cannot be read statically and can
 //     make `related` run every file. This is an accepted residual risk (plan section 5,
-//     config-driven tests).
+//     config-driven tests). vitest adds setupFiles to them (QA-1.3-15 evidence; globalSetup is
+//     not verified): a change to a setup file under a name G.7 does not recognize runs every
+//     test file (correct, at full cost). Under jest such a change is not seen by the related
+//     graph at all.
 //   - A conftest.py or plugin hook (pytest_load_initial_conftests, pytest_cmdline_main) that
 //     adds -n cannot be seen statically; the appended "-n N" only lands when D.4 found xdist.
 //   - Tokenizing: npm on Windows (cmd.exe) does not treat '...' as quotes, while C.1 applies
@@ -940,6 +960,8 @@ export interface DetectedRunner {
   readonly notes: readonly string[];
   /** pytest: what the command itself says, so each spec can redo the config lookup from its inputs (D.4). */
   readonly pytestFacts?: PytestFacts;
+  /** Absolute canonical paths of the --config/-c (pytest: -c/--config-file) values. Config triggers (G.7, QA-1.3-5). */
+  readonly configFiles?: readonly string[];
 }
 
 /** The pytest command's own worker, xdist and config facts (D.4, QA-1.3-3). */
@@ -2170,6 +2192,7 @@ async function finishDetection<K extends ToolKind>(
     xdist,
     covInConfig,
     notes: allNotes,
+    configFiles,
     ...(pytestFacts ? { pytestFacts } : {}),
   };
 }
@@ -2250,15 +2273,19 @@ async function resolveEntryImpl(
 const JS_TEST_RE = /\.(test|spec)\.[cm]?[jt]sx?$/;
 const PY_TEST_RE = /^test_.*\.py$|_test\.py$/;
 const NON_INPUT_EXT_RE = /\.(md|mdx|markdown|rst|adoc|txt)$/i;
-const NON_INPUT_NAMES = new Set([
-  "LICENSE", "LICENCE", ".gitignore", ".gitattributes", ".editorconfig", ".npmignore", ".prettierignore",
-  "package-lock.json", "npm-shrinkwrap.json", "pnpm-lock.yaml", "yarn.lock", "bun.lockb", "bun.lock",
-]);
+const NON_INPUT_NAMES = new Set(["LICENSE", "LICENCE", ".gitignore", ".gitattributes", ".editorconfig", ".npmignore", ".prettierignore"]);
+/** JS dependency and workspace files (G.7, QA-1.3-8): a lockfile-only change can upgrade a dependency. */
+const JS_DEPS = String.raw`package-lock\.json|npm-shrinkwrap\.json|pnpm-lock\.yaml|yarn\.lock|bun\.lockb?|pnpm-workspace\.yaml|\.npmrc|\.yarnrc(?:\.yml)?|\.pnpmfile\.cjs`;
 const TRIGGERS: Record<RunnerKind, RegExp> = {
-  vitest: /^(?:package\.json|vitest\.config\..+|vite\.config\..+|vitest\.workspace\..+|vitest\.projects\..+|tsconfig.*\.json)$/,
-  jest: /^(?:package\.json|jest\.config\..+|babel\.config\..+|\.babelrc|\.babelrc\..+|tsconfig.*\.json)$/,
-  pytest: /^(?:conftest\.py|pyproject\.toml|pytest\.ini|setup\.cfg|tox\.ini)$/,
+  vitest: new RegExp(String.raw`^(?:package\.json|vitest\.config\..+|vite\.config\..+|vitest\.workspace\..+|vitest\.projects\..+|tsconfig.*\.json|${JS_DEPS})$`),
+  jest: new RegExp(String.raw`^(?:package\.json|jest\.config\..+|babel\.config\..+|\.babelrc|\.babelrc\..+|tsconfig.*\.json|${JS_DEPS})$`),
+  pytest: /^(?:conftest\.py|pyproject\.toml|\.?pytest\.ini|\.?pytest\.toml|setup\.cfg|tox\.ini|uv\.lock|poetry\.lock|pdm\.lock|[Pp]ipfile\.lock|requirements[\w.-]*\.txt)$/,
 };
+/**
+ * G.7 (QA-1.3-15): conventional vitest/jest setup-file names. vitest reruns every test for a
+ * setupFiles change and jest's related-test graph never reaches one, so both fail closed.
+ */
+const SETUP_FILE_RE = /^(?:(?:vitest|jest|test)[.-])?(?:global[.-]?)?setup(?:[.-]?(?:tests?|files?|after[.-]?env|env))?\.[cm]?[jt]sx?$/i;
 const NOTE_NO_CHANGES = "no changed files, no affected tests";
 const NOTE_NO_INPUT = "no affected tests: no changed file is a test input";
 const NOTE_NO_PY_MAP = "no affected tests: no test files map to the changed modules";
@@ -2306,8 +2333,12 @@ async function plan(input: StaticScopingInput, search: TestSearchSeam | undefine
 
   // G.7: config triggers.
   const sourcePj = det.source.type === "script" ? ctx.key(det.source.packageJson) : undefined;
+  const configKeys = new Set((det.configFiles ?? []).map((p) => ctx.key(p)));
+  const js = det.kind === "vitest" || det.kind === "jest";
   for (const f of sorted) {
-    if (namesOf(ctx, f).some((b) => TRIGGERS[det.kind].test(b)) || ctx.key(f.abs) === sourcePj) {
+    const names = namesOf(ctx, f);
+    const setup = js && !isJsTestPath(f.rel) && names.some((b) => SETUP_FILE_RE.test(b));
+    if (setup || names.some((b) => TRIGGERS[det.kind].test(b)) || ctx.key(f.abs) === sourcePj || configKeys.has(ctx.key(f.abs))) {
       return s6("config-changed", `config file changed: ${f.rel}`);
     }
   }
@@ -2707,19 +2738,24 @@ export async function planScopedLint(input: PlanScopedLintInput): Promise<LintSp
   const notes = [...det.notes];
   const sorted = await collectChanged(ctx, fs, await canonicalCwd(ctx, fs, input.cwd), det.gitRoot, input.changedFiles, notes);
   if (sorted.length === 0) return unscoped(NO_PATH_KEPT);
+  const configKeys = new Set((det.configFiles ?? []).map((p) => ctx.key(p)));
   for (const f of sorted) {
-    if (namesOf(ctx, f).some((b) => ESLINT_TRIGGER_RE.test(b))) return unscoped(`eslint config changed: ${f.rel}`);
+    if (namesOf(ctx, f).some((b) => ESLINT_TRIGGER_RE.test(b)) || configKeys.has(ctx.key(f.abs))) return unscoped(`eslint config changed: ${f.rel}`);
   }
-  const exts = lintExtensions(det.keptArgs);
-  const F: string[] = [];
+  const candidates: string[] = [];
   for (const f of sorted) {
     const inScope = isInside(ctx, det.runnerCwd, f.abs) && (det.pathScopes.length === 0 || det.pathScopes.some((s) => isInside(ctx, s, f.abs)));
-    if (inScope && exts.has(P.extname(f.abs).toLowerCase()) && (await fs.fileExists(f.abs))) F.push(f.abs);
+    if (inScope && (await fs.fileExists(f.abs))) candidates.push(f.abs);
   }
-  if (F.length === 0) return noAffected(NOTE_NO_LINT);
+  if (candidates.length === 0) return noAffected(NOTE_NO_LINT);
   const r = await resolveEntryImpl(ctx, det, det.runnerCwd, fs);
   if (isS6(r)) return unscoped(r.reason);
   const v9 = Number.parseInt(r.entry.version ?? "", 10) >= 9;
+  // K (QA-1.3-9): eslint >= 9 decides from its flat config which files it lints, and
+  // --no-warn-ignored silences the rest; only older versions need the extension filter.
+  const exts = lintExtensions(det.keptArgs);
+  const F = v9 ? candidates : candidates.filter((f) => exts.has(P.extname(f).toLowerCase()));
+  if (F.length === 0) return noAffected(NOTE_NO_LINT);
   if (!v9 && det.keptArgs.some((a) => a === "--max-warnings" || a.startsWith("--max-warnings="))) {
     return unscoped("eslint <9 cannot scope ignored files under --max-warnings");
   }
@@ -2754,7 +2790,7 @@ function unscoped(reason: string): Unscoped {
   return { unscoped: true, reason };
 }
 
-const ESLINT_TRIGGER_RE = /^(?:eslint\.config\..+|\.eslintrc|\.eslintrc\..+|\.eslintignore|package\.json|tsconfig.*\.json)$/;
+const ESLINT_TRIGGER_RE = new RegExp(String.raw`^(?:eslint\.config\..+|\.eslintrc|\.eslintrc\..+|\.eslintignore|package\.json|tsconfig.*\.json|${JS_DEPS})$`);
 const DEFAULT_LINT_EXTS = [".js", ".mjs", ".cjs", ".jsx", ".ts", ".mts", ".cts", ".tsx"];
 
 /** K: the --ext values (comma-separated, leading dots optional), or the defaults. */
