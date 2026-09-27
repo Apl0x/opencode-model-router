@@ -850,7 +850,7 @@ function harness(model: Model = MODEL, o: HarnessOptions = {}) {
     calls.direct.push(request);
     return { scoped: { kind: "no-affected", note: "direct" }, recheck: undefined };
   };
-  const runtime: BatchRuntime = { direct, plan, openScope, batchWindowMs: WINDOW, recheckMinRemainingMs: 1_000, ...o.runtime };
+  const runtime: BatchRuntime = { direct, plan, openScope, batchWindowMs: WINDOW, recheckMinRemainingMs: 1_000, failureRecheck: true, ...o.runtime };
   return { calls, runtime };
 }
 
@@ -1568,6 +1568,33 @@ describe("createBatchCoordinator: attribution and rechecks", () => {
     expect(calls.rechecks).toHaveLength(0);
   });
 
+  it("QA-2.2-2: failureRecheck off at the gate disables a captured reference, per request, as the direct hook does", async () => {
+    const model: Model = { ...sharedFile("test/common.test.ts"), failing: { "test/common.test.ts": ["old"] }, atRef: { "test/common.test.ts": ["old"] } };
+    const { calls, runtime } = harness(model);
+    const off: BatchRuntime = { ...runtime, failureRecheck: false };
+    const c = createBatchCoordinator({ platform: "linux" });
+    // The window is opened by the gate with the setting on; the second gate has it off.
+    const outs = [
+      c.hook(runtime)(req(["src/a.ts"])),
+      c.hook(off)(req(["src/b.ts"])),
+      c.hook(off)(req(["src/c.ts"], { reference: { kind: "none", reason: "dispatch not tracked" } })),
+    ];
+    await vi.advanceTimersByTimeAsync(WINDOW);
+    const runs = await Promise.all(outs);
+    expect(calls.executes[0]?.spec.inputs).toHaveLength(3);
+    expect(runs.map((r) => r.recheck?.kind)).toEqual(["exact", "disabled", "disabled"]);
+    expect(calls.rechecks.map((r) => r.files)).toEqual([[at("test/common.test.ts")]]);
+    await c.dispose();
+
+    // The opener off does not disable a member whose own gate has it on.
+    const h = harness(model);
+    const c2 = createBatchCoordinator({ platform: "linux" });
+    const outs2 = [c2.hook({ ...h.runtime, failureRecheck: false })(req(["src/a.ts"])), c2.hook(h.runtime)(req(["src/b.ts"]))];
+    await vi.advanceTimersByTimeAsync(WINDOW);
+    expect((await Promise.all(outs2)).map((r) => r.recheck?.kind)).toEqual(["disabled", "exact"]);
+    await c2.dispose();
+  });
+
   it("the flaky taint: a union failure that no own run reproduces makes every member incomplete", async () => {
     const flaky: Model = { ...MODEL, failing: { "test/a.test.ts": ["flaky"] } };
     const warn = vi.fn();
@@ -1834,9 +1861,10 @@ async function directOver(rt: BatchRuntime, request: TestsPassRequest): Promise<
   const scope = await rt.openScope({ cwd: request.cwd, command: request.command });
   try {
     const scoped = await scope.execute(plan, request.deadline);
-    if (scoped.kind !== "ran" || scoped.result.failingIds.length === 0) return { scoped, recheck: undefined };
+    if (scoped.kind !== "ran" || scoped.result.failingIds.length === 0 || scoped.result.failingFiles.length === 0) return { scoped, recheck: undefined };
     const ref = request.reference;
-    if (ref.kind === "disabled") return { scoped, recheck: { kind: "disabled" } };
+    // 2.1's createDirectTestsPassHook (origin/vrb/p21 deterministic.ts): the gate's setting wins over the capture.
+    if (ref.kind === "disabled" || !rt.failureRecheck) return { scoped, recheck: { kind: "disabled" } };
     if (ref.kind === "none") return { scoped, recheck: { kind: "unusable", cause: "no-reference", reason: ref.reason } };
     const recheck = await scope.rechecker(request.command, request.cwd)(ref.reference, scoped.result.failingFiles, request.deadline);
     return { scoped, recheck };
@@ -1853,6 +1881,8 @@ interface CaseRequest {
   readonly cwd: string;
   readonly files: readonly string[] | "unavailable";
   readonly reference: TestsPassRequest["reference"];
+  /** QA-2.2-2: the submitting gate's failureRecheck. */
+  readonly failureRecheck: boolean;
 }
 
 interface PropertyCase {
@@ -1900,20 +1930,21 @@ function genCase(seed: number): PropertyCase {
   const requests: CaseRequest[] = [];
   for (let i = 0; i < n; i++) {
     const reference = pickFrom(refs, { kind: "disabled" });
+    const failureRecheck = !chance(0.15);
     if (chance(0.03)) {
-      requests.push({ command: "npx vitest run", cwd: ROOT, files: "unavailable", reference });
+      requests.push({ command: "npx vitest run", cwd: ROOT, files: "unavailable", reference, failureRecheck });
       continue;
     }
     const count = Math.floor(rnd() * 4);
     if (chance(0.35)) {
       const files = [...new Set(Array.from({ length: count }, () => pickFrom(pt, "tests/test_a.py")))];
-      requests.push({ command: "pytest", cwd: PY, files, reference });
+      requests.push({ command: "pytest", cwd: PY, files, reference, failureRecheck });
     } else {
       const pool = [...vs, ...vt];
       const files = [...new Set(Array.from({ length: count }, () => pickFrom(pool, "src/a.ts")))];
       if (chance(0.05)) files.push("src/untestable.ts");
       const command = chance(0.2) ? "npx vitest run -t smoke" : "npx vitest run";
-      requests.push({ command, cwd: ROOT, files, reference });
+      requests.push({ command, cwd: ROOT, files, reference, failureRecheck });
     }
   }
   return { model, atRefs, requests, flaky: chance(0.15) };
@@ -1976,6 +2007,7 @@ describe("createBatchCoordinator: B12 batched verdicts equal solo verdicts", () 
         rechecker,
         runtime: {
           batchWindowMs: 0,
+          failureRecheck: cr.failureRecheck,
           direct: (r) => {
             if (holder.runtime === undefined) throw new Error("solo runtime not wired");
             return directOver(holder.runtime, r);
@@ -1993,8 +2025,7 @@ describe("createBatchCoordinator: B12 batched verdicts equal solo verdicts", () 
     // Batched: every request in one window.
     const batched = harness(pc.model, { rechecker, ...(pc.flaky ? { execute: flakyExecute(pc.model) } : {}) });
     const c = createBatchCoordinator({ platform: "linux" });
-    const hook = c.hook(batched.runtime);
-    const outs = pc.requests.map((cr) => hook(toRequest(cr)));
+    const outs = pc.requests.map((cr) => c.hook({ ...batched.runtime, failureRecheck: cr.failureRecheck })(toRequest(cr)));
     await vi.advanceTimersByTimeAsync(WINDOW);
     const runs = await Promise.all(outs);
     await c.dispose();
@@ -2042,6 +2073,7 @@ describe("createBatchCoordinator: B12 batched verdicts equal solo verdicts", () 
     let distinctRefs = 0;
     let guardSensitive = 0;
     let zeroTest = 0;
+    let capturedButOff = 0;
     for (let i = 0; i < PROPERTY_CASES; i++) {
       const pc = genCase(PROPERTY_SEED + i);
       if (pc.flaky) flaky++;
@@ -2051,7 +2083,8 @@ describe("createBatchCoordinator: B12 batched verdicts equal solo verdicts", () 
       if (commits.size > 1) distinctRefs++;
       if (pc.requests.some((r) => r.command !== "pytest" && r.files !== "unavailable" && r.files.some(isTestKey))) guardSensitive++;
       if (Object.values(pc.model.tests ?? {}).some((n) => n === 0)) zeroTest++;
+      if (pc.requests.some((r) => r.reference.kind === "captured" && !r.failureRecheck)) capturedButOff++;
     }
-    for (const n of [flaky, pytest, multi, distinctRefs, guardSensitive, zeroTest]) expect(n).toBeGreaterThan(10);
+    for (const n of [flaky, pytest, multi, distinctRefs, guardSensitive, zeroTest, capturedButOff]) expect(n).toBeGreaterThan(10);
   });
 });

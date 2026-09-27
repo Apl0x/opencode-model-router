@@ -235,8 +235,13 @@
 //
 //   Only members whose scoped outcome is "ran" with >= 1 failing id and >= 1 failing file take
 //   part.
-//   1. Pre-decisions for each member, with no spawn (2.1-T4): ReferenceState "disabled" ->
+//   1. Pre-decisions for each member, with no spawn (2.1-T4), in 2.1's direct-hook order:
+//      ReferenceState "disabled", OR the member's own gate-time runtime.failureRecheck is off ->
 //      { kind: "disabled" }; "none" -> { kind: "unusable", cause: "no-reference", reason }.
+//      failureRecheck is read from the runtime of the hook that submitted the member, never from
+//      the window opener's (QA-2.2-2): a reference captured at dispatch while the setting was on
+//      is disabled when the setting is off at the gate (a config reload, or a later
+//      router_verify), as the direct hook does.
 //   2. "captured" members are grouped by referenceKey(reference): root, commit, and the sorted
 //      untracked, tracked and captureReasons entries (capturedAt is excluded). A recheck at one
 //      reference proves nothing about another, so ONE recheck is shared per distinct reference,
@@ -551,6 +556,12 @@ export interface BatchRuntime {
   readonly batchWindowMs: number;
   /** 2.1's RECHECK_MIN_REMAINING_MS (B8.3), injected so this module has no runtime import of deterministic.ts. */
   readonly recheckMinRemainingMs: number;
+  /**
+   * The gate-time enforcement.verify.failureRecheck (VerifyBudget), read per request (B8.1,
+   * QA-2.2-2): off turns every reference, even a captured one, into "disabled", exactly as 2.1's
+   * direct hook decides at the gate.
+   */
+  readonly failureRecheck: boolean;
 }
 
 /** Timer seam for the window timers (W1). */
@@ -615,6 +626,8 @@ interface Member {
   readonly request: TestsPassRequest;
   /** The member's own planScopedRun spec. */
   readonly spec: ScopedSpec;
+  /** B8.1 (QA-2.2-2): the submitting gate's runtime.failureRecheck, not the window opener's. */
+  readonly failureRecheck: boolean;
   /** Arrival order: the tie-break of every deadline ordering. */
   readonly seq: number;
   phase: MemberPhase;
@@ -819,6 +832,7 @@ export function createBatchCoordinator(options: BatchCoordinatorOptions = {}): B
       const member: Member = {
         request,
         spec,
+        failureRecheck: runtime.failureRecheck,
         seq: arrivals++,
         phase: "window",
         settled: false,
@@ -1057,6 +1071,8 @@ export function createBatchCoordinator(options: BatchCoordinatorOptions = {}): B
   /** B8.1: the no-spawn decisions of 2.1-T4, or the captured reference to recheck at. */
   function referenceDecision(m: Member): { readonly decided: RecheckOutcome } | { readonly reference: DispatchReference } {
     const state = m.request.reference;
+    // QA-2.2-2: 2.1's direct hook, `ref.kind === "disabled" || !failureRecheck` -> disabled.
+    if (!m.failureRecheck) return { decided: { kind: "disabled" } };
     switch (state.kind) {
       case "disabled":
         return { decided: { kind: "disabled" } };
