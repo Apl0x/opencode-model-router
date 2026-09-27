@@ -1137,6 +1137,11 @@ memo. The existing timing test already fails if the memo is removed (C, row 1: 1
   grammar-valid value (`VERIFY:` `required|deferred`, `VERIFY_WAIT:` `<n>ms|s`, `CAP:` `none|<n>`, any case;
   QA-1.6-27, QA-1.6-35); a bare `CAP:` after the value falls back silently". Drop "fixed" from the `LINE_TAIL`
   comment. The report side is handled by the handoff delta below.
+- Resolution: 663ebb0 — comment-only. The module header now says that a lower-case value also counts when it is followed
+  on the same line by another key with a format-valid value (`VERIFY:` `required|deferred`, `VERIFY_WAIT:`
+  `<n>ms|s`, `CAP:` `none|<n>`, any case). "Valid" means the value's format only (`cap:0` counts; a value on the
+  next line does not; a bare `CAP:` falls back silently). The `LINE_TAIL` comment no longer calls its ending
+  "a fixed alternative". Code is unchanged; directives/risk tests pass (55/55).
 
 ### Other checks (no finding)
 
