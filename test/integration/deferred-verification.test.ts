@@ -101,9 +101,11 @@ vi.mock("../../src/verify/wiring", async importOriginal => {
 });
 vi.mock("../../src/verify/reference", async importOriginal => ({
   ...(await importOriginal<typeof import("../../src/verify/reference")>()),
-  captureReference: () => {
+  captureReference: (_at: string, signal: AbortSignal) => {
     state.captures += 1;
-    return new Promise(resolveCapture => {
+    return new Promise((resolveCapture, rejectCapture) => {
+      // Like the real capture, an abort (the store clearing the dispatch) ends it without a reference.
+      signal.addEventListener("abort", () => rejectCapture(new Error("capture aborted")), { once: true });
       const delay = state.captureDelayMs;
       if (delay === "never") return;
       if (delay === undefined) resolveCapture(state.captureResult);
@@ -406,7 +408,7 @@ describe("wiring (2.4.2a)", () => {
 
 type DispatchPath = "task" | "delegate";
 /** The paths routed so far; every routing case below runs on each of them. */
-const PATHS: DispatchPath[] = ["task"];
+const PATHS: DispatchPath[] = ["task", "delegate"];
 
 const ACCEPT_TESTS = "[acceptance]\ncheck: testsPass command=\"npm test\"\n[/acceptance]";
 /** A testsPass DoD whose other check fails: a required gate rejects it, a deferred one never looks. */
@@ -418,7 +420,9 @@ interface PluginHarness {
   hooks: any;
   producerPrompts: number;
   created: string[];
-  run(path: DispatchPath, prompt: string, reply?: string): Promise<string>;
+  /** Clock value when the producer started: the task before hook returned, or the delegate producer prompt. */
+  startedAt: number | undefined;
+  run(path: DispatchPath, prompt: string, reply?: string, tier?: string): Promise<string>;
 }
 
 async function makePlugin(home: string): Promise<PluginHarness> {
@@ -427,19 +431,21 @@ async function makePlugin(home: string): Promise<PluginHarness> {
     hooks: undefined,
     producerPrompts: 0,
     created: [],
-    async run(p, prompt, reply = "DONE: implemented.") {
+    startedAt: undefined,
+    async run(p, prompt, reply = "DONE: implemented.", tier = "fast") {
       counter += 1;
       if (p === "task") {
         const input = { tool: "task", sessionID: "orch", callID: `call${counter}`, args: { subagent_type: "fast", prompt, description: "the work" } };
         const before = { args: { ...input.args } };
         await h.hooks["tool.execute.before"](input, before);
+        h.startedAt = Date.now();
         // The host hands the (possibly rewritten) args to the after hook.
         input.args = before.args;
         const output = { output: `<task_result>\n${reply}\n</task_result>`, metadata: { sessionId: `child${counter}` } };
         await h.hooks["tool.execute.after"](input, output);
         return output.output;
       }
-      return h.hooks.tool.delegate.execute({ task: prompt, tier: "fast" }, { sessionID: "orch" });
+      return h.hooks.tool.delegate.execute({ task: prompt, tier }, { sessionID: "orch" });
     },
   };
   const ctx = {
@@ -457,7 +463,10 @@ async function makePlugin(home: string): Promise<PluginHarness> {
           return { data: { id } };
         },
         prompt: async (req: { body?: { system?: unknown } }) => {
-          if (req.body?.system === undefined) h.producerPrompts += 1;
+          if (req.body?.system === undefined) {
+            h.producerPrompts += 1;
+            h.startedAt ??= Date.now();
+          }
           return { data: { parts: [{ type: "text", text: "DONE: implemented. VERIFY:required" }] } };
         },
         abort: async () => ({}),
@@ -594,6 +603,47 @@ describe("the plugin routes by mode on both dispatch paths", () => {
         expect(ctx.dispatchedAt).toBeGreaterThanOrEqual(before);
         expect(ctx.returnedAt).toBeGreaterThanOrEqual(ctx.dispatchedAt);
         expect(ctx.root).toBe(root);
+      }
+    });
+
+    it("VERIFY_WAIT:5s with a capture that takes 20 s: the producer starts at 5 s", async () => {
+      vi.useFakeTimers();
+      state.captureDelayMs = 20_000;
+      // The capture may run up to baselineTimeoutMs (default 15 s) after the wait.
+      writeOverrides(home, { baselineTimeoutMs: 30_000 });
+      const h = await makePlugin(home);
+      const t0 = Date.now();
+      const done = h.run(p, `VERIFY_WAIT:5s\nImplement it.\n${ACCEPT_TESTS}`);
+      await vi.advanceTimersByTimeAsync(20_000);
+      const out = await done;
+      expect(h.startedAt).toBe(t0 + 5_000);
+      expect(out).toMatch(FOOTER_LINE);
+      // The capture outlived the result (the dispatch record was not cleared under it): a later
+      // router_verify gets the reference.
+      await vi.advanceTimersByTimeAsync(20_000);
+      expect(await pendingOf("orch")[0].reference).toEqual({ kind: "captured", reference: REF });
+    });
+
+    it("VERIFY_WAIT:0s with a capture that never settles: the producer starts at once and the result is not held", async () => {
+      state.captureDelayMs = "never";
+      let snapshots = 0;
+      state.snapshotImpl = async () =>
+        (snapshots++ === 0 ? snap([], "clean") : snap([{ path: resolve(root, "src", "a.ts"), status: " M" }], "after"));
+      const h = await makePlugin(home);
+      const out = await h.run(p, `VERIFY_WAIT:0s\nImplement it.\n${ACCEPT_TESTS}`);
+      expect(out).toMatch(FOOTER_LINE);
+      // Still in flight at return: counted as no reference (risk raised one step).
+      expect(pendingOf("orch")[0].risk.reasons).toContain(REASONS.noReference);
+    });
+
+    it("the registered producer tier is the canonical lowercase id", async () => {
+      const h = await makePlugin(home);
+      if (p === "task") {
+        await h.run(p, `Implement it.\n${ACCEPT_TESTS}`);
+        expect(pendingOf("orch")[0].producerTier).toBe("fast");
+      } else {
+        await h.run(p, `Implement it.\n${ACCEPT_TESTS}`, undefined, " Fast ");
+        expect(pendingOf("orch")[0].producerTier).toBe("fast");
       }
     });
 

@@ -78,7 +78,7 @@ import { access, readFile as fsReadFile } from "node:fs/promises";
 import { tool } from "@opencode-ai/plugin";
 import { scrubText } from "./guard/scrub";
 import { accept, unverifiableGateResult } from "./verify/gate";
-import { createVerificationWiring, dispatchDirectiveText, extractAssistantText } from "./verify/wiring";
+import { createVerificationWiring, dispatchDirectiveText, extractAssistantText, type DispatchStart } from "./verify/wiring";
 import { appendRouterFooter } from "./verify/pending";
 import { createDeadline } from "./verify/deterministic";
 import {
@@ -353,7 +353,7 @@ const ModelRouterPlugin: Plugin = async (ctx: PluginInput) => {
 
   const {
     graderSessions, dispatchGrader, buildGateDeps, disposeChildSession,
-    beginVerificationBounded, prepareVerification, startReferenceGc,
+    prepareVerification, startReferenceGc,
     sweepVerification, disposeVerification,
     startDispatch, takeDispatch, isDeferred, finishDeferred, applyLineage, pending,
   } = createVerificationWiring({
@@ -492,6 +492,13 @@ const ModelRouterPlugin: Plugin = async (ctx: PluginInput) => {
           // early return or a throw skipped — otherwise each retry leaks another.
           const producerSessions: string[] = [];
           let baselineID: string | undefined;
+          /** 2.4.2c: the directives and start time of this delegation, from its first attempt. */
+          let dispatchStart: DispatchStart | undefined;
+          /**
+           * 2.4.2c: finishDeferred clears the dispatch record (baselineID) once its reference
+           * settled; clearing it in the finally below would abort a capture still in flight.
+           */
+          let deferredOwnsBaseline = false;
           try {
             let activeCfg = cfg;
             try {
@@ -541,6 +548,11 @@ const ModelRouterPlugin: Plugin = async (ctx: PluginInput) => {
               sessionID: string;
               text: string;
               gateRes: Awaited<ReturnType<typeof accept>>;
+            } | {
+              sessionID: string;
+              text: string;
+              /** 2.4.2c: deferred; the section 1.5-16 footer to append to the result. */
+              deferredFooter: string;
             } | null> => {
               const taskText = forcingNote
                 ? `${scrubText(forcingNote)}\n\n${args.task}`
@@ -558,8 +570,9 @@ const ModelRouterPlugin: Plugin = async (ctx: PluginInput) => {
               // recapturing after a failed attempt would excuse its regression.
               if (!baselineID) {
                 baselineID = producerSid;
-                // 2.1.5b: wait at most captureWaitMs; the capture continues in the background.
-                await beginVerificationBounded(changedFileStore, baselineID, args.cwd, dod);
+                // 2.4.2c: the directives come from the orchestrator's `task` argument only; the
+                // capture is awaited for at most VERIFY_WAIT and continues in the background.
+                dispatchStart = await startDispatch(changedFileStore, baselineID, args.cwd, dod, args.task, false);
               }
               // Compose with Layer 1: guard the plugin-created producer session.
               try {
@@ -604,6 +617,39 @@ const ModelRouterPlugin: Plugin = async (ctx: PluginInput) => {
                 producerError =
                   error instanceof Error ? error.message : String(error);
                 producerText = "";
+              }
+              // pending.ts R11: the producer's changes landed by now.
+              const returnedAt = Date.now();
+
+              // 2.4.2c, section 1.5-16: a deferred delegation runs no gate and no ladder. A producer
+              // that failed outright produced nothing to verify later; it keeps today's
+              // failed-attempt path, which runs no verification process either.
+              if (dispatchStart !== undefined && producerError === null && isDeferred(dod, dispatchStart.directives)) {
+                const finish = await finishDeferred(changedFileStore, {
+                  dispatchID: baselineID,
+                  orchestratorSessionID: toolCtx?.sessionID ?? "",
+                  producerSessionID: producerSid,
+                  producerTier: tier,
+                  description: args.task,
+                  cwd: args.cwd,
+                  dod,
+                  dispatchedAt: dispatchStart.dispatchedAt,
+                });
+                deferredOwnsBaseline = true;
+                if (producerSid !== baselineID) changedFileStore.clear(producerSid);
+                try {
+                  sessionStore.unregister(producerSid);
+                  sessionRootMemo.delete(producerSid);
+                } catch {
+                  // non-fatal
+                }
+                try {
+                  guardStore.clear(producerSid);
+                } catch {
+                  // non-fatal
+                }
+                await disposeChildSession(producerSid);
+                return { sessionID: producerSid, text: producerText, deferredFooter: finish.footer };
               }
 
               const { gateBudgetMs } = resolveVerifyBudget(activeCfg);
@@ -696,6 +742,18 @@ const ModelRouterPlugin: Plugin = async (ctx: PluginInput) => {
               } finally {
                 gateDeadline.dispose();
               }
+              // pending.ts R11, as on the native path. Within this ladder every attempt is judged
+              // against the first attempt's reference and dispatchedAt precedes every landedAt, so
+              // it only affects later delegations of the same session (a native re-dispatch of
+              // rejected delegate work is the T11 case too).
+              gateRes = applyLineage(gateRes, {
+                orchestratorSessionID: toolCtx?.sessionID ?? "",
+                root: verification.snapshot?.root,
+                dispatchID: baselineID,
+                dispatchedAt: dispatchStart?.dispatchedAt ?? returnedAt,
+                returnedAt,
+                strictUnverifiable: activeCfg.enforcement?.verify?.strictUnverifiable,
+              });
 
               // Per-attempt cleanup (drop producer session tracking + state).
               if (producerSid !== baselineID) changedFileStore.clear(producerSid);
@@ -730,6 +788,11 @@ const ModelRouterPlugin: Plugin = async (ctx: PluginInput) => {
                 return "[router] delegate failed: could not create a producer session.";
               }
               producerText = attempt.text;
+              if ("deferredFooter" in attempt) {
+                // Section 1.5-16: the result unchanged plus the footer, appended last. Never
+                // labelled accepted or verified, and never retried or escalated.
+                return appendRouterFooter(producerText, attempt.deferredFooter);
+              }
               const producerSid = attempt.sessionID;
               const gateRes = attempt.gateRes;
 
@@ -781,7 +844,7 @@ const ModelRouterPlugin: Plugin = async (ctx: PluginInput) => {
             // disposeChildSession is fail-soft, so re-disposing an already
             // disposed session is harmless.
             for (const sid of producerSessions) {
-              changedFileStore.clear(sid);
+              if (!(deferredOwnsBaseline && sid === baselineID)) changedFileStore.clear(sid);
               await disposeChildSession(sid);
             }
           }
