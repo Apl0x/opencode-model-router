@@ -23,6 +23,15 @@ import {
   type TestSearchSeam,
   type Unverifiable,
 } from "../../src/verify/runner";
+import {
+  isUnscoped,
+  planRerun,
+  planScopedLint,
+  readResult,
+  type LintSpec,
+  type RunnerFs,
+  type RunResult,
+} from "../../src/verify/runner";
 import type { FsSeam } from "../../src/verify/types";
 
 // ---------------------------------------------------------------------------------------------
@@ -970,5 +979,457 @@ describe("planStaticScoping", () => {
   it("pytest entry notes surface (venv fallback)", async () => {
     const r = await st({ command: "pytest", files: { "/r/.git": "", "/r/.venv/bin/pytest": "", "/r/tests/test_a.py": "" }, changedFiles: changed("tests/test_a.py") });
     expect(r).toMatchObject({ scopable: true, pendingSearches: 0, notes: ["pytest resolved from /r/.venv/bin/pytest"] });
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// I. readResult
+// ---------------------------------------------------------------------------------------------
+
+const REPORTS = path.join(FIX, "reports");
+const RPT_JSON = `/tmp/omr-verify-${UUID}.json`;
+const RPT_XML = `/tmp/omr-verify-${UUID}.xml`;
+
+/** A captured report with its placeholders substituted. `root` is JSON-escaped for .json reports. */
+function report(name: string, root: string): string {
+  const raw = readFileSync(path.join(REPORTS, name), "utf8");
+  const r = name.endsWith(".json") ? JSON.stringify(root).slice(1, -1) : root;
+  return raw.split("<ROOT>").join(r).split("<REPO>").join("repo").split("<PYTHON>").join("py").split("<HOST>").join("host");
+}
+
+/** In-memory RunnerFs that records reads and unlinks. */
+function resultFs(files: Record<string, string>, unlinkFails = false): RunnerFs & { unlinked: string[]; reads: string[] } {
+  const unlinked: string[] = [];
+  const reads: string[] = [];
+  return {
+    unlinked,
+    reads,
+    fileExists: async (p) => p in files,
+    readFile: async (p) => {
+      reads.push(p);
+      if (!(p in files)) throw new Error(`ENOENT ${p}`);
+      return files[p];
+    },
+    unlink: async (p) => {
+      unlinked.push(p);
+      if (unlinkFails) throw new Error(`EPERM ${p}`);
+    },
+  };
+}
+
+function mkSpec(over: Partial<ScopedSpec> = {}): ScopedSpec {
+  return {
+    runner: "vitest",
+    mode: "related",
+    file: "/usr/bin/node",
+    args: [],
+    cwd: "/root/vitest-proj",
+    env: {},
+    reportPath: RPT_JSON,
+    gitRoot: "/root",
+    entry: "/root/node_modules/vitest/vitest.mjs",
+    inputs: [],
+    inputsAreTests: false,
+    workers: 2,
+    notes: [],
+    ...over,
+  };
+}
+
+const exec = (code: number, stdout = "", stderr = "") => ({ code, stdout, stderr });
+
+async function read(sp: ScopedSpec, files: Record<string, string>, code: number, host = POSIX_HOST, stdout = ""): Promise<RunResult & { fs: ReturnType<typeof resultFs> }> {
+  const fs = resultFs(files);
+  const r = await readResult(sp, exec(code, stdout), fs, host);
+  return { ...r, fs };
+}
+
+describe("readResult: vitest JSON", () => {
+  it("failures give <file> > <ancestors> > <title> ids and delete the report", async () => {
+    const r = await read(mkSpec(), { [RPT_JSON]: report("vitest-fail.json", "/root") }, 1);
+    expect(r.failingIds).toEqual(["test/str.test.js > str > bad"]);
+    expect(r.failingFiles).toEqual(["/root/vitest-proj/test/str.test.js"]);
+    expect(r).toMatchObject({ total: 3, complete: true, collectionError: false, source: "report" });
+    expect(r.note).toBeUndefined();
+    expect(r.fs.unlinked).toEqual([RPT_JSON]);
+  });
+
+  it("pass and zero tests", async () => {
+    const pass = await read(mkSpec(), { [RPT_JSON]: report("vitest-pass.json", "/root") }, 0);
+    expect(pass).toMatchObject({ failingIds: [], failingFiles: [], total: 1, complete: true, collectionError: false });
+    const none = await read(mkSpec(), { [RPT_JSON]: report("vitest-none.json", "/root") }, 0);
+    expect(none).toMatchObject({ failingIds: [], total: 0, complete: true });
+  });
+
+  it("an import-time throw (assertionResults []) is a bare file id and a collection error", async () => {
+    const r = await read(mkSpec(), { [RPT_JSON]: report("vitest-collect-error.json", "/root") }, 1);
+    expect(r.failingIds).toEqual(["test/throws.test.js"]);
+    expect(r.failingFiles).toEqual(["/root/vitest-proj/test/throws.test.js"]);
+    expect(r).toMatchObject({ collectionError: true, complete: true, total: 1 });
+  });
+
+  it("non-zero exit with a report listing no failure is incomplete", async () => {
+    const r = await read(mkSpec(), { [RPT_JSON]: report("vitest-pass.json", "/root") }, 1);
+    expect(r).toMatchObject({ complete: false, collectionError: false, note: "runner exited 1 but its report lists no failure" });
+  });
+
+  it("tolerates odd suite shapes: non-record, nameless, no assertionResults, no titles, no total", async () => {
+    const json = JSON.stringify({
+      testResults: [
+        null,
+        { status: "failed" },
+        { name: "/root/vitest-proj/a.test.ts", status: "failed", assertionResults: [{ status: "failed", title: "t" }] },
+        { name: "/root/vitest-proj/b.test.ts", status: "passed" },
+      ],
+    });
+    const r = await read(mkSpec(), { [RPT_JSON]: json }, 1);
+    expect(r).toMatchObject({ failingIds: ["a.test.ts > t"], total: undefined, complete: true, collectionError: false });
+  });
+});
+
+describe("readResult: jest JSON (win32 names)", () => {
+  const W = { ...WIN_HOST };
+  const wspec = (over: Partial<ScopedSpec> = {}) =>
+    mkSpec({ runner: "jest", cwd: "C:\\root\\jest-proj", gitRoot: "C:\\root", reportPath: `C:\\Temp\\omr-verify-${UUID}.json`, ...over });
+  const at = `C:\\Temp\\omr-verify-${UUID}.json`;
+
+  it("failures map to cwd-relative / ids and native failingFiles", async () => {
+    const r = await read(wspec(), { [at]: report("jest-fail.json", "C:\\root") }, 1, W);
+    expect(r.failingIds).toEqual(["test/str.test.js > str > bad"]);
+    expect(r.failingFiles).toEqual(["C:\\root\\jest-proj\\test\\str.test.js"]);
+    expect(r).toMatchObject({ total: 3, complete: true, collectionError: false });
+    expect(r.fs.unlinked).toEqual([at]);
+  });
+
+  it("'Test suite failed to run' (numRuntimeErrorTestSuites) is a collection error", async () => {
+    const r = await read(wspec(), { [at]: report("jest-collect-error.json", "C:\\root") }, 1, W);
+    expect(r.failingIds).toEqual(["test/broken.test.js"]);
+    expect(r).toMatchObject({ collectionError: true, complete: true, total: 1 });
+  });
+
+  it("numRuntimeErrorTestSuites alone marks a collection error", async () => {
+    const r = await read(wspec(), { [at]: JSON.stringify({ numRuntimeErrorTestSuites: 1, numTotalTests: 0, testResults: [] }) }, 1, W);
+    expect(r).toMatchObject({ failingIds: [], collectionError: true, complete: true, total: 0 });
+  });
+
+  it("pass and none", async () => {
+    expect(await read(wspec(), { [at]: report("jest-pass.json", "C:\\root") }, 0, W)).toMatchObject({ failingIds: [], total: 1, complete: true });
+    expect(await read(wspec(), { [at]: report("jest-none.json", "C:\\root") }, 0, W)).toMatchObject({ failingIds: [], total: 0, complete: true });
+  });
+
+  it("the tmpdir check is case-insensitive on win32", async () => {
+    const lower = `c:\\temp\\omr-verify-${UUID}.json`;
+    const r = await read(wspec({ reportPath: lower }), { [lower]: report("jest-pass.json", "C:\\root") }, 0, W);
+    expect(r.source).toBe("report");
+    expect(r.fs.unlinked).toEqual([lower]);
+  });
+});
+
+describe("readResult: fallback to text", () => {
+  it("truncated JSON falls back to observeTests: incomplete, collection error on non-zero exit", async () => {
+    const full = report("vitest-fail.json", "/root");
+    const r = await read(mkSpec(), { [RPT_JSON]: full.slice(0, 200) }, 1, POSIX_HOST, "FAIL test/str.test.js > str > bad\n");
+    expect(r).toMatchObject({
+      failingIds: ["test/str.test.js > str > bad"],
+      failingFiles: ["/root/vitest-proj/test/str.test.js"],
+      total: undefined,
+      complete: false,
+      collectionError: true,
+      source: "text",
+      note: "runner exited 1 without a usable report",
+    });
+    expect(r.fs.unlinked).toEqual([RPT_JSON]);
+  });
+
+  it("vitest syntax error: exit 1 and no report is never a pass", async () => {
+    const r = await read(mkSpec(), {}, 1);
+    expect(r).toMatchObject({ failingIds: [], collectionError: true, complete: false, source: "text" });
+    expect(r.fs.unlinked).toEqual([RPT_JSON]);
+  });
+
+  it("exit 0 without a report is noted and incomplete", async () => {
+    const r = await read(mkSpec(), {}, 0);
+    expect(r).toMatchObject({ collectionError: false, complete: false, note: "runner exited 0 without writing its report" });
+  });
+
+  it("a JSON value without testResults is unusable", async () => {
+    expect((await read(mkSpec(), { [RPT_JSON]: "[]" }, 1)).source).toBe("text");
+    expect((await read(mkSpec(), { [RPT_JSON]: "{}" }, 1)).source).toBe("text");
+  });
+
+  it("pytest FAILED lines map files; ids without a separator have no file", async () => {
+    const sp = mkSpec({ runner: "pytest", reportPath: RPT_XML, cwd: "/root/p" });
+    const r = await read(sp, {}, 1, POSIX_HOST, "FAILED tests/test_a.py::test_x - boom\n--- FAIL: TestGo (0.01s)\n");
+    expect(r.failingIds).toEqual(["TestGo", "tests/test_a.py::test_x"]);
+    expect(r.failingFiles).toEqual(["/root/p/tests/test_a.py"]);
+  });
+
+  it("a report already deleted (unlink rejects) still yields a result", async () => {
+    const fs = resultFs({}, true);
+    const r = await readResult(mkSpec(), exec(1), fs, POSIX_HOST);
+    expect(r.source).toBe("text");
+    expect(fs.unlinked).toEqual([RPT_JSON]);
+  });
+});
+
+describe("readResult: N.4 report path guard", () => {
+  for (const bad of ["/etc/passwd", "/tmp/evil.json", `/tmp/sub/omr-verify-${UUID}.json`, `/r/omr-verify-${UUID}.json`, `/tmp/omr-verify-${UUID}.txt`]) {
+    it(`never reads or deletes ${bad}`, async () => {
+      const fs = resultFs({ [bad]: report("vitest-pass.json", "/root") });
+      const r = await readResult(mkSpec({ reportPath: bad }), exec(0), fs, POSIX_HOST);
+      expect(fs.unlinked).toEqual([]);
+      expect(fs.reads).toEqual([]);
+      expect(r).toMatchObject({ source: "text", complete: false, note: `report path rejected: ${bad}` });
+    });
+  }
+
+  it("uses the process tmpdir by default", async () => {
+    const p = path.join(tmpdir(), `omr-verify-${UUID}.json`);
+    const fs = resultFs({ [p]: report("vitest-pass.json", "/root") });
+    await readResult(mkSpec({ reportPath: p, cwd: "/root/vitest-proj" }), exec(0), fs);
+    expect(fs.unlinked).toEqual([p]);
+  });
+});
+
+describe("readResult: pytest junit", () => {
+  const inputs = ["/root/pytest-proj/tests/test_math.py", "/root/pytest-proj/tests/test_str.py", "/root/pytest-proj/tests/test_broken.py"];
+  const pspec = (over: Partial<ScopedSpec> = {}) =>
+    mkSpec({ runner: "pytest", reportPath: RPT_XML, cwd: "/root/pytest-proj", gitRoot: "/root", inputs, inputsAreTests: true, ...over });
+
+  it("classname maps to the file via the longest module suffix", async () => {
+    const r = await read(pspec(), { [RPT_XML]: report("pytest-fail.xml", "/root") }, 1);
+    expect(r.failingIds).toEqual(["tests/test_str.py::TestStr::test_bad"]);
+    expect(r.failingFiles).toEqual(["/root/pytest-proj/tests/test_str.py"]);
+    expect(r).toMatchObject({ total: 3, complete: true, collectionError: false, source: "report" });
+    expect(r.fs.unlinked).toEqual([RPT_XML]);
+  });
+
+  it("xdist report (ANSI escapes, reordered cases) gives the same ids", async () => {
+    const r = await read(pspec(), { [RPT_XML]: report("pytest-xdist-fail.xml", "/root") }, 1);
+    expect(r.failingIds).toEqual(["tests/test_str.py::TestStr::test_bad"]);
+    expect(r.total).toBe(3);
+  });
+
+  it("collection <error> is a bare file id, not counted in total (exit 2)", async () => {
+    const r = await read(pspec(), { [RPT_XML]: report("pytest-collect-error.xml", "/root") }, 2);
+    expect(r.failingIds).toEqual(["tests/test_broken.py"]);
+    expect(r).toMatchObject({ collectionError: true, total: 0, complete: true });
+  });
+
+  it("exit 5: no tests collected is complete with total 0; pass is complete", async () => {
+    expect(await read(pspec(), { [RPT_XML]: report("pytest-none.xml", "/root") }, 5)).toMatchObject({ failingIds: [], total: 0, complete: true });
+    expect(await read(pspec(), { [RPT_XML]: report("pytest-pass.xml", "/root") }, 0)).toMatchObject({ failingIds: [], total: 1, complete: true });
+  });
+
+  it("exit 4 and 3 are incomplete with their notes", async () => {
+    expect(await read(pspec(), { [RPT_XML]: report("pytest-missing.xml", "/root") }, 4)).toMatchObject({ complete: false, note: "pytest usage error (exit 4)" });
+    expect(await read(pspec(), { [RPT_XML]: report("pytest-none.xml", "/root") }, 3)).toMatchObject({ complete: false, note: "pytest internal error (exit 3)" });
+  });
+
+  it("exit 1 with no failure in the report is incomplete", async () => {
+    expect(await read(pspec(), { [RPT_XML]: report("pytest-pass.xml", "/root") }, 1)).toMatchObject({ complete: false, note: "runner exited 1 but its report lists no failure" });
+  });
+
+  it("unmapped classnames keep a raw id and make the result incomplete", async () => {
+    const r = await read(pspec({ inputs: [] }), { [RPT_XML]: report("pytest-fail.xml", "/root") }, 1);
+    expect(r).toMatchObject({ failingIds: ["tests.test_str.TestStr::test_bad"], failingFiles: [], complete: false, note: "pytest classname not mapped to a test file: tests.test_str.TestStr" });
+    const c = await read(pspec({ inputs: [] }), { [RPT_XML]: report("pytest-collect-error.xml", "/root") }, 2);
+    expect(c).toMatchObject({ failingIds: ["tests.test_broken"], collectionError: true, complete: false });
+  });
+
+  it("setup <error> is a failure; entities decode; <skipped> is not a failure; truncated XML falls back", async () => {
+    const xml =
+      '<?xml version="1.0"?><testsuites><testsuite>' +
+      '<testcase classname="tests.test_math" name="test_p[a&amp;b&#65;&#x42;&lt;&gt;&quot;&apos;]"><error message="fixture failed">x</error></testcase>' +
+      '<testcase classname="tests.test_math" name="test_s"><skipped message="s"/></testcase>' +
+      "<testcase /></testsuite></testsuites>";
+    const r = await read(pspec(), { [RPT_XML]: xml }, 1);
+    // The attribute-less <testcase /> has classname "": an unmapped collection pseudo-case with an empty id.
+    expect(r.failingIds).toEqual(["", "tests/test_math.py::test_p[a&bAB<>\"']"]);
+    expect(r).toMatchObject({ total: 2, collectionError: true, complete: false });
+    const t = await read(pspec(), { [RPT_XML]: report("pytest-fail.xml", "/root").slice(0, 300) }, 1);
+    expect(t.source).toBe("text");
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// planRerun (1.3.2.e)
+// ---------------------------------------------------------------------------------------------
+
+describe("planRerun", () => {
+  const budget = { maxWorkers: 2 };
+  const host = { ...POSIX_HOST, pathEnv: "/usr/bin" };
+  const VITEST_ENTRY = "/r/node_modules/vitest/vitest.mjs";
+
+  it("vitest: run exactly the existing files, never a --, workers capped", async () => {
+    const files = jsRepo({}, { "/r/test/a.test.ts": "", "/r/test/b.test.ts": "" });
+    const det = await detect("vitest run --maxWorkers=8 --silent", files);
+    const r = spec(
+      await planRerun(det, ["/r/test/b.test.ts", "/r/test/a.test.ts", "/r/test/gone.test.ts", "rel.test.ts", "/elsewhere/x.test.ts", "/r/test/a.test.ts"], "/r", budget, {
+        fs: memFs(files),
+        host,
+      }),
+    );
+    expect(r.args).toEqual([
+      VITEST_ENTRY, "run", "/r/test/a.test.ts", "/r/test/b.test.ts", "--silent", "--passWithNoTests", "--maxWorkers=2",
+      "--coverage.enabled=false", "--reporter=json", `--outputFile=${RPT_JSON}`,
+    ]);
+    expect(r.args).not.toContain("--");
+    expect(r).toMatchObject({ mode: "rerun", inputsAreTests: true, workers: 2, cwd: "/r", gitRoot: "/r", file: "/usr/bin/node", entry: VITEST_ENTRY });
+    expect(r.notes).toEqual([
+      "rerun file missing in this tree: test/gone.test.ts",
+      "rerun file dropped (relative or outside the git root): rel.test.ts",
+      "rerun file dropped (relative or outside the git root): /elsewhere/x.test.ts",
+    ]);
+  });
+
+  it("jest: --runTestsByPath with -- before the files", async () => {
+    const files = jsRepo({}, { "/r/test/a.test.js": "" });
+    const det = await detect("jest -i", files);
+    const r = spec(await planRerun(det, ["/r/test/a.test.js"], "/r", budget, { fs: memFs(files), host, cores: 4 }));
+    expect(r.args).toEqual([
+      "/r/node_modules/jest/bin/jest.js", "--runTestsByPath", "--passWithNoTests", "--maxWorkers=1", "--coverage=false", "--json",
+      `--outputFile=${RPT_JSON}`, "--", "/r/test/a.test.js",
+    ]);
+  });
+
+  it("pytest: same argv as scoped, -- before the files", async () => {
+    const files = pyRepo({ "/r/tests/test_a.py": "" });
+    const det = await detect("pytest", files, host);
+    const r = spec(await planRerun(det, ["/r/tests/test_a.py"], "/r", budget, { fs: memFs(files), host }));
+    expect(r.file).toBe("/usr/bin/pytest");
+    expect(r.args).toEqual(["-q", "-p", "no:cacheprovider", `--junitxml=${RPT_XML}`, "--", "/r/tests/test_a.py"]);
+    expect(r.workers).toBeNull();
+  });
+
+  it("reference worktree: the current tree's entry is reused, ids stay cwd-relative", async () => {
+    const cur = jsRepo();
+    const det = await detect("vitest", cur);
+    const entry = await resolveEntry(det, "/r", memFs(cur), host);
+    if (isUnverifiable(entry)) throw new Error(entry.reason);
+    const refFiles = { "/ref/.git": "", "/ref/test/a.test.ts": "" };
+    const withEntry = spec(await planRerun(det, ["/ref/test/a.test.ts"], "/ref", budget, { fs: memFs(refFiles), host, entry }));
+    expect(withEntry).toMatchObject({ cwd: "/ref", gitRoot: "/ref", entry: VITEST_ENTRY, inputs: ["/ref/test/a.test.ts"] });
+    expectS6(await planRerun(det, ["/ref/test/a.test.ts"], "/ref", budget, { fs: memFs(refFiles), host }), "runner-not-installed");
+  });
+
+  it("nothing left -> NoAffected; no git root and tmpdir-in-repo -> S6", async () => {
+    const det = await detect("vitest");
+    expect(await planRerun(det, ["/r/test/gone.test.ts"], "/r", budget, { fs: memFs(jsRepo()), host })).toEqual({
+      noAffected: true,
+      note: "no rerun: none of the test files exist in this tree",
+    });
+    expectS6(await planRerun(det, ["/x/a.test.ts"], "/x", budget, { fs: memFs({ "/x/a.test.ts": "" }), host }), "no-git-root");
+    const files = jsRepo({}, { "/r/a.test.ts": "" });
+    expectS6(await planRerun(det, ["/r/a.test.ts"], "/r", budget, { fs: memFs(files), host: { ...host, tmpdir: "/r/tmp" } }), "tmpdir-in-repo");
+  });
+
+  it("entry notes (pytest venv) are carried", async () => {
+    const files = { "/r/.git": "", "/r/.venv/bin/pytest": "", "/r/tests/test_a.py": "" };
+    const det = await detect("pytest", files, POSIX_HOST);
+    const r = spec(await planRerun(det, ["/r/tests/test_a.py"], "/r", budget, { fs: memFs(files), host: POSIX_HOST }));
+    expect(r.notes).toEqual(["pytest resolved from /r/.venv/bin/pytest"]);
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// K. planScopedLint (1.3.2.g)
+// ---------------------------------------------------------------------------------------------
+
+const ESLINT_ENTRY = "/r/node_modules/eslint/bin/eslint.js";
+function lintRepo(version = "9.1.0", scripts: Record<string, string> = {}, extra: Record<string, string> = {}): Record<string, string> {
+  return jsRepo(scripts, {
+    "/r/node_modules/eslint/package.json": JSON.stringify({ name: "eslint", version, bin: { eslint: "./bin/eslint.js" } }),
+    [ESLINT_ENTRY]: "",
+    "/r/src/a.ts": "",
+    "/r/src/b.vue": "",
+    "/r/lib/c.js": "",
+    "/r/README.md": "",
+    ...extra,
+  });
+}
+
+async function lint(command: string, changedFiles: ChangedPath[] | "unavailable", files = lintRepo(), host: Partial<RunnerHost> = POSIX_HOST) {
+  const { search: _s, ...rest } = input({ command, changedFiles, files, win: host.platform === "win32" });
+  return planScopedLint({ ...rest, host });
+}
+
+function lintSpec(x: object): LintSpec {
+  expect(isUnscoped(x) || isNoAffected(x), JSON.stringify(x)).toBe(false);
+  return x as LintSpec;
+}
+
+function expectUnscoped(x: object, reason: string): void {
+  expect(x).toEqual({ unscoped: true, reason });
+}
+
+describe("planScopedLint", () => {
+  it("plain eslint: only changed lintable files, absolute, with --no-warn-ignored on v9", async () => {
+    const r = lintSpec(await lint("eslint --fix --cache .", changed("src/a.ts", "README.md", "src/b.vue", "src/gone.ts", "../out.ts")));
+    expect(r.args).toEqual([ESLINT_ENTRY, "--cache", "--no-warn-ignored", "/r/src/a.ts"]);
+    expect(r).toMatchObject({ runner: "eslint", file: "/usr/bin/node", cwd: "/r", gitRoot: "/r", entry: ESLINT_ENTRY, inputs: ["/r/src/a.ts"], workers: null });
+    expect(r.notes).toEqual(["dropped outside the git root: ../out.ts"]);
+  });
+
+  it("npm run lint script: --ext, path scopes and --concurrency capped", async () => {
+    const files = lintRepo("9.1.0", { lint: "eslint --ext .vue,ts --concurrency 4 src" });
+    const r = lintSpec(await lint("npm run lint", changed("src/a.ts", "src/b.vue", "lib/c.js"), files));
+    expect(r.args).toEqual([ESLINT_ENTRY, "--ext", ".vue,ts", "--concurrency=2", "--no-warn-ignored", "/r/src/a.ts", "/r/src/b.vue"]);
+    expect(r.workers).toBe(2);
+  });
+
+  it("--ext= form, --concurrency off kept, --concurrency=auto", async () => {
+    const a = lintSpec(await lint("eslint --ext=vue --concurrency off", changed("src/a.ts", "src/b.vue")));
+    expect(a.args).toEqual([ESLINT_ENTRY, "--ext=vue", "--concurrency", "off", "--no-warn-ignored", "/r/src/b.vue"]);
+    expect(a.workers).toBeNull();
+    expect(lintSpec(await lint("npx eslint --concurrency=auto", changed("src/a.ts"))).args).toContain("--concurrency=2");
+  });
+
+  it("eslint < 9: no --no-warn-ignored; --max-warnings -> Unscoped", async () => {
+    const r = lintSpec(await lint("pnpm exec eslint", changed("src/a.ts"), lintRepo("8.57.0")));
+    expect(r.args).toEqual([ESLINT_ENTRY, "/r/src/a.ts"]);
+    expectUnscoped(await lint("eslint --max-warnings 0", changed("src/a.ts"), lintRepo("8.57.0")), "eslint <9 cannot scope ignored files under --max-warnings");
+    expectUnscoped(await lint("eslint --max-warnings=0", changed("src/a.ts"), lintRepo("8.57.0")), "eslint <9 cannot scope ignored files under --max-warnings");
+  });
+
+  it("composites and unsupported commands -> Unscoped with the B/C reason", async () => {
+    expectUnscoped(await lint("npm run lint", changed("src/a.ts"), lintRepo("9.1.0", { lint: "tsc && eslint ." })), 'composite scripts.lint: "&&"');
+    expectUnscoped(await lint("next lint", changed("src/a.ts")), 'unsupported command "next" in command');
+    expectUnscoped(await lint("vitest", changed("src/a.ts")), 'unsupported command "vitest" in command');
+    expectUnscoped(await lint("pytest", changed("src/a.ts")), 'unsupported command "pytest" in command');
+    expectUnscoped(await lint("uv run pytest", changed("src/a.ts")), 'unsupported command "uv run pytest" in command');
+    expectUnscoped(await lint("npx vitest", changed("src/a.ts")), 'unsupported command "npx vitest" in command');
+    expectUnscoped(await lint("eslint --init", changed("src/a.ts")), 'unsupported eslint argument "--init" in command');
+    expectUnscoped(await lint("eslint src/**", changed("src/a.ts")), 'eslint glob pattern in command: "src/**"');
+    expectUnscoped(await lint("eslint ../elsewhere", changed("src/a.ts")), 'unsupported eslint argument "../elsewhere" in command');
+  });
+
+  it("unavailable, empty, config changes, nothing lintable, not installed", async () => {
+    expectUnscoped(await lint("eslint", "unavailable"), "change attribution unavailable");
+    expect(await lint("eslint", [])).toEqual({ noAffected: true, note: "no changed lintable files" });
+    expectUnscoped(await lint("eslint", changed("src/a.ts", "eslint.config.js")), "eslint config changed: eslint.config.js");
+    expectUnscoped(await lint("eslint", changed("pkg/.eslintrc.json")), "eslint config changed: pkg/.eslintrc.json");
+    expect(await lint("eslint src", changed("README.md", "lib/c.js"))).toEqual({ noAffected: true, note: "no changed lintable files" });
+    expectUnscoped(await lint("eslint", changed("src/a.ts"), jsRepo({}, { "/r/src/a.ts": "" })), "runner not installed: eslint");
+  });
+
+  it("win32: config trigger match is case-insensitive", async () => {
+    const files = Object.fromEntries(Object.entries(lintRepo()).map(([k, v]) => [`C:${k.replace(/\//g, "\\")}`, v]));
+    const host = { ...WIN_HOST };
+    const { search: _s, ...rest } = input({ command: "eslint", changedFiles: changed("ESLint.Config.JS"), files, win: true, cwd: "C:\\r" });
+    expectUnscoped(await planScopedLint({ ...rest, host }), "eslint config changed: ESLint.Config.JS");
+    const ok = await planScopedLint({ ...rest, changedFiles: changed("src\\A.TS"), host });
+    expect(lintSpec(ok).inputs).toEqual(["C:\\r\\src\\A.TS"]);
+  });
+
+  it("too many files -> Unscoped", async () => {
+    const extra: Record<string, string> = {};
+    const names: string[] = [];
+    for (let i = 0; i < 300; i++) {
+      const n = `src/${"x".repeat(120)}${i}.ts`;
+      extra[`/r/${n}`] = "";
+      names.push(n);
+    }
+    expectUnscoped(await lint("eslint", changed(...names), lintRepo("9.1.0", {}, extra)), "too many inputs for one command line: 300 files");
   });
 });

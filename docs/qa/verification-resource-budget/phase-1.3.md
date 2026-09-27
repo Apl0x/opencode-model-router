@@ -407,3 +407,15 @@ Choices made where the runner.ts design header left room (safer option taken eac
 - Notes not fixed by M: `npm options ignored: <tokens>`, `non-input files skipped: <n>`, `dropped a path containing a NUL byte`, `dropped a path starting with "-": <p>`, bad-bin details (`unreadable package.json <p>`, `package name is not "<pkg>"`, `no bin entry`, `bin escapes the package directory`, `bin is not a .js, .mjs or .cjs file`, `bin entry missing: <p>`).
 - Config-trigger basenames are matched case-insensitively on win32.
 - resolveEntry reports the venv-fallback note only through planScopedRun/planStaticScoping notes (ResolvedEntry has no notes field).
+
+## Implementation notes (part 2)
+
+Choices made where the runner.ts design header left room (safer option taken each time):
+
+- Detection is shared with lint: `parseInvocation`/`detectImpl` take the accepted runner heads (`vitest`/`jest`/`pytest` for tests, `eslint` for lint), so a lint command such as `vitest`, `pytest` or `uv run pytest` gets the same `unsupported command` reason text as B would produce.
+- planRerun finds the target tree's own git root from `cwd` (walking up to `.git`), so a reference worktree gets `gitRoot`/`cwd` of that tree and cwd-relative ids that compare equal. Test files must be absolute and inside that root; others are dropped with `rerun file dropped (relative or outside the git root): <f>`, missing ones with `rerun file missing in this tree: <rel>`. The tmpdir-in-repo check is repeated for the target tree. The runner's detection notes are not copied into the rerun spec.
+- planRerun without `deps.entry` resolves the entry from the target tree (a reference worktree without node_modules -> S6 runner-not-installed); 2.1 passes the current tree's entry.
+- readResult: a reportPath failing the N.4 guard is neither read nor deleted; the result is the text fallback with note `report path rejected: <path>` (complete false). Text fallback after a non-zero exit adds the note `runner exited <code> without a usable report`.
+- JSON: `numRuntimeErrorTestSuites > 0` is honoured for any JSON report (vitest never sets it). Suites without a string `name` are skipped; `numTotalTests` missing gives `total: undefined`.
+- junit: the report is usable only when it contains `</testsuites>` (truncation check). pytest exit 5 counts as a clean exit (no "exited but no failure" note). A collection pseudo-case whose module maps to no input keeps its raw dotted name as id and makes the result incomplete. Priority of notes: exit 4, exit 3, unmapped classname, then the generic "exited but lists no failure".
+- Lint: `[]` changed files -> NoAffected "no changed lintable files". An unknown eslint version counts as < 9 (no `--no-warn-ignored`, and `--max-warnings` -> Unscoped). `--concurrency off` is kept verbatim and emits no cap. Argv over MAX_ARGV_CHARS -> Unscoped `too many inputs for one command line: <n> files`. Extension matching is case-insensitive.
