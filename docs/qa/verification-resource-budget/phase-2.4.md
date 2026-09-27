@@ -88,6 +88,122 @@ Use a scratch plugin or the smoke harness:
 - (e) The union-schema question from gather item 1.
 - (f) The `sessionID` availability in `experimental.chat.system.transform` (gather item 2).
 
+### Gather answers (merged tree `c3ba342` = `vrb/p24` + `origin/vrb/wave-2` `fbcf456`)
+
+Line numbers are for `c3ba342`. SDK: `@opencode-ai/plugin` 1.18.18 in `node_modules`. `vrb/wave-2`
+holds 2.1 only; 2.2 is **not merged yet**, so item 6 stays open.
+
+1. **Tool registration.** `tool: { ...(enableDelegateTool ? { delegate: tool({ description, args,
+   execute }) } : {}) }` at `src/index.ts:444-778`. Args are built with `tool.schema.string()
+   .optional().describe(…)` (`src/index.ts:448-468`). `execute(args, toolCtx)` returns
+   `Promise<string>` (`src/index.ts:469-477`). SDK: `tool<Args extends z.ZodRawShape>`, whose `args`
+   is a raw object **shape**, wrapped as `z.ZodObject<Args>` (`plugin/dist/tool.d.ts:47-55`);
+   `tool.schema` is `typeof z` (`tool.d.ts:56-58`). **A top-level union is not expressible**: the
+   root is always an object. A field may be a zod union, but whether every provider's JSON-schema
+   conversion accepts `anyOf` is untested. Decision: use `{ handles?: string[]; pending?: boolean }`
+   and check "exactly one" at runtime.
+2. **System transform.** `output.system.push(assembleSystemPrompt(…))` (`src/index.ts:1544`). SDK
+   input is `{ sessionID?: string; model }` (`plugin/dist/index.d.ts:265-270`), so the sessionID is
+   **optional**. The plugin reads `_input?.sessionID` and returns fail-closed when it is missing
+   (`src/index.ts:1502-1506`). Child suppression runs before any push: `graderSessions.has ||
+   sessionStore.isSubagent || !resolveIsRootSession` → `stripDelegateInstructions` and return
+   (`src/index.ts:1512-1533`). The pending block goes next to `:1544`, orchestrator path only.
+3. **`task` hooks.**
+   - The SDK types `input.sessionID` for `tool.execute.before/after` (`index.d.ts:235-258`). The
+     plugin treats it as the **calling (orchestrator) session**: the dispatch id is
+     `task:${input.sessionID}:${input.callID}` (`src/index.ts:925`, `:1114`), and the child comes
+     separately from `parseTaskResult(output).childSessionID` (`:1105`).
+   - `args.prompt`/`args.description` are read from `output.args` in before (`:928-929`) and from
+     `input.args` in after (`:1111-1112`).
+   - The capture wait happens in before: `beginVerificationBounded(changedFileStore,
+     task:<sid>:<callID>, cwd, dod)` (`:921-931`); delegate calls it at `:547-551`. 2.4.2 replaces
+     both with `VERIFY_WAIT`. `prepareVerification` runs at `:1124` (task) and `:607` (delegate).
+4. **`buildForcingNote(reasons: string[], escalation?: { producerTier?: string; nextTier?: string |
+   null }): string`** (`src/verify/dispatch.ts:493-496`). The next-tier rule sits in the caller:
+   `ladder = cfg.enforcement?.escalate?.ladder ?? ["fast","medium","heavy"]`, `nextTier = outcome
+   !== "unverifiable" && li >= 0 && li < len-1 ? ladder[li+1] : null` (`src/index.ts:1210-1213`).
+5. **Merged 2.1 API.**
+   - `prepareVerification(store, id, childID, cwd?, deadline?): Promise<PreparedVerification>`
+     (`src/verify/wiring.ts:163-169`). It returns `{ changedFiles: ChangedFile[]; changeBaseline:
+     "available" | "unavailable"; reference: ReferenceState (settled); snapshot: TreeSnapshot |
+     undefined }` (`wiring.ts:84-97`).
+   - `TreeSnapshot.root?: string` is the real path of `--show-toplevel` (`src/verify/dispatch.ts:21-24`).
+   - `createDeadline(budgetMs, opts?)` returns an `OwnedDeadline` (`src/verify/deterministic.ts:733`).
+   - Gate path: `createDeadline(gateBudgetMs)` → `prepareVerification` → `buildGateDeps(parent,
+     inFlight, verification, deadline)` → `withTimeout(accept(…), deadline.remaining())` →
+     `unverifiableGateResult` on reject (`src/index.ts:1120-1208`; delegate `:597-686`).
+     `router_verify` should reuse this sequence.
+   - The per-dispatch reference promise and its TTL live in `createChangedFileStore`
+     (`src/verify/dispatch.ts`). Not re-read for this gather; 2.4.2a must confirm them.
+   - **Lineage precondition: holds on the normal path.**
+     - `fromJudgement` copies `TestsPassJudgement.failures` onto the CheckResult
+       (`deterministic.ts:1451-1460`).
+     - `runDeterministic` concatenates them into `Verdict.failures` (`deterministic.ts:1680-1697`;
+       the field is at `types.ts:24-28`).
+     - `gateResult` spreads the verdict (`src/verify/gate.ts:79`), and `accept` returns it
+       (`gate.ts:211`). So index.ts sees `res.verdict.failures` / `gateRes.verdict.failures`.
+     - **Caveat:** on a gate timeout, `unverifiableGateResult` builds a fresh verdict without
+       `failures` (`gate.ts:84-93`), so that path loses it. Checker verdicts never carry it.
+     - Keep the lineage API.
+6. **2.2 coordinator.** It is not in the merged tree (wave-2 holds 2.1 only), so this item is open
+   until 2.2.3 merges.
+7. **Session deletion: yes.** The SDK defines `EventSessionDeleted { type: "session.deleted";
+   properties: { info: Session } }` (`sdk/dist/gen/types.gen.d.ts:505-510`). The plugin already
+   handles it at `src/index.ts:1262-1274` (`info.id` → unregister). 2.4 adds
+   `pending.forgetSession(id)` there. TTL stays as the backstop.
+8. **Config.** `RouterConfig.enforcement.verify` has `baselineTimeoutMs` (`src/router/config.ts:135`),
+   `gateBudgetMs` (`:139`), `defaultVerify` (`:149`), `captureWaitMs` (`:151`), `background` (`:153`)
+   and `pendingTtlMs` (`:155`). `resolveVerifyBudget` (`:1329`) defaults them to `"deferred"`, 5000,
+   `false` and 3 600 000 (`:1356-1360`), with `baselineTimeoutMs` 15 000 (`:1350`). **The QA-1.6-8
+   clamp is in place:** `captureWaitMs = min(own ?? 5000, baselineTimeoutMs)` (`:1351`).
+9. **`planStaticScoping(input: StaticScopingInput): Promise<StaticScoping>`**
+   (`src/verify/runner.ts:4447`). The no-spawn guarantee was not re-read here; 2.4.2a confirms it
+   against the runner header.
+10. **Producer tier.**
+    - `sessionStore.getTier(sessionID): string | null` (`src/router/sessions.ts:373`).
+    - The native `task` path takes the tier from `input.args.subagent_type` (`src/index.ts:1106-1109`).
+    - `delegate` uses `args.tier.trim()` or `activeCfg.defaultTier || "medium"`
+      (`src/index.ts:491-494`). It trims but does **not lowercase**, so 2.4 must canonicalise it.
+11. **Deferred-finish latency.** `git status --porcelain=v2 -z --untracked-files=all` on this
+    worktree took 60.6 / 49.9 / 53.5 ms (pwsh `Measure-Command`, warm cache). A full
+    `snapshotTree` also runs `rev-parse --show-toplevel` and digests dirty files (`src/verify/tree.ts:82-118`),
+    so it costs more. The 2 s bound is kept: it is about 30× the measured git time. On expiry,
+    register `"unavailable"` with `unattributedRisk()`.
+
+### Spike F answers (static; live items for 3.1)
+
+- **(a) Second tool: yes, by type.** `Hooks.tool` is `{ [key: string]: ToolDefinition }`
+  (`plugin/dist/index.d.ts:179-181`), so `router_verify` sits next to `delegate` in the same object
+  (`src/index.ts:444-778`). Visibility and callability by the orchestrator still **need a live
+  check in 3.1**: set `enforcement.verify` on, then `opencode run "call router_verify with
+  pending: true"`, and confirm the tool call is in the transcript.
+- **(b) Long execute: no timeout in the SDK types.**
+  - `ToolContext` carries only `abort: AbortSignal` (`plugin/dist/tool.d.ts:16`), and
+    `plugin/dist/index.d.ts` has no timeout field.
+  - The plugin sets its own bounds (`withTimeout`, `src/index.ts:575-589`, `:638-652`).
+  - The host limit **needs a live check in 3.1**: a scratch tool that awaits 100 s, invoked with
+    `opencode run`. Record whether `ctx.abort` fires and when.
+- **(c) Verbatim `vrf_…` and `·`: no plugin-side sanitiser alters them.**
+  - `scrubText` redacts only key/value secrets and token shapes (`src/guard/scrub.ts:1-26`): no
+    `vrf_` pattern, and no non-ASCII stripping.
+  - The task path appends to `output.output` (`src/index.ts:1214-1220`), and delegate returns a
+    plain string (`:743`, `:753-758`).
+  - Host and model-side delivery **needs a live check in 3.1**: append `unverified · vrf_<24 hex>`
+    in `tool.execute.after` for `task` and on the delegate return, then ask the orchestrator to
+    echo it byte for byte.
+- **(d) Subagents can see plugin tools: yes by default.**
+  - Tier agents are registered with no `tools` map (`src/index.ts:1367-1375`).
+  - opencode filters tools per agent through `agent.<name>.tools: { [id]: boolean }`
+    (`sdk/dist/gen/types.gen.d.ts:840-842`) and `experimental.primary_tools` ("Tools that should
+    only be available to primary agents", `types.gen.d.ts:1210-1212`).
+  - So a subagent can call `router_verify` unless the config restricts it. R6 scoping makes such
+    a call harmless ("unknown handle"). Optional hardening: add `router_verify` to
+    `primary_tools` in the `config` hook.
+- **(e) Union args:** see gather item 1. The root must be an object shape; use optional fields
+  plus a runtime "exactly one" check.
+- **(f) `sessionID` in the system transform:** see gather item 2. It is typed optional, and the
+  plugin fails closed when it is missing.
+
 ## Design notes (2.4.1)
 
 The full design is the header of `src/verify/pending.ts`, sections R1–R13. The exported API
