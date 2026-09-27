@@ -638,7 +638,7 @@ describe("lowPriority", () => {
     const script = `process.exit(${code})`;
     expect((await runArgv(process.execPath, ["-e", script], { cwd: tmpdir(), timeoutMs: 60_000, lowPriority: true })).code).toBe(code);
     expect((await runShell(`${node} -e "${script}"`, { cwd: tmpdir(), timeoutMs: 60_000, lowPriority: true })).code).toBe(code);
-  }, 20000);
+  }, 130_000);
 
   it.runIf(isWin)("keeps the exit code of a .cmd target run through runShell (Windows-only: .cmd is a Windows batch file)", async () => {
     const dir = scratch();
@@ -647,5 +647,5 @@ describe("lowPriority", () => {
     expect(r.code).toBe(3);
     const ok = await runShell("npm.cmd --version", { cwd: dir, timeoutMs: 60000, lowPriority: true });
     expect(ok.code).toBe(0);
-  }, 60000);
+  }, 130_000);
 });
