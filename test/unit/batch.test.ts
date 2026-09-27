@@ -1,4 +1,4 @@
-import { posix } from "node:path";
+import { posix, win32 } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   BATCH_REASONS,
@@ -2123,6 +2123,15 @@ describe("createBatchCoordinator: attribution and rechecks", () => {
 
 // ---------------------------------------------------------------------------------------------
 // B12: the equivalence property. Batched verdicts equal solo verdicts over seeded random cases.
+//
+// QA-2.2-6: the fake runner writes real reports (vitest JSON; pytest junit with a pinned
+// --rootdir, suffix-colliding paths such as tests/test_x.py and sub/tests/test_x.py, a module next
+// to a package of the same name, and classes nested in the module) and parses them with the REAL
+// readResult, so a parser mapping bug (QA-2.2-1) reaches the verdicts. Requests come from several
+// cwds, about a third of the cases use win32 paths (case-folded keys, spellings in another case),
+// `-t smoke` filters the tests now and at the reference, test counts differ per reference, and
+// each case asserts one scope per batch and the B13 spawn bounds. The judge is a port of 2.1's
+// judgeScoped rules (T5/T6), so a rejection is never collapsed into unverifiable.
 // ---------------------------------------------------------------------------------------------
 
 /** mulberry32: a small deterministic PRNG (as in test/unit/guards.test.ts). */
@@ -2146,32 +2155,45 @@ interface Verdict {
   readonly unknown: readonly string[];
 }
 
+/** 2.1-T5's fileKeyOfId: the part before the first " > ", else before the first "::", else the id. */
+function fileKeyOfId(id: string): string {
+  const gt = id.indexOf(" > ");
+  if (gt >= 0) return id.slice(0, gt);
+  const cc = id.indexOf("::");
+  return cc >= 0 ? id.slice(0, cc) : id;
+}
+
 /**
- * Stand-in for 2.1's judgeScoped (plugged in at 2.2.3): the truth-table essentials of 2.1-T5/T6.
- * green -> pass; any introduced failure -> fail; every failure pre-existing at an exact reference
- * -> pass; otherwise unverifiable.
+ * The verdict rules of 2.1's judgeScoped (origin/vrb/p21 deterministic.ts T5, T6), ported until
+ * 2.2.3 plugs in the real function. Every exact classification follows T5.5, so an incomplete or
+ * collection-error inventory with a proven introduced id is a rejection (R2i/R3 x X- = F r1).
  */
 function judgeStandIn(run: TestsPassRun): Verdict {
   const bare = (verdict: VerdictKind): Verdict => ({ verdict, introduced: [], preexisting: [], unknown: [] });
   const s = run.scoped;
   if (s.kind === "no-affected") return bare("pass");
   if (s.kind !== "ran") return bare("unverifiable");
-  const r = s.result;
-  if (!r.complete || r.collectionError || r.source !== "report") return bare("unverifiable");
-  if (r.failingIds.length === 0) return bare("pass");
+  const c = s.result;
+  // T5.2 (R1) and T5.3 (R4, R3 without identities).
+  if (c.failingIds.length === 0) return bare(c.complete && !c.collectionError ? "pass" : "unverifiable");
+  // T5.4: no recheck, or a non-exact column.
   const rc = run.recheck;
+  if (rc?.kind !== "exact") return bare("unverifiable");
   const introduced: string[] = [];
   const preexisting: string[] = [];
   const unknown: string[] = [];
-  for (const id of r.failingIds) {
-    const k = keyOfId(id);
-    if (rc?.kind !== "exact") unknown.push(id);
-    else if (rc.absentFiles.includes(k)) introduced.push(id);
-    else if (!rc.ranFiles.includes(k) || rc.result === undefined || !rc.result.complete) unknown.push(id);
-    else if (rc.result.failingIds.includes(id)) preexisting.push(id);
-    else introduced.push(id);
+  const r = rc.result;
+  for (const x of c.failingIds) {
+    const f = fileKeyOfId(x);
+    if (rc.absentFiles.includes(f)) introduced.push(x);
+    else if (!rc.ranFiles.includes(f)) unknown.push(x);
+    else if (r?.failingIds.includes(x) === true) preexisting.push(x);
+    else if (c.source === "report") introduced.push(x);
+    else if (!(r?.failingIds.some((id) => fileKeyOfId(id) === f) ?? false)) introduced.push(x);
+    else unknown.push(x);
   }
-  const verdict: VerdictKind = introduced.length > 0 ? "fail" : unknown.length > 0 ? "unverifiable" : "pass";
+  // T5.6.
+  const verdict: VerdictKind = introduced.length > 0 ? "fail" : unknown.length === 0 && c.complete && !c.collectionError ? "pass" : "unverifiable";
   return { verdict, introduced: introduced.sort(), preexisting: preexisting.sort(), unknown: unknown.sort() };
 }
 
@@ -2180,7 +2202,7 @@ async function directOver(rt: BatchRuntime, request: TestsPassRequest): Promise<
   const plan = await rt.plan({ command: request.command, cwd: request.cwd, changedFiles: request.changedFiles }, request.deadline);
   if ("noAffected" in plan) return { scoped: { kind: "no-affected", note: plan.note }, recheck: undefined };
   if ("unverifiable" in plan) return { scoped: { kind: "unverifiable", code: plan.code, reason: plan.reason }, recheck: undefined };
-  const scope = await rt.openScope({ cwd: request.cwd, command: request.command });
+  const scope = rt.openScope({ cwd: request.cwd, command: request.command });
   try {
     const scoped = await scope.execute(plan, request.deadline);
     if (scoped.kind !== "ran" || scoped.result.failingIds.length === 0 || scoped.result.failingFiles.length === 0) return { scoped, recheck: undefined };
@@ -2195,8 +2217,44 @@ async function directOver(rt: BatchRuntime, request: TestsPassRequest): Promise<
   }
 }
 
-const PY = "/p";
+/** The paths of one case: posix, or win32 (case-insensitive keys). */
+interface World {
+  readonly platform: "linux" | "win32";
+  readonly P: typeof posix;
+  /** The vitest project: runner cwd and git root. */
+  readonly root: string;
+  /** The pytest project: runner cwd, git root and pinned --rootdir. */
+  readonly py: string;
+  readonly tmp: string;
+  /** Where the fake rechecker's reference worktree lives. */
+  readonly refRoot: string;
+}
+
+const LINUX: World = { platform: "linux", P: posix, root: "/r", py: "/p", tmp: "/tmp", refRoot: "/tmp/omr-ref" };
+const WIN: World = { platform: "win32", P: win32, root: "C:\\r", py: "C:\\p", tmp: "C:\\Temp", refRoot: "C:\\Temp\\omr-ref" };
 const REF_B: DispatchReference = { ...REF, commit: "c2", head: "h2" };
+
+const VT = [..."abcdef"].map((x) => `test/${x}.test.ts`);
+const VS = [..."abcdef"].map((x) => `src/${x}.ts`);
+/** pytest test files: three share the dotted suffix "test_x", and tests/test_x.py sits next to the package tests/test_x/. */
+const PT = ["tests/test_a.py", "tests/test_b.py", "tests/test_x.py", "sub/tests/test_x.py", "app/tests/test_x.py", "tests/test_x/test_y.py"];
+const V_NAMES = ["t1", "t2", "smoke1"];
+/** "TestK::t2" is a test method of class TestK: junit classname "<module>.TestK", name "t2". */
+const P_NAMES = ["t1", "TestK::t2", "smoke1"];
+
+interface TestFile {
+  readonly names: readonly string[];
+  readonly failing: readonly string[];
+}
+
+interface PropertyModel {
+  /** vitest source key -> its related test keys. A test file relates to itself. */
+  readonly related: Readonly<Record<string, readonly string[]>>;
+  /** Test key -> its tests now. */
+  readonly now: Readonly<Record<string, TestFile>>;
+  /** Reference commit -> test key -> its tests there (their number differs per reference); a missing key is absent there. */
+  readonly refs: Readonly<Record<string, Readonly<Record<string, TestFile>>>>;
+}
 
 interface CaseRequest {
   readonly command: string;
@@ -2208,8 +2266,8 @@ interface CaseRequest {
 }
 
 interface PropertyCase {
-  readonly model: Model;
-  readonly atRefs: Readonly<Record<string, Readonly<Record<string, readonly string[]>>>>;
+  readonly world: World;
+  readonly model: PropertyModel;
   readonly requests: readonly CaseRequest[];
   readonly flaky: boolean;
 }
@@ -2218,58 +2276,64 @@ function genCase(seed: number): PropertyCase {
   const rnd = mulberry32(seed);
   const chance = (p: number) => rnd() < p;
   const pickFrom = <T,>(xs: readonly T[], fallback: T): T => xs[Math.floor(rnd() * xs.length)] ?? fallback;
-  const vt = [..."abcdef"].map((x) => `test/${x}.test.ts`);
-  const vs = [..."abcdef"].map((x) => `src/${x}.ts`);
-  const pt = [..."abcd"].map((x) => `tests/test_${x}.py`);
-  const related: Record<string, readonly string[]> = Object.fromEntries(vs.map((s) => [s, vt.filter(() => chance(0.35))]));
-  const tests: Record<string, number> = {};
-  const failing: Record<string, readonly string[]> = {};
-  for (const t of [...vt, ...pt]) {
-    tests[t] = chance(0.15) ? 0 : 1 + Math.floor(rnd() * 3);
-    if ((tests[t] ?? 0) > 0 && chance(0.3)) {
-      const names = ["t1", "t2"].filter(() => chance(0.6));
-      failing[t] = names.length > 0 ? names : ["t1"];
-    }
-  }
-  const atRefs: Record<string, Record<string, readonly string[]>> = {};
+  const world = chance(0.35) ? WIN : LINUX;
+  const P = world.P;
+  const related: Record<string, readonly string[]> = Object.fromEntries(VS.map((s) => [s, VT.filter(() => chance(0.35))]));
+  const file = (pool: readonly string[]): TestFile => {
+    const names = chance(0.15) ? [] : pool.filter(() => chance(0.7));
+    return { names, failing: names.filter(() => chance(0.25)) };
+  };
+  const now: Record<string, TestFile> = Object.fromEntries([...VT.map((t) => [t, file(V_NAMES)]), ...PT.map((t) => [t, file(P_NAMES)])]);
+  const refs: Record<string, Record<string, TestFile>> = {};
   for (const commit of [REF.commit, REF_B.commit]) {
-    const at: Record<string, readonly string[]> = {};
-    for (const t of [...vt, ...pt]) {
+    const at: Record<string, TestFile> = {};
+    for (const [t, f] of Object.entries(now)) {
       if (chance(0.2)) continue; // absent at this reference
-      at[t] = (failing[t] ?? []).filter(() => chance(0.6));
+      // Per-reference counts: the file may hold fewer tests there, or none at all.
+      const names = chance(0.15) ? [] : chance(0.3) ? f.names.filter(() => chance(0.5)) : f.names;
+      at[t] = { names, failing: f.failing.filter((n) => names.includes(n) && chance(0.6)) };
     }
-    atRefs[commit] = at;
+    refs[commit] = at;
   }
-  const model: Model = { related, tests, failing, counts: !chance(0.2) };
-  const refs: TestsPassRequest["reference"][] = [
+  const refStates: TestsPassRequest["reference"][] = [
     { kind: "captured", reference: REF },
     { kind: "captured", reference: REF },
     { kind: "captured", reference: REF_B },
     { kind: "none", reason: "no reference captured" },
     { kind: "disabled" },
   ];
+  // win32: a request may spell a path in another case; the planner's realpath gives it back canonical.
+  const spell = (p: string) => (world.platform === "win32" && chance(0.3) ? p.toUpperCase() : p);
+  // Most requests of a case share their runner's command, so batches of several members are common.
+  const pyCommand = pickFrom(["pytest", "pytest", "pytest -c pytest.ini", "pytest -c pytest.ini", "pytest -q"], "pytest");
+  const vCommand = chance(0.25) ? "npx vitest run -t smoke" : "npx vitest run";
   const n = 1 + Math.floor(rnd() * 6);
   const requests: CaseRequest[] = [];
   for (let i = 0; i < n; i++) {
-    const reference = pickFrom(refs, { kind: "disabled" });
+    const reference = pickFrom(refStates, { kind: "disabled" });
     const failureRecheck = !chance(0.15);
     if (chance(0.03)) {
-      requests.push({ command: "npx vitest run", cwd: ROOT, files: "unavailable", reference, failureRecheck });
+      requests.push({ command: "npx vitest run", cwd: world.root, files: "unavailable", reference, failureRecheck });
       continue;
     }
     const count = Math.floor(rnd() * 4);
     if (chance(0.35)) {
-      const files = [...new Set(Array.from({ length: count }, () => pickFrom(pt, "tests/test_a.py")))];
-      requests.push({ command: "pytest", cwd: PY, files, reference, failureRecheck });
+      const cwd = chance(0.3) ? P.join(world.py, "tests") : world.py;
+      const keys = [...new Set(Array.from({ length: count }, () => pickFrom(PT, "tests/test_a.py")))];
+      const files = keys.map((k) => spell(P.relative(cwd, P.join(world.py, k))));
+      // "-c pytest.ini": an explicit config gets no --rootdir pin (runner.ts D.4), so readResult maps classnames by suffix.
+      const command = chance(0.8) ? pyCommand : pickFrom(["pytest", "pytest -q", "pytest -c pytest.ini"], "pytest");
+      requests.push({ command, cwd, files, reference, failureRecheck });
     } else {
-      const pool = [...vs, ...vt];
-      const files = [...new Set(Array.from({ length: count }, () => pickFrom(pool, "src/a.ts")))];
-      if (chance(0.05)) files.push("src/untestable.ts");
-      const command = chance(0.2) ? "npx vitest run -t smoke" : "npx vitest run";
-      requests.push({ command, cwd: ROOT, files, reference, failureRecheck });
+      const cwd = chance(0.3) ? P.join(world.root, "src") : world.root;
+      const keys = [...new Set(Array.from({ length: count }, () => pickFrom([...VS, ...VT], "src/a.ts")))];
+      const files = keys.map((k) => spell(P.relative(cwd, P.join(world.root, k))));
+      if (chance(0.05)) files.push(P.relative(cwd, P.join(world.root, "src/untestable.ts")));
+      const command = chance(0.8) ? vCommand : "npx vitest run";
+      requests.push({ command, cwd, files, reference, failureRecheck });
     }
   }
-  return { model, atRefs, requests, flaky: chance(0.15) };
+  return { world, model: { related, now, refs }, requests, flaky: chance(0.15) };
 }
 
 function toRequest(c: CaseRequest): TestRequest {
@@ -2278,35 +2342,209 @@ function toRequest(c: CaseRequest): TestRequest {
     : req(c.files, { command: c.command, cwd: c.cwd, reference: c.reference });
 }
 
-/** The model rechecker per reference: pytest failing files are runner-unsupported, vitest reruns at that reference. */
-function caseRechecker(pc: PropertyCase) {
-  return (reference: DispatchReference, files: readonly string[]): RecheckOutcome => {
-    const py = files.some((f) => f.endsWith(".py"));
-    return recheckModel({ ...pc.model, atRef: pc.atRefs[reference.commit] ?? {} }, py ? "pytest" : "npx vitest run", py ? PY : ROOT, files);
+/** A test name filter for `-t <pattern>` (vitest), kept by the rerun as well. */
+function nameFilter(words: readonly string[]): (name: string) => boolean {
+  const i = words.indexOf("-t");
+  const pattern = i >= 0 ? words[i + 1] : undefined;
+  return pattern === undefined ? () => true : (name) => name.includes(pattern);
+}
+
+const slashKey = (w: World, from: string, abs: string) => w.P.relative(from, abs).replace(/\\/g, "/");
+
+/**
+ * planScopedRun over the model: canonical inputs (the realpath seam), a pinned --rootdir for pytest
+ * unless the command names its config with -c (runner.ts D.4: the spawn reads it and its directory
+ * is the rootdir), and a report path readResult accepts.
+ */
+function planCase(w: World, input: BatchPlanInput, n: number): ScopingPlan {
+  if (input.changedFiles === "unavailable") return { unverifiable: true, code: "attribution-unavailable", reason: "no change attribution" };
+  const P = w.P;
+  const words = input.command.split(" ");
+  const pytest = words.includes("pytest");
+  const runnerCwd = pytest ? w.py : w.root;
+  const known = pytest ? PT : [...VS, ...VT];
+  const fold = (k: string) => (w.platform === "win32" ? k.toLowerCase() : k);
+  const canonical = (abs: string) => {
+    const k = slashKey(w, runnerCwd, abs);
+    const hit = known.find((x) => fold(x) === fold(k));
+    return hit === undefined ? abs : P.join(runnerCwd, hit);
+  };
+  const byKey = new Map<string, string>();
+  for (const c of input.changedFiles) {
+    const abs = canonical(P.resolve(input.cwd, c.path));
+    byKey.set(fold(abs), abs);
+  }
+  const inputs = [...byKey.values()].sort();
+  if (inputs.length === 0) return { noAffected: true, note: "no affected tests" };
+  if (inputs.some((f) => f.includes("untestable"))) return { unverifiable: true, code: "config-changed", reason: "a config file changed" };
+  const reportPath = P.join(w.tmp, `omr-verify-00000000-0000-4000-8000-${String(n).padStart(12, "0")}.${pytest ? "xml" : "json"}`);
+  const entry = pytest ? P.join(w.py, ".venv", "bin", "pytest") : P.join(w.root, "node_modules", "vitest", "vitest.mjs");
+  const options = words.slice(pytest ? 1 : 3);
+  return {
+    runner: pytest ? "pytest" : "vitest",
+    mode: "related",
+    file: pytest ? entry : P.join(w.root, "node.exe"),
+    args: pytest
+      ? ["-p", "no:cacheprovider", `--junitxml=${reportPath}`, "--maxfail=0", ...options, ...(options.includes("-c") ? [] : [`--rootdir=${w.py}`]), "--", ...inputs]
+      : [entry, "related", "--run", "--reporter=json", `--outputFile=${reportPath}`, ...options, ...inputs],
+    cwd: runnerCwd,
+    env: {},
+    reportPath,
+    gitRoot: runnerCwd,
+    entry,
+    inputs,
+    inputsAreTests: pytest,
+    workers: pytest ? null : 2,
+    notes: [`planned ${inputs.length} input(s)`],
   };
 }
 
-/** A failure that appears only in the first union run (B-G2). */
-function flakyExecute(model: Model) {
-  return (spec: ScopedSpec, _deadline: Deadline, n: number): ScopedOutcome => {
-    const out = ranModel(model, spec);
-    if (n !== 0 || out.kind !== "ran") return out;
-    const key = spec.runner === "pytest" ? "tests/test_zz.py" : "test/zz.test.ts";
-    const id = idOf(spec.runner, key, "flaky");
-    const result: RunResult = {
-      ...out.result,
-      failingIds: [...out.result.failingIds, id].sort(),
-      failingFiles: [...out.result.failingFiles, posix.join(spec.cwd, key)].sort(),
+/** vitest's jest-compatible JSON report of one spec over the model. */
+function vitestReport(w: World, model: PropertyModel, spec: ScopedSpec, flaky: boolean): { text: string; code: number } {
+  const keys = new Set<string>();
+  for (const abs of spec.inputs) {
+    const k = slashKey(w, spec.cwd, abs);
+    if (isTestKey(k)) keys.add(k);
+    for (const t of model.related[k] ?? []) keys.add(t);
+  }
+  const only = nameFilter(spec.args);
+  const suites = [...keys].sort().map((k) => {
+    const f = model.now[k] ?? { names: [], failing: [] };
+    const failing = f.failing.filter(only);
+    return {
+      name: w.P.join(spec.cwd, k),
+      status: failing.length > 0 ? "failed" : "passed",
+      assertionResults: f.names.filter(only).map((title) => ({ title, ancestorTitles: [], status: failing.includes(title) ? "failed" : "passed" })),
     };
-    return { ...out, result, exitCode: 1 };
+  });
+  if (flaky) suites.push({ name: w.P.join(spec.cwd, "test/zz.test.ts"), status: "failed", assertionResults: [{ title: "flaky", ancestorTitles: [], status: "failed" }] });
+  const total = suites.reduce((n, s) => n + s.assertionResults.length, 0);
+  const failed = suites.some((s) => s.status === "failed");
+  return { text: JSON.stringify({ numTotalTests: total, numRuntimeErrorTestSuites: 0, testResults: suites }), code: failed ? 1 : 0 };
+}
+
+/** pytest's junit XML of one spec over the model; classnames are rootdir-relative module paths, then class names. */
+function pytestReport(w: World, model: PropertyModel, spec: ScopedSpec, flaky: boolean): { text: string; code: number } {
+  const cases: string[] = [];
+  let failed = false;
+  const testcase = (classname: string, name: string, fails: boolean) => {
+    failed ||= fails;
+    cases.push(`<testcase classname="${classname}" name="${name}" time="0.01">${fails ? '<failure message="assert">boom</failure>' : ""}</testcase>`);
   };
+  for (const abs of spec.inputs) {
+    const k = slashKey(w, w.py, abs);
+    const module = k.replace(/\.py$/, "").split("/").join(".");
+    const f = model.now[k] ?? { names: [], failing: [] };
+    for (const n of f.names) {
+      const parts = n.split("::");
+      const name = parts.pop() ?? n;
+      testcase([module, ...parts].join("."), name, f.failing.includes(n));
+    }
+    if (flaky && abs === spec.inputs[0]) testcase(module, "flaky", true);
+  }
+  return {
+    text: `<?xml version="1.0" encoding="utf-8"?><testsuites><testsuite name="pytest">${cases.join("")}</testsuite></testsuites>`,
+    code: failed ? 1 : cases.length === 0 ? 5 : 0,
+  };
+}
+
+/** 2.1's Rechecker over the model: pytest is runner-unsupported; vitest reruns the files present at the reference, with the same -t. */
+function recheckCase(w: World, model: PropertyModel, command: string, reference: DispatchReference, files: readonly string[]): RecheckOutcome {
+  const words = command.split(" ");
+  if (words.includes("pytest")) return { kind: "unusable", cause: "runner-unsupported", reason: "pytest imports the live tree" };
+  const at = model.refs[reference.commit] ?? {};
+  const only = nameFilter(words);
+  const keys = [...new Set(files.map((f) => slashKey(w, w.root, f)))].sort();
+  const ranFiles = keys.filter((k) => at[k] !== undefined);
+  const absentFiles = keys.filter((k) => at[k] === undefined);
+  if (ranFiles.length === 0) return { kind: "exact", result: undefined, ranFiles, absentFiles, notes: [] };
+  const testsByFile: Record<string, number> = Object.fromEntries(ranFiles.map((k) => [k, (at[k]?.names ?? []).filter(only).length]));
+  const total = ranFiles.reduce((n, k) => n + (testsByFile[k] ?? 0), 0);
+  // T4.k: readResult's rerun zero-test guard makes the rerun incomplete.
+  if (total === 0) return { kind: "unusable", cause: "incomplete", reason: "rerun ran no tests although every input is a test file" };
+  const failingIds = ranFiles.flatMap((k) => (at[k]?.failing ?? []).filter(only).map((n) => `${k} > ${n}`)).sort();
+  const failingFiles = [...new Set(failingIds.map(fileKeyOfId))].map((k) => w.P.join(w.refRoot, k)).sort();
+  return {
+    kind: "exact",
+    result: { failingIds, failingFiles, collectionError: false, total, complete: true, source: "report", testsByFile },
+    ranFiles,
+    absentFiles,
+    notes: [],
+  };
+}
+
+interface PropertyCalls {
+  readonly opens: number[];
+  readonly closes: number[];
+  readonly executes: { readonly scope: number; readonly spec: ScopedSpec; out?: ScopedOutcome }[];
+  readonly rechecks: { readonly scope: number; readonly command: string; readonly files: readonly string[] }[];
+}
+
+/** The runtime of one case: every execute goes through the real readResult; `flaky` injects a failure into the first execute. */
+function propertySeams(pc: PropertyCase, flaky: boolean) {
+  const w = pc.world;
+  const calls: PropertyCalls = { opens: [], closes: [], executes: [], rechecks: [] };
+  let reports = 0;
+  const plan: BatchPlanner = async (input) => planCase(w, input, reports++);
+  const openScope: OpenVerificationScope = () => {
+    const id = calls.opens.push(calls.opens.length) - 1;
+    let closed = false;
+    return {
+      execute: async (spec) => {
+        if (closed) throw new Error("execute after close");
+        const entry: PropertyCalls["executes"][number] = { scope: id, spec };
+        const inject = flaky && calls.executes.length === 0;
+        calls.executes.push(entry);
+        const report = spec.runner === "pytest" ? pytestReport(w, pc.model, spec, inject) : vitestReport(w, pc.model, spec, inject);
+        const fs = {
+          fileExists: async (p: string) => p === spec.reportPath,
+          readFile: async (p: string) => {
+            if (p !== spec.reportPath) throw new Error(`ENOENT ${p}`);
+            return report.text;
+          },
+          unlink: async () => undefined,
+        };
+        const result = await readResult(spec, { code: report.code, stdout: "", stderr: "" }, fs, { platform: w.platform, tmpdir: w.tmp });
+        const out: ScopedOutcome = { kind: "ran", result, exitCode: report.code, spec, notes: [...spec.notes, ...(result.note !== undefined ? [result.note] : [])] };
+        entry.out = out;
+        return out;
+      },
+      rechecker: (command) => async (reference, files) => {
+        if (closed) throw new Error("recheck after close");
+        calls.rechecks.push({ scope: id, command, files });
+        return recheckCase(w, pc.model, command, reference, files);
+      },
+      close: async () => {
+        if (closed) return;
+        closed = true;
+        calls.closes.push(id);
+      },
+    };
+  };
+  const direct: TestsPassHook = async () => {
+    throw new Error("the property never bypasses to the direct hook");
+  };
+  const runtime: BatchRuntime = { direct, plan, openScope, batchWindowMs: WINDOW, recheckMinRemainingMs: 1_000, failureRecheck: true };
+  return { calls, runtime };
 }
 
 const PROPERTY_CASES = 300;
 const PROPERTY_CHUNK = 50;
 const PROPERTY_SEED = 0x2b12;
 /** What the property cases exercised, so a vacuous generator cannot pass silently. */
-const propertyTally = { pass: 0, fail: 0, unverifiable: 0, sharedRuns: 0, flakyMembers: 0 };
+const propertyTally = {
+  pass: 0,
+  fail: 0,
+  unverifiable: 0,
+  sharedRuns: 0,
+  flakyMembers: 0,
+  win32Batches: 0,
+  multiCwdBatches: 0,
+  suffixUnions: 0,
+  unpinnedSuffixUnions: 0,
+  filteredBatches: 0,
+  reusedRechecks: 0,
+};
 
 describe("createBatchCoordinator: B12 batched verdicts equal solo verdicts", () => {
   beforeEach(() => {
@@ -2318,74 +2556,151 @@ describe("createBatchCoordinator: B12 batched verdicts equal solo verdicts", () 
 
   async function runCase(seed: number): Promise<void> {
     const pc = genCase(seed);
-    const rechecker = caseRechecker(pc);
+    const w = pc.world;
 
-    // Solo: every request alone, through runtime.direct (batchWindowMs 0).
+    // Solo: every request alone, through 2.1's one-request path.
+    const solo = propertySeams(pc, false);
     const soloVerdicts: Verdict[] = [];
-    let soloExecutes = 0;
-    for (const cr of pc.requests) {
-      const holder: { runtime?: BatchRuntime } = {};
-      const solo = harness(pc.model, {
-        rechecker,
-        runtime: {
-          batchWindowMs: 0,
-          failureRecheck: cr.failureRecheck,
-          direct: (r) => {
-            if (holder.runtime === undefined) throw new Error("solo runtime not wired");
-            return directOver(holder.runtime, r);
-          },
-        },
-      });
-      holder.runtime = solo.runtime;
-      const c = createBatchCoordinator({ platform: "linux" });
-      soloVerdicts.push(judgeStandIn(await c.hook(solo.runtime)(toRequest(cr))));
-      await c.dispose();
-      expect(solo.calls.closes.length, `seed ${seed}: solo scopes closed`).toBe(solo.calls.opens.length);
-      soloExecutes += solo.calls.executes.length;
-    }
+    for (const cr of pc.requests) soloVerdicts.push(judgeStandIn(await directOver({ ...solo.runtime, failureRecheck: cr.failureRecheck }, toRequest(cr))));
+    expect(solo.calls.closes.length, `seed ${seed}: solo scopes closed`).toBe(solo.calls.opens.length);
 
-    // Batched: every request in one window.
-    const batched = harness(pc.model, { rechecker, ...(pc.flaky ? { execute: flakyExecute(pc.model) } : {}) });
-    const c = createBatchCoordinator({ platform: "linux" });
+    // Batched: every request in one window, each through its own gate's hook.
+    const batched = propertySeams(pc, pc.flaky);
+    const c = createBatchCoordinator({ platform: w.platform });
     const outs = pc.requests.map((cr) => c.hook({ ...batched.runtime, failureRecheck: cr.failureRecheck })(toRequest(cr)));
     await vi.advanceTimersByTimeAsync(WINDOW);
     const runs = await Promise.all(outs);
     await c.dispose();
+    const where = (i: number) => `seed ${seed} (${w.platform}), request ${i}: ${JSON.stringify(pc.requests[i])}`;
     expect(batched.calls.closes.length, `seed ${seed}: batched scopes closed`).toBe(batched.calls.opens.length);
     expect(vi.getTimerCount(), `seed ${seed}: leaked timers`).toBe(0);
-    if (batched.calls.executes.length < soloExecutes) propertyTally.sharedRuns++;
+    expect(c.stats().splits, `seed ${seed}: the model never splits`).toBe(0);
+    if (batched.calls.executes.length < solo.calls.executes.length) propertyTally.sharedRuns++;
 
-    const flakySpec = pc.flaky ? batched.calls.executes[0]?.spec : undefined;
-    const flakyKey = flakySpec === undefined ? undefined : batchKey(flakySpec, "linux");
+    // The batches: the requests whose own plan is a spec, grouped by batch key, in arrival order.
+    const batches = new Map<string, { readonly i: number; readonly spec: ScopedSpec }[]>();
+    pc.requests.forEach((cr, i) => {
+      if (cr.files === "unavailable") return;
+      const plan = planCase(w, { command: cr.command, cwd: cr.cwd, changedFiles: cr.files.map((path) => ({ path, status: "M" })) }, 0);
+      if ("noAffected" in plan || "unverifiable" in plan) return;
+      const key = batchKey(plan, w.platform);
+      batches.set(key, [...(batches.get(key) ?? []), { i, spec: plan }]);
+    });
+    // Exactly one scope per batch, and every run of a scope belongs to its batch.
+    expect(batched.calls.opens.length, `seed ${seed}: one scope per batch`).toBe(batches.size);
+    const scopeOf = new Map<string, number>();
+    for (const e of batched.calls.executes) {
+      const key = batchKey(e.spec, w.platform);
+      expect(scopeOf.get(key) ?? e.scope, `seed ${seed}: a batch used two scopes`).toBe(e.scope);
+      scopeOf.set(key, e.scope);
+    }
+    expect(scopeOf.size, `seed ${seed}: every batch ran under its own scope`).toBe(batches.size);
+
+    // B13 spawn bounds, per batch.
+    let flakyKey: string | undefined;
+    for (const [key, members] of batches) {
+      const scope = scopeOf.get(key);
+      const executes = batched.calls.executes.filter((e) => e.scope === scope);
+      const rechecks = batched.calls.rechecks.filter((r) => r.scope === scope);
+      const n = members.length;
+      const pytest = members[0]?.spec.runner === "pytest";
+      const at = `seed ${seed}, batch ${key}`;
+      if (pc.flaky && batched.calls.executes[0]?.scope === scope) flakyKey = key;
+      if (w.platform === "win32") propertyTally.win32Batches++;
+      if (new Set(members.map((m) => pc.requests[m.i]?.cwd)).size > 1) propertyTally.multiCwdBatches++;
+      if (members.some((m) => m.spec.args.includes("-t"))) propertyTally.filteredBatches++;
+      const referenceKeys = new Set(
+        members.flatMap((m) => {
+          const ref = pc.requests[m.i]?.reference;
+          return ref?.kind === "captured" ? [referenceKey(ref.reference)] : [];
+        }),
+      );
+      expect(rechecks.length, `${at}: rechecks`).toBeLessThanOrEqual(n + referenceKeys.size);
+      if (n === 1) {
+        expect(executes.map((e) => e.spec.inputs), `${at}: a batch of one is the direct path`).toEqual([members[0]?.spec.inputs]);
+        continue;
+      }
+      const union = executes[0];
+      const want = new Set(members.flatMap((m) => m.spec.inputs.map((f) => (w.platform === "win32" ? f.toLowerCase() : f))));
+      expect(new Set(union?.spec.inputs.map((f) => (w.platform === "win32" ? f.toLowerCase() : f))), `${at}: the union's inputs`).toEqual(want);
+      if (pytest && ["tests/test_x.py", "sub/tests/test_x.py", "app/tests/test_x.py"].filter((k) => union?.spec.inputs.includes(w.P.join(w.py, k))).length > 1) {
+        propertyTally.suffixUnions++;
+        if (union?.spec.args.includes("-c") === true) propertyTally.unpinnedSuffixUnions++;
+      }
+      const u = union?.out;
+      const comparable = u?.kind === "ran" && u.result.complete && !u.result.collectionError && u.result.source === "report";
+      if (!comparable) expect(executes.length, `${at}: not comparable -> 1 + n`).toBe(1 + n);
+      else if (pytest) expect(executes.length, `${at}: pytest attributes statically`).toBe(1);
+      else if (u.result.failingIds.length > 0) expect(executes.length, `${at}: mode B`).toBe(1 + n);
+      else {
+        const ambiguous = members.filter((m) => isGuardSensitive(m.spec, w.platform)).length;
+        expect(executes.length, `${at}: a green union`).toBeLessThanOrEqual(1 + ambiguous);
+        expect(rechecks.length, `${at}: a green union rechecks nothing`).toBe(0);
+      }
+    }
+    const answered = runs.filter((r) => r.recheck !== undefined && ["exact", "unusable", "approximate"].includes(r.recheck.kind)).length;
+    if (answered > batched.calls.rechecks.length) propertyTally.reusedRechecks++;
+
     runs.forEach((run, i) => {
       const got = judgeStandIn(run);
       propertyTally[got.verdict]++;
-      const solo = soloVerdicts[i];
+      const soloVerdict = soloVerdicts[i];
       const cr = pc.requests[i];
-      const where = `seed ${seed}, request ${i}: ${JSON.stringify(cr)}`;
       // B-G2 (never a false pass), on every case.
-      if (got.verdict === "pass" && solo?.verdict !== "pass") throw new Error(`false pass (${where}): solo ${JSON.stringify(solo)}`);
+      if (got.verdict === "pass" && soloVerdict?.verdict !== "pass") throw new Error(`false pass (${where(i)}): solo ${JSON.stringify(soloVerdict)}`);
       if (flakyKey !== undefined && cr !== undefined && cr.files !== "unavailable") {
-        const plan = planModel({ command: cr.command, cwd: cr.cwd, changedFiles: cr.files.map((path) => ({ path, status: "M" })) });
-        const inFlakyBatch = !("noAffected" in plan) && !("unverifiable" in plan) && batchKey(plan, "linux") === flakyKey;
-        if (inFlakyBatch) {
+        const plan = planCase(w, { command: cr.command, cwd: cr.cwd, changedFiles: cr.files.map((path) => ({ path, status: "M" })) }, 0);
+        if (!("noAffected" in plan) && !("unverifiable" in plan) && batchKey(plan, w.platform) === flakyKey) {
           propertyTally.flakyMembers++;
-          expect(got.verdict, `${where}: a member of the flaky batch judged ok`).not.toBe("pass");
+          // vitest: every member runs its own spec, and the unreproduced union failure taints them all.
+          if (plan.runner !== "pytest") expect(got.verdict, `${where(i)}: a member of the flaky batch judged ok`).not.toBe("pass");
           return;
         }
       }
-      expect(got, where).toEqual(solo);
+      expect(got, where(i)).toEqual(soloVerdict);
     });
   }
 
   for (let start = 0; start < PROPERTY_CASES; start += PROPERTY_CHUNK) {
     it(`seeds ${start}..${start + PROPERTY_CHUNK - 1}`, async () => {
       for (let i = start; i < start + PROPERTY_CHUNK; i++) await runCase(PROPERTY_SEED + i);
-    }, 20_000);
+    }, 30_000);
   }
 
-  it("the property cases reached every verdict, shared runs and flaky members", () => {
-    for (const n of Object.values(propertyTally)) expect(n).toBeGreaterThan(10);
+  it("an unpinned pytest union whose classname is ambiguous runs own specs and taints no one (found by the property)", async () => {
+    const t1 = { names: ["t1"], failing: [] };
+    const pc: PropertyCase = {
+      world: LINUX,
+      model: {
+        related: {},
+        now: { "tests/test_x.py": { names: ["t1"], failing: ["t1"] }, "sub/tests/test_x.py": t1, "tests/test_a.py": t1 },
+        refs: {},
+      },
+      requests: ["tests/test_x.py", "sub/tests/test_x.py", "tests/test_a.py"].map((f) => ({
+        command: "pytest -c pytest.ini",
+        cwd: LINUX.py,
+        files: [f],
+        reference: { kind: "captured", reference: REF },
+        failureRecheck: true,
+      })),
+      flaky: false,
+    };
+    const { calls, runtime } = propertySeams(pc, false);
+    const c = createBatchCoordinator({ platform: "linux" });
+    const outs = pc.requests.map((cr) => c.hook(runtime)(toRequest(cr)));
+    await vi.advanceTimersByTimeAsync(WINDOW);
+    const runs = await Promise.all(outs);
+    // Without a pinned rootdir "tests.test_x" names tests/test_x.py and sub/tests/test_x.py alike.
+    expect(calls.executes[0]?.out).toMatchObject({ result: { failingIds: ["tests.test_x::t1"], complete: false } });
+    expect(calls.executes).toHaveLength(4);
+    expect(runs.map((r) => judgeStandIn(r).verdict)).toEqual(["unverifiable", "pass", "pass"]);
+    expect(ran(runs[0] ?? aborted(""))).toMatchObject({ result: { failingIds: ["tests/test_x.py::t1"], complete: true } });
+    expect(c.stats().taints).toBe(0);
+    await c.dispose();
+  });
+
+  it("the property cases reached every verdict, shared runs, flaky members, win32, several cwds, colliding pytest paths, -t and reuse", () => {
+    for (const [what, n] of Object.entries(propertyTally)) expect(n, what).toBeGreaterThan(10);
   });
 
   it("the generator covers the interesting shapes", () => {
@@ -2396,17 +2711,21 @@ describe("createBatchCoordinator: B12 batched verdicts equal solo verdicts", () 
     let guardSensitive = 0;
     let zeroTest = 0;
     let capturedButOff = 0;
+    let fewerAtRef = 0;
+    let nested = 0;
     for (let i = 0; i < PROPERTY_CASES; i++) {
       const pc = genCase(PROPERTY_SEED + i);
       if (pc.flaky) flaky++;
-      if (pc.requests.some((r) => r.command === "pytest")) pytest++;
+      if (pc.requests.some((r) => r.command.startsWith("pytest"))) pytest++;
       if (pc.requests.length > 1) multi++;
       const commits = new Set(pc.requests.flatMap((r) => (r.reference.kind === "captured" ? [r.reference.reference.commit] : [])));
       if (commits.size > 1) distinctRefs++;
-      if (pc.requests.some((r) => r.command !== "pytest" && r.files !== "unavailable" && r.files.some(isTestKey))) guardSensitive++;
-      if (Object.values(pc.model.tests ?? {}).some((n) => n === 0)) zeroTest++;
+      if (pc.requests.some((r) => !r.command.startsWith("pytest") && r.files !== "unavailable" && r.files.some((f) => /\.test\.ts$/i.test(f)))) guardSensitive++;
+      if (Object.values(pc.model.now).some((f) => f.names.length === 0)) zeroTest++;
       if (pc.requests.some((r) => r.reference.kind === "captured" && !r.failureRecheck)) capturedButOff++;
+      if (Object.values(pc.model.refs).some((at) => Object.entries(at).some(([k, f]) => f.names.length < (pc.model.now[k]?.names.length ?? 0)))) fewerAtRef++;
+      if (Object.values(pc.model.now).some((f) => f.failing.includes("TestK::t2"))) nested++;
     }
-    for (const n of [flaky, pytest, multi, distinctRefs, guardSensitive, zeroTest, capturedButOff]) expect(n).toBeGreaterThan(10);
+    for (const n of [flaky, pytest, multi, distinctRefs, guardSensitive, zeroTest, capturedButOff, fewerAtRef, nested]) expect(n).toBeGreaterThan(10);
   });
 });

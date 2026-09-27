@@ -235,7 +235,10 @@
 //       it is decided once it is empty or no own run is left (B5.7). If it is then non-empty,
 //       some union failure was reproduced by no member's own run, and taintUnreproduced makes
 //       EVERY live member's "ran" result complete = false, with the note "batched run failure not
-//       reproduced by any request's own run: <ids>". Per 2.1-T6, complete = false never passes (R4 u12; R2i u10 or u8), and a
+//       reproduced by any request's own run: <ids>". A pytest union id that names none of the
+//       union's inputs (a classname readResult could not map, runner.ts I step 3) is left out: its
+//       raw form cannot equal any own run's id, and it only occurs in an incomplete union, whose
+//       members all run their own specs verbatim (7.1). Per 2.1-T6, complete = false never passes (R4 u12; R2i u10 or u8), and a
 //       proven introduced id still rejects (R2i x X- = F r1). The unreproduced id could belong to
 //       any member's related set, and for vitest/jest a green own run cannot rule that out.
 //
@@ -1099,7 +1102,7 @@ export function createBatchCoordinator(options: BatchCoordinatorOptions = {}): B
    */
   function attribute(b: Batch, union: RanOutcome): void {
     const n = b.members.length;
-    b.unionIds = union.result.failingIds;
+    b.unionIds = taintable(union);
     for (const m of b.members) {
       const a = attributeUnion(union.result, union.result.testsByFile, m.spec, platform);
       if (a.kind === "own-run") {
@@ -1112,6 +1115,19 @@ export function createBatchCoordinator(options: BatchCoordinatorOptions = {}): B
       m.scoped = { kind: "ran", result: a.result, exitCode: a.exitCode, spec: m.spec, notes: [...m.spec.notes, `batched: 1 run for ${n} requests`] };
       m.phase = "held";
     }
+  }
+
+  /**
+   * B7.5: the union failing ids the taint compares with the members' outcomes. For pytest an id
+   * that names none of the union's inputs is a classname readResult could not map (runner.ts I
+   * step 3: unmapped or ambiguous), whose raw form no own run can reproduce. It only occurs in an
+   * incomplete union, where every member runs its own spec verbatim anyway, so it is left out.
+   */
+  function taintable(union: RanOutcome): readonly string[] {
+    const spec = union.spec;
+    if (spec === undefined || !spec.inputsAreTests) return union.result.failingIds;
+    const keys = new Set(spec.inputs.map((f) => fold(fileKeyOf(spec.cwd, f, platform), platform)));
+    return union.result.failingIds.filter((id) => keys.has(fold(idFileKey(id), platform)));
   }
 
   /** B7.5: the union failing ids that no finished own run or static derivation reproduces yet. */
