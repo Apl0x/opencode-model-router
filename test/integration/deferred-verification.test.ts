@@ -12,7 +12,12 @@
  * delegation must leave the exec record empty and never construct the S3 slot's scope opener.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 import { resolve } from "node:path";
+import ModelRouterPlugin from "../../src/index";
+import { invalidateConfigCache } from "../../src/router/config";
 import {
   canonicalTier,
   createVerificationWiring,
@@ -68,6 +73,29 @@ vi.mock("../../src/verify/deterministic", async importOriginal => {
     createDirectTestsPassHook: (deps: Parameters<typeof actual.createDirectTestsPassHook>[0]) => {
       state.testsPassHooks += 1;
       return actual.createDirectTestsPassHook(deps);
+    },
+  };
+});
+// The plugin's own wiring instance, so the tests can read its pending registry and spy on lineage.
+const captured = vi.hoisted(() => ({
+  wiring: undefined as import("../../src/verify/wiring").VerificationWiring | undefined,
+  lineage: [] as Array<import("../../src/verify/wiring").LineageContext>,
+}));
+vi.mock("../../src/verify/wiring", async importOriginal => {
+  const actual = await importOriginal<typeof import("../../src/verify/wiring")>();
+  return {
+    ...actual,
+    createVerificationWiring: (...args: Parameters<typeof actual.createVerificationWiring>) => {
+      const wiring = actual.createVerificationWiring(...args);
+      const wrapped: import("../../src/verify/wiring").VerificationWiring = {
+        ...wiring,
+        applyLineage: (res, ctx) => {
+          captured.lineage.push(ctx);
+          return wiring.applyLineage(res, ctx);
+        },
+      };
+      captured.wiring = wrapped;
+      return wrapped;
     },
   };
 });
@@ -369,5 +397,226 @@ describe("wiring (2.4.2a)", () => {
       const pass = passing(["t > a"]);
       expect(wiring.applyLineage(pass, ctx({ dispatchedAt: 300 }))).toBe(pass);
     });
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// The plugin: both dispatch paths (2.4.2b native `task`, 2.4.2c `delegate`)
+// ---------------------------------------------------------------------------------------------
+
+type DispatchPath = "task" | "delegate";
+/** The paths routed so far; every routing case below runs on each of them. */
+const PATHS: DispatchPath[] = ["task"];
+
+const ACCEPT_TESTS = "[acceptance]\ncheck: testsPass command=\"npm test\"\n[/acceptance]";
+/** A testsPass DoD whose other check fails: a required gate rejects it, a deferred one never looks. */
+const ACCEPT_TESTS_AND_MISSING = "[acceptance]\ncheck: testsPass command=\"npm test\"\ncheck: fileExists path=missing-file.txt\n[/acceptance]";
+const ACCEPT_MISSING_ONLY = "[acceptance]\ncheck: fileExists path=missing-file.txt\n[/acceptance]";
+const FOOTER_LINE = /^\[router\] unverified \u00b7 vrf_[0-9a-f]{24} \u00b7 risk (low|medium|high)/m;
+
+interface PluginHarness {
+  hooks: any;
+  producerPrompts: number;
+  created: string[];
+  run(path: DispatchPath, prompt: string, reply?: string): Promise<string>;
+}
+
+async function makePlugin(home: string): Promise<PluginHarness> {
+  let counter = 0;
+  const h: PluginHarness = {
+    hooks: undefined,
+    producerPrompts: 0,
+    created: [],
+    async run(p, prompt, reply = "DONE: implemented.") {
+      counter += 1;
+      if (p === "task") {
+        const input = { tool: "task", sessionID: "orch", callID: `call${counter}`, args: { subagent_type: "fast", prompt, description: "the work" } };
+        const before = { args: { ...input.args } };
+        await h.hooks["tool.execute.before"](input, before);
+        // The host hands the (possibly rewritten) args to the after hook.
+        input.args = before.args;
+        const output = { output: `<task_result>\n${reply}\n</task_result>`, metadata: { sessionId: `child${counter}` } };
+        await h.hooks["tool.execute.after"](input, output);
+        return output.output;
+      }
+      return h.hooks.tool.delegate.execute({ task: prompt, tier: "fast" }, { sessionID: "orch" });
+    },
+  };
+  const ctx = {
+    directory: root,
+    worktree: root,
+    project: {},
+    serverUrl: new URL("http://localhost"),
+    $: () => undefined,
+    client: {
+      session: {
+        get: async () => ({ data: {} }),
+        create: async () => {
+          const id = `sess_${h.created.length + 1}`;
+          h.created.push(id);
+          return { data: { id } };
+        },
+        prompt: async (req: { body?: { system?: unknown } }) => {
+          if (req.body?.system === undefined) h.producerPrompts += 1;
+          return { data: { parts: [{ type: "text", text: "DONE: implemented. VERIFY:required" }] } };
+        },
+        abort: async () => ({}),
+        delete: async () => ({}),
+      },
+    },
+  };
+  void home;
+  h.hooks = await ModelRouterPlugin(ctx as unknown as Parameters<typeof ModelRouterPlugin>[0]);
+  return h;
+}
+
+function writeOverrides(home: string, verify: Record<string, unknown>): void {
+  const p = path.join(home, ".config/opencode/opencode-model-router.overrides.jsonc");
+  fs.mkdirSync(path.dirname(p), { recursive: true });
+  fs.writeFileSync(p, JSON.stringify({ enforcement: { verify } }), "utf-8");
+  invalidateConfigCache();
+}
+
+describe("the plugin routes by mode on both dispatch paths", () => {
+  let home = "";
+  const saved = { HOME: process.env.HOME, USERPROFILE: process.env.USERPROFILE };
+
+  beforeEach(() => {
+    home = fs.mkdtempSync(path.join(os.tmpdir(), "omr-deferred-"));
+    process.env.HOME = home;
+    process.env.USERPROFILE = home;
+    process.env.MODEL_ROUTER_ENFORCE = "1";
+    process.env.MODEL_ROUTER_VERIFIED_DELEGATE = "1";
+    invalidateConfigCache();
+    captured.wiring = undefined;
+    captured.lineage = [];
+  });
+
+  afterEach(() => {
+    for (const key of ["HOME", "USERPROFILE"] as const) {
+      if (saved[key] === undefined) delete process.env[key];
+      else process.env[key] = saved[key];
+    }
+    delete process.env.MODEL_ROUTER_ENFORCE;
+    delete process.env.MODEL_ROUTER_VERIFIED_DELEGATE;
+    invalidateConfigCache();
+    fs.rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+  });
+
+  const pendingOf = (sid: string) => {
+    if (captured.wiring === undefined) throw new Error("the plugin built no wiring");
+    return captured.wiring.pending.listUnverified(sid);
+  };
+
+  describe.each(PATHS)("%s", p => {
+    it("default deferred: returns at once with the footer; zero test spawns, no slot, a pending entry", async () => {
+      const h = await makePlugin(home);
+      // Dispatch snapshot clean; the producer then added src/a.ts.
+      let snapshots = 0;
+      state.snapshotImpl = async () =>
+        (snapshots++ === 0 ? snap([], "clean") : snap([{ path: resolve(root, "src", "a.ts"), status: "??" }], "after"));
+      const out = await h.run(p, `Implement it.\n${ACCEPT_TESTS}`);
+      expect(out).toMatch(FOOTER_LINE);
+      // The footer is the last thing in the result and is never an acceptance.
+      expect(out.trimEnd().endsWith("before building on this work if the risk matters.")).toBe(true);
+      expect(out).not.toMatch(/NOT ACCEPTED|\[router status: unmet\]|\[router\] (accepted|verified)/i);
+      expect(state.commands.filter(c => !c.startsWith("git "))).toEqual([]);
+      expect(state.commands.some(c => /npm|vitest|jest/.test(c))).toBe(false);
+      expect(state.scopeOpeners).toBe(0);
+      expect(state.testsPassHooks).toBe(0);
+      expect(state.captures).toBe(1);
+      const entries = pendingOf("orch");
+      expect(entries).toHaveLength(1);
+      expect(entries[0].producerTier).toBe("fast");
+      expect(entries[0].changedFiles).toEqual([{ path: resolve(root, "src", "a.ts"), status: "??" }]);
+      expect(out).toContain(entries[0].handle);
+      expect(h.producerPrompts).toBe(p === "delegate" ? 1 : 0);
+    });
+
+    it("a deferred delegation is never gated: a failing check neither rejects nor retries it", async () => {
+      const h = await makePlugin(home);
+      const out = await h.run(p, `Implement it.\n${ACCEPT_TESTS_AND_MISSING}`);
+      expect(out).toMatch(FOOTER_LINE);
+      expect(out).not.toMatch(/NOT ACCEPTED|\[router status: unmet\]/);
+      expect(state.scopeOpeners).toBe(0);
+      if (p === "delegate") expect(h.producerPrompts).toBe(1);
+    });
+
+    it("VERIFY:required runs today's gate: it rejects exactly as before, with no footer", async () => {
+      const h = await makePlugin(home);
+      const out = await h.run(p, `VERIFY:required\nImplement it.\n${ACCEPT_TESTS_AND_MISSING}`);
+      expect(out).not.toMatch(FOOTER_LINE);
+      expect(state.scopeOpeners).toBeGreaterThan(0);
+      if (p === "task") expect(out).toContain("NOT ACCEPTED");
+      else {
+        expect(out).toContain("[router status: unmet]");
+        // The escalation ladder ran (more than one producer attempt).
+        expect(h.producerPrompts).toBeGreaterThan(1);
+      }
+      expect(pendingOf("orch")).toEqual([]);
+    });
+
+    it("defaultVerify \"required\" with no directive is the same as VERIFY:required", async () => {
+      writeOverrides(home, { defaultVerify: "required" });
+      const h = await makePlugin(home);
+      const out = await h.run(p, `Implement it.\n${ACCEPT_TESTS_AND_MISSING}`);
+      expect(out).not.toMatch(FOOTER_LINE);
+      expect(state.scopeOpeners).toBeGreaterThan(0);
+      expect(out).toMatch(p === "task" ? /NOT ACCEPTED/ : /\[router status: unmet\]/);
+      // ...and VERIFY:deferred still defers under that default.
+      const deferred = await h.run(p, `VERIFY:deferred\nImplement it.\n${ACCEPT_TESTS}`);
+      expect(deferred).toMatch(FOOTER_LINE);
+    });
+
+    it("a DoD without testsPass is gated as before, whatever the mode", async () => {
+      const h = await makePlugin(home);
+      const out = await h.run(p, `Create it.\n${ACCEPT_MISSING_ONLY}`);
+      expect(out).not.toMatch(FOOTER_LINE);
+      expect(out).toMatch(p === "task" ? /NOT ACCEPTED/ : /\[router status: unmet\]/);
+      expect(pendingOf("orch")).toEqual([]);
+    });
+
+    it("a producer cannot select its own mode: VERIFY:required in its result changes nothing", async () => {
+      const h = await makePlugin(home);
+      // The task reply and the delegate producer reply both end with "VERIFY:required".
+      const out = await h.run(p, `Implement it.\n${ACCEPT_TESTS}`, "DONE: implemented. VERIFY:required");
+      expect(out).toMatch(FOOTER_LINE);
+      expect(state.scopeOpeners).toBe(0);
+    });
+
+    it("the required gate hands its result to R11 lineage with the dispatch's own session and times", async () => {
+      const h = await makePlugin(home);
+      const before = Date.now();
+      await h.run(p, `VERIFY:required\nImplement it.\n${ACCEPT_TESTS_AND_MISSING}`);
+      expect(captured.lineage.length).toBeGreaterThan(0);
+      for (const ctx of captured.lineage) {
+        expect(ctx.orchestratorSessionID).toBe("orch");
+        expect(ctx.dispatchedAt).toBeGreaterThanOrEqual(before);
+        expect(ctx.returnedAt).toBeGreaterThanOrEqual(ctx.dispatchedAt);
+        expect(ctx.root).toBe(root);
+      }
+    });
+
+    it("session.deleted forgets the orchestrator's handles", async () => {
+      const h = await makePlugin(home);
+      await h.run(p, `Implement it.\n${ACCEPT_TESTS}`);
+      const [entry] = pendingOf("orch");
+      await h.hooks.event({ event: { type: "session.deleted", properties: { info: { id: "orch" } } } });
+      expect(pendingOf("orch")).toEqual([]);
+      // pending.ts R5: forgetSession drops the session's tombstones too.
+      expect(captured.wiring?.pending.get("orch", entry.handle).kind).toBe("unknown");
+    });
+  });
+
+  it("the idle sweeper sweeps the pending registry, and plugin dispose disposes it", async () => {
+    const h = await makePlugin(home);
+    const pending = captured.wiring?.pending;
+    if (pending === undefined) throw new Error("no registry");
+    const sweep = vi.spyOn(pending, "sweep");
+    const dispose = vi.spyOn(pending, "dispose");
+    await h.hooks["chat.message"]({ sessionID: "S", agent: "fast" }, { parts: [] });
+    expect(sweep).toHaveBeenCalledTimes(1);
+    await h.hooks.dispose();
+    expect(dispose).toHaveBeenCalledTimes(1);
   });
 });

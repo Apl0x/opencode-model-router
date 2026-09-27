@@ -78,7 +78,8 @@ import { access, readFile as fsReadFile } from "node:fs/promises";
 import { tool } from "@opencode-ai/plugin";
 import { scrubText } from "./guard/scrub";
 import { accept, unverifiableGateResult } from "./verify/gate";
-import { createVerificationWiring, extractAssistantText } from "./verify/wiring";
+import { createVerificationWiring, dispatchDirectiveText, extractAssistantText } from "./verify/wiring";
+import { appendRouterFooter } from "./verify/pending";
 import { createDeadline } from "./verify/deterministic";
 import {
   DEFAULT_DELEGATE_PROMPT_TIMEOUT_MS,
@@ -338,6 +339,8 @@ const ModelRouterPlugin: Plugin = async (ctx: PluginInput) => {
     // 2.2.3: the S5 batch coordinator's defensive eviction (batch.ts B11). Declared below; the
     // sweeper only runs from chat.message, long after this factory has returned.
     () => { sweepVerification(); },
+    // 2.4.2b: TTL eviction and reaping of the pending registry (pending.ts R7; no timer of its own).
+    () => { pending.sweep(); },
   ]);
 
   // Layer-2's impure corner: exec, fs, and the opencode client, built once and
@@ -352,6 +355,7 @@ const ModelRouterPlugin: Plugin = async (ctx: PluginInput) => {
     graderSessions, dispatchGrader, buildGateDeps, disposeChildSession,
     beginVerificationBounded, prepareVerification, startReferenceGc,
     sweepVerification, disposeVerification,
+    startDispatch, takeDispatch, isDeferred, finishDeferred, applyLineage, pending,
   } = createVerificationWiring({
     client: ctx.client,
     directory: ctx.directory,
@@ -443,6 +447,8 @@ const ModelRouterPlugin: Plugin = async (ctx: PluginInput) => {
     // that dispose is both called and awaited, so flushing here is enough.
     dispose: async () => {
       stopReferenceGc();
+      // 2.4.2b: evict every pending delegation; in-flight router_verify runs resolve (pending.ts R5).
+      pending.dispose();
       // 2.2.3: settle batched testsPass requests and kill running batches (never rejects).
       await disposeVerification();
       await logger.flush();
@@ -927,13 +933,16 @@ const ModelRouterPlugin: Plugin = async (ctx: PluginInput) => {
       if (input?.tool === "task" && typeof input.callID === "string" && typeof input.sessionID === "string") {
         const mode = resolveEnforcementMode({ config: cfg, env: process.env }).mode;
         if (shouldVerifyTask("task", mode, cfg.enforcement?.verify?.require)) {
-          // 2.1.5b: wait at most captureWaitMs; the capture continues in the background.
-          await beginVerificationBounded(changedFileStore, `task:${input.sessionID}:${input.callID}`,
+          const prompt = typeof output?.args?.prompt === "string" ? output.args.prompt : undefined;
+          const description = typeof output?.args?.description === "string" ? output.args.description : undefined;
+          // 2.4.2b: the directives come from the orchestrator's own prompt, read here before the
+          // dispatch header or any repair touches it, and are kept for the after hook. The capture
+          // is awaited for at most VERIFY_WAIT (section 1.5-14) and continues in the background.
+          await startDispatch(changedFileStore, `task:${input.sessionID}:${input.callID}`,
             typeof output?.args?.cwd === "string" ? output.args.cwd : undefined,
-            buildDelegationDoD({
-              prompt: typeof output?.args?.prompt === "string" ? output.args.prompt : undefined,
-              description: typeof output?.args?.description === "string" ? output.args.description : undefined,
-            }));
+            buildDelegationDoD({ prompt, description }),
+            dispatchDirectiveText(prompt, description),
+            true);
         }
       }
       // A task call with no prompt (typically a forced delegation of a bare
@@ -1108,6 +1117,8 @@ const ModelRouterPlugin: Plugin = async (ctx: PluginInput) => {
         const requireMode = cfg.enforcement?.verify?.require;
         if (shouldVerifyTask(input.tool, mode, requireMode)) {
           try {
+            // pending.ts R11: the producer's changes landed by now.
+            const returnedAt = Date.now();
             const { finalReturnText, childSessionID } = parseTaskResult(output);
             const producerTier =
               typeof input?.args?.subagent_type === "string"
@@ -1118,6 +1129,29 @@ const ModelRouterPlugin: Plugin = async (ctx: PluginInput) => {
               description: input?.args?.description,
             });
             const dispatchID = `task:${input.sessionID}:${input.callID}`;
+            const orchestratorSessionID = typeof input.sessionID === "string" ? input.sessionID : "";
+            const taskPrompt = typeof input?.args?.prompt === "string" ? input.args.prompt : undefined;
+            const taskDescription = typeof input?.args?.description === "string" ? input.args.description : undefined;
+            // 2.4.2b: the mode the orchestrator chose at dispatch (never the subagent's text).
+            const start = takeDispatch(dispatchID, dispatchDirectiveText(taskPrompt, taskDescription));
+            if (isDeferred(dod, start.directives)) {
+              // Section 1.5-16: no gate, no test process; the result goes back now with the
+              // footer, which is appended last and never says accepted or verified.
+              const finish = await finishDeferred(changedFileStore, {
+                dispatchID,
+                orchestratorSessionID,
+                producerSessionID: childSessionID ?? "",
+                producerTier,
+                description: taskDescription?.trim() ? taskDescription : (taskPrompt ?? ""),
+                cwd: typeof input?.args?.cwd === "string" ? input.args.cwd : undefined,
+                dod,
+                dispatchedAt: start.dispatchedAt,
+              });
+              output.output = appendRouterFooter(typeof output.output === "string" ? output.output : "", finish.footer);
+              // The dispatch record is cleared by finishDeferred once its capture settled.
+              if (childSessionID) changedFileStore.clear(childSessionID);
+              return;
+            }
             // Same bound as the delegate gate: one deadline per invocation,
             // a withTimeout ceiling, and abort-on-reject so a hung check or
             // grader cannot hold the after-hook (and its process tree) open.
@@ -1212,6 +1246,16 @@ const ModelRouterPlugin: Plugin = async (ctx: PluginInput) => {
             } finally {
               gateDeadline.dispose();
             }
+            // pending.ts R11: a proven-introduced rejection is recorded for this session; a pass
+            // on ids an earlier rejection introduced becomes unverifiable (never a new pass/fail).
+            res = applyLineage(res, {
+              orchestratorSessionID,
+              root: verification.snapshot?.root,
+              dispatchID,
+              dispatchedAt: start.dispatchedAt,
+              returnedAt,
+              strictUnverifiable: cfg.enforcement?.verify?.strictUnverifiable,
+            });
             if (!res.accepted && !res.verdict.skipped) {
               const ladder = cfg.enforcement?.escalate?.ladder ?? ["fast", "medium", "heavy"];
               const li = ladder.indexOf(producerTier);
@@ -1272,6 +1316,8 @@ const ModelRouterPlugin: Plugin = async (ctx: PluginInput) => {
             sessionRootMemo.delete(id);
             sessionLookupFailedAt.delete(id);
             sessionStore.unregister(id);
+            // 2.4.2b: a deleted orchestrator's handles, tombstones and lineage records go with it.
+            pending.forgetSession(id);
           }
         } catch {
           // best-effort: cleanup must never crash a real session
