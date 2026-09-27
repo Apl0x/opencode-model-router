@@ -47,14 +47,17 @@
 //      written (2.1-T2 P5f). It cannot be merged, and S6 forbids widening a scoped run into it.
 //   3. runtime.batchWindowMs <= 0 -> runtime.direct(request). "batchWindowMs: 0 disables
 //      batching": every request runs alone, still scoped.
-//   4. request.deadline.signal is already aborted -> aborted BATCH_REASONS.beforeRun. Nothing is
-//      planned or spawned.
-//   5. plan = runtime.plan(request, request.deadline), that is, planScopedRun (B6). Then:
+//   4. plan = runtime.plan(request, request.deadline), that is, planScopedRun (B6). Then:
 //        NoAffected    -> { scoped: { kind: "no-affected", note }, recheck: undefined }
 //        Unverifiable  -> { scoped: { kind: "unverifiable", code, reason }, recheck: undefined }
 //                         (S6; changedFiles "unavailable" lands here as attribution-unavailable)
 //        rejection     -> { scoped: { kind: "error", reason }, recheck: undefined }
-//      These are exactly 2.1-T2 P3: none of them takes the slot or waits for a window.
+//      These are exactly 2.1-T2 P3: none of them takes the slot or waits for a window. Planning
+//      comes first even when the deadline is already aborted, as in 2.1's direct hook, so those
+//      requests get the same planning outcome as alone (QA-2.2-9).
+//   5. ScopedSpec, but the coordinator was disposed meanwhile -> B2.1; the deadline is aborted ->
+//      aborted BATCH_REASONS.beforeRun (2.1's ABORTED_BEFORE_RUN: its execute answers so with an
+//      aborted deadline). Nothing is spawned.
 //   6. ScopedSpec -> the request joins the window of batchKey(spec) (B3, B4).
 //
 // -----------------------------------------------------------------------------------------------
@@ -349,6 +352,12 @@
 //                                              recheck started } }, as 2.1-T4.j reports an
 //                                              aborted rerun
 //     The member is then released from D, and the batch continues for the others.
+//   - Wording (QA-2.2-9). BATCH_REASONS.beforeRun and .run are 2.1's ABORTED_BEFORE_RUN and
+//     ABORTED_DURING_RUN, verbatim. A member cut during the union step gets ABORTED_DURING_RUN
+//     even while the union still waits for the slot, where alone it would get slot-busy with
+//     deadlineCut (u14, SLOT_DEADLINE_REASON): the scope does not expose when its first execute
+//     took the hold, and the union IS the member's scoped run. Both are unverifiable (u13, u14).
+//     .window and .attribution have no direct-path equivalent: those waits exist only in a batch.
 //   - When all members have aborted, D aborts. The running execute or rechecker kills its tree
 //     (exec.ts), and nothing more is spawned: an aborted signal never spawns. The batch then
 //     finishes and closes its scope.
@@ -578,7 +587,10 @@ export const BATCH_MAX_REQUESTS = 8;
 /** B11: how long sweep() tolerates a batch whose members are all settled but whose seam never returned. */
 export const BATCH_STALE_GRACE_MS = 60_000;
 
-/** Stable ScopedOutcome "aborted" reasons (B2, B9). They reach the orchestrator through 2.1-T7 u13. */
+/**
+ * Stable ScopedOutcome "aborted" reasons (B2, B9). They reach the orchestrator through 2.1-T7 u13.
+ * beforeRun and run are 2.1's ABORTED_BEFORE_RUN and ABORTED_DURING_RUN, verbatim (QA-2.2-9).
+ */
 export const BATCH_REASONS = {
   disposed: "verification coordinator disposed",
   beforeRun: "gate budget exhausted before the scoped run",
@@ -635,6 +647,7 @@ export interface BatchCoordinatorOptions {
   readonly now?: () => number;
   /** Default: the global setTimeout/clearTimeout, with each handle unref'd (B11). */
   readonly timers?: BatchTimers;
+  /** A logger whose warn throws is dropped for the coordinator's life (B-G5, QA-2.2-10). */
   readonly logger?: Pick<PluginLogger, "warn">;
 }
 
@@ -815,7 +828,7 @@ export function createBatchCoordinator(options: BatchCoordinatorOptions = {}): B
   const platform = options.platform ?? process.platform;
   const now = options.now ?? (() => Date.now());
   const timers = options.timers ?? defaultTimers;
-  const logger = options.logger;
+  let logger = options.logger;
 
   const windows = new Map<string, BatchWindow>();
   const running = new Set<Batch>();
@@ -825,7 +838,19 @@ export function createBatchCoordinator(options: BatchCoordinatorOptions = {}): B
   let pending = 0;
   let arrivals = 0;
 
-  const warn = (text: string, extra?: Record<string, unknown>) => logger?.warn(text, extra);
+  /**
+   * B-G5 (QA-2.2-10): logging never throws into the coordinator. A logger that throws is dropped
+   * for the coordinator's life, so it cannot reject runBatch, a scope close or dispose().
+   */
+  const warn = (text: string, extra?: Record<string, unknown>): void => {
+    const current = logger;
+    if (current === undefined) return;
+    try {
+      current.warn(text, extra);
+    } catch {
+      logger = undefined;
+    }
+  };
   const live = (b: Batch) => b.members.filter((m) => !m.settled);
 
   // -- settlement ------------------------------------------------------------------------------
@@ -1366,7 +1391,8 @@ export function createBatchCoordinator(options: BatchCoordinatorOptions = {}): B
   async function submit(runtime: BatchRuntime, request: TestsPassRequest): Promise<TestsPassRun> {
     if (disposed) return abortedRun(BATCH_REASONS.disposed);
     if (request.testScope === "full" || !(runtime.batchWindowMs > 0)) return await runtime.direct(request);
-    if (request.deadline.signal.aborted) return abortedRun(BATCH_REASONS.beforeRun);
+    // QA-2.2-9: planning comes first, as in 2.1's direct hook, so an exhausted deadline still gets
+    // the planning outcome (NoAffected, S6) the direct path gives, and aborted only for a spec.
     let plan: ScopingPlan;
     try {
       plan = await runtime.plan({ command: request.command, cwd: request.cwd, changedFiles: request.changedFiles }, request.deadline);

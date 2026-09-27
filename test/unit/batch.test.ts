@@ -1002,10 +1002,58 @@ describe("createBatchCoordinator: windows and the union run", () => {
     gone.deadline.abort();
     expect(await hook(gone)).toEqual(aborted(BATCH_REASONS.beforeRun));
     expect(await hook(late)).toEqual(aborted(BATCH_REASONS.beforeRun));
-    expect(calls.plans).toHaveLength(4);
+    // QA-2.2-9: as in 2.1's direct hook, an exhausted deadline is planned first, so a planning
+    // outcome is the same as alone.
+    const noneLeft = req([]);
+    noneLeft.deadline.abort();
+    expect(await hook(noneLeft)).toEqual({ scoped: { kind: "no-affected", note: "no affected tests" }, recheck: undefined });
+    const s6 = req(["vitest.untestable.ts"]);
+    s6.deadline.abort();
+    expect(await hook(s6)).toMatchObject({ scoped: { kind: "unverifiable", code: "config-changed" } });
+    expect(calls.plans).toHaveLength(7);
     expect(calls.opens).toHaveLength(0);
     expect(c.stats()).toMatchObject({ openWindows: 0, pendingRequests: 0 });
     expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("QA-2.2-9: the direct-path reasons are 2.1's constants, verbatim", () => {
+    // origin/vrb/p21 src/verify/deterministic.ts ABORTED_BEFORE_RUN and ABORTED_DURING_RUN.
+    expect(BATCH_REASONS.beforeRun).toBe("gate budget exhausted before the scoped run");
+    expect(BATCH_REASONS.run).toBe("gate budget exhausted during the scoped run");
+  });
+
+  it("QA-2.2-10: a logger that throws never turns into a rejection; it is dropped after its first throw", async () => {
+    const warn = vi.fn(() => {
+      throw new Error("logger down");
+    });
+    const c = createBatchCoordinator({ platform: "linux", logger: { warn } });
+    // An internal failure (runBatch's catch logs), a split (logged) and a failing close (logged).
+    const opening = harness(MODEL, { runtime: { openScope: () => { throw new Error("boom"); } } });
+    const failed = [c.hook(opening.runtime)(req(["src/a.ts"])), c.hook(opening.runtime)(req(["src/b.ts"]))];
+    await vi.advanceTimersByTimeAsync(WINDOW);
+    expect((await Promise.all(failed)).map((r) => r.scoped)).toEqual([
+      { kind: "error", reason: "verification batch failed: boom" },
+      { kind: "error", reason: "verification batch failed: boom" },
+    ]);
+    expect(warn).toHaveBeenCalledTimes(1);
+    const inner = harness(MODEL, { argvCap: 1 });
+    const closing = harness(MODEL, {
+      argvCap: 1,
+      runtime: {
+        openScope: (meta) => ({
+          ...inner.runtime.openScope(meta),
+          close: async () => {
+            throw new Error("close failed");
+          },
+        }),
+      },
+    });
+    const split = [c.hook(closing.runtime)(req(["src/a.ts"])), c.hook(closing.runtime)(req(["src/b.ts"]))];
+    await vi.advanceTimersByTimeAsync(WINDOW);
+    expect((await Promise.all(split)).map((r) => ran(r).exitCode)).toEqual([0, 0]);
+    await expect(c.dispose()).resolves.toBeUndefined();
+    expect(c.stats()).toMatchObject({ splits: 1, runningBatches: 0 });
+    expect(warn).toHaveBeenCalledTimes(1);
   });
 
   it("an arrival during a running batch joins the next window, never the running union", async () => {
