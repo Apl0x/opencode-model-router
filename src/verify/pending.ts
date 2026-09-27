@@ -2,8 +2,8 @@
 // ===============================================================================================
 // PENDING VERIFICATION REGISTRY: design (plan Phase 2.4, task 2.4.1; S7, sections 1.5-16..20)
 //
-// STATUS: design + exported API. Every function body throws "not implemented" until task 2.4.1b
-// (R12) implements this header. Contract types used here come from the 2.1.1 block of
+// STATUS: implemented (task 2.4.1b, R12); tests in test/unit/pending.test.ts. The header below is
+// the contract. Contract types used here come from the 2.1.1 block of
 // src/verify/types.ts (ReferenceState, Verdict) and are never redefined.
 // ===============================================================================================
 //
@@ -324,6 +324,8 @@
 //   - Lineage (R11) is id-based: a renamed test id escapes it (the pass keeps 2.1's n2 note).
 // ===============================================================================================
 
+import { randomBytes } from "node:crypto";
+
 import type { DoD } from "./dod";
 import type { RiskAssessment, RiskLevel } from "./risk";
 import type { ChangedPath } from "./runner";
@@ -557,59 +559,601 @@ export interface LateNotice {
 }
 
 // ---------------------------------------------------------------------------------------------
-// API (stubs until task 2.4.1b)
+// Text helpers (R9)
 // ---------------------------------------------------------------------------------------------
 
-function notImplemented(name: string): never {
-  throw new Error(`not implemented: pending.ts ${name} (plan task 2.4.1b)`);
+// Every C0/C1 control (tab included), U+2028 and U+2029.
+const CONTROL_CHARS = /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/g;
+// A directive key followed by its colon, as directives.ts scans it (anywhere, any case).
+const DIRECTIVE_KEY = /\b(VERIFY_WAIT|VERIFY|CAP)[^\S\r\n]*:/gi;
+
+/**
+ * The character rules shared by every dynamic fragment: controls -> space, backtick -> `'`,
+ * directive keys lose their colon (R9 directive safety), whitespace runs -> one space, trim.
+ */
+function sanitizeInline(text: string): string {
+  return text
+    .replace(CONTROL_CHARS, " ")
+    .replace(/`/g, "'")
+    .replace(DIRECTIVE_KEY, "$1 ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function formatIds(ids: readonly string[], max: number): string {
+  const shown = ids.slice(0, max).map(sanitizeInline);
+  const rest = ids.length - shown.length;
+  return rest > 0 ? `${shown.join(", ")} (+${rest} more)` : shown.join(", ");
+}
+
+const UNREGISTERED_PHRASE: Record<NonNullable<FooterInput["unregistered"]>, string> = {
+  "invalid-input": "not registered",
+  "registry-full": "pending registry full",
+  "handle-collision": "handle allocation failed",
+};
+
+function syntheticVerdict(reason: string): Verdict {
+  return { pass: false, outcome: "unverifiable", method: "deterministic", reasons: [reason], caveats: [reason] };
+}
+
+// ---------------------------------------------------------------------------------------------
+// Registry (R2-R8, R11)
+// ---------------------------------------------------------------------------------------------
+
+interface RunSlot {
+  readonly promise: Promise<SettledVerification>;
+  readonly resolve: (value: SettledVerification) => void;
+}
+
+interface EntryRecord {
+  readonly handle: string;
+  readonly seq: number;
+  readonly orchestratorSessionID: string;
+  readonly dispatchID: string;
+  readonly producerSessionID: string;
+  readonly producerTier: string;
+  readonly description: string;
+  readonly cwd: string;
+  readonly root: string | undefined;
+  readonly dispatchedAt: number;
+  readonly createdAt: number;
+  readonly risk: RiskAssessment;
+  readonly changedFilesDropped: number;
+  dod: DoD | undefined;
+  reference: Promise<ReferenceState>;
+  changedFiles: readonly ChangedPath[] | "unavailable";
+  digests: Promise<FileDigests | undefined> | undefined;
+  state: PendingState;
+  verifyingSince: number | undefined;
+  result: SettledVerification | undefined;
+  run: RunSlot | undefined;
+  pathWeight: number;
+  refWeight: number;
+  released: boolean;
+  doomed: boolean;
+  live: boolean;
+}
+
+type LookupMiss = Extract<Lookup, { readonly kind: "expired" | "unknown" }>;
+
+interface LedgerRecord {
+  readonly record: RejectionRecord;
+  readonly recordedAt: number;
+}
+
+function defaultRandom(bytes: number): Uint8Array {
+  return randomBytes(bytes);
+}
+
+function toHex(bytes: Uint8Array): string {
+  let out = "";
+  for (const b of bytes) out += b.toString(16).padStart(2, "0");
+  return out;
+}
+
+function isNonEmptyString(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0;
+}
+
+/** Eviction order (R7): verified oldest first, then unverified oldest first. Verifying never. */
+function evictionCandidates(records: Iterable<EntryRecord>): EntryRecord[] {
+  const byAge = (a: EntryRecord, b: EntryRecord): number => a.createdAt - b.createdAt || a.seq - b.seq;
+  const all = [...records].filter((r) => r.state !== "verifying");
+  return [
+    ...all.filter((r) => r.state === "verified").sort(byAge),
+    ...all.filter((r) => r.state === "unverified").sort(byAge),
+  ];
 }
 
 /** R2-R8, R11. */
 export function createPendingRegistry(options: PendingRegistryOptions): PendingRegistry {
-  void options;
-  return notImplemented("createPendingRegistry");
+  const now = options.now ?? Date.now;
+  const random = options.random ?? defaultRandom;
+  const maxPerSession = options.maxPerSession ?? MAX_ENTRIES_PER_SESSION;
+  const maxGlobal = options.maxGlobal ?? MAX_ENTRIES_GLOBAL;
+  const maxWeight = options.maxWeight ?? MAX_GLOBAL_WEIGHT;
+  const { ttlMs, maxVerifyingMs } = options;
+
+  const sessions = new Map<string, Map<string, EntryRecord>>();
+  const byHandle = new Map<string, EntryRecord>();
+  /** handle -> the session it was issued to; insertion order = FIFO. */
+  const tombstones = new Map<string, string>();
+  const ledger = new Map<string, LedgerRecord[]>();
+  const counters = { seq: 0, weight: 0, hookFailures: 0 };
+
+  function snapshot(rec: EntryRecord): PendingEntry {
+    return Object.freeze({
+      handle: rec.handle,
+      orchestratorSessionID: rec.orchestratorSessionID,
+      dispatchID: rec.dispatchID,
+      producerSessionID: rec.producerSessionID,
+      producerTier: rec.producerTier,
+      description: rec.description,
+      cwd: rec.cwd,
+      root: rec.root,
+      dispatchedAt: rec.dispatchedAt,
+      dod: rec.dod,
+      reference: rec.reference,
+      changedFiles: rec.changedFiles,
+      changedFilesDropped: rec.changedFilesDropped,
+      risk: rec.risk,
+      digests: rec.digests,
+      createdAt: rec.createdAt,
+      state: rec.state,
+      verifyingSince: rec.verifyingSince,
+      result: rec.result,
+    });
+  }
+
+  function addTombstone(handle: string, sessionID: string): void {
+    tombstones.delete(handle);
+    tombstones.set(handle, sessionID);
+    while (tombstones.size > TOMBSTONE_MAX) {
+      const oldest = tombstones.keys().next();
+      if (oldest.done === true) break;
+      tombstones.delete(oldest.value);
+    }
+  }
+
+  function evict(rec: EntryRecord, cause: EvictionCause): void {
+    if (!rec.live) return;
+    rec.live = false;
+    const session = sessions.get(rec.orchestratorSessionID);
+    session?.delete(rec.handle);
+    if (session !== undefined && session.size === 0) sessions.delete(rec.orchestratorSessionID);
+    byHandle.delete(rec.handle);
+    counters.weight -= rec.pathWeight + rec.refWeight;
+    addTombstone(rec.handle, rec.orchestratorSessionID);
+    const hook = options.onEvict;
+    if (hook === undefined) return;
+    try {
+      hook(snapshot(rec), cause);
+    } catch {
+      // A logging hook must never break the registry (PendingRegistryOptions.onEvict).
+      counters.hookFailures += 1;
+    }
+  }
+
+  function release(rec: EntryRecord): void {
+    counters.weight -= rec.pathWeight + rec.refWeight;
+    rec.pathWeight = 0;
+    rec.refWeight = 0;
+    rec.released = true;
+    rec.dod = undefined;
+    rec.digests = undefined;
+    rec.changedFiles = "unavailable";
+    rec.reference = Promise.resolve<ReferenceState>({ kind: "none", reason: RELEASED_REASON });
+  }
+
+  function isExpired(rec: EntryRecord, at: number): boolean {
+    return at - rec.createdAt >= ttlMs;
+  }
+
+  function recordRejection(record: RejectionRecord): void {
+    if (!isNonEmptyString(record.orchestratorSessionID) || !isNonEmptyString(record.root)) return;
+    if (record.introduced.length === 0) return;
+    const stored: RejectionRecord = Object.freeze({
+      orchestratorSessionID: record.orchestratorSessionID,
+      root: record.root,
+      label: record.label,
+      landedAt: record.landedAt,
+      introduced: Object.freeze(record.introduced.slice(0, MAX_LEDGER_IDS)),
+    });
+    const list = ledger.get(record.orchestratorSessionID) ?? [];
+    list.push({ record: stored, recordedAt: now() });
+    while (list.length > MAX_LEDGER_PER_SESSION) list.shift();
+    ledger.set(record.orchestratorSessionID, list);
+  }
+
+  /** Resolves a run and moves the entry out of "verifying" (settle, reap). */
+  function finishRun(rec: EntryRecord, settled: SettledVerification): void {
+    const run = rec.run;
+    rec.run = undefined;
+    rec.verifyingSince = undefined;
+    rec.result = settled;
+    if (settled.retryable) {
+      rec.state = "unverified";
+    } else {
+      rec.state = "verified";
+      release(rec);
+    }
+    run?.resolve(settled);
+  }
+
+  /** Reaping, TTL eviction and ledger expiry (R7). Returns the number of evicted entries. */
+  function maintain(at: number): number {
+    let evicted = 0;
+    for (const rec of [...byHandle.values()]) {
+      if (rec.state === "verifying" && rec.verifyingSince !== undefined && rec.verifyingSince + maxVerifyingMs <= at) {
+        finishRun(rec, {
+          verdict: syntheticVerdict(ABANDONED_REASON),
+          retryable: true,
+          handle: rec.handle,
+          settledAt: at,
+        });
+      }
+      if (rec.state === "verifying") continue;
+      if (rec.doomed) {
+        evict(rec, "session-gone");
+        evicted += 1;
+      } else if (isExpired(rec, at)) {
+        evict(rec, "ttl");
+        evicted += 1;
+      }
+    }
+    for (const [sid, list] of ledger) {
+      const kept = list.filter((l) => at - l.recordedAt < ttlMs);
+      if (kept.length === 0) ledger.delete(sid);
+      else if (kept.length !== list.length) ledger.set(sid, kept);
+    }
+    return evicted;
+  }
+
+  function lookup(sessionID: string, handle: string): EntryRecord | LookupMiss {
+    const rec = sessions.get(sessionID)?.get(handle);
+    if (rec !== undefined) return rec;
+    if (tombstones.get(handle) === sessionID) return { kind: "expired", handle };
+    return { kind: "unknown", handle };
+  }
+
+  function isRecord(value: EntryRecord | LookupMiss): value is EntryRecord {
+    return !("kind" in value);
+  }
+
+  function enforceWeight(): void {
+    if (counters.weight <= maxWeight) return;
+    maintain(now());
+    for (const victim of evictionCandidates(byHandle.values())) {
+      if (counters.weight <= maxWeight) break;
+      evict(victim, "weight-cap");
+    }
+  }
+
+  function drawHandle(): string | undefined {
+    for (let i = 0; i < HANDLE_MAX_DRAWS; i += 1) {
+      const candidate = HANDLE_PREFIX + toHex(random(HANDLE_RANDOM_BYTES));
+      if (!HANDLE_PATTERN.test(candidate)) continue;
+      if (byHandle.has(candidate) || tombstones.has(candidate)) continue;
+      return candidate;
+    }
+    return undefined;
+  }
+
+  function register(reg: PendingRegistration): RegisterResult {
+    if (
+      !isNonEmptyString(reg.orchestratorSessionID) ||
+      !isNonEmptyString(reg.producerSessionID) ||
+      reg.orchestratorSessionID === reg.producerSessionID
+    ) {
+      return {
+        ok: false,
+        code: "invalid-input",
+        detail: "orchestrator and producer session ids must be non-empty and differ",
+      };
+    }
+    const at = now();
+    maintain(at);
+
+    const incoming = reg.changedFiles;
+    let changedFiles: readonly ChangedPath[] | "unavailable" = "unavailable";
+    let changedFilesDropped = 0;
+    if (incoming !== "unavailable") {
+      if (incoming.length > MAX_STORED_CHANGED_FILES) changedFilesDropped = incoming.length;
+      else changedFiles = Object.freeze([...incoming]);
+    }
+    const pathWeight = changedFiles === "unavailable" ? 0 : changedFiles.length;
+
+    // Plan the evictions first: a registration that cannot fit evicts nothing.
+    const session = sessions.get(reg.orchestratorSessionID);
+    const victims: Array<{ rec: EntryRecord; cause: EvictionCause }> = [];
+    const chosen = new Set<EntryRecord>();
+    if (session !== undefined) {
+      let count = session.size;
+      for (const rec of evictionCandidates(session.values())) {
+        if (count + 1 <= maxPerSession) break;
+        victims.push({ rec, cause: "session-cap" });
+        chosen.add(rec);
+        count -= 1;
+      }
+      if (count + 1 > maxPerSession) {
+        return { ok: false, code: "registry-full", detail: `session holds ${count} verifying entries` };
+      }
+    } else if (maxPerSession < 1) {
+      return { ok: false, code: "registry-full", detail: "per-session cap is 0" };
+    }
+    let count = byHandle.size - victims.length;
+    let weight = counters.weight - victims.reduce((sum, v) => sum + v.rec.pathWeight + v.rec.refWeight, 0);
+    for (const rec of evictionCandidates(byHandle.values())) {
+      if (count + 1 <= maxGlobal && weight + pathWeight <= maxWeight) break;
+      if (chosen.has(rec)) continue;
+      victims.push({ rec, cause: count + 1 > maxGlobal ? "global-cap" : "weight-cap" });
+      chosen.add(rec);
+      count -= 1;
+      weight -= rec.pathWeight + rec.refWeight;
+    }
+    if (count + 1 > maxGlobal || weight + pathWeight > maxWeight) {
+      return { ok: false, code: "registry-full", detail: "the pending registry cannot hold another entry" };
+    }
+
+    const handle = drawHandle();
+    if (handle === undefined) {
+      return { ok: false, code: "handle-collision", detail: `no free handle after ${HANDLE_MAX_DRAWS} draws` };
+    }
+    for (const v of victims) evict(v.rec, v.cause);
+
+    const reference = reg.reference.then(
+      (state) => state,
+      (): ReferenceState => ({ kind: "none", reason: REFERENCE_FAILED_REASON }),
+    );
+    const digests = reg.digests?.then(
+      (d) => d,
+      () => undefined,
+    );
+    counters.seq += 1;
+    const rec: EntryRecord = {
+      handle,
+      seq: counters.seq,
+      orchestratorSessionID: reg.orchestratorSessionID,
+      dispatchID: reg.dispatchID,
+      producerSessionID: reg.producerSessionID,
+      producerTier: reg.producerTier,
+      description: sanitizeDescription(reg.description),
+      cwd: reg.cwd,
+      root: reg.root,
+      dispatchedAt: reg.dispatchedAt,
+      createdAt: at,
+      risk: reg.risk,
+      changedFilesDropped,
+      dod: reg.dod,
+      reference,
+      changedFiles,
+      digests,
+      state: "unverified",
+      verifyingSince: undefined,
+      result: undefined,
+      run: undefined,
+      pathWeight,
+      refWeight: 0,
+      released: false,
+      doomed: false,
+      live: true,
+    };
+    const target = session ?? new Map<string, EntryRecord>();
+    target.set(handle, rec);
+    sessions.set(reg.orchestratorSessionID, target);
+    byHandle.set(handle, rec);
+    counters.weight += pathWeight;
+
+    // R7: the reference's weight is added when it resolves "captured" (a promise callback).
+    void reference.then((state) => {
+      if (!rec.live || rec.released || state.kind !== "captured") return;
+      rec.refWeight = state.reference.untracked.size + state.reference.tracked.size;
+      counters.weight += rec.refWeight;
+      enforceWeight();
+    });
+
+    return { ok: true, handle, evicted: victims.map((v) => v.rec.handle) };
+  }
+
+  function markVerifying(sessionID: string, handle: string): ClaimResult {
+    const at = now();
+    maintain(at);
+    const found = lookup(sessionID, handle);
+    if (!isRecord(found)) return found;
+    const rec = found;
+    if (rec.state === "verified" && rec.result !== undefined) {
+      return { kind: "settled", entry: snapshot(rec), result: rec.result };
+    }
+    if (rec.state === "verifying" && rec.run !== undefined) {
+      return { kind: "joined", entry: snapshot(rec), run: rec.run.promise };
+    }
+    let resolveRun: (value: SettledVerification) => void = () => undefined;
+    const promise = new Promise<SettledVerification>((resolve) => {
+      resolveRun = resolve;
+    });
+    const run: RunSlot = { promise, resolve: resolveRun };
+    rec.state = "verifying";
+    rec.verifyingSince = at;
+    rec.run = run;
+    let used = false;
+    const settle = (result: VerificationResult): boolean => {
+      if (used || rec.run !== run || !rec.live) return false;
+      used = true;
+      const settledAt = now();
+      const settled: SettledVerification = Object.freeze({ ...result, handle: rec.handle, settledAt });
+      finishRun(rec, settled);
+      if (!result.retryable && result.introduced !== undefined && result.introduced.length > 0 && rec.root !== undefined) {
+        recordRejection({
+          orchestratorSessionID: rec.orchestratorSessionID,
+          root: rec.root,
+          label: rec.handle,
+          landedAt: rec.createdAt,
+          introduced: result.introduced,
+        });
+      }
+      if (rec.doomed) evict(rec, "session-gone");
+      else if (isExpired(rec, settledAt)) evict(rec, "ttl");
+      return true;
+    };
+    return { kind: "claimed", entry: snapshot(rec), run: promise, settle };
+  }
+
+  function listByState(sessionID: string, states: readonly PendingState[]): EntryRecord[] {
+    maintain(now());
+    const session = sessions.get(sessionID);
+    if (session === undefined) return [];
+    return [...session.values()]
+      .filter((r) => states.includes(r.state))
+      .sort((a, b) => b.createdAt - a.createdAt || b.seq - a.seq);
+  }
+
+  return {
+    register,
+    get(sessionID, handle) {
+      maintain(now());
+      const found = lookup(sessionID, handle);
+      return isRecord(found) ? { kind: "found", entry: snapshot(found) } : found;
+    },
+    listUnverified(sessionID, limit) {
+      const list = listByState(sessionID, ["unverified"]);
+      const bounded = limit === undefined ? list : list.slice(0, Math.max(0, Math.floor(limit)));
+      return bounded.map(snapshot);
+    },
+    listOpen(sessionID) {
+      return listByState(sessionID, ["unverified", "verifying"]).map(snapshot);
+    },
+    markVerifying,
+    sweep(nowMs) {
+      return maintain(nowMs ?? now());
+    },
+    forgetSession(sessionID) {
+      const session = sessions.get(sessionID);
+      for (const rec of session === undefined ? [] : [...session.values()]) {
+        if (rec.state === "verifying") rec.doomed = true;
+        else evict(rec, "session-gone");
+      }
+      for (const [handle, sid] of [...tombstones]) {
+        if (sid === sessionID) tombstones.delete(handle);
+      }
+      ledger.delete(sessionID);
+    },
+    recordRejection,
+    findLineage(query) {
+      maintain(now());
+      const list = ledger.get(query.orchestratorSessionID) ?? [];
+      for (let i = list.length - 1; i >= 0; i -= 1) {
+        const { record } = list[i];
+        if (record.root !== query.root || record.landedAt > query.dispatchedAt) continue;
+        const introduced = new Set(record.introduced);
+        const ids = [...new Set(query.preexisting)].filter((id) => introduced.has(id));
+        if (ids.length > 0) return { label: record.label, ids };
+      }
+      return undefined;
+    },
+    stats() {
+      let verifying = 0;
+      for (const rec of byHandle.values()) if (rec.state === "verifying") verifying += 1;
+      let rejections = 0;
+      for (const list of ledger.values()) rejections += list.length;
+      return {
+        entries: byHandle.size,
+        sessions: sessions.size,
+        verifying,
+        weight: counters.weight,
+        tombstones: tombstones.size,
+        rejections,
+      };
+    },
+    dispose() {
+      const at = now();
+      for (const rec of [...byHandle.values()]) {
+        if (rec.run !== undefined) {
+          finishRun(rec, { verdict: syntheticVerdict(DISPOSED_REASON), retryable: true, handle: rec.handle, settledAt: at });
+        }
+        evict(rec, "disposed");
+      }
+      ledger.clear();
+    },
+  };
 }
+
+// ---------------------------------------------------------------------------------------------
+// Pure builders (R2, R9, R10, R11)
+// ---------------------------------------------------------------------------------------------
 
 /** R2: trimmed, one pair of surrounding backticks/quotes stripped, lowercased, HANDLE_PATTERN. */
 export function normalizeHandle(text: string): string | undefined {
-  void text;
-  return notImplemented("normalizeHandle");
+  let value = text.trim();
+  const first = value.charAt(0);
+  if (value.length >= 2 && (first === "`" || first === '"' || first === "'") && value.endsWith(first)) {
+    value = value.slice(1, -1);
+  }
+  value = value.toLowerCase();
+  return HANDLE_PATTERN.test(value) ? value : undefined;
 }
 
 /** R9. */
 export function sanitizeDescription(text: string): string {
-  void text;
-  return notImplemented("sanitizeDescription");
+  const clean = sanitizeInline(text);
+  if (clean.length === 0) return "(no description)";
+  const points = Array.from(clean);
+  if (points.length <= MAX_DESCRIPTION_CHARS) return clean;
+  return points.slice(0, MAX_DESCRIPTION_CHARS - 1).join("") + "\u2026";
 }
 
 /** R10: the risk of a delegation whose changed files could not be attributed. */
 export function unattributedRisk(): RiskAssessment {
-  return notImplemented("unattributedRisk");
+  return { level: "high", reasons: [UNATTRIBUTED_RISK_REASON] };
 }
 
 /** R9, section 1.5-16. */
 export function buildDeferredFooter(input: FooterInput): string {
-  void input;
-  return notImplemented("buildDeferredFooter");
+  const risk = formatRisk(input.risk.level, input.risk.reasons, FOOTER_MAX_REASONS);
+  if (input.handle !== undefined) {
+    return (
+      `[router] unverified \u00b7 ${input.handle} \u00b7 ${risk}\n` +
+      "[router] Call `router_verify` with this handle before building on this work if the risk matters."
+    );
+  }
+  const phrase = UNREGISTERED_PHRASE[input.unregistered ?? "invalid-input"];
+  return (
+    `[router] unverified \u00b7 no handle (${phrase}) \u00b7 ${risk}\n` +
+    "[router] This delegation cannot be verified later; re-dispatch it with required verification if the risk matters."
+  );
 }
 
 /** R9. */
 export function appendRouterFooter(output: string, footer: string): string {
-  void output;
-  void footer;
-  return notImplemented("appendRouterFooter");
+  const trimmed = output.trimEnd();
+  return trimmed.length === 0 ? footer : `${trimmed}\n\n${footer}`;
 }
 
 /** R9, section 1.5-20. `entries` = listUnverified(sessionID), newest first. undefined when empty. */
 export function buildPendingListBlock(entries: readonly PendingEntry[]): string | undefined {
-  void entries;
-  return notImplemented("buildPendingListBlock");
+  if (entries.length === 0) return undefined;
+  const shown = entries.slice(0, PENDING_LIST_LIMIT);
+  const lines = ["[router] Unverified delegations in this session (newest first):"];
+  for (const e of shown) {
+    lines.push(`- ${e.handle} \u00b7 ${formatRisk(e.risk.level, e.risk.reasons, 0)} \u00b7 ${sanitizeDescription(e.description)}`);
+  }
+  if (entries.length > shown.length) lines.push(`- ... and ${entries.length - shown.length} more`);
+  lines.push(
+    "[router] Before your final answer, call `router_verify` with the handles that matter, or with `pending: true` for all of them.",
+  );
+  return lines.join("\n");
 }
 
 /** R9, section 1.5-19 (background mode only). undefined when empty. */
 export function buildLateNoticeBlock(notices: readonly LateNotice[]): string | undefined {
-  void notices;
-  return notImplemented("buildLateNoticeBlock");
+  if (notices.length === 0) return undefined;
+  const lines = ["[router] Background verification found introduced failures:"];
+  for (const n of notices) {
+    lines.push(
+      `- ${n.handle} \u00b7 ${sanitizeDescription(n.description)} \u00b7 failing: ${formatIds(n.introduced, LATE_NOTICE_MAX_IDS)}`,
+    );
+  }
+  lines.push("[router] Nothing was retried; decide whether to re-dispatch.");
+  return lines.join("\n");
 }
 
 /**
@@ -617,21 +1161,27 @@ export function buildLateNoticeBlock(notices: readonly LateNotice[]): string | u
  * `after` counts as drifted), sorted. Pure.
  */
 export function driftedPaths(before: FileDigests, after: FileDigests): string[] {
-  void before;
-  void after;
-  return notImplemented("driftedPaths");
+  const out: string[] = [];
+  for (const [path, digest] of before) {
+    if (after.get(path) !== digest) out.push(path);
+  }
+  return out.sort();
 }
 
 /** R11. */
 export function buildLineageCaveat(match: LineageMatch): string {
-  void match;
-  return notImplemented("buildLineageCaveat");
+  return (
+    `${formatIds(match.ids, LATE_NOTICE_MAX_IDS)} failed after ${sanitizeInline(match.label)} in this session and still fail; ` +
+    "the reference of this delegation already contained that change, so pre-existing cannot be told apart from not fixed"
+  );
 }
 
 /** R9: the risk fragment shared by the footer and the pending list. */
 export function formatRisk(level: RiskLevel, reasons: readonly string[], maxReasons: number): string {
-  void level;
-  void reasons;
-  void maxReasons;
-  return notImplemented("formatRisk");
+  const max = Math.max(0, Math.floor(maxReasons));
+  const shown = reasons.slice(0, max).map(sanitizeInline);
+  if (shown.length === 0) return `risk ${level}`;
+  const rest = reasons.length - shown.length;
+  const parts = rest > 0 ? [...shown, `+${rest} more`] : shown;
+  return `risk ${level} (${parts.join("; ")})`;
 }
