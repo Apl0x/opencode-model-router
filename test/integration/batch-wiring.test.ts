@@ -49,8 +49,11 @@ const state = vi.hoisted(() => ({
   planGate: undefined as undefined | ((changed: readonly string[]) => Promise<void> | undefined),
   /** How long each scoped test run takes, in real time. */
   runMs: 0,
-  /** One slot holder, first come first served (maxConcurrentVerifications 1). */
+  /** When set, a run's time from its number of inputs (QA-2.2-25: maxWorkers 2 runs 2 files at a time). */
+  runMsFor: undefined as undefined | ((inputs: number) => number),
+  /** Slot holders first come first served, at most `capacity` at once (maxConcurrentVerifications). */
   fifo: false,
+  capacity: 1,
   queue: [] as (() => void)[],
   /** When set, materialize returns an exact reference over this copy of the project. */
   refRoot: "",
@@ -89,22 +92,28 @@ vi.mock("../../src/verify/runner", async importOriginal => {
 
 vi.mock("../../src/verify/slot", async importOriginal => ({
   ...(await importOriginal<typeof import("../../src/verify/slot")>()),
-  acquireSlot: async (opts: { signal?: AbortSignal }) => {
+  acquireSlot: async (opts: { signal?: AbortSignal; waitMs?: number }) => {
     if (opts.signal?.aborted) return { busy: true as const };
-    if (state.fifo && state.holds > 0) {
-      // Wait for a hand-off: the holder's release passes its hold on, so holds never drops to 0 between.
+    if (state.fifo && state.holds >= state.capacity) {
+      // Wait for a hand-off: the holder's release passes its hold on, so holds never drops between.
+      // The wait ends at waitMs or at the signal, as the real slot's does.
       const granted = await new Promise<boolean>(resolve => {
+        let timer: ReturnType<typeof setTimeout> | undefined;
         const go = (): void => {
+          clearTimeout(timer);
           opts.signal?.removeEventListener("abort", stop);
           resolve(true);
         };
         const stop = (): void => {
+          clearTimeout(timer);
+          opts.signal?.removeEventListener("abort", stop);
           const i = state.queue.indexOf(go);
           if (i >= 0) state.queue.splice(i, 1);
           resolve(false);
         };
         state.queue.push(go);
         opts.signal?.addEventListener("abort", stop, { once: true });
+        if (opts.waitMs !== undefined) timer = setTimeout(stop, opts.waitMs);
       });
       if (!granted) return { busy: true as const };
     } else {
@@ -162,7 +171,8 @@ async function fakeVitest(args: readonly string[]): Promise<ExecOut> {
   state.runs.push({ inputs: [...inputs].sort(), holds: state.holds });
   if (state.hang !== undefined) await state.hang;
   await state.runGate?.(state.runs.length - 1);
-  if (state.runMs > 0) await new Promise(resolve => setTimeout(resolve, state.runMs));
+  const runMs = state.runMsFor?.(inputs.length) ?? state.runMs;
+  if (runMs > 0) await new Promise(resolve => setTimeout(resolve, runMs));
   const letters = [...new Set(inputs.map(a => /[\\/]([a-z])(?:\.test)?\.ts$/.exec(a)?.[1]).filter((x): x is string => x !== undefined))].sort();
   const testResults = letters.map(x => {
     const failing = failingNow[x] ?? [];
@@ -281,6 +291,26 @@ function holdPlanning(x: string): () => void {
 
 const sleep = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms));
 
+/**
+ * Another gate's check: it takes one FIFO slot now and releases it after `ms` (QA-2.2-23, N1).
+ * Await the result before the next run, so a release never lands in another run's counters.
+ */
+function occupySlot(ms: number): Promise<void> {
+  state.holds++;
+  state.maxHolds = Math.max(state.maxHolds, state.holds);
+  return new Promise<void>(released =>
+    setTimeout(() => {
+      const next = state.queue.shift();
+      if (next !== undefined) next();
+      else state.holds--;
+      released();
+    }, ms),
+  );
+}
+
+/** A verdict and whether the gate accepted it: what the deadline cases compare. */
+const outcomeOf = (r: GateResult | undefined) => [r?.verdict.outcome, r?.accepted];
+
 /** Five gates at once (batched), then the same five with batchWindowMs: 0 (alone). */
 async function batchedAndAlone(options: (x: string) => GateOptions = () => ({}), verify: Parameters<typeof wiringWith>[0] = {}) {
   resetCounters();
@@ -315,7 +345,9 @@ beforeEach(() => {
   state.failing = {};
   state.failingAtRef = {};
   state.runMs = 0;
+  state.runMsFor = undefined;
   state.fifo = false;
+  state.capacity = 1;
   state.refRoot = "";
   state.hang = undefined;
   state.runGate = undefined;
@@ -686,5 +718,80 @@ describe("batched gates under deadline pressure are never weaker than batchWindo
     expect(batched.verdicts.map(verdictOf)).toEqual(alone.verdicts.map(verdictOf));
     // f's run, then the five own runs (a split: no union) and c's reference run.
     expect(batched.runs).toBe(1 + 5 + 1);
+  }, 40_000);
+});
+
+/**
+ * QA-2.2-23 to QA-2.2-25 (the phase 2.2.3 QA round 2 repro shapes N1, N1b, N2, N2b and N3). A
+ * first lone gate f measures the key's run estimate, 1 s. The recheck threshold is 10 s and the
+ * margin 1 s, so a member with a captured reference has an 11 s floor, and one without has 1 s.
+ * Each case runs batched, then with batchWindowMs: 0, and the verdicts must be equal: by default an
+ * unverifiable verdict is accepted, so a batched unverifiable where alone is fail would weaken
+ * the gate.
+ */
+describe("QA-2.2-23 to QA-2.2-25: batched gates keep the verdict of batchWindowMs: 0", () => {
+  /** f's lone run (the 1 s estimate), then `body` on the same wiring. */
+  const twice = async <T>(body: (wiring: VerificationWiring) => Promise<T>) => {
+    const once = async (verify: Parameters<typeof wiringWith>[0]) => {
+      resetCounters();
+      const wiring = wiringWith(verify);
+      await gate(wiring, "f");
+      const out = await body(wiring);
+      await wiring.disposeVerification();
+      return { out, runs: state.runs.length, acquires: state.acquires, maxHolds: state.maxHolds };
+    };
+    const batched = await once({ batchWindowMs: 2000 });
+    const alone = await once({ batchWindowMs: 0 });
+    return { batched, alone };
+  };
+
+  it("N1 (QA-2.2-23): a short member whose slot wait is cut leaves the others their own slot wait", async () => {
+    exactReference();
+    state.failing = { a: ["t2"] };
+    state.fifo = true;
+    state.runMs = 1_000;
+    // Another gate's check holds the one slot for 3.5 s. c (2.5 s, no reference) cannot outlive
+    // it; a and b (60 s, exact reference) can, and a has an introduced failure.
+    const { batched, alone } = await twice(async wiring => {
+      const held = occupySlot(3_500);
+      void barrier(3);
+      const verdicts = await Promise.all([
+        gate(wiring, "a", { reference: captured(), budgetMs: 60_000 }),
+        gate(wiring, "b", { reference: captured(), budgetMs: 60_000 }),
+        gate(wiring, "c", { budgetMs: 2_500 }),
+      ]);
+      await held;
+      return verdicts;
+    });
+    expect(alone.out.map(outcomeOf)).toEqual([
+      ["fail", false],
+      ["pass", true],
+      ["unverifiable", true],
+    ]);
+    expect(batched.out.map(verdictOf)).toEqual(alone.out.map(verdictOf));
+    // No slot hold is ever nested or shared by two batches: one live hold per scope, at most one.
+    expect(batched.maxHolds).toBe(1);
+  }, 40_000);
+
+  it("N1b (QA-2.2-23): the same with one long member, where the batch splits", async () => {
+    exactReference();
+    state.failing = { a: ["t2"] };
+    state.fifo = true;
+    state.runMs = 1_000;
+    const { batched, alone } = await twice(async wiring => {
+      const held = occupySlot(3_500);
+      void barrier(2);
+      const verdicts = await Promise.all([
+        gate(wiring, "a", { reference: captured(), budgetMs: 60_000 }),
+        gate(wiring, "c", { budgetMs: 2_500 }),
+      ]);
+      await held;
+      return verdicts;
+    });
+    expect(alone.out.map(outcomeOf)).toEqual([
+      ["fail", false],
+      ["unverifiable", true],
+    ]);
+    expect(batched.out.map(verdictOf)).toEqual(alone.out.map(verdictOf));
   }, 40_000);
 });

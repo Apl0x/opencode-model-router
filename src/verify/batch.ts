@@ -31,7 +31,7 @@
 //        turn a would-be pass into unverifiable. It never turns anything into a pass (B7.5).
 //   B-G3 One slot hold per batch (QA-1.4-18). Each batch opens one VerificationScope, once, and
 //        holds it across the union run, the attribution runs and every recheck. Scopes are never
-//        nested.
+//        nested. A split batch opens none: it hands each member to a batch of its own (B5.6).
 //   B-G4 A requester's own deadline bounds every step it waits for. One requester's expiry or
 //        abort never cancels the batch for the others. When every requester is gone, the running
 //        tree is killed.
@@ -42,9 +42,9 @@
 //        batchWindowMs: 0 under the same budget, as far as a cheap estimate can ensure. By default
 //        an unverifiable verdict is accepted with a caveat (strictUnverifiable off), so a batch
 //        that turned a rejection into a deadline-induced unverifiable would weaken the gate. A
-//        lone request never waits (W7). The window never eats into a member's reserve (W3). A
-//        member whose budget cannot cover the batched schedule runs alone, first (B5.2a).
-//        Residuals: B15.
+//        lone request never waits (W7). The window never eats into a member's reserve (W3). When
+//        any member's budget cannot cover the batched schedule, every member runs alone, exactly
+//        as its direct hook would (B5.2a, B5.6). Residuals: B15.
 //
 // -----------------------------------------------------------------------------------------------
 // B2. BYPASSES (no window, no union), checked in this order on arrival
@@ -140,21 +140,20 @@
 //   1. |M| = 1: skip steps 2a and 2. Step 4 runs the member's own spec with the member's own
 //      deadline. Steps 5 and 7 have nothing to do, and step 8 is a single-member recheck. This is
 //      exactly the direct path.
-//   2a. Deadline check (QA-2.2-17 c), before union planning. Take the members in deadline order,
-//      and e and each member's floor as in W3. A member is "solo" when its remaining() is below
-//        floor + 2e x (number of solo members) + e x (1 + p + i),
-//      where p is the number of pooled (not solo) members and i its index among them. That sum is
-//      the worst case of the batched schedule ahead of its recheck: the union, every pooled
-//      member's own run (mode B; a member can be held until the last of them, B5.7), one recheck
-//      for each pooled member ahead of it, and the own run and recheck of each solo member, which
-//      come first. The check repeats until no member moves (at most once per member).
-//        - Fewer than two pooled members: split (step 6). Every member runs its own spec in
-//          deadline order, which is the alone cost and order.
-//        - Otherwise, after step 3, the solo members' own runs and rechecks run first, in deadline
-//          order, outside the union. Each is its own run's outcome, verbatim, and final at once:
-//          no union failure can taint it. A solo run never counts as reproducing a union failure
-//          (7.5), because it cannot tell which pooled member the failure belongs to. Steps 2, 4
-//          and 7 then cover the pooled members only.
+//   2a. Deadline check (QA-2.2-17 c, QA-2.2-23), before union planning. Take the members in
+//      deadline order, and e and each member's floor as in W3. The batch pools only when every
+//      member's remaining() is at least
+//        floor + e x (1 + n + i),
+//      where n is the number of members and i the member's index. That sum is the worst case of
+//      the batched schedule ahead of its recheck: the union, every member's own run (mode B; a
+//      member can be held until the last of them, B5.7) and one recheck for each member ahead of
+//      it. Otherwise the batch splits (step 6), and every member runs alone.
+//      QA-2.2-23: 9ed2abb instead ran the short members first inside the batch's scope. The
+//      scope's first execute takes its one hold, and 2.1's scope reports a failed hold attempt to
+//      every later call at once (P4). So a short member's cut slot wait became slot-busy for every
+//      other member, including members with a minute left. No member now runs in a scope whose
+//      hold another member's deadline decides: a pooled scope's first execute is the union under
+//      D, and a split member's scope is its own.
 //      Before the first measured run of a key, e is 0 and only the floor counts (a residual,
 //      B15).
 //   2. Union planning (B6), bounded by D: runtime.plan({ command and cwd of the first member,
@@ -179,10 +178,15 @@
 //      So a member never waits for a step it does not need: the member with the least time left
 //      runs, rechecks and settles first, and the queue never nests a scope. A member settled in
 //      the meantime (an abort) is skipped, and nothing is spawned for it.
-//   6. Split: every member is "own-run" (step 5), and there is no union run. The cost is the
-//      same as without batching, and the verdicts are the same by construction. The split is
-//      logged once per batch. Causes: an inconsistent union plan (step 2), or step 2a's
-//      deadline check.
+//   6. Split (QA-2.2-23): there is no union run, and this batch opens no scope. Every member runs
+//      alone, as a batch of one (step 1) with its own gate's runtime: its own scope, whose hold it
+//      takes under its own deadline, its own run and its own recheck. That is each member's
+//      direct path, so the cost is the same as without batching, and so is every verdict, apart
+//      from the time the member spent in the window (W3). The batches of one start in arrival
+//      order, the order in which the members' direct hooks would have queued for the slot, and
+//      each competes for the slot as its direct hook would: in parallel as far as
+//      maxConcurrentVerifications allows. The split is logged once per batch. Causes: step 2a's
+//      deadline check, or an inconsistent union plan (step 2).
 //   7. Finality and the flaky taint (B7.5). A member's outcome is known after step 4 (derived) or
 //      after its own run. It is FINAL once no taint can change it: the union was green or did not
 //      run, or every union failing id is reproduced (by a finished own run or a static
@@ -279,8 +283,7 @@
 //   7.5 Flaky taint (B-G2). When U had failing ids, unreproduced = U.failingIds minus the ids of
 //       every finished own run and every static derivation (7.3a). A derivation counts even for
 //       a member that left during the union run, because pytest attribution is exact (QA-2.2-3);
-//       an own run counts even when its member left before it returned. A solo member's run
-//       (B5.2a) does not count: it ran outside the union. The set only shrinks, so
+//       an own run counts even when its member left before it returned. The set only shrinks, so
 //       it is decided once it is empty or no own run is left (B5.7). If it is then non-empty,
 //       some union failure was reproduced by no member's own run, and taintUnreproduced makes
 //       EVERY live member's "ran" result complete = false, with the note "batched run failure not
@@ -421,9 +424,10 @@
 //     requester wait past its deadline.
 //   - QA-2.2-17: under the default policy (strictUnverifiable off) such a verdict is accepted, so
 //     the batch must not be what runs a member out of budget. W3 keeps each member's floor plus
-//     one run out of the window wait. B5.2a keeps a member out of the union unless its budget
-//     covers the worst-case batched schedule ahead of its recheck. W7 removes the window from a
-//     lone request altogether. What remains is an estimate's error (B15).
+//     one run out of the window wait. B5.2a pools the members only when every member's budget
+//     covers the worst-case batched schedule ahead of its recheck; otherwise each runs alone
+//     (B5.6). W7 removes the window from a lone request altogether. What remains is an
+//     estimate's error (B15).
 //
 // -----------------------------------------------------------------------------------------------
 // B10. SLOT DISCIPLINE (S3, QA-1.4-18)
@@ -434,7 +438,9 @@
 //   last of them. The coordinator never opens a scope while it waits on another (no nesting),
 //   and no requester's gate waits for a batch's close. Batches for different keys hold separate
 //   slots, but only as far as maxConcurrentVerifications allows (W6). A batch never waits for
-//   another batch, so batches cannot deadlock each other.
+//   another batch, so batches cannot deadlock each other. A split (B5.6) opens no scope and hands
+//   each member to a batch of one, which holds at most one slot, as the member's direct hook
+//   would; it never waits for those batches either.
 //   Early-settled members (QA-2.2-5, accepted cost). A member settles as soon as its outcome is
 //   final (B5.8) while its batch may still hold the slot for the other members' runs and
 //   rechecks. Its gate then goes on to its next S3 check (lintClean, run, ...), which opens its
@@ -527,9 +533,8 @@
 //   vitest/jest, failing              1 + n scoped runs (mode B), + 1 recheck per distinct
 //                                     reference among the failing members when later members'
 //                                     files are covered (B8.6), else up to 1 per member
-//   split (union inconsistent, or     n scoped runs, as without batching
+//   split (union inconsistent, or     n scoped runs and n scopes, as without batching (B5.6)
 //     the B5.2a deadline check)
-//   s solo members (B5.2a)            s own runs, then the pooled cost above for n - s members
 //   n = 1                             exactly the direct path (W7: no window wait when alone)
 //   The plan's acceptance criterion, "<= 1 scoped run + <= 1 recheck per window", is asserted on
 //   the green and pytest paths and with a shared reference. On the vitest/jest failing path the
@@ -581,8 +586,8 @@
 //         batching, not verdicts, until the next measurement.
 //   - Serial runs under one hold. With maxConcurrentVerifications > 1, the direct path could run
 //     members in parallel where a batch runs their own runs and rechecks one at a time. B5.2a
-//     sizes each pooled member's worst case against its own budget, whatever the slot count,
-//     but the solo members still run one after another.
+//     pools only when each member's worst case fits its own budget, whatever the slot count, and
+//     a split runs every member in its own scope, in parallel as far as the slots allow.
 //   - QA-2.2-5 (B10): an early-settled member's next S3 check may end slot-busy behind its own
 //     batch where alone it could have run.
 //
@@ -839,6 +844,8 @@ interface Ready {
 
 interface Member {
   readonly request: TestsPassRequest;
+  /** The submitting gate's runtime: a member that runs alone (B5.6) runs with it, as its direct hook would. */
+  readonly runtime: BatchRuntime;
   /** The member's own planScopedRun spec. */
   readonly spec: ScopedSpec;
   /** B8.1 (QA-2.2-2): the submitting gate's runtime.failureRecheck, not the window opener's. */
@@ -847,10 +854,8 @@ interface Member {
   readonly currentTree: TreeSnapshot | undefined;
   /** W3 (QA-2.2-17): the submitting gate's runtime.recheckMinRemainingMs, for its reserve. */
   readonly recheckMinRemainingMs: number;
-  /** Arrival order: the tie-break of every deadline ordering. */
+  /** Arrival order: the tie-break of every deadline ordering, and the order of a split (B5.6). */
   readonly seq: number;
-  /** B5.2a (QA-2.2-17 c): it runs its own spec, and its recheck, before the union and outside it. */
-  solo: boolean;
   phase: MemberPhase;
   settled: boolean;
   window: BatchWindow | undefined;
@@ -998,7 +1003,8 @@ export function createBatchCoordinator(options: BatchCoordinatorOptions = {}): B
       logger = undefined;
     }
   };
-  const live = (b: Batch) => b.members.filter((m) => !m.settled);
+  /** The members a batch still answers for: a split (B5.6) hands each member to a batch of its own. */
+  const live = (b: Batch) => b.members.filter((m) => !m.settled && m.batch === b);
 
   // -- settlement ------------------------------------------------------------------------------
 
@@ -1127,12 +1133,12 @@ export function createBatchCoordinator(options: BatchCoordinatorOptions = {}): B
     return new Promise<TestsPassRun>((resolve) => {
       const member: Member = {
         request,
+        runtime,
         spec,
         failureRecheck: runtime.failureRecheck,
         currentTree: runtime.currentTree,
         recheckMinRemainingMs: runtime.recheckMinRemainingMs,
         seq: arrivals++,
-        solo: false,
         phase: "window",
         settled: false,
         window: undefined,
@@ -1170,9 +1176,14 @@ export function createBatchCoordinator(options: BatchCoordinatorOptions = {}): B
     if (windows.get(w.key) === w) windows.delete(w.key);
     const members = w.members.filter((m) => !m.settled);
     if (members.length === 0) return;
+    startBatch(w.key, w.runtime, members);
+  }
+
+  /** A batch over `members` (W4), or a member's batch of one (B5.1, B5.6). */
+  function startBatch(key: string, runtime: BatchRuntime, members: readonly Member[]): void {
     const b: Batch = {
-      key: w.key,
-      runtime: w.runtime,
+      key,
+      runtime,
       members,
       deadline: createBatchDeadline(members.map((m) => m.request.deadline)),
       group: undefined,
@@ -1203,9 +1214,10 @@ export function createBatchCoordinator(options: BatchCoordinatorOptions = {}): B
     } catch (e) {
       // B-G5: fail closed for every member the failure affects.
       warn("verify batch: internal failure", { error: message(e) });
-      for (const m of b.members) settle(m, errorRun(`verification batch failed: ${message(e)}`));
+      for (const m of b.members) if (m.batch === b) settle(m, errorRun(`verification batch failed: ${message(e)}`));
     } finally {
-      for (const m of b.members) settle(m, errorRun("verification batch ended without an outcome"));
+      // A member handed to a batch of its own (B5.6) is that batch's to settle.
+      for (const m of b.members) if (m.batch === b) settle(m, errorRun("verification batch ended without an outcome"));
       running.delete(b);
       b.group?.dispose();
       b.deadline.dispose();
@@ -1221,38 +1233,28 @@ export function createBatchCoordinator(options: BatchCoordinatorOptions = {}): B
     if (b.members.length === 1) {
       queueOwn([first]);
     } else {
-      // Step 2a (QA-2.2-17 c): a member whose budget cannot cover the batched schedule runs alone.
-      const solo = soloForDeadline(b);
-      const pooled = b.members.filter((m) => !solo.has(m));
-      if (pooled.length <= 1) {
-        split(b, "the members' budgets cannot cover a batched run");
-      } else {
-        // Step 2.
-        const planned = await planUnion(b, pooled);
-        if (b.deadline.signal.aborted) return;
-        if (typeof planned === "string") {
-          split(b, planned);
-        } else {
-          unionSpec = planned;
-          if (solo.size > 0) {
-            warn("verify batch: members short of budget run alone before the batched run", { members: b.members.length, alone: solo.size });
-            for (const m of solo) {
-              m.solo = true;
-              if (!m.settled) m.phase = "own-wait";
-            }
-          }
-        }
+      // Step 2a (QA-2.2-17 c, QA-2.2-23): the batch pools only when every member's budget covers
+      // the batched schedule. Otherwise every member runs alone (step 6), with its own scope.
+      if (!poolFits(b)) {
+        dissolve(b, "the members' budgets cannot cover a batched run");
+        return;
       }
+      // Step 2.
+      const planned = await planUnion(b, live(b));
+      if (b.deadline.signal.aborted) return;
+      if (typeof planned === "string") {
+        dissolve(b, planned);
+        return;
+      }
+      unionSpec = planned;
     }
     // Everyone is gone, or the coordinator was disposed: open nothing.
     if (b.deadline.signal.aborted) return;
 
-    // Step 3.
+    // Step 3. Its first execute is the union under D, or a batch of one's own run under its own
+    // deadline: the hold is never taken under another member's deadline (QA-2.2-23).
     const scope = b.runtime.openScope({ cwd: first.request.cwd, command: first.request.command });
     b.scope = scope;
-
-    // Step 2a: the solo members' own runs and rechecks come first, earliest deadline first.
-    await drain(b, scope, true);
 
     // Step 4.
     if (unionSpec !== undefined) {
@@ -1272,24 +1274,19 @@ export function createBatchCoordinator(options: BatchCoordinatorOptions = {}): B
     }
 
     // Steps 5, 7 and 8 (QA-2.2-3).
-    await drain(b, scope, false);
+    await drain(b, scope);
   }
 
   /**
    * B5.5 (QA-2.2-3): one queue under the hold, one command at a time, earliest deadline first. A
    * member's recheck runs as soon as its outcome is final, before the own runs of members with
-   * more time left; nothing waits for a step it does not need. The solo phase (B5.2a) runs only
-   * the solo members, whose outcomes are final at once: no union failure can taint them.
+   * more time left; nothing waits for a step it does not need.
    */
-  async function drain(b: Batch, scope: BatchScope, soloPhase: boolean): Promise<void> {
+  async function drain(b: Batch, scope: BatchScope): Promise<void> {
     for (;;) {
-      if (soloPhase) {
-        for (const m of live(b)) if (m.solo && m.phase === "held") release(b, m);
-      } else {
-        advance(b);
-      }
+      advance(b);
       const next = live(b)
-        .filter((m) => (!soloPhase || m.solo) && (m.phase === "own-wait" || m.phase === "recheck-wait"))
+        .filter((m) => m.phase === "own-wait" || m.phase === "recheck-wait")
         .sort(byDeadline)[0];
       if (next === undefined) return;
       if (next.phase === "own-wait") await runOwn(b, scope, next);
@@ -1301,36 +1298,34 @@ export function createBatchCoordinator(options: BatchCoordinatorOptions = {}): B
     for (const m of members) m.phase = "own-wait";
   }
 
-  /** Step 6: every member runs its own spec, and there is no union run. */
-  function split(b: Batch, cause: string): void {
+  /**
+   * Step 6 (QA-2.2-23): the batch splits. Every live member runs alone as a batch of one (B5.1),
+   * with its own gate's runtime: its own scope, whose hold it takes under its own deadline, its own
+   * run and its own recheck. That is its direct path, so no member's slot wait, run or recheck
+   * depends on another member's budget. The batches start in arrival order, the order in which the
+   * members' direct hooks would have queued for the slot. This batch opened no scope, so no hold
+   * is shared or nested; each batch of one holds at most one, as its direct hook would.
+   */
+  function dissolve(b: Batch, cause: string): void {
     counters.splits++;
     warn("verify batch: split into own runs", { members: b.members.length, cause });
-    queueOwn(live(b));
+    for (const m of live(b).sort((x, y) => x.seq - y.seq)) startBatch(b.key, m.runtime, [m]);
   }
 
   /**
-   * B5.2a (QA-2.2-17 c). The members whose budget cannot cover the worst case of the batched
-   * schedule before their recheck: the union run, every pooled member's own run (mode B; a member
-   * can be held until the last of them, B5.7), one recheck for each pooled member ahead of it in
-   * deadline order, and the own run and recheck of every solo member, which come first. Each run
-   * and recheck is estimated at the key's last measured duration; before the first measurement
-   * the estimate is 0 and only the floor counts (W3). Moving a member to solo changes the others'
-   * sums, so the check repeats until nothing moves: at most once per member.
+   * B5.2a (QA-2.2-17 c). Whether every member's budget covers the worst case of the batched
+   * schedule before its recheck: the union run, every member's own run (mode B; a member can be
+   * held until the last of them, B5.7) and one recheck for each member ahead of it in deadline
+   * order. Each run and recheck is estimated at the key's last measured duration; before the
+   * first measurement the estimate is 0 and only the floor counts (W3).
    */
-  function soloForDeadline(b: Batch): Set<Member> {
+  function poolFits(b: Batch): boolean {
     const e = estimate(b.key);
     const order = live(b).sort(byDeadline);
-    const solo = new Set<Member>();
-    for (;;) {
-      const pooled = order.filter((m) => !solo.has(m));
-      const ahead = 2 * e * solo.size;
-      const short = pooled.find((m, i) => m.request.deadline.remaining() < floorOf(m) + ahead + e * (1 + pooled.length + i));
-      if (short === undefined) return solo;
-      solo.add(short);
-    }
+    return order.every((m, i) => m.request.deadline.remaining() >= floorOf(m) + e * (1 + order.length + i));
   }
 
-  /** B6 and the step-2 consistency checks over the pooled members. Returns the union spec, or the cause of a split. */
+  /** B6 and the step-2 consistency checks over the members. Returns the union spec, or the cause of a split. */
   async function planUnion(b: Batch, pooled: readonly Member[]): Promise<ScopedSpec | string> {
     const changes: BatchMemberChanges[] = [];
     for (const m of pooled) {
@@ -1364,11 +1359,9 @@ export function createBatchCoordinator(options: BatchCoordinatorOptions = {}): B
    * ids derived for a member that already left still count as reproduced.
    */
   function attribute(b: Batch, union: RanOutcome): void {
-    // B5.2a: the solo members are not in the union, and are settled by now.
-    const pooled = b.members.filter((m) => !m.solo);
-    const n = pooled.length;
+    const n = b.members.length;
     b.unionIds = taintable(union);
-    for (const m of pooled) {
+    for (const m of b.members) {
       const a = attributeUnion(union.result, union.result.testsByFile, m.spec, platform);
       if (a.kind === "own-run") {
         if (!m.settled) m.phase = "own-wait";
@@ -1428,7 +1421,7 @@ export function createBatchCoordinator(options: BatchCoordinatorOptions = {}): B
     warn("verify batch: a batched run failure was not reproduced by any request's own run", { ids: unreproduced });
     for (const m of live(b)) {
       const s = m.scoped;
-      if (!m.solo && s?.kind === "ran") m.scoped = { ...s, result: taintUnreproduced(s.result, unreproduced) };
+      if (s?.kind === "ran") m.scoped = { ...s, result: taintUnreproduced(s.result, unreproduced) };
     }
   }
 
@@ -1478,10 +1471,8 @@ export function createBatchCoordinator(options: BatchCoordinatorOptions = {}): B
     const link = linkDeadline(m.request.deadline, b.deadline.signal);
     const out = await execute(b.key, scope, m.spec, link.deadline);
     link.unlink();
-    // B7.5: a finished run is evidence even when its member has already left. A solo member's run
-    // (B5.2a) is not: it ran outside the union, so it cannot tell which pooled member a union
-    // failure belongs to.
-    if (out.kind === "ran" && !m.solo) for (const id of out.result.failingIds) b.reproduced.add(id);
+    // B7.5: a finished run is evidence even when its member has already left.
+    if (out.kind === "ran") for (const id of out.result.failingIds) b.reproduced.add(id);
     if (m.settled) return;
     m.scoped = out;
     if (out.kind !== "ran") settle(m, { scoped: out, recheck: undefined });
