@@ -698,6 +698,24 @@ describe("materialize / dispose", { timeout: 60_000 }, () => {
     }
   });
 
+  it("QA-1.5-16: a clean `eol=crlf` file edited between capture and materialize -> inexact for that path", async () => {
+    await fsp.writeFile(join(repo, ".gitattributes"), "a.txt text eol=crlf\n");
+    await git(repo, "add", ".gitattributes");
+    await git(repo, "commit", "-q", "-m", "eol");
+    expect(await git(repo, "status", "--porcelain")).toBe("");
+    const ref = await capture();
+    expect(ref.tracked.size).toBe(0);
+    await fsp.writeFile(join(repo, "a.txt"), "a1\n"); // the producer's edit after dispatch
+    const handle = await mat(ref);
+    try {
+      expect(await fsp.readFile(join(handle.dir, "a.txt"), "utf8")).toBe("a0\r\n");
+      expect(handle.exact).toBe(false);
+      expect(handle.inexactReasons).toContainEqual({ cause: "checkout-conversion", path: "a.txt" });
+    } finally {
+      await handle.dispose();
+    }
+  });
+
   it("QA-1.5-13: an eol comparison that cannot run makes the reference approximate, not failed", async () => {
     const failing: CaptureDeps["argv"] = async (file, args, opts) =>
       args.includes("--eol") ? { code: 128, stdout: "", stderr: "fatal: simulated", timedOut: false } : argv(file, args, opts);

@@ -1022,13 +1022,15 @@ function splitZ(stdout: string): string[] {
  * mixed, none, -text, or "" for a missing or non-regular file). Each record is
  * "i/%-5s w/%-5s attr/%-17s\t<path>" (git's ls-files.c); only the path follows the tab.
  */
-function parseEolList(stdout: string): Map<string, string> {
-  const result = new Map<string, string>();
+function parseEolList(stdout: string): Map<string, { i: string; w: string }> {
+  const result = new Map<string, { i: string; w: string }>();
   for (const record of splitZ(stdout)) {
     const tab = record.indexOf("\t");
     if (tab < 0) continue;
-    const match = /(?:^|\s)w\/(\S*)/.exec(record.slice(0, tab));
-    if (match) result.set(record.slice(tab + 1), match[1] ?? "");
+    const prefix = record.slice(0, tab);
+    const w = /(?:^|\s)w\/(\S*)/.exec(prefix);
+    const i = /^i\/(\S*)/.exec(prefix);
+    if (w) result.set(record.slice(tab + 1), { i: i?.[1] ?? "", w: w[1] ?? "" });
   }
   return result;
 }
@@ -1776,8 +1778,15 @@ export async function materialize(
       if (!liveEol || !refEol) {
         conversion(""); // not compared: budget spent or git failed
       } else {
+        // QA-1.5-16: a path edited since capture (in changed, not in ref.tracked) has unknown
+        // dispatch bytes; it is flagged when the reference's checkout converted it (w/ != i/).
         const differing = [...refEol]
-          .filter(([rel, w]) => !ref.tracked.has(rel) && !changed.has(rel) && liveEol.has(rel) && liveEol.get(rel) !== w)
+          .filter(([rel, { i, w }]) => {
+            if (ref.tracked.has(rel)) return false;
+            if (changed.has(rel)) return i !== "" && w !== "" && i !== w;
+            const live = liveEol.get(rel);
+            return live !== undefined && live.w !== w;
+          })
           .map(([rel]) => rel)
           .sort(byCodeUnit);
         for (const rel of differing.slice(0, MAX_CONVERSION_REASONS)) conversion(rel);
