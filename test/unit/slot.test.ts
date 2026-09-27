@@ -1,9 +1,21 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
+import { open as fsOpen, unlink as fsUnlink, utimes as fsUtimes } from "node:fs/promises";
 import { hostname, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { acquireSlot, isPidAlive, withSlot, type SlotDeps, type SlotHandle, type SlotResult } from "../../src/verify/slot";
+import {
+  acquireSlot,
+  exitReleaseFailures,
+  isPidAlive,
+  reapClaimPath,
+  releaseAllSlotsSync,
+  withSlot,
+  type FileSnapshot,
+  type SlotDeps,
+  type SlotHandle,
+  type SlotResult,
+} from "../../src/verify/slot";
 
 // Every test uses its own slot dir, never the real shared one, so parallel runs
 // cannot interfere. Timing constants are scaled down through the deps seam.
@@ -41,11 +53,37 @@ function writeLock(path: string, over: Record<string, unknown>, ageMs = 0): void
   writeFileSync(path, JSON.stringify({ pid: process.pid, hostname: hostname(), token: "other", startedAt: 0, cwd: "", command: "", ...over }));
   if (ageMs) setAge(path, ageMs);
 }
+function tokenAt(path: string): string | undefined {
+  if (!existsSync(path)) return undefined;
+  const v: unknown = JSON.parse(readFileSync(path, "utf8"));
+  return typeof v === "object" && v !== null && "token" in v ? String(v.token) : undefined;
+}
 function setAge(path: string, ageMs: number): void {
   const t = new Date(Date.now() - ageMs);
   utimesSync(path, t, t);
 }
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+async function waitUntil(cond: () => boolean, ms = 5_000): Promise<void> {
+  const end = Date.now() + ms;
+  while (!cond()) {
+    if (Date.now() > end) throw new Error("condition not met in time");
+    await sleep(10);
+  }
+}
+/** The default read of slot.ts, for seams that wrap it. */
+async function realRead(path: string): Promise<FileSnapshot> {
+  const fh = await fsOpen(path, "r");
+  try {
+    const st = await fh.stat();
+    return { text: await fh.readFile("utf8"), mtimeMs: st.mtimeMs, size: st.size };
+  } finally {
+    await fh.close();
+  }
+}
+/** Claim files (`slot-<i>.lock.reap-<hash>`) present in `dir`. */
+function claimsIn(dir: string): string[] {
+  return readdirSync(dir).filter((n) => n.includes(".reap-"));
+}
 /** A PID that is not running now (Windows reuses PIDs quickly, so check it). */
 async function deadPid(): Promise<number> {
   for (;;) {
@@ -204,13 +242,17 @@ describe("slot: stale detection", () => {
     held(await acquireSlot({ max: 1, waitMs: 0, meta }, deps));
   }, 15_000);
 
-  it("a foreign host lock is never judged by PID: fresh heartbeat kept, old heartbeat reclaimed", async () => {
+  it("a foreign host lock is never judged by PID: fresh heartbeat kept, old heartbeat reclaimed after confirmation", async () => {
     const dir = freshDir();
     const p = join(dir, "slot-0.lock");
     writeLock(p, { hostname: "some-other-host", pid: await deadPid() });
     expect(await acquireSlot({ max: 1, waitMs: 400, meta }, fast(dir, { staleMs: 5_000 }))).toEqual({ busy: true });
     setAge(p, 6_000);
-    held(await acquireSlot({ max: 1, waitMs: 0, meta }, fast(dir, { staleMs: 5_000 })));
+    // One look is not enough: the same (token, mtime) must be seen for 2 heartbeats (2 x 100 ms).
+    expect(await acquireSlot({ max: 1, waitMs: 0, meta }, fast(dir, { staleMs: 5_000 }))).toEqual({ busy: true });
+    const t0 = Date.now();
+    held(await acquireSlot({ max: 1, waitMs: 3_000, meta }, fast(dir, { staleMs: 5_000 })));
+    expect(Date.now() - t0).toBeGreaterThanOrEqual(190);
   });
 
   it("same host + dead PID is stale immediately, even with a fresh heartbeat", async () => {
@@ -223,9 +265,62 @@ describe("slot: stale detection", () => {
     const dir = freshDir();
     const p = join(dir, "slot-0.lock");
     writeFileSync(p, body);
-    expect(await acquireSlot({ max: 1, waitMs: 0, meta }, fast(dir, { corruptGraceMs: 5_000 }))).toEqual({ busy: true });
-    setAge(p, 6_000);
-    held(await acquireSlot({ max: 1, waitMs: 0, meta }, fast(dir, { corruptGraceMs: 5_000 })));
+    expect(await acquireSlot({ max: 1, waitMs: 0, meta }, fast(dir, { corruptGraceMs: 300 }))).toEqual({ busy: true });
+    const t0 = Date.now();
+    held(await acquireSlot({ max: 1, waitMs: 3_000, meta }, fast(dir, { corruptGraceMs: 300 })));
+    expect(Date.now() - t0).toBeGreaterThanOrEqual(250);
+  });
+});
+
+describe("slot: clock changes and suspend/resume (QA-1.4-1, QA-1.4-8)", () => {
+  it("production defaults: a live holder whose file looks 31 s old (resume from sleep) or a waiter whose clock jumped +31 s does not reap it", async () => {
+    const dir = freshDir();
+    const p = join(dir, "slot-0.lock");
+    held(await acquireSlot({ max: 1, waitMs: 0, meta }, { dir }));
+    setAge(p, 31_000);
+    expect(await acquireSlot({ max: 1, waitMs: 0, meta }, { dir })).toEqual({ busy: true });
+    expect(await acquireSlot({ max: 1, waitMs: 0, meta }, { dir, now: () => Date.now() + 31_000 })).toEqual({ busy: true });
+    expect(existsSync(p)).toBe(true);
+  });
+
+  it("a live holder keeps its slot against a waiting observer with an aged file or a stepped clock", async () => {
+    const dir = freshDir();
+    const p = join(dir, "slot-0.lock");
+    held(await acquireSlot({ max: 1, waitMs: 0, meta }, fast(dir, { heartbeatMs: 100 })));
+    const mine = tokenAt(p);
+    setAge(p, 31_000);
+    // The observer confirms over 2 of its heartbeats (2 x 500 ms); the holder beats every 100 ms.
+    const observer = fast(dir, { heartbeatMs: 500, staleMs: 1_000 });
+    expect(await acquireSlot({ max: 1, waitMs: 1_500, meta }, observer)).toEqual({ busy: true });
+    expect(await acquireSlot({ max: 1, waitMs: 1_500, meta }, { ...observer, now: () => Date.now() + 31_000 })).toEqual({ busy: true });
+    expect(tokenAt(p)).toBe(mine);
+  }, 10_000);
+
+  it("a lock whose mtime is in the future (clock stepped back) is reclaimed once seen unchanged for staleMs of monotonic time", async () => {
+    const dir = freshDir();
+    const p = join(dir, "slot-0.lock");
+    writeLock(p, { hostname: "some-other-host" });
+    const future = new Date(Date.now() + 3_600_000);
+    utimesSync(p, future, future);
+    const t0 = Date.now();
+    held(await acquireSlot({ max: 1, waitMs: 5_000, meta }, fast(dir, { staleMs: 600 })));
+    expect(Date.now() - t0).toBeGreaterThanOrEqual(550);
+  });
+
+  it("the wait deadline is monotonic: wall-clock steps neither cut a wait short nor extend it", async () => {
+    const dir = freshDir();
+    held(await acquireSlot({ max: 1, waitMs: 0, meta }, fast(dir)));
+    // The observers confirm staleness over 2 x 1 s, longer than the wait: only the deadline ends it.
+    let calls = 0;
+    const forward = () => Date.now() + (calls++ > 1 ? 3_600_000 : 0);
+    let t0 = Date.now();
+    expect(await acquireSlot({ max: 1, waitMs: 600, meta }, fast(dir, { heartbeatMs: 1_000, now: forward }))).toEqual({ busy: true });
+    expect(Date.now() - t0).toBeGreaterThanOrEqual(550);
+    calls = 0;
+    const backward = () => Date.now() - (calls++ > 1 ? 3_600_000 : 0);
+    t0 = Date.now();
+    expect(await acquireSlot({ max: 1, waitMs: 600, meta }, fast(dir, { heartbeatMs: 1_000, now: backward }))).toEqual({ busy: true });
+    expect(Date.now() - t0).toBeLessThan(2_000);
   });
 });
 
@@ -249,7 +344,7 @@ describe("slot: release", () => {
     const p = join(dir, "slot-0.lock");
     const a = held(await acquireSlot({ max: 1, waitMs: 0, meta }, fast(dir, { heartbeatMs: 1_000_000 })));
     setAge(p, 10_000);
-    const b = held(await acquireSlot({ max: 1, waitMs: 0, meta }, fast(dir, { staleMs: 1_000 })));
+    const b = held(await acquireSlot({ max: 1, waitMs: 2_000, meta }, fast(dir, { staleMs: 1_000 })));
     const owner = readFileSync(p, "utf8");
     await a.release();
     expect(readFileSync(p, "utf8")).toBe(owner);
@@ -279,6 +374,7 @@ describe("slot: release", () => {
     await b.release();
     expect(existsSync(p)).toBe(true);
     expect(warns.some((w) => w.includes("could not delete"))).toBe(true);
+    expect(warns.some((w) => w.includes("release incomplete"))).toBe(true);
     // Still ours and still held: another acquirer is busy until it goes stale.
     expect(await acquireSlot({ max: 1, waitMs: 0, meta }, fast(dir))).toEqual({ busy: true });
   });
@@ -299,6 +395,191 @@ describe("slot: release", () => {
       }, deps),
     ).rejects.toBeDefined();
     expect(existsSync(p)).toBe(false);
+  });
+});
+
+describe("slot: claims replace the time-leased reap lock (QA-1.4-2, QA-1.4-11)", () => {
+  it("a crashed reaper's claim (dead PID) is cleared and the dead lock reaped at once", async () => {
+    const dir = freshDir();
+    const p = join(dir, "slot-0.lock");
+    writeLock(p, { pid: await deadPid(), token: "dead-holder" });
+    writeLock(reapClaimPath(p, "dead-holder"), { pid: await deadPid(), token: "dead-reaper", command: "reap" });
+    held(await acquireSlot({ max: 1, waitMs: 0, meta }, fast(dir)));
+    expect(claimsIn(dir)).toEqual([]);
+  });
+
+  it("a live claimer's claim survives one look and a stepped clock; it is removed only once inert", async () => {
+    const dir = freshDir();
+    const p = join(dir, "slot-0.lock");
+    writeLock(p, { pid: await deadPid(), token: "dead-holder" });
+    const claim = reapClaimPath(p, "dead-holder");
+    writeLock(claim, { pid: process.ppid, token: "live-claimer", command: "reap" }, 60_000);
+    expect(await acquireSlot({ max: 1, waitMs: 0, meta }, { dir })).toEqual({ busy: true });
+    expect(await acquireSlot({ max: 1, waitMs: 0, meta }, { dir, now: () => Date.now() + 10_500 })).toEqual({ busy: true });
+    expect(existsSync(claim)).toBe(true);
+    // Inert: older than staleMs and seen unchanged for 2 x claimHoldMaxMs (2 x 100 ms here).
+    const t0 = Date.now();
+    held(await acquireSlot({ max: 1, waitMs: 3_000, meta }, fast(dir, { claimHoldMaxMs: 100 })));
+    expect(Date.now() - t0).toBeGreaterThanOrEqual(190);
+    expect(claimsIn(dir)).toEqual([]);
+  });
+
+  it("a reaper held inside its claim by EBUSY retries keeps it against a waiter whose clock jumped (P3)", async () => {
+    const dir = freshDir();
+    const p = join(dir, "slot-0.lock");
+    writeLock(p, { pid: await deadPid(), token: "dead-holder" });
+    let blocking = true;
+    const stuck = async (path: string) => {
+      if (path === p && blocking) throw Object.assign(new Error("busy"), { code: "EBUSY" });
+      await fsUnlink(path);
+    };
+    const a = acquireSlot({ max: 1, waitMs: 5_000, meta }, fast(dir, { unlink: stuck, unlinkRetryMs: 40 }));
+    await waitUntil(() => claimsIn(dir).length === 1);
+    expect(await acquireSlot({ max: 1, waitMs: 0, meta }, fast(dir, { now: () => Date.now() + 10_500 }))).toEqual({ busy: true });
+    blocking = false;
+    held(await a);
+    expect(await acquireSlot({ max: 1, waitMs: 0, meta }, fast(dir))).toEqual({ busy: true });
+    expect(claimsIn(dir)).toEqual([]);
+  });
+
+  it("6 processes against a planted dead lock: never two holders", async () => {
+    const dir = freshDir();
+    writeLock(join(dir, "slot-0.lock"), { pid: await deadPid(), token: "planted" });
+    await cycleSix(dir, 1, 150);
+    expect(claimsIn(dir)).toEqual([]);
+  }, 30_000);
+
+  it("6 processes against a planted dead lock plus a crashed reaper's claim and legacy reap/tombstone files", async () => {
+    const dir = freshDir();
+    const p = join(dir, "slot-0.lock");
+    writeLock(p, { pid: await deadPid(), token: "planted" });
+    writeLock(reapClaimPath(p, "planted"), { pid: await deadPid(), token: "dead-reaper", command: "reap" }, 11_000);
+    writeFileSync(`${p}.reap`, "legacy");
+    writeFileSync(`${p}.reap.dead-0`, "tombstone");
+    await cycleSix(dir, 1, 150);
+    expect(claimsIn(dir)).toEqual([]);
+  }, 30_000);
+});
+
+describe("slot: release never fails the caller (QA-1.4-4, QA-1.4-6, QA-1.4-17)", () => {
+  const eio = async (path: string) => {
+    if (/slot-\d+\.lock$/.test(path)) throw Object.assign(new Error("io"), { code: "EIO" });
+    await fsUnlink(path);
+  };
+
+  it("release never rejects and does not cache a failure; withSlot keeps fn's value and error", async () => {
+    const dir = freshDir();
+    const warns: string[] = [];
+    const a = held(await acquireSlot({ max: 1, waitMs: 0, meta }, fast(dir, { unlink: eio, logger: { warn: (m) => warns.push(m) } })));
+    await expect(a.release()).resolves.toBeUndefined();
+    await expect(a.release()).resolves.toBeUndefined();
+    expect(warns.some((w) => w.includes("release incomplete"))).toBe(true);
+
+    let breakReads = false;
+    const read = async (path: string) => {
+      if (breakReads) throw Object.assign(new Error("io"), { code: "EIO" });
+      return realRead(path);
+    };
+    const b = held(await acquireSlot({ max: 1, waitMs: 0, meta }, fast(freshDir(), { read })));
+    breakReads = true;
+    await expect(b.release()).resolves.toBeUndefined();
+    breakReads = false;
+
+    expect(await withSlot({ max: 1, waitMs: 0, meta }, async () => 42, fast(freshDir(), { unlink: eio }))).toEqual({ value: 42 });
+    await expect(
+      withSlot({ max: 1, waitMs: 0, meta }, async () => { throw new Error("boom"); }, fast(freshDir(), { unlink: eio })),
+    ).rejects.toThrow("boom");
+  });
+
+  it("transient sharing violations on the lock and claim files during release are retried, and the file is deleted", async () => {
+    const dir = freshDir();
+    const p = join(dir, "slot-0.lock");
+    let busyReads = 0;
+    const read = async (path: string) => {
+      if (busyReads > 0 && (path === p || path.includes(".reap-"))) {
+        busyReads--;
+        throw Object.assign(new Error("busy"), { code: "EBUSY" });
+      }
+      return realRead(path);
+    };
+    const warns: string[] = [];
+    const a = held(await acquireSlot({ max: 1, waitMs: 0, meta }, fast(dir, { read, logger: { warn: (m) => warns.push(m) } })));
+    busyReads = 4;
+    await a.release();
+    expect(existsSync(p)).toBe(false);
+    expect(claimsIn(dir)).toEqual([]);
+    expect(warns).toEqual([]);
+    held(await acquireSlot({ max: 1, waitMs: 0, meta }, fast(dir)));
+  });
+
+  it("a release that cannot read its lock keeps the slot, warns, and deletes it in the background later", async () => {
+    const dir = freshDir();
+    const p = join(dir, "slot-0.lock");
+    let locked = false;
+    const read = async (path: string) => {
+      if (locked && path === p) throw Object.assign(new Error("busy"), { code: "EBUSY" });
+      return realRead(path);
+    };
+    const warns: string[] = [];
+    const a = held(await acquireSlot({ max: 1, waitMs: 0, meta }, fast(dir, { read, unlinkRetries: 2, logger: { warn: (m) => warns.push(m) } })));
+    locked = true;
+    await a.release();
+    expect(existsSync(p)).toBe(true);
+    expect(warns.some((w) => w.includes("release incomplete"))).toBe(true);
+    expect(await acquireSlot({ max: 1, waitMs: 0, meta }, fast(dir))).toEqual({ busy: true });
+    locked = false;
+    await waitUntil(() => !existsSync(p));
+    held(await acquireSlot({ max: 1, waitMs: 0, meta }, fast(dir)));
+  });
+
+  it("a heartbeat tick in flight when release starts never touches the file afterwards", async () => {
+    const dir = freshDir();
+    const p = join(dir, "slot-0.lock");
+    let arm = false;
+    let gate: () => void = () => undefined;
+    let started: () => void = () => undefined;
+    const tickStarted = new Promise<void>((r) => (started = r));
+    const read = async (path: string) => {
+      if (arm && path === p) {
+        arm = false;
+        started();
+        await new Promise<void>((r) => (gate = r));
+      }
+      return realRead(path);
+    };
+    let touches = 0;
+    const utimes = async (path: string, t: Date) => {
+      touches++;
+      await fsUtimes(path, t, t);
+    };
+    const a = held(await acquireSlot({ max: 1, waitMs: 0, meta }, fast(dir, { heartbeatMs: 50, read, utimes })));
+    arm = true;
+    await tickStarted;
+    const before = touches;
+    const releasing = a.release();
+    gate();
+    await releasing;
+    await sleep(200);
+    expect(touches).toBe(before);
+    expect(existsSync(p)).toBe(false);
+  });
+
+  it("the exit hook follows the claim protocol: it deletes its own file and leaves one a live reaper has claimed", async () => {
+    const dir = freshDir();
+    const p0 = join(dir, "slot-0.lock");
+    const p1 = join(dir, "slot-1.lock");
+    const deps = fast(dir, { heartbeatMs: 1_000_000 });
+    held(await acquireSlot({ max: 2, waitMs: 0, meta }, deps));
+    held(await acquireSlot({ max: 2, waitMs: 0, meta }, deps));
+    const foreign = reapClaimPath(p1, tokenAt(p1)!);
+    writeLock(foreign, { pid: process.ppid, token: "reaper", command: "reap" });
+    const failures = exitReleaseFailures;
+    releaseAllSlotsSync();
+    expect(existsSync(p0)).toBe(false);
+    expect(existsSync(p1)).toBe(true);
+    expect(claimsIn(dir)).toEqual([foreign.slice(dir.length + 1)]);
+    expect(exitReleaseFailures).toBe(failures);
+    rmSync(foreign);
   });
 });
 

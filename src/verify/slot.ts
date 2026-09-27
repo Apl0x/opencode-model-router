@@ -6,35 +6,57 @@
  * `<tmp>/opencode-model-router/verify-slots/slot-<i>.lock`, created with
  * `open(path, "wx")` (atomic create-or-fail on NTFS and ext4, see the Phase 1.4
  * pre-flight) and holding `{pid, hostname, token, startedAt, cwd, command}`.
+ * The creator re-reads the file after writing it and holds the slot only if its
+ * own token is there (a creator stalled between the create and the write may
+ * have been reaped as an empty file).
  *
- * Crash recovery: the holder refreshes the file's mtime every 5 s (unref'd
- * timer). A lock is stale when its host is this host and its PID is dead, or
- * when its heartbeat is older than 30 s whatever the host (a foreign PID space
- * is never probed). A corrupt/empty lock is stale once it is older than a short
- * grace, because a creator writes the JSON right after the exclusive create.
+ * Staleness. The holder refreshes the file's mtime every `heartbeatMs` (5 s,
+ * unref'd timer). A lock is stale when
+ *   (a) its host is this host and its PID is dead (immediately), or
+ *   (b) its heartbeat is older than `staleMs` (30 s) by the wall clock, AND this
+ *       process has seen the same (token, mtime) for at least 2 heartbeats of its
+ *       own monotonic clock (`performance.now()`), with no gap longer than 2
+ *       heartbeats between two observations.
+ * A suspend/resume or a clock step makes a live holder's file look old, but the
+ * holder heartbeats within one interval after it runs again, which changes the
+ * mtime and restarts the observation; a gap in the observations (the observer
+ * slept) restarts it too. A lock seen unchanged for `staleMs` of monotonic time
+ * is stale whatever its mtime says (an mtime in the future after the clock
+ * stepped back). A foreign host is never judged by PID. A corrupt/empty lock uses
+ * rule (b) with the short `corruptGraceMs` for both the age and the observation,
+ * because a creator writes the JSON right after the exclusive create.
  *
- * TOCTOU between "judged stale" and "deleted": every delete of a slot file (a
- * reap of a stale lock, or an owner's release) happens under a per-slot reap
- * lock (`slot-<i>.lock.reap`, also `wx`) and re-reads the file under it,
- * deleting only when the token is still the one judged stale. Creation needs
- * the slot file to be absent and only deleters remove it, so under the reap
- * lock the file cannot change identity between the re-read and the unlink.
- * Unlink failures from antivirus/indexer handles (EBUSY/EPERM/EACCES) are
- * retried and never reported as success.
+ * Deletion. Every delete of a lock file whose identity is K (its token; for a
+ * corrupt file its mtime and size) runs under the claim file
+ * `slot-<i>.lock.reap-<hash(K)>`, created with `wx`. That includes the owner's
+ * own release and the exit hook. The claim holder re-reads the file before every
+ * unlink attempt and deletes it only while it is still K. K is never reused and
+ * only a K-claim holder deletes K's file, so the file cannot be deleted and
+ * re-created between the re-read and the unlink (no ABA, no time lease).
+ * A claim holds `{pid, hostname, token}` and is removed by its owner. A crashed
+ * claimer's claim is removed the same way, under the claim for *its* token, when
+ * its owner is provably dead (same host, dead PID) or when it is older than
+ * `staleMs` and has been seen unchanged for 2 x `claimHoldMaxMs`. A claimer never
+ * deletes anything after holding its claim for `claimHoldMaxMs` of its monotonic
+ * clock (self-fencing), so the second rule never removes the claim of a claimer
+ * that still acts. Transient antivirus/indexer errors (EBUSY/EPERM/EACCES) are
+ * retried, and a failed delete is never reported as success.
  *
- * Clock note: age is `now - mtime`. An mtime in the future (clock moved back)
- * counts as fresh, so a clock change can delay reclaiming a crashed foreign
- * holder but never makes a live holder look stale; same-host crashes are still
- * caught by the PID probe.
+ * Residual risk: every check-then-act on a file system has a window between the
+ * last check and the syscall. A process frozen exactly there (SIGSTOP, a debugger)
+ * for longer than the stale rules allow can still act late. A holder that stops
+ * heartbeating for 2 intervals while its lock looks older than `staleMs` is
+ * reaped; that is the plan's heartbeat contract.
  *
  * If the temp dir is unwritable the module degrades to an in-process semaphore
  * with the same API and logs that once per slot dir. No process is spawned here.
  */
-import { randomUUID } from "node:crypto";
-import { readFileSync, unlinkSync } from "node:fs";
-import { mkdir, open, readFile, stat, unlink, utimes } from "node:fs/promises";
+import { createHash, randomUUID } from "node:crypto";
+import { closeSync, openSync, readFileSync, unlinkSync, writeSync } from "node:fs";
+import { mkdir, open, unlink, utimes, type FileHandle } from "node:fs/promises";
 import { hostname as osHostname, tmpdir } from "node:os";
 import { join } from "node:path";
+import { performance } from "node:perf_hooks";
 import type { PluginLogger } from "../router/logger";
 
 export interface SlotMeta {
@@ -50,17 +72,28 @@ export interface SlotOptions {
 }
 
 export interface SlotHandle {
+  /** Deletes this holder's lock file. Idempotent; never rejects. */
   release(): Promise<void>;
 }
 
 export type SlotResult = SlotHandle | { busy: true };
+
+/** One consistent read of a lock file: content and stat from the same open file. */
+export interface FileSnapshot {
+  text: string;
+  mtimeMs: number;
+  size: number;
+}
 
 /** Test seams. Defaults are the production values of plan 1.4.1. */
 export interface SlotDeps {
   /** Slot directory. Default: `<os.tmpdir()>/opencode-model-router/verify-slots`. */
   dir?: string;
   logger?: Pick<PluginLogger, "warn">;
+  /** Wall clock (ms). Compared with file mtimes and written into new files, nothing else. */
   now?: () => number;
+  /** Monotonic clock (ms). Wait deadlines, observation windows and claim fencing. */
+  mono?: () => number;
   random?: () => number;
   hostname?: string;
   pid?: number;
@@ -68,10 +101,13 @@ export interface SlotDeps {
   heartbeatMs?: number;
   staleMs?: number;
   corruptGraceMs?: number;
+  /** A claimer stops deleting after holding its claim this long (self-fencing). */
+  claimHoldMaxMs?: number;
   backoffMinMs?: number;
   backoffMaxMs?: number;
-  reapStaleMs?: number;
   unlink?: (path: string) => Promise<void>;
+  read?: (path: string) => Promise<FileSnapshot>;
+  utimes?: (path: string, time: Date) => Promise<void>;
   unlinkRetries?: number;
   unlinkRetryMs?: number;
   /** Called on every wake-up of the wait loop (attempt), for busy-wait assertions. */
@@ -82,9 +118,9 @@ export const SLOT_DEFAULTS = {
   heartbeatMs: 5_000,
   staleMs: 30_000,
   corruptGraceMs: 2_000,
+  claimHoldMaxMs: 5_000,
   backoffMinMs: 250,
   backoffMaxMs: 2_000,
-  reapStaleMs: 10_000,
   unlinkRetries: 6,
   unlinkRetryMs: 50,
 } as const;
@@ -104,8 +140,10 @@ interface LockInfo {
 
 type LockState =
   | { kind: "missing" }
+  | { kind: "unreadable"; code: string }
   | { kind: "ok"; info: LockInfo; mtimeMs: number }
-  | { kind: "corrupt"; mtimeMs: number };
+  | { kind: "corrupt"; mtimeMs: number; size: number };
+type Present = Extract<LockState, { kind: "ok" | "corrupt" }>;
 
 type Cfg = Required<Omit<SlotDeps, "logger" | "onAttempt">> & Pick<SlotDeps, "logger" | "onAttempt">;
 
@@ -113,8 +151,20 @@ function errCode(e: unknown): string | undefined {
   return typeof e === "object" && e !== null && "code" in e ? String((e as { code: unknown }).code) : undefined;
 }
 
-const RETRYABLE_UNLINK = new Set(["EBUSY", "EPERM", "EACCES"]);
+/** Sharing violations from antivirus/indexer handles: retried, never a verdict. */
+const TRANSIENT = new Set(["EBUSY", "EPERM", "EACCES"]);
 const UNWRITABLE = new Set(["EACCES", "EPERM", "EROFS", "ENOTDIR", "ENOENT", "EEXIST"]);
+
+/** Failures of the logger itself (a throwing logger must not break slot bookkeeping). */
+export let loggerFailures = 0;
+
+function warn(cfg: Cfg, msg: string, data: Record<string, unknown>): void {
+  try {
+    cfg.logger?.warn(msg, data);
+  } catch {
+    loggerFailures++;
+  }
+}
 
 export function isPidAlive(pid: number): boolean {
   try {
@@ -127,10 +177,22 @@ export function isPidAlive(pid: number): boolean {
   }
 }
 
+async function readSnapshot(path: string): Promise<FileSnapshot> {
+  const fh = await open(path, "r");
+  try {
+    const st = await fh.stat();
+    const text = await fh.readFile("utf8");
+    return { text, mtimeMs: st.mtimeMs, size: st.size };
+  } finally {
+    await fh.close();
+  }
+}
+
 function resolveCfg(deps: SlotDeps = {}): Cfg {
   return {
     dir: deps.dir ?? defaultSlotDir(),
     now: deps.now ?? Date.now,
+    mono: deps.mono ?? (() => performance.now()),
     random: deps.random ?? Math.random,
     hostname: deps.hostname ?? osHostname(),
     pid: deps.pid ?? process.pid,
@@ -138,10 +200,12 @@ function resolveCfg(deps: SlotDeps = {}): Cfg {
     heartbeatMs: deps.heartbeatMs ?? SLOT_DEFAULTS.heartbeatMs,
     staleMs: deps.staleMs ?? SLOT_DEFAULTS.staleMs,
     corruptGraceMs: deps.corruptGraceMs ?? SLOT_DEFAULTS.corruptGraceMs,
+    claimHoldMaxMs: deps.claimHoldMaxMs ?? SLOT_DEFAULTS.claimHoldMaxMs,
     backoffMinMs: deps.backoffMinMs ?? SLOT_DEFAULTS.backoffMinMs,
     backoffMaxMs: deps.backoffMaxMs ?? SLOT_DEFAULTS.backoffMaxMs,
-    reapStaleMs: deps.reapStaleMs ?? SLOT_DEFAULTS.reapStaleMs,
     unlink: deps.unlink ?? unlink,
+    read: deps.read ?? readSnapshot,
+    utimes: deps.utimes ?? ((p, t) => utimes(p, t, t)),
     unlinkRetries: deps.unlinkRetries ?? SLOT_DEFAULTS.unlinkRetries,
     unlinkRetryMs: deps.unlinkRetryMs ?? SLOT_DEFAULTS.unlinkRetryMs,
     logger: deps.logger,
@@ -169,95 +233,189 @@ function parseLock(text: string): LockInfo | undefined {
   }
 }
 
-async function readLock(path: string): Promise<LockState> {
+/** Missing, unreadable (a scanner holds it: unknown, never stale), or present. */
+async function readLock(path: string, cfg: Cfg): Promise<LockState> {
+  let snap: FileSnapshot;
   try {
-    const st = await stat(path);
-    const text = await readFile(path, "utf8");
-    const info = parseLock(text);
-    return info ? { kind: "ok", info, mtimeMs: st.mtimeMs } : { kind: "corrupt", mtimeMs: st.mtimeMs };
+    snap = await cfg.read(path);
   } catch (e) {
     const code = errCode(e);
     if (code === "ENOENT") return { kind: "missing" };
-    // Held open/locked by a scanner: unknown, so treat as present and fresh.
-    if (code === "EBUSY" || code === "EPERM" || code === "EACCES") return { kind: "corrupt", mtimeMs: Number.POSITIVE_INFINITY };
+    if (code !== undefined && TRANSIENT.has(code)) return { kind: "unreadable", code };
     throw e;
   }
+  const info = parseLock(snap.text);
+  return info ? { kind: "ok", info, mtimeMs: snap.mtimeMs } : { kind: "corrupt", mtimeMs: snap.mtimeMs, size: snap.size };
 }
 
-function isStale(s: LockState, cfg: Cfg): boolean {
-  if (s.kind === "missing") return false;
-  const age = cfg.now() - s.mtimeMs;
-  if (s.kind === "corrupt") return age > cfg.corruptGraceMs;
-  if (age > cfg.staleMs) return true;
-  return s.info.hostname === cfg.hostname && !cfg.isPidAlive(s.info.pid);
+/** What a file is: its token, or for a corrupt file its mtime and size. Names its claim. */
+function identity(s: Present): string {
+  return s.kind === "ok" ? s.info.token : `corrupt:${s.mtimeMs}:${s.size}`;
+}
+/** Identity plus mtime: what must stay unchanged for a staleness verdict to hold. */
+function observedKey(s: Present): string {
+  return `${identity(s)}@${s.mtimeMs}`;
 }
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
-/** Unlink, retrying transient Windows sharing violations. True when the file is gone. */
-async function unlinkRetry(path: string, cfg: Cfg): Promise<boolean> {
-  for (let i = 0; ; i++) {
-    try {
-      await cfg.unlink(path);
-      return true;
-    } catch (e) {
-      const code = errCode(e);
-      if (code === "ENOENT") return true;
-      if (!code || !RETRYABLE_UNLINK.has(code) || i >= cfg.unlinkRetries) {
-        cfg.logger?.warn("verification slot: could not delete lock file", { path, code: code ?? String(e) });
-        return false;
-      }
-      await sleep(cfg.unlinkRetryMs * 2 ** i);
-    }
+// ---- staleness ----------------------------------------------------------------
+
+interface Observation {
+  key: string;
+  first: number;
+  last: number;
+}
+/** Per process: since when (monotonic) each file has been seen with the same key, without gaps. */
+const observations = new Map<string, Observation>();
+
+/** Record that `path` is seen with `key` now. Returns for how long it has been seen unchanged. */
+function observe(path: string, key: string, cfg: Cfg): number {
+  const t = cfg.mono();
+  const maxGap = 2 * cfg.heartbeatMs;
+  const o = observations.get(path);
+  if (!o || o.key !== key || t - o.last > maxGap || t < o.last) {
+    if (observations.size > 256) for (const [p, x] of observations) if (t - x.last > maxGap) observations.delete(p);
+    observations.set(path, { key, first: t, last: t });
+    return 0;
   }
+  o.last = t;
+  return t - o.first;
 }
 
-/** Create `path` exclusively with `content`. True when this call created it. */
-async function createExclusive(path: string, content: string): Promise<boolean> {
-  let fh;
+/** Same host and the PID is gone: provably dead, no confirmation needed. */
+function ownerDead(s: Present, cfg: Cfg): boolean {
+  return s.kind === "ok" && s.info.hostname === cfg.hostname && !cfg.isPidAlive(s.info.pid);
+}
+
+/** Old by the wall clock (or by the observation alone), and seen unchanged for `confirmMs`. */
+function observedStale(path: string, s: Present, cfg: Cfg, ageMs: number, confirmMs: number): boolean {
+  const span = observe(path, observedKey(s), cfg);
+  return span >= confirmMs && (cfg.now() - s.mtimeMs > ageMs || span >= ageMs);
+}
+
+function lockStale(path: string, s: Present, cfg: Cfg): boolean {
+  if (s.kind === "corrupt") return observedStale(path, s, cfg, cfg.corruptGraceMs, cfg.corruptGraceMs);
+  return ownerDead(s, cfg) || observedStale(path, s, cfg, cfg.staleMs, 2 * cfg.heartbeatMs);
+}
+
+function claimStale(path: string, s: Present, cfg: Cfg): boolean {
+  if (s.kind === "corrupt") return observedStale(path, s, cfg, cfg.corruptGraceMs, cfg.corruptGraceMs);
+  return ownerDead(s, cfg) || observedStale(path, s, cfg, cfg.staleMs, 2 * cfg.claimHoldMaxMs);
+}
+
+// ---- exclusive create and claimed delete --------------------------------------
+
+/**
+ * Create `path` exclusively with `info`, then re-read it: true only when it
+ * still holds `info.token`. An unreadable re-read (a scanner) counts as ours:
+ * nobody else can have created the file, and a reaper needs it to be seen
+ * unchanged for a while first.
+ */
+async function createOwned(path: string, info: LockInfo, cfg: Cfg): Promise<boolean> {
+  let fh: FileHandle;
   try {
     fh = await open(path, "wx");
   } catch (e) {
     const code = errCode(e);
-    if (code === "EEXIST" || code === "EBUSY" || code === "EPERM" || code === "EACCES") return false;
+    if (code === "EEXIST" || (code !== undefined && TRANSIENT.has(code))) return false;
     throw e;
   }
   try {
-    await fh.writeFile(content, "utf8");
+    await fh.writeFile(JSON.stringify(info), "utf8");
   } finally {
     await fh.close();
   }
+  const s = await readLock(path, cfg);
+  return s.kind === "unreadable" || (s.kind === "ok" && s.info.token === info.token);
+}
+
+/** Claims currently held by this process (claim path -> claim token), for the exit hook. */
+const activeClaims = new Map<string, string>();
+const MAX_CLAIM_DEPTH = 3;
+
+/** The claim file under which the file with identity `id` (in slot `slotPath`'s family) is deleted. */
+export function reapClaimPath(slotPath: string, id: string): string {
+  return `${slotPath}.reap-${createHash("sha256").update(id).digest("hex").slice(0, 32)}`;
+}
+
+type Removal = "removed" | "gone" | "changed" | "contended" | "failed";
+
+/**
+ * Unlink `target` while `stillVictim` holds, re-reading it before every attempt.
+ * Gives up (without deleting) at the monotonic `deadline`.
+ */
+async function unlinkWhile(target: string, deadline: number, cfg: Cfg, stillVictim: (s: Present) => boolean): Promise<Removal> {
+  let last = "";
+  for (let i = 0; ; i++) {
+    if (cfg.mono() > deadline) {
+      warn(cfg, "verification slot: claim held too long, delete abandoned", { path: target, code: last });
+      return "failed";
+    }
+    const cur = await readLock(target, cfg);
+    if (cur.kind === "missing") return "gone";
+    if (cur.kind === "unreadable") last = cur.code;
+    else if (!stillVictim(cur)) return "changed";
+    else {
+      try {
+        await cfg.unlink(target);
+        return "removed";
+      } catch (e) {
+        const code = errCode(e) ?? String(e);
+        if (code === "ENOENT") return "gone";
+        last = code;
+        if (!TRANSIENT.has(code)) break;
+      }
+    }
+    if (i >= cfg.unlinkRetries) break;
+    await sleep(cfg.unlinkRetryMs * 2 ** i);
+  }
+  warn(cfg, "verification slot: could not delete lock file", { path: target, code: last });
+  return "failed";
+}
+
+/**
+ * Delete `target` (identity `id`) under its claim, only while `stillVictim`
+ * holds. A dead claimer's leftover claim is cleared first (one level up).
+ */
+async function removeUnderClaim(
+  slotPath: string,
+  target: string,
+  id: string,
+  stillVictim: (s: Present) => boolean,
+  cfg: Cfg,
+  depth = 0,
+): Promise<Removal> {
+  const claim = reapClaimPath(slotPath, id);
+  for (let round = 0; round < 2; round++) {
+    const token = randomUUID();
+    const info: LockInfo = { pid: cfg.pid, hostname: cfg.hostname, token, startedAt: cfg.now(), cwd: "", command: "reap" };
+    if (await createOwned(claim, info, cfg)) {
+      const since = cfg.mono();
+      activeClaims.set(claim, token);
+      try {
+        return await unlinkWhile(target, since + cfg.claimHoldMaxMs, cfg, stillVictim);
+      } finally {
+        activeClaims.delete(claim);
+        // Dropping the claim is safe until another process could judge it stale (2 x claimHoldMaxMs).
+        await unlinkWhile(claim, since + 1.5 * cfg.claimHoldMaxMs, cfg, (c) => c.kind === "ok" && c.info.token === token);
+      }
+    }
+    if (depth >= MAX_CLAIM_DEPTH || !(await reclaimClaim(slotPath, claim, cfg, depth + 1))) return "contended";
+  }
+  return "contended";
+}
+
+/** Remove a claim whose owner is dead or that is inert. True when the claim path is free. */
+async function reclaimClaim(slotPath: string, claim: string, cfg: Cfg, depth: number): Promise<boolean> {
+  const s = await readLock(claim, cfg);
+  if (s.kind === "missing") return true;
+  if (s.kind === "unreadable" || !claimStale(claim, s, cfg)) return false;
+  const key = observedKey(s);
+  const r = await removeUnderClaim(slotPath, claim, identity(s), (c) => observedKey(c) === key, cfg, depth);
+  if (r !== "removed" && r !== "gone") return false;
+  observations.delete(claim);
   return true;
-}
-
-/** Run `fn` under the per-slot reap lock. Returns undefined when the lock is busy. */
-async function withReapLock<T>(slotPath: string, cfg: Cfg, fn: () => Promise<T>): Promise<T | undefined> {
-  const reapPath = `${slotPath}.reap`;
-  const token = randomUUID();
-  if (!(await createExclusive(reapPath, token))) {
-    // A reaper that crashed under the lock: reclaim by age only.
-    const st = await stat(reapPath).catch((e: unknown) => (errCode(e) === "ENOENT" ? undefined : Promise.reject(e)));
-    if (st && cfg.now() - st.mtimeMs > cfg.reapStaleMs) await unlinkRetry(reapPath, cfg);
-    return undefined;
-  }
-  try {
-    return await fn();
-  } finally {
-    const cur = await readFile(reapPath, "utf8").catch((e: unknown) => (errCode(e) === "ENOENT" ? "" : Promise.reject(e)));
-    if (cur === token) await unlinkRetry(reapPath, cfg);
-  }
-}
-
-/** Delete `path` if it still holds the lock `observed` (same token, still stale when `requireStale`). */
-async function compareAndDelete(path: string, token: string | undefined, cfg: Cfg, requireStale: boolean): Promise<boolean> {
-  const res = await withReapLock(path, cfg, async () => {
-    const cur = await readLock(path);
-    if (cur.kind === "missing") return false;
-    if (token === undefined ? cur.kind !== "corrupt" : cur.kind !== "ok" || cur.info.token !== token) return false;
-    if (requireStale && !isStale(cur, cfg)) return false;
-    return unlinkRetry(path, cfg);
-  });
-  return res === true;
 }
 
 // ---- held slots, released synchronously on process exit ----------------------
@@ -265,6 +423,8 @@ async function compareAndDelete(path: string, token: string | undefined, cfg: Cf
 interface Held {
   path: string;
   token: string;
+  pid: number;
+  hostname: string;
 }
 const held = new Set<Held>();
 let exitHooked = false;
@@ -272,19 +432,69 @@ let exitHooked = false;
 export let exitReleaseFailures = 0;
 export let lastExitReleaseError: string | undefined;
 
+function unlinkIfTokenSync(path: string, token: string): void {
+  let text: string;
+  try {
+    text = readFileSync(path, "utf8");
+  } catch (e) {
+    if (errCode(e) === "ENOENT") return;
+    throw e;
+  }
+  if (parseLock(text)?.token === token) unlinkSync(path);
+}
+
+/** The exit-time release follows the claim protocol, synchronously. */
+function releaseOneSync(h: Held): void {
+  const claim = reapClaimPath(h.path, h.token);
+  if (activeClaims.has(claim)) {
+    // Our own async release holds the claim right now; the loop below drops it.
+    unlinkIfTokenSync(h.path, h.token);
+    return;
+  }
+  const token = randomUUID();
+  let fd: number;
+  try {
+    fd = openSync(claim, "wx");
+  } catch (e) {
+    if (errCode(e) === "EEXIST") return; // another process is reaping this lock and deletes it
+    throw e;
+  }
+  try {
+    try {
+      writeSync(fd, JSON.stringify({ pid: h.pid, hostname: h.hostname, token, startedAt: Date.now(), cwd: "", command: "exit" }));
+    } finally {
+      closeSync(fd);
+    }
+    unlinkIfTokenSync(h.path, h.token);
+  } finally {
+    unlinkIfTokenSync(claim, token);
+  }
+}
+
+function noteExitFailure(e: unknown): void {
+  exitReleaseFailures++;
+  lastExitReleaseError = errCode(e) ?? String(e);
+}
+
 function releaseAllSync(): void {
   for (const h of held) {
     try {
-      const info = parseLock(readFileSync(h.path, "utf8"));
-      if (info?.token === h.token) unlinkSync(h.path);
+      releaseOneSync(h);
     } catch (e) {
       // Best effort at exit: the heartbeat stops with the process and the PID
       // probe reclaims the slot. Nothing can be logged asynchronously here.
-      exitReleaseFailures++;
-      lastExitReleaseError = errCode(e) ?? String(e);
+      noteExitFailure(e);
     }
   }
   held.clear();
+  for (const [claim, token] of activeClaims) {
+    try {
+      unlinkIfTokenSync(claim, token);
+    } catch (e) {
+      noteExitFailure(e);
+    }
+  }
+  activeClaims.clear();
 }
 
 function hookExit(): void {
@@ -364,37 +574,24 @@ async function dirWritable(dir: string): Promise<boolean> {
 
 // ---- file slots -------------------------------------------------------------
 
-function startHeartbeat(path: string, token: string, cfg: Cfg): NodeJS.Timeout {
-  const timer = setInterval(() => {
-    void (async () => {
-      const cur = await readLock(path);
-      if (cur.kind !== "ok" || cur.info.token !== token) return;
-      const t = new Date(cfg.now());
-      await utimes(path, t, t);
-    })().catch((e: unknown) => cfg.logger?.warn("verification slot: heartbeat failed", { path, code: errCode(e) ?? String(e) }));
-  }, cfg.heartbeatMs);
-  timer.unref();
-  return timer;
+function slotPathOf(dir: string, i: number): string {
+  return join(dir, `slot-${i}.lock`);
 }
 
 async function tryAcquireOnce(opts: SlotOptions, cfg: Cfg): Promise<SlotHandle | undefined> {
   for (let i = 0; i < opts.max; i++) {
-    const path = join(cfg.dir, `slot-${i}.lock`);
-    for (let attempt = 0; attempt < 2; attempt++) {
+    const path = slotPathOf(cfg.dir, i);
+    for (let attempt = 0; attempt < 3; attempt++) {
       const token = randomUUID();
-      const info: LockInfo = {
-        pid: cfg.pid,
-        hostname: cfg.hostname,
-        token,
-        startedAt: cfg.now(),
-        cwd: opts.meta.cwd,
-        command: opts.meta.command,
-      };
-      if (await createExclusive(path, JSON.stringify(info))) return makeFileHandle(path, token, cfg);
-      const cur = await readLock(path);
-      if (cur.kind === "missing") continue; // released meanwhile: retry the create once
-      if (!isStale(cur, cfg)) break;
-      if (!(await compareAndDelete(path, cur.kind === "ok" ? cur.info.token : undefined, cfg, true))) break;
+      const info: LockInfo = { pid: cfg.pid, hostname: cfg.hostname, token, startedAt: cfg.now(), cwd: opts.meta.cwd, command: opts.meta.command };
+      if (await createOwned(path, info, cfg)) return makeFileHandle(path, token, cfg);
+      const cur = await readLock(path, cfg);
+      if (cur.kind === "missing") continue; // released meanwhile: create again
+      if (cur.kind === "unreadable" || !lockStale(path, cur, cfg)) break;
+      const key = observedKey(cur);
+      const r = await removeUnderClaim(path, path, identity(cur), (c) => observedKey(c) === key, cfg);
+      if (r !== "removed" && r !== "gone") break;
+      observations.delete(path);
     }
   }
   return undefined;
@@ -402,30 +599,104 @@ async function tryAcquireOnce(opts: SlotOptions, cfg: Cfg): Promise<SlotHandle |
 
 function makeFileHandle(path: string, token: string, cfg: Cfg): SlotHandle {
   hookExit();
-  const entry: Held = { path, token };
+  const entry: Held = { path, token, pid: cfg.pid, hostname: cfg.hostname };
   held.add(entry);
-  const hb = startHeartbeat(path, token, cfg);
-  let releasing: Promise<void> | undefined;
-  return {
-    release: () => {
-      releasing ??= (async () => {
-        clearInterval(hb);
-        held.delete(entry);
-        // Wait briefly for a concurrent reaper; then delete under the reap lock.
-        for (let i = 0; i < 20; i++) {
-          const r = await withReapLock(path, cfg, async () => {
-            const cur = await readLock(path);
-            if (cur.kind !== "ok" || cur.info.token !== token) return true; // reclaimed: not ours any more
-            return unlinkRetry(path, cfg);
-          });
-          if (r !== undefined) return;
-          await sleep(cfg.unlinkRetryMs);
-        }
-        cfg.logger?.warn("verification slot: reap lock busy, slot left to stale detection", { path });
-      })();
-      return releasing;
-    },
+  // held -> releasing (an attempt runs) -> done, or -> deferred (retried on a timer) -> ...
+  let phase: "held" | "releasing" | "deferred" | "done" = "held";
+  let tick: Promise<void> | undefined;
+  let attempt: Promise<void> | undefined;
+  let retryTimer: NodeJS.Timeout | undefined;
+  let deferrals = 0;
+  let beatWarned = false;
+  const beating = () => phase === "held" || phase === "deferred";
+  const maxDeferrals = Math.max(1, Math.ceil(cfg.staleMs / cfg.heartbeatMs));
+
+  const finish = () => {
+    phase = "done";
+    clearInterval(hb);
+    clearTimeout(retryTimer);
+    held.delete(entry);
   };
+
+  const beat = async (): Promise<void> => {
+    const cur = await readLock(path, cfg);
+    if (!beating() || cur.kind === "unreadable") return; // a scanner has it open: next tick
+    if (cur.kind !== "ok" || cur.info.token !== token) {
+      if (phase === "deferred") finish(); // the pending delete happened (or the slot was reaped)
+      return;
+    }
+    for (let i = 0; ; i++) {
+      if (!beating()) return; // a release began: never touch the file again
+      try {
+        await cfg.utimes(path, new Date(cfg.now()));
+        beatWarned = false;
+        return;
+      } catch (e) {
+        const code = errCode(e) ?? String(e);
+        if (code === "ENOENT" || !TRANSIENT.has(code) || i >= cfg.unlinkRetries) {
+          if (!beatWarned) warn(cfg, "verification slot: heartbeat failed", { path, code });
+          beatWarned = true;
+          return;
+        }
+      }
+      await sleep(cfg.unlinkRetryMs * 2 ** i);
+    }
+  };
+  const hb = setInterval(() => {
+    if (tick || !beating()) return;
+    tick = beat()
+      .catch((e: unknown) => warn(cfg, "verification slot: heartbeat failed", { path, code: errCode(e) ?? String(e) }))
+      .finally(() => {
+        tick = undefined;
+      });
+  }, cfg.heartbeatMs);
+  hb.unref();
+
+  /** One delete of our own file under its claim. True when the file is no longer ours. */
+  const deleteOwn = async (): Promise<boolean> => {
+    for (let n = 0; ; n++) {
+      const r = await removeUnderClaim(path, path, token, (s) => s.kind === "ok" && s.info.token === token, cfg);
+      // "contended": a process judging us stale holds the claim for a moment; it deletes our file.
+      if (r === "contended" && n < cfg.unlinkRetries) {
+        await sleep(cfg.unlinkRetryMs * 2 ** n);
+        continue;
+      }
+      return r === "removed" || r === "gone" || r === "changed";
+    }
+  };
+
+  const runAttempt = async (): Promise<void> => {
+    phase = "releasing";
+    clearTimeout(retryTimer);
+    if (tick) await tick;
+    let settled = false;
+    try {
+      settled = await deleteOwn();
+    } catch (e) {
+      warn(cfg, "verification slot: release failed", { path, code: errCode(e) ?? String(e) });
+    }
+    if (settled) return finish();
+    // Not confirmed: keep the file ours (heartbeat and exit hook) and retry in the background.
+    phase = "deferred";
+    if (++deferrals > maxDeferrals) {
+      finish();
+      warn(cfg, "verification slot: release gave up, slot left to stale detection", { path });
+      return;
+    }
+    if (deferrals === 1) warn(cfg, "verification slot: release incomplete, retrying in the background", { path });
+    retryTimer = setTimeout(() => void release(), cfg.heartbeatMs);
+    retryTimer.unref();
+  };
+
+  const release = (): Promise<void> => {
+    if (phase === "done") return Promise.resolve();
+    attempt ??= runAttempt().finally(() => {
+      attempt = undefined;
+    });
+    return attempt;
+  };
+
+  return { release };
 }
 
 /**
@@ -441,11 +712,11 @@ export async function acquireSlot(opts: SlotOptions, deps?: SlotDeps): Promise<S
   if (!(await dirWritable(cfg.dir))) {
     if (!degradedLogged.has(cfg.dir)) {
       degradedLogged.add(cfg.dir);
-      cfg.logger?.warn("verification slot: temp dir unwritable, using an in-process semaphore", { dir: cfg.dir });
+      warn(cfg, "verification slot: temp dir unwritable, using an in-process semaphore", { dir: cfg.dir });
     }
     return acquireLocal(o, cfg);
   }
-  const deadline = cfg.now() + Math.max(0, opts.waitMs);
+  const deadline = cfg.mono() + Math.max(0, opts.waitMs);
   for (let k = 0; ; k++) {
     cfg.onAttempt?.();
     const h = await tryAcquireOnce(o, cfg);
@@ -456,10 +727,12 @@ export async function acquireSlot(opts: SlotOptions, deps?: SlotDeps): Promise<S
       }
       return h;
     }
-    const remaining = deadline - cfg.now();
+    const remaining = deadline - cfg.mono();
     if (remaining <= 0 || opts.signal?.aborted) return { busy: true };
     const base = Math.min(cfg.backoffMaxMs, cfg.backoffMinMs * 2 ** k);
-    const delay = Math.min(remaining, Math.max(1, Math.round(base * (0.5 + cfg.random() * 0.5))));
+    const jittered = Math.max(1, Math.round(base * (0.5 + cfg.random() * 0.5)));
+    // Observations need a wake-up at least every 2 heartbeats to stay unbroken.
+    const delay = Math.min(remaining, cfg.heartbeatMs, jittered);
     const aborted = await new Promise<boolean>((resolve) => {
       const onAbort = () => {
         clearTimeout(t);
@@ -483,13 +756,16 @@ export async function withSlot<T>(
 ): Promise<{ busy: true } | { value: T }> {
   const s = await acquireSlot(opts, deps);
   if ("busy" in s) return s;
+  let out: { value: T };
   try {
-    return { value: await fn() };
+    out = { value: await fn() };
   } finally {
+    // release() never rejects (a failed delete is retried in the background and
+    // logged), so it can neither replace fn's error nor mask its value.
     await s.release();
   }
+  return out;
 }
 
 /** Synchronous variant of the exit hook, exported for tests. */
 export const releaseAllSlotsSync = releaseAllSync;
-
