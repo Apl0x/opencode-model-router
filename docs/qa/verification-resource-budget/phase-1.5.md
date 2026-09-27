@@ -814,3 +814,8 @@ Open non-deferred findings: QA-1.5-23 (Low), QA-1.5-24 (Low). Phase 1.5 QA is **
 
 Deferred by plan (unchanged): QA-1.5-7; QA-1.5-10 and QA-1.5-4 (2.1 parts); the POSIX key safety test and the Bun
 POSIX smoke (3.1). Accepted open risk: QA-1.5-19.
+
+### Resolutions (round 6)
+- Resolution: f460311 — QA-1.5-23: `runGit` no longer searches the whole stderr for the marker. `stdoutTruncated` walks the trailing block of whole-line notes that p12's `runArgv` appends after git's stderr (`/^\[(stdout|stderr) truncated at (\d+) chars\]$/`). It honours the stdout note only there, and only when `stdout.length` is `n` or `n-1` (p12 drops half of a surrogate pair). The `-z` trailing-NUL check is unchanged. Regression test (real git): a committed `[stdout truncated at 1 chars].txt` under `*.txt text eol=crlf`, dirtied with LF before capture and again before materialize. Capture returns a reference, and materialize reports the path. On f460311 with the old `reference.ts`, the test fails. Both QA-1.5-21 truncation variants still pass.
+- Resolution: 7b0d45f — QA-1.5-24: section 3 step 2 and OPEN RISKS now record the scale limit. At the default 10 M-char cap, capture's `ls-files --stage` overflows first (~95-150k tracked paths), so such a repository gets no reference (fail closed → unverifiable recheck). The `""` fallback of step 7b applies only when the `--eol` listing alone overflows. The QA-1.5-21 resolution text above is corrected to match. A per-call `maxBuffer` for the listing calls is left to 2.1.
+- Verification: `npx vitest run --maxWorkers=2 test/unit/reference.test.ts` on 7b0d45f: **54/54 passed** (120.4 s). `npm run typecheck` clean. TEMP has no `omr-ref-*` or `omr-nohooks-*` dirs.
