@@ -31,6 +31,7 @@
   `pytest.ini`, `tox.ini`, `setup.cfg`, `setup.py`, `.gitlab-ci.yml`, `Makefile`, `CMakeLists.txt`,
   `requirements*.txt`/`constraints*.txt`; snapshots (`__snapshots__/**`, `*.snap`) count as test files.
 - `assessRisk` takes an optional `root` (git root); absolute paths are made repo-relative before classification.
+- Deviation (QA-1.6-18): a non-upper-case `VERIFY`/`VERIFY_WAIT` key counts only when its value ends the line, is followed by closing marks/punctuation/a table pipe up to the end of the line, or by another directive key with a valid value on the same line (QA-1.6-27, QA-1.6-35). Upper-case keys are unchanged.
 
 ## Risk implementation notes
 
@@ -666,7 +667,6 @@ Method:
 | QA-1.6-33 | Info | The lower-case prose guard deviates from §1.5-15 "same rules as `CAP:`" but is not recorded as a deviation |
 
 **QA-1.6-27 — Low — a valid lower-case directive followed by another directive on the same line is dropped silently**
-- Resolution: 288cb6a — after a non-upper-case key the tail may be closing marks/a table pipe/horizontal space, then end of line or another `VERIFY`/`VERIFY_WAIT`/`CAP` key (any case) + `:`; sticky regex on the text, no 256-char slice. L1/L2/L3/L6 → required; 300 spaces/dots + prose, L4, L5 stay rejected (L7 `<!-- … -->` stays prose, recorded in the header). Tests added.
 - Where: directives.ts:90 (`LINE_TAIL`), :127-131.
 - Evidence (probe; every case logs nothing):
   - [L1] `verify:required verify_wait:2s` → `deferred/default`, while the wait on the same line applies (2000/directive);
@@ -686,9 +686,9 @@ Method:
   closing marks (table cells). Test the tail with a sticky regex at `end` on `text` itself, instead of a
   256-character slice; it stays linear because its two classes are disjoint. Add L1, L2, L3 and L6 as
   tests. L4, L5 and L7 may stay prose, but record that decision in the header.
+- Resolution: 288cb6a — after a non-upper-case key the tail may be closing marks/a table pipe/horizontal space, then end of line or another `VERIFY`/`VERIFY_WAIT`/`CAP` key (any case) + `:`; sticky regex on the text, no 256-char slice. L1/L2/L3/L6 → required; 300 spaces/dots + prose, L4, L5 stay rejected (L7 `<!-- … -->` stays prose, recorded in the header). Tests added.
 
 **QA-1.6-28 — Low — the directive scan is quadratic on whitespace-free runs of keys (a regression from dcbd023)**
-- Resolution: 288cb6a — run end memoised per whitespace-free run, values matched in place with sticky regexes, only the ≤32-char logged value sliced. Probe at 1M: `VERIFY:` 41.7 ms, `VERIFY_WAIT:` 14.5 ms, `verify:` 41.0 ms, `VERIFY:a,` 29.3 ms. Timing test (1M chars < 500 ms per key form); all prior tests unchanged and green.
 - Where: directives.ts:117-123. Each key match re-reads the rest of its whitespace-free token with
   `/\S*/y` and copies it (`raw.replace(LEAD, "")`). Because scanning resumes right after the colon
   (the QA-1.6-19 fix), a run of k keys costs O(k × run length).
@@ -714,9 +714,9 @@ Method:
   for the QA-1.6-7 lower-case 200 × `A` case, which breaks that test, and it turns a 400-digit wait from
   "capped at 15000" into "malformed". So it is not recommended. Add a timing test such as
   `"VERIFY:".repeat(15_000)` < 50 ms (the QA-1.6-21 pattern).
+- Resolution: 288cb6a — run end memoised per whitespace-free run, values matched in place with sticky regexes, only the ≤32-char logged value sliced. Probe at 1M: `VERIFY:` 41.7 ms, `VERIFY_WAIT:` 14.5 ms, `verify:` 41.0 ms, `VERIFY:a,` 29.3 ms. Timing test (1M chars < 500 ms per key form); all prior tests unchanged and green.
 
 **QA-1.6-29 — Info — log escaping still passes invisible code points raw**
-- Resolution: 288cb6a — after `JSON.stringify` everything outside `[\x20-\x7e]` is escaped (`\uXXXX`, astral as `\u{…}`). Test covers U+E0049, U+034F, U+202E.
 - Where: directives.ts:93 (`UNSAFE`).
 - Evidence: the probe enumerated every non-whitespace code point in `\p{Cc}`, `\p{Cf}`,
   `\p{Default_Ignorable_Code_Point}`, `\p{Zl}` or `\p{Zp}`, placed each one inside a logged value, and
@@ -727,9 +727,9 @@ Method:
   exposure is bounded to 32 UTF-16 units and the log only.
 - Fix (optional): after `JSON.stringify`, escape everything outside printable ASCII (`/[^\x20-\x7e]/g`).
   That is complete, and simpler than a list; every valid value is ASCII.
+- Resolution: 288cb6a — after `JSON.stringify` everything outside `[\x20-\x7e]` is escaped (`\uXXXX`, astral as `\u{…}`). Test covers U+E0049, U+034F, U+202E.
 
 **QA-1.6-30 — Info — purity-guard false negatives and false positives**
-- Resolution: 7267b6c — both guards strip comments first and match `\bimport\s*\(`, `\brequire\s*\(`, `\bimport\b`, `\bfetch\b`, `\bprocess\b`, `export\s*\*`, indented `import/export … from`, `Worker`, `EventSource`, `sendBeacon`, `Bun.`, `Deno.`; risk removes its one allowed `import type` line before scanning.
 - Where: directives.test.ts:155-156; the risk.test.ts purity test.
 - Evidence: the guard regexes, copied verbatim, were run on sample lines.
   - Missed by **both** guards:
@@ -748,9 +748,9 @@ Method:
     the TS API is not available.
 - Fix (optional): `\bimport\s*\(`, `\brequire\s*\(`, `\bfetch\b`, `\bprocess\b`, `^\s*(import|export)\b.*\bfrom\b`,
   and add `\bWorker\b|\bEventSource\b|sendBeacon|\bBun\.|\bDeno\.`. False positives are acceptable.
+- Resolution: 7267b6c — both guards strip comments first and match `\bimport\s*\(`, `\brequire\s*\(`, `\bimport\b`, `\bfetch\b`, `\bprocess\b`, `export\s*\*`, indented `import/export … from`, `Worker`, `EventSource`, `sendBeacon`, `Bun.`, `Deno.`; risk removes its one allowed `import type` line before scanning.
 
 **QA-1.6-31 — Info — test/dependency config conventions outside the rules**
-- Resolution: 7267b6c — added `setup-jest`, `jest-setup`, `vitest-setup`, `global-teardown` (`.[cm]?[jt]sx?`), `playwright.config.*`, `requirements*.in`, `Pipfile`. Tests added. (`cypress`/`karma`/`.mocharc`/`babel`/`environment.yml` not added: outside the dispatch scope.)
 - Where: risk.ts:147-148 (`SETUP_FILE`), :165-179.
 - Evidence (probe): each of these → low `["1-5 files changed"]`:
   - test-setup/teardown names:
@@ -772,9 +772,9 @@ Method:
   - add `^(playwright|cypress)\.config\.`;
   - add `.in` beside `.txt` in both requirements rules;
   - add `Pipfile`.
+- Resolution: 7267b6c — added `setup-jest`, `jest-setup`, `vitest-setup`, `global-teardown` (`.[cm]?[jt]sx?`), `playwright.config.*`, `requirements*.in`, `Pipfile`. Tests added. (`cypress`/`karma`/`.mocharc`/`babel`/`environment.yml` not added: outside the dispatch scope.)
 
 **QA-1.6-32 — Info — trimming trailing slashes from `root` is quadratic**
-- Resolution: 7267b6c — trailing `/` trimmed with an `endsWith` loop; timing test with 1M-slash roots (< 200 ms).
 - Where: risk.ts:109 (`norm(root).replace(/\/+$/, "")`).
 - Evidence (timing, root = `"/".repeat(n) + "x"`): 10k → 66.9 ms, 20k → 282.3 ms, 40k → 1217.6 ms,
   100k → 6744.2 ms, 1M → killed > 30 s. The round-2 claim "all other directive and risk regexes are
@@ -783,9 +783,9 @@ Method:
   `docs/` runs and `.setup` runs, all ≤ 10.7 ms at 1M.
   Under the QA-1.6-22 contract, `root` is `git rev-parse --show-toplevel` output, not model input.
 - Fix (optional): trim with a loop (`while (r.endsWith("/")) r = r.slice(0, -1)`).
+- Resolution: 7267b6c — trailing `/` trimmed with an `endsWith` loop; timing test with 1M-slash roots (< 200 ms).
 
 **QA-1.6-33 — Info — the lower-case prose guard is an unrecorded deviation from §1.5-15**
-- Resolution: 288cb6a — Deviation (QA-1.6-18): a non-upper-case VERIFY key counts only when its value ends the line (or is followed by another directive key / table pipe, QA-1.6-27); `CAP:` has no such guard. Recorded in the directives.ts header and here; plan amendment stays in the next plan revision.
 - Where: this report, "Result" (the deviation list) and the round-2 "Deferred by plan" row "Amend the
   plan's 1.6.1 signature".
 - Evidence: §1.5-15 says "the same rules as `CAP:`". `CAP:`'s key is case-insensitive with no prose
@@ -794,6 +794,7 @@ Method:
   header, but it is not listed with the `modeSource`/`waitSource` deviation.
 - Fix: add "Deviation (QA-1.6-18): a non-upper-case key counts only when its value ends the line" under
   "Result", and include it in the next plan revision.
+- Resolution: 288cb6a — Deviation (QA-1.6-18): a non-upper-case VERIFY key counts only when its value ends the line (or is followed by another directive key / table pipe, QA-1.6-27); `CAP:` has no such guard. Recorded in the directives.ts header and here; plan amendment stays in the next plan revision.
 
 ### Other checks (no finding)
 
@@ -934,6 +935,7 @@ newline since `fe7a82b` (pre-existing); this append ends with one.
   (in-process): 28.7 / 99.7 / 13.9 ms for rows 1-3. **0** behaviour differences on 77 inputs × 2
   defaults (the 42 direct string-literal inputs of the unit file plus 35 probes from this round). Add
   `"verify:1,verify:a,".repeat(27_778) + " ".repeat(500_000) + "x"` to the timing test.
+- Resolution: 33ce7ea — tail result at the run end cached once per run (`tokTail`, reset with `tokEnd`); 1M-char timing test (`"verify:1,verify:a,".repeat(27_778)` + 500k spaces, < 500 ms).
 
 **QA-1.6-35 — Info — the key-terminated tail accepts any following key + colon**
 - Where: directives.ts:99-102 (`(?:VERIFY(?:_WAIT)?|CAP)${HWS}:`, no value, no leading `\b`).
@@ -958,6 +960,7 @@ newline since `fe7a82b` (pre-existing); this append ends with one.
   L8, T13; T1, T3, T5-T8, T11, T29 and `verify: required cap:3x` → default; linear (1M ≤ 127 ms
   in-process). Trade-off: `verify:required CAP:` with an empty `CAP:` then falls back silently.
   Otherwise, accept it and record the decision in the header.
+- Resolution: 33ce7ea — the tail's key alternative now needs a valid value (`VERIFY: required|deferred`, `VERIFY_WAIT: <n>ms|s`, `CAP: none|<n>`, leading `\b`); T1, T5, T3 → default (tests). Accepted trade-off: `verify:required CAP:` falls back silently.
 
 **QA-1.6-36 — Info — QA-1.6-31 was narrower than its fix text**
 - Where: risk.ts:148-149, :181-183; the QA-1.6-31 resolution line.
@@ -971,6 +974,7 @@ newline since `fe7a82b` (pre-existing); this append ends with one.
 
   These are rated at the file-count level, never below it. §1.5-17 does not name them.
 - Fix (optional): add them, or list them in the QA-1.6-31 resolution as out of scope.
+- Resolution: 33ce7ea — `requirements/*.in`, case-insensitive `requirements/` folder, `setupVitest`/`setup-vitest`/`testSetup`/`globalTeardown` (`.[cm]?[jt]sx?`) are config; tests.
 
 **QA-1.6-37 — Info — report hygiene**
 - The QA-1.6-33 fix asked for a "Deviation (QA-1.6-18)" line under "Result"; "Result" still lists only the
@@ -979,6 +983,7 @@ newline since `fe7a82b` (pre-existing); this append ends with one.
   a "Round-N resolutions" list. Cosmetic.
 - Round-3 "Handoff to 2.4" item 4 is stale: it is superseded below.
 - Fix: add the "Result" line in the next doc pass.
+- Resolution: this commit — "Deviation (QA-1.6-18)" line added under "Result"; round-3 resolution bullets moved after "Where:"/"Fix"; file LF with a final newline.
 
 ### Other checks (no finding)
 
