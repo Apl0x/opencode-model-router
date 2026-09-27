@@ -87,6 +87,8 @@ export interface DeterministicDeps {
   reference?: ReferenceState;
   /** The validated budget (resolveVerifyBudget). Absent: testScope "affected", failureRecheck on. */
   budget?: import("../router/config").VerifyBudget;
+  /** lintClean scoping (T8); default planScopedLint. Used only with `openScope`. */
+  planLint?: typeof import("./runner").planScopedLint;
   /**
    * The gate's deadline (T3). Absent: each testsPass check runs under its own deadline of
    * `budget.gateBudgetMs` (else `timeoutMs`), disposed when the check ends.
@@ -95,7 +97,8 @@ export interface DeterministicDeps {
   /** Preserve completed failures if an outer gate budget expires later. */
   onFailure?: (reason: string) => void;
   exec: ExecSeam;
-  fs: FsSeam;
+  /** Any FsSeam; lintClean scoping also uses the optional PlannerFs members when present. */
+  fs: import("./runner").PlannerFs;
   cwd: string;
   mutex?: MutexRegistry;
   /** per-check timeout in ms; default 120000 */

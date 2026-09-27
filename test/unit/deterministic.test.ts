@@ -10,10 +10,17 @@ import {
   isCommandAllowed,
   shapeMismatch,
 } from "../../src/verify/deterministic";
-import { NO_TESTS_PASS_HOOK } from "../../src/verify/deterministic";
+import {
+  createDeadline,
+  NO_TESTS_PASS_HOOK,
+  SLOT_DEADLINE_REASON,
+  type CommandOutcome,
+  type OpenCheckScope,
+} from "../../src/verify/deterministic";
 import { resolveVerifyBudget } from "../../src/router/config";
 import type { DoD, Check } from "../../src/verify/dod";
-import type { DeterministicDeps, ExecResult, TestsPassHook, TestsPassRequest, TestsPassRun } from "../../src/verify/types";
+import type { LintSpec } from "../../src/verify/runner";
+import type { Deadline, DeterministicDeps, ExecResult, TestsPassHook, TestsPassRequest, TestsPassRun } from "../../src/verify/types";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -433,6 +440,139 @@ describe("runDeterministic — repo-command defaults", () => {
     expect(mutexUsed).toBe(false);
     await runDeterministic(makeDoD([{ kind: "lintClean" }]), deps);
     expect(mutexUsed).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// buildPasses / lintClean / run under per-check scopes (2.1.2.5, T8)
+// ---------------------------------------------------------------------------
+
+describe("runDeterministic — command checks under per-check scopes", () => {
+  const ranWith = (code: number, stdout = ""): CommandOutcome => ({ kind: "ran", exec: { code, stdout, stderr: "" }, notes: [] });
+  function fakeScopes(outcome: (what: string) => CommandOutcome = () => ranWith(0)) {
+    const events: string[] = [];
+    const deadlines: Deadline[] = [];
+    let open = 0;
+    let maxOpen = 0;
+    const unused = async (): Promise<never> => { throw new Error("not used by command checks"); };
+    const openScope: OpenCheckScope = meta => {
+      open++;
+      maxOpen = Math.max(maxOpen, open);
+      events.push(`open ${meta.command}`);
+      return {
+        execute: unused,
+        rechecker: () => unused,
+        runShell: async (command, _cwd, deadline) => { deadlines.push(deadline); events.push(`shell ${command}`); return outcome(command); },
+        runLint: async (spec, deadline) => { deadlines.push(deadline); events.push(`lint ${spec.inputs.join(",")}`); return outcome(spec.inputs.join(",")); },
+        close: async () => { open--; events.push(`close ${meta.command}`); },
+      };
+    };
+    return { openScope, events, deadlines, maxOpen: () => maxOpen };
+  }
+  const neverExec: DeterministicDeps["exec"] = async () => { throw new Error("scoped checks never use deps.exec"); };
+  const lintSpec = (inputs: string[]): LintSpec => ({
+    runner: "eslint", file: "/usr/bin/node", args: ["eslint.js", ...inputs], cwd: "/fake/cwd", env: {}, gitRoot: "/fake/cwd",
+    entry: "eslint.js", inputs, workers: null, notes: [],
+  });
+
+  it("each check opens its own scope and closes it before the next check starts (never nested)", async () => {
+    const s = fakeScopes();
+    const verdict = await runDeterministic(
+      makeDoD([
+        { kind: "buildPasses", command: "npm run build" },
+        { kind: "run", command: "node check.js" },
+        { kind: "lintClean", command: "npx eslint ." },
+      ]),
+      makeDeps({ exec: neverExec, openScope: s.openScope, planLint: async () => ({ unscoped: true, reason: "change attribution unavailable" }) }),
+    );
+    expect(verdict.outcome).toBe("pass");
+    expect(s.events).toEqual([
+      "open npm run build", "shell npm run build", "close npm run build",
+      "open node check.js", "shell node check.js", "close node check.js",
+      "open npx eslint .", "shell npx eslint .", "close npx eslint .",
+    ]);
+    expect(s.maxOpen()).toBe(1);
+  });
+
+  it("lintClean: NoAffected passes with its note and takes no slot", async () => {
+    const s = fakeScopes();
+    const verdict = await runDeterministic(
+      makeDoD([{ kind: "lintClean", command: "npx eslint ." }]),
+      makeDeps({ exec: neverExec, openScope: s.openScope, planLint: async () => ({ noAffected: true, note: "no changed lintable files" }) }),
+    );
+    expect(verdict.outcome).toBe("pass");
+    expect(verdict.notes).toEqual(["lintClean: no changed lintable files"]);
+    expect(s.events).toEqual([]);
+  });
+
+  it("lintClean: a LintSpec runs through the argv scope and its exit code decides", async () => {
+    const s = fakeScopes(() => ranWith(1, "a.ts: 1 problem"));
+    const changedFiles = [{ path: "/fake/cwd/a.ts", status: " M" }];
+    const inputs: unknown[] = [];
+    const verdict = await runDeterministic(
+      makeDoD([{ kind: "lintClean", command: "npx eslint ." }]),
+      makeDeps({
+        exec: neverExec, openScope: s.openScope, changedFiles,
+        planLint: async input => { inputs.push(input); return lintSpec(["/fake/cwd/a.ts"]); },
+      }),
+    );
+    expect(inputs[0]).toMatchObject({ command: "npx eslint .", cwd: "/fake/cwd", changedFiles, budget: { maxWorkers: 2 } });
+    expect(s.events).toEqual(["open npx eslint .", "lint /fake/cwd/a.ts", "close npx eslint ."]);
+    expect(verdict.outcome).toBe("fail");
+    expect(verdict.reasons[0]).toBe("command exited 1: npx eslint . (scoped to 1 changed files)");
+  });
+
+  it("slot busy and a gate-budget cut are unverifiable; the check's own timeout still fails", async () => {
+    const busy = await runDeterministic(
+      makeDoD([{ kind: "buildPasses", command: "npm run build" }]),
+      makeDeps({ exec: neverExec, openScope: fakeScopes(() => ({ kind: "slot-busy", waitedMs: 60000, deadlineCut: false })).openScope }),
+    );
+    expect(busy.outcome).toBe("unverifiable");
+    expect(busy.caveats).toEqual(["verification slot busy (waited 60000ms)"]);
+
+    const cut = await runDeterministic(
+      makeDoD([{ kind: "run", command: "node check.js" }]),
+      makeDeps({ exec: neverExec, openScope: fakeScopes(() => ({ kind: "slot-busy", waitedMs: 5000, deadlineCut: true })).openScope }),
+    );
+    expect(cut.caveats).toEqual([SLOT_DEADLINE_REASON]);
+
+    const timedOut = (): CommandOutcome => ({ kind: "timed-out", boundMs: 120000, exec: { code: -1, stdout: "", stderr: "", timedOut: true } });
+    const own = await runDeterministic(
+      makeDoD([{ kind: "buildPasses", command: "npm run build" }]),
+      makeDeps({ exec: neverExec, openScope: fakeScopes(timedOut).openScope }),
+    );
+    expect(own.outcome).toBe("fail");
+    expect(own.reasons[0]).toBe("buildPasses timed out after 120000ms: npm run build");
+
+    const spent = createDeadline(0);
+    try {
+      const gate = await runDeterministic(
+        makeDoD([{ kind: "buildPasses", command: "npm run build" }]),
+        makeDeps({ exec: neverExec, openScope: fakeScopes(timedOut).openScope, deadline: spent }),
+      );
+      expect(gate.outcome).toBe("unverifiable");
+      expect(gate.caveats).toEqual(["buildPasses: gate budget exhausted during the run: npm run build"]);
+    } finally {
+      spent.dispose();
+    }
+  });
+
+  it("every scoped check runs under the gate deadline, or its own of gateBudgetMs", async () => {
+    const gate = createDeadline(60_000);
+    try {
+      const s = fakeScopes();
+      await runDeterministic(
+        makeDoD([{ kind: "buildPasses", command: "npm run build" }, { kind: "run", command: "node check.js" }]),
+        makeDeps({ exec: neverExec, openScope: s.openScope, deadline: gate }),
+      );
+      expect(s.deadlines).toEqual([gate, gate]);
+    } finally {
+      gate.dispose();
+    }
+    const s = fakeScopes();
+    const budget = { ...resolveVerifyBudget(undefined, { cores: 8 }), gateBudgetMs: 4321 };
+    await runDeterministic(makeDoD([{ kind: "run", command: "node check.js" }]), makeDeps({ exec: neverExec, openScope: s.openScope, budget }));
+    expect(s.deadlines[0]?.budgetMs).toBe(4321);
   });
 });
 

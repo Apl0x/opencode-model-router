@@ -30,6 +30,8 @@ import type {
 import type {
   DetectedRunner,
   LintSpec,
+  NoAffected,
+  Unscoped,
   PlannerFs,
   RunnerFs,
   RunnerHost,
@@ -44,7 +46,17 @@ import { scrubText } from "../guard/scrub";
 import { resolveAgainst } from "./paths";
 import { isAbsolute, posix as pathPosix, win32 as pathWin32 } from "node:path";
 import { judgeScoped, observeTests, REFERENCE_NONE } from "./baseline";
-import { detectRunner, isNoAffected, isUnverifiable, planRerun, planScopedRun, readResult, resolveEntry } from "./runner";
+import {
+  detectRunner,
+  isNoAffected,
+  isUnscoped,
+  isUnverifiable,
+  planRerun,
+  planScopedLint,
+  planScopedRun,
+  readResult,
+  resolveEntry,
+} from "./runner";
 import { fileKeyOfId } from "./baseline";
 import { DEFAULT_MATERIALIZE_TIMEOUT_MS, gcStaleReferences, materialize, nodeReferenceFs } from "./reference";
 import { acquireSlot, type SlotHandle } from "./slot";
@@ -190,16 +202,17 @@ async function runRun(
     if (!isCommandAllowed(check.command, allowlist)) {
       return { ok: false, unverifiable: true, reason: `command not allowlisted: ${check.command}` };
     }
-    const r: ExecResult = await deps.exec(check.command, { cwd: deps.cwd, timeoutMs });
-    if (r.timedOut) {
-      return { ok: false, reason: `run timed out after ${timeoutMs}ms: ${check.command}` };
-    }
+    const command = check.command;
+    const got = await obtainExec("run", command, deps, timeoutMs, (scope, deadline) => scope.runShell(command, deps.cwd, deadline));
+    if ("result" in got) return got.result;
+    const r = got.exec;
     const out = r.stdout + "\n" + r.stderr;
     if (check.expect !== undefined && !out.includes(check.expect)) {
       return {
         ok: false,
         reason: `expected substring not found: "${check.expect}"`,
         evidence: out.slice(0, 2000),
+        ...withNotes(got.notes),
       };
     }
     const ok = r.code === 0;
@@ -208,9 +221,10 @@ async function runRun(
         ok: false,
         reason: `command exited ${r.code}: ${check.command}`,
         evidence: out.slice(0, 2000),
+        ...withNotes(got.notes),
       };
     }
-    return { ok: true, evidence: `exit 0: ${check.command}` };
+    return { ok: true, evidence: `exit 0: ${check.command}`, ...withNotes(got.notes) };
   } catch (err) {
     return { ok: false, reason: `run check errored: ${scrubText(String(err))}` };
   }
@@ -1267,6 +1281,94 @@ export function createDirectTestsPassHook(deps: DirectTestsPassHookDeps): TestsP
   };
 }
 
+// -----------------------------------------------------------------------------------------------
+// Command checks under per-check scopes (2.1.2.5, T8)
+// -----------------------------------------------------------------------------------------------
+
+/** How one command check spawns under its scope. */
+type Launch = (scope: CheckScope, deadline: Deadline) => Promise<CommandOutcome>;
+
+/** T7 u14, shared by every command check. */
+export const SLOT_DEADLINE_REASON = "gate budget exhausted waiting for the verification slot";
+
+function withNotes(notes: readonly string[]): { note?: string } {
+  return notes.length > 0 ? { note: notes.join("; ") } : {};
+}
+
+/** Runs `fn` under the gate's deadline, or under one of its own (disposed afterwards) when the deps carry none. */
+async function withCheckDeadline<T>(deps: DeterministicDeps, timeoutMs: number, fn: (deadline: Deadline) => Promise<T>): Promise<T> {
+  let owned: OwnedDeadline | undefined;
+  const deadline: Deadline = deps.deadline ?? (owned = createDeadline(deps.budget?.gateBudgetMs ?? timeoutMs));
+  try {
+    return await fn(deadline);
+  } finally {
+    owned?.dispose();
+  }
+}
+
+/** T8: slot busy, a gate-budget cut and executor errors are unverifiable; the check's own timeout fails, as today. */
+function blockedResult(kind: string, command: string, out: Exclude<CommandOutcome, { kind: "ran" }>, deadline: Deadline): CheckResult {
+  switch (out.kind) {
+    case "slot-busy":
+      return { ok: false, unverifiable: true, reason: out.deadlineCut ? SLOT_DEADLINE_REASON : `verification slot busy (waited ${out.waitedMs}ms)` };
+    case "aborted":
+      return { ok: false, unverifiable: true, reason: `${kind}: ${out.reason}: ${command}` };
+    case "error":
+      return { ok: false, unverifiable: true, reason: `${kind} check errored: ${scrubText(out.reason)}` };
+    case "timed-out":
+      // A bound the gate deadline cut short is budget exhaustion, not the command's own timeout.
+      return deadline.remaining() === 0
+        ? { ok: false, unverifiable: true, reason: `${kind}: gate budget exhausted during the run: ${command}` }
+        : { ok: false, reason: `${kind} timed out after ${out.boundMs}ms: ${command}` };
+  }
+}
+
+/**
+ * The exec result of one non-testsPass command check. With `deps.openScope` (T8): its own scope,
+ * one slot hold, low priority, deadline-bound, closed before this returns so scopes never nest
+ * (runDeterministic is sequential). Without it: deps.exec, as before.
+ */
+async function obtainExec(
+  kind: string,
+  command: string,
+  deps: DeterministicDeps,
+  timeoutMs: number,
+  launch: Launch,
+): Promise<{ exec: ExecResult; notes: readonly string[] } | { result: CheckResult }> {
+  const openScope = deps.openScope;
+  if (!openScope) {
+    const r: ExecResult = await deps.exec(command, { cwd: deps.cwd, timeoutMs });
+    if (r.timedOut) return { result: { ok: false, reason: `${kind} timed out after ${timeoutMs}ms: ${command}` } };
+    return { exec: r, notes: [] };
+  }
+  return withCheckDeadline(deps, timeoutMs, async deadline => {
+    const scope = openScope({ cwd: deps.cwd, command });
+    let out: CommandOutcome;
+    try {
+      out = await launch(scope, deadline);
+    } finally {
+      await scope.close();
+    }
+    return out.kind === "ran" ? { exec: out.exec, notes: out.notes } : { result: blockedResult(kind, command, out, deadline) };
+  });
+}
+
+/** T8 lintClean scoping. A planner failure, or a relative cwd, runs the command unscoped (as today). */
+async function planLint(command: string, deps: DeterministicDeps): Promise<LintSpec | NoAffected | Unscoped> {
+  if (!deps.cwd || !isAbsolute(deps.cwd)) return { unscoped: true, reason: "no absolute working directory" };
+  try {
+    return await (deps.planLint ?? planScopedLint)({
+      command,
+      cwd: deps.cwd,
+      changedFiles: deps.changedFiles ?? "unavailable",
+      budget: { maxWorkers: deps.budget?.maxWorkers ?? 2 },
+      fs: deps.fs,
+    });
+  } catch (err) {
+    return { unscoped: true, reason: `lint planning failed: ${errorText(err)}` };
+  }
+}
+
 /** G5: testsPass with no TestsPassHook in the deps is unverifiable, never a run. */
 export const NO_TESTS_PASS_HOOK = "testsPass: not run: no scoped test pipeline is wired for this verification";
 
@@ -1292,22 +1394,22 @@ async function runTestsPass(command: string, deps: DeterministicDeps, timeoutMs:
   if (!deps.cwd || !isAbsolute(deps.cwd)) {
     return { ok: false, unverifiable: true, reason: `testsPass cannot run without an absolute working directory: ${command}` };
   }
-  let owned: OwnedDeadline | undefined;
-  const deadline: Deadline = deps.deadline ?? (owned = createDeadline(deps.budget?.gateBudgetMs ?? timeoutMs));
+  const hook = deps.testsPass;
+  const cwd = deps.cwd;
   try {
-    const run = await deps.testsPass({
-      command,
-      cwd: deps.cwd,
-      testScope: deps.budget?.testScope ?? "affected",
-      changedFiles: deps.changedFiles ?? "unavailable",
-      reference: deps.reference ?? defaultReference(deps),
-      deadline,
+    return await withCheckDeadline(deps, timeoutMs, async deadline => {
+      const run = await hook({
+        command,
+        cwd,
+        testScope: deps.budget?.testScope ?? "affected",
+        changedFiles: deps.changedFiles ?? "unavailable",
+        reference: deps.reference ?? defaultReference(deps),
+        deadline,
+      });
+      return fromJudgement(judgeScoped(run.scoped, run.recheck));
     });
-    return fromJudgement(judgeScoped(run.scoped, run.recheck));
   } catch (err) {
     return { ok: false, unverifiable: true, reason: `testsPass check errored: ${scrubText(String(err))}` };
-  } finally {
-    owned?.dispose();
   }
 }
 
@@ -1352,20 +1454,32 @@ async function runCommandCheck(
       if (!isCommandAllowed(command, allowlist)) {
         return { ok: false, unverifiable: true, reason: `command not allowlisted: ${command}` };
       }
-      const r: ExecResult = await deps.exec(command, { cwd: deps.cwd, timeoutMs });
-      if (r.timedOut) {
-        return { ok: false, reason: `${kind} timed out after ${timeoutMs}ms: ${command}` };
+      let launch: Launch = (scope, deadline) => scope.runShell(command, deps.cwd, deadline);
+      let scopedTo: number | undefined;
+      if (kind === "lintClean" && deps.openScope) {
+        // T8: NoAffected passes with its note and takes no slot; Unscoped runs the command as today.
+        const plan = await planLint(command, deps);
+        if (isNoAffected(plan)) return { ok: true, note: `lintClean: ${plan.note}` };
+        if (!isUnscoped(plan)) {
+          launch = (scope, deadline) => scope.runLint(plan, deadline);
+          scopedTo = plan.inputs.length;
+        }
       }
+      const got = await obtainExec(kind, command, deps, timeoutMs, launch);
+      if ("result" in got) return got.result;
+      const r = got.exec;
       const out = r.stdout + "\n" + r.stderr;
       const ok = r.code === 0;
+      const scoped = scopedTo !== undefined ? ` (scoped to ${scopedTo} changed files)` : "";
       if (!ok) {
         return {
           ok: false,
-          reason: `command exited ${r.code}: ${command}`,
+          reason: `command exited ${r.code}: ${command}${scoped}`,
           evidence: out.slice(0, 2000),
+          ...withNotes(got.notes),
         };
       }
-      return { ok: true, evidence: `exit 0: ${command}` };
+      return { ok: true, evidence: `exit 0: ${command}${scoped}`, ...withNotes(got.notes) };
     } catch (err) {
       return { ok: false, reason: `${kind} check errored: ${scrubText(String(err))}` };
     }
