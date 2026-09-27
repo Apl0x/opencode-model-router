@@ -275,7 +275,7 @@ export function buildDoDProtocolSection(cfg: RouterConfig): string {
     : "If you omit the block, a minimal DoD is auto-inferred from the task type.";
   return [
     "### Acceptance / Definition of Done (enforcement is ON)",
-    "Non-trivial delegations are independently verified before their result is accepted (producer \u2260 grader; grader \u2265 producer tier). Attach an acceptance block to your dispatch so the gate knows what \"done\" means:",
+    "Non-trivial delegations are verified independently (producer \u2260 grader; grader \u2265 producer tier). Required-mode delegations and non-testsPass DoDs are gated before return; testsPass delegations are deferred by default and return unverified with a `[router] unverified \u00b7 vrf_\u2026` footer, a risk level and a handle. Attach an acceptance block to your dispatch so the gate knows what \"done\" means:",
     "",
     "[acceptance]",
     "check: testsPass",
@@ -287,6 +287,8 @@ export function buildDoDProtocolSection(cfg: RouterConfig): string {
     "[/acceptance]",
     "",
     "- check kinds: testsPass | buildPasses | lintClean | fileExists path=\u2026 | schemaMatch path=\u2026 schema=\u2026 | run command=\"\u2026\" expect=\u2026",
+    "- testsPass runs only the tests affected by the producer's changes (the full suite is CI's job); prefer it over a hand-written full-suite run command. A failure that also fails at the dispatch-time reference is excused as pre-existing.",
+    "- Per dispatch you may add `VERIFY:required|deferred` (default deferred: returns at once with a handle and a risk level) and `VERIFY_WAIT:<n>s`. Pick required when later work depends on this delegation, or call router_verify before building on a medium/high-risk deferred result; unverified delegations stay listed in the prompt until verified.",
     "- Command allowlist (first-token basename): npm, npx, pnpm, yarn, bun, node, tsc, tsx, vitest, jest, eslint, prettier. No shell chaining, redirection, substitution or newlines; interpreter inline-eval/print flags are forbidden. buildPasses probes a build script, then root tsconfig.json (npx tsc --noEmit). Unavailable checks produce acceptance caveats, not producer escalation; strictUnverifiable restores rejection.",
     "- " + omitLine,
     "- A failing DoD causes the result to be rejected and retried/escalated, not silently accepted.",

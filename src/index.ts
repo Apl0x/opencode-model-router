@@ -500,7 +500,7 @@ const ModelRouterPlugin: Plugin = async (ctx: PluginInput) => {
     tool: {
       ...(enableDelegateTool ? { delegate: tool({
         description:
-          "Delegate a task to a tier subagent (fast | medium | heavy). The subagent's result is INDEPENDENTLY VERIFIED (deterministic checks, or an independent grader at >= the producer tier in a fresh session) before it is returned. Returns an accepted result on PASS, or an honest 'unmet' status on FAIL — never a self-reported completion. Optionally pass an [acceptance]...[/acceptance] block to define the Definition of Done.",
+          "Delegate a task to a tier subagent (fast | medium | heavy). Required-mode delegations and non-testsPass DoDs are verified independently (deterministic checks, or a grader at >= the producer tier in a fresh session) before return: an accepted result on PASS, an honest 'unmet' status on FAIL. testsPass delegations are deferred by default and return UNVERIFIED with a `[router] unverified · vrf_…` footer, a risk level and a handle; verify them with router_verify, or dispatch in required mode (`VERIFY:required|deferred`). Optionally pass an [acceptance]...[/acceptance] block to define the Definition of Done.",
         args: {
           task: tool.schema
             .string()
@@ -1670,7 +1670,7 @@ const ModelRouterPlugin: Plugin = async (ctx: PluginInput) => {
           "criteria: <plain-language success condition, when no deterministic check applies>",
           "deliverable: <path or short description>",
           "[/acceptance]",
-          "Prefer deterministic checks (testsPass/buildPasses/fileExists). Use a criteria line for design/explanatory tasks. Trivial read-only steps need no acceptance block.",
+          "Prefer deterministic checks (testsPass/buildPasses/fileExists). testsPass means the tests affected by the producer's changes pass (the full suite is CI's job), so prefer it over a hand-written full-suite run command. Use a criteria line for design/explanatory tasks. Trivial read-only steps need no acceptance block.",
         ].join("\n"),
         description:
           "Annotate a plan with [tier:fast/medium/heavy] delegation tags",
