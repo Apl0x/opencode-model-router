@@ -340,3 +340,275 @@ narrow edge; Info = no change required.
 - Purity: risk.ts has a single `import type` from `./runner`; directives.ts has no imports. No
   process, fs or network access.
 - Reason strings are stable and pinned by a test.
+
+## QA re-review (round 2)
+
+Reviewer: @heavy, adversarial re-review of `3338d75..f16b56c` (35669c0, 3ddd994, f16b56c):
+`src/verify/directives.ts`, `src/verify/risk.ts`, both test files and this report, against plan
+§1.5-15, §1.5-17, "Phase 1.6" (plan L857-915) and the 2.4 tasks (plan L1158-1218).
+
+Method:
+- `npx vitest run --maxWorkers=2 test/unit/directives.test.ts test/unit/risk.test.ts` → 2 files, 41 passed.
+- Throwaway scripts in `%TEMP%\omr-qa16r2` (deleted afterwards), run with `node --experimental-strip-types`.
+  They import both modules and a verbatim copy of `parseCapDirective` (sessions.ts:59-66). The
+  labels in brackets below (`[1a]`, `[e20]`, ...) are probe cases; the quoted results are their
+  actual output.
+- Real porcelain: a temp git repo (git 2.51.0.windows.1) put into `MD`, `RD`, `R `, `RM`, `UU`,
+  `D `, ` D`, ` M`, `??` and intent-to-add states. Its changed files were read with the real
+  `snapshotTree` (tree.ts) and passed to `assessRisk`. tree.ts:21/27 passes `status --porcelain=v1 -z`
+  records as `{ path: resolve(root, record.slice(3)), status: record.slice(0, 2) }`, where `root` is
+  the `rev-parse --show-toplevel` output. The rename source is skipped (tree.ts:28).
+
+### Resolved findings — verification
+
+| Finding | Status | Evidence |
+|---|---|---|
+| QA-1.6-1 | Verified | [1a] `**VERIFY:required**` → required (`**CAP:3**` → 3); [1b] `` `VERIFY:required` `` → required; [1c] `VERIFY:required.` → required; [1d] `VERIFY:"required"` → required; [1e] `**VERIFY_WAIT:2s**` → 2000. |
+| QA-1.6-2 | Verified (whitespace-separated occurrences) | [2a] `Verify: run npm test and report.\n\nVERIFY:required` → required, no log; `CAP:abc CAP:3` → 3. Residual in the same whitespace-free token: QA-1.6-19. |
+| QA-1.6-3 | Verified for the mandatory part (no line straddle); same-line residual | [3a] `Steps to verify:\nrequired fields present` → default; [3d] `VERIFY:\ndeferred` (default required) → required/default. The round-1 same-line examples still parse: [3b] `Verify: required fields are validated` → required; [3c] `Things to verify: deferred loading works` → deferred, `modeSource:"directive"`. The round-1 fix called the terminator part optional, so this is tracked as QA-1.6-18. |
+| QA-1.6-4 | Verified (doc contract) | Contract in directives.ts:21-27. Behaviour unchanged by design: [4a] literal example + `VERIFY:deferred` → required; [4b] `\|VERIFY:required\|` → default, no log (documented); [4d] `VERIFY:required\|deferred`/`VERIFY_WAIT:<n>s` → defaults, no log. |
+| QA-1.6-5 | Verified | Test renamed "is deterministic and stateless"; directives.ts:29-35 names the prompt-only rule and the quoting risk. Two consecutive calls return equal results. |
+| QA-1.6-6 | Verified | [6a] `VERIFY_WAIT:2s` → `modeSource:"default"`, `waitSource:"directive"`; [6b] `VERIFY:maybe VERIFY_WAIT:1s` → `modeSource:"default"` + one log line. |
+| QA-1.6-7 | Verified (length, C0, C1/DEL) | [7a] 200 × `A` → the log holds exactly 32 `A`s; [7b] ESC and U+009B → `\u001b` / `\u009b` escaped. Residual for Unicode format characters: QA-1.6-24. |
+| QA-1.6-9 | Verified | With `root`: [9a] `/home/u/docs/app/test/a.test.ts` ` D` → high; [9b] `D:\work\docs\app\src\core.ts` ` D` → medium; [9c] `/home/u/docs/app/package.json`, no reference → high; [9d] `/tmp/test/app/src/a.ts` → low `["1-5 files changed"]`. Absolute paths without a usable root never count as docs (tested). Edge cases: QA-1.6-22. |
+| QA-1.6-10 | Verified | `requirements.txt`, `CMakeLists.txt`, `docs/package.json` (no reference) → high, config reason; [10d] `docs/conf.py` + `docs/vite.config.ts` → medium. Residual: QA-1.6-23. |
+| QA-1.6-11 | Verified | `src/__snapshots__/a.test.ts.snap` → medium "a test file was modified"; `vite.config.ts`, `vitest.workspace.ts`, `vitest.setup.ts`, `pytest.ini`, `tox.ini`, `setup.cfg`, `.gitlab-ci.yml` → medium config. Breadth of the setup rule: QA-1.6-21. |
+| QA-1.6-12 | Verified, including real porcelain | Synthetic: `MD` test → high; `AD`/`RD` → deleted-or-renamed. Real `snapshotTree` output: `MD test/a.test.ts` → high; `RD`, `R `, `RM`, `D `, and a worktree-column ` R` → medium. See "Real porcelain" below. |
+| QA-1.6-13 | Verified with an explicit `previousPath`; not reachable from tree.ts yet | [13a] `src/a.test.ts` → `src/a.ts` and [13b] → `src/a.test.ts.bak` → high "a test file was deleted". Real output: raw `R  test/r.ts\0test/r.test.ts\0`, yet `snapshotTree` lists only `test/r.ts`, so `previousPath` stays empty. Without it, [13c] `R ` → medium only. Deferred (2.1). |
+| QA-1.6-15 | Verified | [15a] 6 × `src/a.ts` → low; [15b] `./src/a.ts`, `src\a.ts`, `src/a.ts`, `D:\r\src\a.ts`, `d:/R/src/A.ts` + `src/b.ts` with root `D:\r` → 2 keys, low. [15c] POSIX case-distinct paths stay distinct (correct). |
+| QA-1.6-16 | Verified | directives.ts purity test added; both guards reject `require(`/`import(`/`process.`; the parity inputs include bold, backtick and punctuation wrappers. Residual guard gaps: QA-1.6-25. |
+
+Not changed by design (unchanged from round 1):
+- QA-1.6-8: deferred to the §1.4 config-resolver phase.
+- QA-1.6-14: the header note is now present (risk.ts:16-17); the unknown case is deferred (2.4).
+- QA-1.6-17: Info, no change.
+
+### Real porcelain (tree.ts → assessRisk, root = `rev-parse --show-toplevel`)
+
+| status (tree.ts) | path | level, reasons |
+|---|---|---|
+| ` D` | `docs/guide.md` | low, documentation-only |
+| ` M` | `docs/my guide.md`, `docs/ünï.md` | low, documentation-only (`-z` means no quoting; spaces and Unicode survive) |
+| `R ` / `RM` / `RD` | `src/b2.ts` / `src/c2.ts` / `src/renamed.ts` | medium, deleted-or-renamed |
+| ` R` | `src/ita.ts` | medium. Git paired the intent-to-add file with a deleted staged file as a worktree rename, so a planned `AD` came out as ` R` + `A `: R in the Y column. |
+| `D ` | `src/gone.ts` | medium |
+| `A ` | `src/new.ts` | low |
+| `UU` | `src/conflict.ts` | low (see QA-1.6-26) |
+| `MD` | `test/a.test.ts` | high, "a test file was deleted" |
+| `R ` | `test/r.ts` (from `test/r.test.ts`) | medium, test modified (still under `test/`) |
+| `??` | `notes.md` | low, documentation-only |
+
+All 13 records together → high `["6-15 files changed","a test file was deleted","files were deleted or renamed"]`,
+with every root spelling and with no root.
+
+### New findings
+
+| ID | Severity | Summary |
+|---|---|---|
+| QA-1.6-18 | Low | Same-line prose is still a directive; the leading-quote acceptance widens it |
+| QA-1.6-19 | Low | A second occurrence in the same whitespace-free token is swallowed (`CAP:` finds it) |
+| QA-1.6-20 | Low | NBSP/Unicode spaces around the colon no longer parse, silently (parity regression) |
+| QA-1.6-21 | Low | The `*setup*` config rule over-rates application code and is the only super-linear regex |
+| QA-1.6-22 | Low | The `root` contract: a subdirectory root can under-rate; `TreeSnapshot` does not expose the toplevel |
+| QA-1.6-23 | Low | `requirements/*.txt` directories are not treated as dependency manifests |
+| QA-1.6-24 | Info | Log escaping leaves Unicode format characters (bidi overrides) raw |
+| QA-1.6-25 | Info | The purity guards miss global network APIs and non-listed re-exports |
+| QA-1.6-26 | Info | The first-letter status heuristic for word forms; `UU` rated as an ordinary change |
+
+**QA-1.6-18 — Low — same-line prose is still a directive; the leading-quote acceptance widens it**
+- Where: directives.ts:70 (`i` flag on the key), :72 (`LEAD`), :73.
+- Evidence (probe):
+  - [3b] `Verify: required fields are validated` → required;
+  - [3c] `Things to verify: deferred loading works`, `defaultVerify:"required"` → deferred, `modeSource:"directive"`;
+  - [q1] `Please verify: "deferred" state is rendered correctly.` → deferred;
+  - [q3] ``Things to verify: `deferred` imports still resolve`` → deferred;
+  - [q2] `Also verify: *required* fields show an error.` → required;
+  - [q4] `verify: 'required' props are passed` → required.
+
+  q1-q4 are new with 35669c0. The round-1 grammar kept the quote/backtick in the value, so those
+  inputs fell back to the default. Downgrades only matter with the opt-in `defaultVerify:"required"`.
+  Upgrades spend a synchronous gate, which is the resource this plan budgets.
+- Fix: keep upper-case `VERIFY:` as it is. When the key is not written in upper case, accept the
+  value only if nothing except closing markup or punctuation follows it before the end of the line
+  or the next directive. The plan's `verify:Required` test still passes, and 3b/3c/q1-q4 are
+  rejected. Add these six strings as tests.
+
+**QA-1.6-19 — Low — a second occurrence in the same whitespace-free token is swallowed**
+- Where: directives.ts:70-71 (`(\S*)` inside the scan regex) and :92 (`matchAll` resumes after the capture).
+- Evidence (probe):
+  - [s1] `VERIFY:maybe,VERIFY:required` → default, log `"maybe,VERIFY:required"`; `CAP:abc,CAP:3` → 3;
+  - [s2] the same with `;`;
+  - [s3] `(VERIFY:tbd)/VERIFY:required` → default;
+  - [s4] `VERIFY_WAIT:soon,VERIFY_WAIT:2s` → 5000 (default);
+  - [s5] with different keys (`VERIFY:required,VERIFY_WAIT:2s`) both parse.
+
+  The drop is logged, not silent, and the trigger is narrow. It still breaks the "same rules as
+  `CAP:`" parity.
+- Fix: match only key + colon in `VERIFY_RE`/`WAIT_RE`. Read the token with a sticky `/\S*/y` at
+  the end of the match, so scanning resumes right after the colon. Add s1/s4 as parity tests.
+
+**QA-1.6-20 — Low — NBSP/Unicode spaces around the colon no longer parse (silent parity regression)**
+- Where: directives.ts:70-71 (`[ \t]*`, introduced for QA-1.6-3).
+- Evidence (probe):
+  - [n1] `VERIFY:\u00a0required` → default, **no log**; `CAP:\u00a03` → 3;
+  - [n3] U+3000 → the same;
+  - `VERIFY\u00a0:required` → default.
+
+  The round-1 "Verified OK" list had "a no-break space after the colon parse(s)". The failure is
+  silent because `(\S*)` captures `""`, and an empty value is skipped without a log line. An
+  explicit `required` becomes the default `deferred`: the failure class named in the 2.4 QA focus.
+- Fix: replace `[ \t]*` with `[^\S\r\n\u2028\u2029]*` on both sides of the colon. That allows any
+  horizontal whitespace and still never straddles a line. Add NBSP/U+3000 parity tests next to
+  the existing line-break tests.
+
+**QA-1.6-21 — Low — the `*setup*` config rule over-rates application code and is the only super-linear regex**
+- Where: risk.ts:157 (`/setup[^/]*\.[cm]?[jt]sx?$/i`).
+- Evidence:
+  - Over-rating (probe): `src/setup.ts`, `src/ui/SetupWizard.tsx`, `src/hooks/useSetup.ts`,
+    `src/server/setupRoutes.js` and `lib/teardownAndSetup.mjs` → medium "config, lock or CI files
+    changed". `src/setup.ts` with no reference → high. (This repo has no such file:
+    `git ls-files | rg -i setup` is empty, so these are synthetic paths.)
+  - Setup files under test directories already hit the test row: `test/setup.ts` and
+    `tests/auth.setup.ts` → "a test file was modified". Outside test directories the broad pattern
+    adds mostly false positives.
+  - Cost (probe, basename of repeated `setup`): 10k chars → 12 ms, 20k → 56 ms, 40k → 206 ms,
+    80k → 840 ms, which is quadratic. At 100k, `isConfigPath` takes 1.3 s and `assessRisk` 2.6 s
+    per file (it runs the rule twice). Real file names are at most 255 characters (255 → 0.0 ms).
+    But tool-observed paths (`extractChangedFile`, dispatch.ts:54-67) are model-supplied arguments
+    that are never checked against the filesystem.
+  - All other directive and risk regexes are linear. 100k-character adversarial inputs took
+    ≤ 4.1 ms; 1M characters took 24.6 ms, a 10× input giving about a 7.7× time.
+- Answer: not acceptable as is. Restrict the rule to test-setup naming conventions.
+- Fix: replace line 157 with `/\.setup\.[cm]?[jt]sx?$/i.test(b)` (covers `vitest.setup.*`,
+  `jest.setup.*`, `auth.setup.*`) or
+  `/^(setupTests|setup-tests|test-setup|global-setup|globalSetup)\.[cm]?[jt]sx?$/i.test(b)`. Both
+  are linear. Tests: keep `vitest.setup.ts`, `src/setupTests.js`, `e2e/global-setup.ts` and
+  `jest.setup.js` as config; assert `src/setup.ts` and `src/ui/SetupWizard.tsx` are not config.
+  Record the change as an adjustment to the §1.5-17 extension.
+
+**QA-1.6-22 — Low — the `root` contract: a subdirectory root can under-rate; `TreeSnapshot` does not expose the toplevel**
+- Where: risk.ts:7-11, :56-57, :102-111; dispatch.ts:18-24; tree.ts:16, :47.
+- Evidence:
+  - [e20] root `D:\repo\tests`, deleted `D:\repo\tests\helpers\db.ts` → medium ("files were deleted
+    or renamed"). With the toplevel root [e19] → high ("a test file was deleted"). A root that is
+    a subdirectory strips the inner `tests/` segment and under-rates a test deletion.
+  - Real run under `%TEMP%` (`C:\Users\MARQUI~1\...`): `show-toplevel` =
+    `C:/Users/Marquinho/...`, and the tree.ts paths are `C:\Users\Marquinho\...`. For the
+    docs-only subset:
+    - root = the 8.3 spelling → medium `["1-5 files changed","files were deleted or renamed"]`
+      (conservative);
+    - root = `show-toplevel` or `snapshot.cwd` → low.
+    - `realpathSync(repo)` returned the 8.3 form; `realpath` from `fs/promises`, as used by
+      tree.ts, returned the long form.
+  - `TreeSnapshot` carries `cwd: realpath(cwd)` but not the git root. `cwd` is a subdirectory
+    whenever the delegation's cwd is one. So the 2.4 caller has no toplevel to hand unless it runs
+    git again.
+  - UNC roots are not case-folded. [e9] `\\SERVER\share\repo\docs\a.md` under root
+    `\\server\share\repo` → not docs. [e10] a `tests` ancestor makes a `src` deletion "a test file
+    was deleted". Both are conservative.
+  - Correct edge cases:
+    - trailing separators [e1-e4] and mixed separators [e5];
+    - drive-letter case [e6] and POSIX case sensitivity [e7];
+    - `D:\` [e16] and `/` [e17] as roots;
+    - the root itself as a path [e11] and paths outside the root [e12, e13, e18] fall back
+      conservatively;
+    - `D:\repo2` is not taken to be under `D:\repo` [e13].
+  - `..` segments are not normalised: [e15] `D:\repo\..\evil\README.md` → docs. tree.ts resolves
+    paths, so only raw tool-observed paths could contain `..` (Info).
+- Fix now (doc): in the risk.ts header, state that `root` must be the toplevel the paths were
+  resolved against (`git rev-parse --show-toplevel`, as tree.ts uses), never the delegation cwd,
+  because a subdirectory root can under-rate. Optionally fold case for `//host/share` roots, as is
+  done for drive letters.
+- Deferred by plan (2.1/2.4): expose the toplevel on `TreeSnapshot` (or emit repo-relative paths),
+  and pass it through in the 2.4 wiring.
+
+**QA-1.6-23 — Low — `requirements/*.txt` directories are not dependency manifests**
+- Where: risk.ts:167 (basename-only `^(requirements|constraints).*\.txt$`).
+- Evidence (probe): `requirements/base.txt`, no reference → medium `["1-5 files changed","no reference…"]`
+  with no config reason. `requirements.txt` → high with the config reason. The pip layout
+  `-r requirements/base.txt` is common.
+- Fix: also match `(^|/)requirements/[^/]*\.txt$`, with a test.
+
+**QA-1.6-24 — Info — log escaping leaves Unicode format characters raw**
+- Where: directives.ts:78-83.
+- Evidence: [7d] `verify:\u202eevil` → the log line contains a raw U+202E (right-to-left
+  override). `JSON.stringify` escapes C0; `safe` adds U+007F-U+009F only. Bidi controls, zero-width
+  characters and U+2028/2029 inside a longer token pass through. The problem is limited to the log.
+- Fix (optional): widen the class to `[\u007f-\u009f\u200b-\u200f\u2028-\u202e\u2060-\u2069\ufeff]`.
+
+**QA-1.6-25 — Info — the purity guards miss global network APIs and non-listed re-exports**
+- Where: risk.test.ts (purity test) and directives.test.ts (QA-1.6-16 test).
+- Evidence: running the risk guard regex on these strings reports each as NOT caught:
+  - `await fetch("http://x")`;
+  - `new WebSocket(u)`;
+  - `export { cpus } from "node:os"` (the directives guard catches `node:`, but not `fetch`).
+
+  Neither module contains any of them today.
+- Fix (optional): add `\bfetch\(|\bWebSocket\b|\bXMLHttpRequest\b|^export .* from` to both guards.
+
+**QA-1.6-26 — Info — the first-letter status heuristic for word forms; `UU` rated as ordinary**
+- Where: risk.ts:173-177.
+- Evidence (probe):
+  - `removed` → R → "renamed". For a test file this gives medium, not high: `testGone` needs
+    `deleted` (risk.ts:231-232).
+  - `dirty` → D.
+  - `UU` (unresolved conflict, real porcelain) → low.
+
+  No producer emits word forms that start with D or R today: tree.ts emits porcelain codes, and
+  `extractChangedFile` emits `written`/`modified` (dispatch.ts:66). The header documents the rule.
+- Fix: none now. If 2.x introduces word statuses, map them explicitly (`deleted|removed` → D,
+  `renamed` → R).
+
+### Other checks (no finding)
+
+- `modeSource`/`waitSource` compared with the plan contract. Plan 1.6.1 (L874-875) specifies one
+  `source`. A grep of the plan shows L875 is the only place that mentions it. The 2.4 tasks and
+  tests (L1158-1218) consume only `mode` and `waitMs`. The deviation is recorded under "Result".
+  What 2.4 consumers must do:
+  - use `modeSource` wherever they need "the orchestrator chose the mode" (e.g. a footer or log
+    note, or the "`defaultVerify:"required"` with no directive" test → `modeSource:"default"`);
+  - never infer it from `waitSource`;
+  - destructure `mode`/`waitMs`, not `source`.
+
+  The 1.6.1 signature text in the plan should be amended when the plan is next revised.
+- Directives:
+  - `VERIFY:**required**`, ``VERIFY:``required`` ``, `VERIFY:_required_`, `_VERIFY:required_` and
+    `VERIFY:[required]` → default. The matching `CAP:` forms (`CAP:**3**`, `CAP:_3_`, `_CAP:3_`,
+    `CAP:[3]`) → null too, so parity holds.
+  - `*VERIFY:required*`, `VERIFY:*required*` → required.
+  - Header nit: `_` is listed as an accepted leading mark, but `VERIFY:_required_` fails at the
+    closing `_` (a word character).
+  - `VERIFY:required/deferred` → required (the `/` form is not a placeholder). The router contract
+    requires `|` or `<…>`, so this is not a finding.
+  - `CAP:0 CAP:3` → null, while `VERIFY_WAIT:0s VERIFY_WAIT:2s` → 0. Both follow their own grammar.
+  - `VERIFY_WAIT:007s` → 7000; `5Ms` → 5; `VERIFY_WAIT : 2s` → 2000; a 400-digit number → capped
+    at 15000; `VERIFY_WAIT:2s|5s` → placeholder.
+  - U+2028 after the colon → skipped (`\S*` ends at it).
+  - The global regexes are used through `matchAll` (it clones them), and the value regexes are
+    non-global, so there is no `lastIndex` state across calls.
+- Docs set:
+  - `README` and `LICENSE` (no extension), `docs/a.pdf`, `docs/index.html`, `docs/api.json` and
+    `docs/_static/app.js` → not docs. That errs to medium only when there is no reference.
+  - `docs/requirements.txt` and `.github/PULL_REQUEST_TEMPLATE.md` → config. This is plan-mandated
+    (`.github/**`) and conservative.
+  - `Docs/guide.txt`, `CHANGELOG.TXT`, `notes.MD` → docs. `test/fixtures/x.md` → test.
+  - `src/prompts/system.md` → docs. Markdown anywhere is documentation for test-risk purposes.
+    Acceptable, because the signal concerns test verdicts.
+- Dedupe: counts only; the rows still see every record (correct: a duplicate cannot hide a deletion).
+
+### Deferred by plan
+
+| Item | Phase |
+|---|---|
+| Golden check that `parseVerifyDirectives` returns defaults over the final header/protocol text (QA-1.6-4) | 2.3 / 2.4 |
+| "Subagent cannot self-select" enforcement test; parse only the orchestrator `prompt` (QA-1.6-5) | 2.4 |
+| Clamp `captureWaitMs ≤ baselineTimeoutMs` (QA-1.6-8) | §1.4 config resolver phase |
+| Fill `previousPath` from the porcelain rename source. tree.ts:28 skips it today; confirmed on real `-z` output (QA-1.6-13) | 2.1 |
+| Unknown or failed attribution must not become `[]` → low (QA-1.6-14) | 2.4 |
+| Expose the git toplevel on `TreeSnapshot` / pass it as `root` (QA-1.6-22) | 2.1 / 2.4 |
+| Tool-observed `ChangedFile` never carries a deletion (`written`/`modified` only, dispatch.ts:66), so `apply_patch` deletes and shell `rm` never reach risk as deletions | 2.1 / 2.4 (changed-file computation) |
+| Amend the plan's 1.6.1 signature (`source` → `modeSource`/`waitSource`) | next plan revision |
+
+Outcome: every resolved finding except QA-1.6-3 is verified. QA-1.6-3's mandatory part is
+verified, and its residual is QA-1.6-18. Six new Low and three Info findings are open. No High or
+Medium finding is open.
