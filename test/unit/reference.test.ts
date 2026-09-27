@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import * as fsp from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -14,25 +14,63 @@ import {
   type ReferenceDeps,
 } from "../../src/verify/reference";
 
-// Test-only ArgvSeam: real git through execFile (reference.ts never imports child_process).
+const isWin = process.platform === "win32";
+const linkType = isWin ? "junction" : "dir";
+
+type SeamOptions = Parameters<CaptureDeps["argv"]>[2];
+
+/** Kill a process and all its descendants (what runArgv (1.2) does on abort or timeout). */
+function treeKill(pid: number): Promise<void> {
+  return new Promise((resolve) => {
+    if (isWin) {
+      execFile("taskkill", ["/T", "/F", "/PID", String(pid)], { windowsHide: true }, () => resolve());
+      return;
+    }
+    try {
+      process.kill(-pid, "SIGKILL");
+    } catch (error) {
+      // ESRCH: the group already exited, nothing left to kill.
+      if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
+    }
+    resolve();
+  });
+}
+
+// Test-only ArgvSeam, production-like: env merged over process.env, and a tree kill on
+// abort or timeout; resolves only after the process has exited (reference.ts never
+// imports child_process).
 const argv: CaptureDeps["argv"] = (file, args, opts) =>
   new Promise((resolve) => {
-    execFile(
-      file,
-      [...args],
-      {
-        cwd: opts?.cwd,
-        timeout: opts?.timeoutMs,
-        signal: opts?.signal,
-        windowsHide: true,
-        maxBuffer: 64 * 1024 * 1024,
-        encoding: "utf8",
-      },
-      (error, stdout, stderr) => {
-        if (!error) return resolve({ code: 0, stdout, stderr });
-        resolve({ code: typeof error.code === "number" ? error.code : 1, stdout, stderr, timedOut: error.killed === true });
-      },
-    );
+    const child = spawn(file, [...args], {
+      cwd: opts?.cwd,
+      env: opts?.env ? { ...process.env, ...opts.env } : process.env,
+      windowsHide: true,
+      detached: !isWin,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let stdout = "";
+    let stderr = "";
+    let killed = false;
+    child.stdout.setEncoding("utf8").on("data", (chunk: string) => void (stdout += chunk));
+    child.stderr.setEncoding("utf8").on("data", (chunk: string) => void (stderr += chunk));
+    const kill = () => {
+      if (killed || child.pid === undefined || child.exitCode !== null) return;
+      killed = true;
+      void treeKill(child.pid);
+    };
+    const timer = opts?.timeoutMs ? setTimeout(kill, opts.timeoutMs) : undefined;
+    opts?.signal?.addEventListener("abort", kill, { once: true });
+    if (opts?.signal?.aborted) kill();
+    const done = (code: number) => {
+      clearTimeout(timer);
+      opts?.signal?.removeEventListener("abort", kill);
+      resolve({ code, stdout, stderr, timedOut: killed });
+    };
+    child.on("error", (error) => {
+      stderr += String(error);
+      done(-1);
+    });
+    child.on("close", (code) => done(code ?? 1));
   });
 
 async function git(cwd: string, ...args: string[]): Promise<string> {
@@ -41,8 +79,14 @@ async function git(cwd: string, ...args: string[]): Promise<string> {
   return result.stdout;
 }
 
-const isWin = process.platform === "win32";
-const linkType = isWin ? "junction" : "dir";
+async function waitFor(predicate: () => Promise<boolean>, timeoutMs: number): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (await predicate()) return true;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  return predicate();
+}
 
 let base: string;
 let repo: string;
@@ -79,8 +123,12 @@ function deps(over: Partial<ReferenceDeps> = {}): ReferenceDeps {
   return { argv, fs: nodeReferenceFs, tmpdir: tmp, logger: { warn: (m) => void warnings.push(m) }, ...over };
 }
 
+function captureDeps(over: Partial<CaptureDeps> = {}): CaptureDeps {
+  return { argv, fs: nodeReferenceFs, tmpdir: tmp, ...over };
+}
+
 async function capture(signal = new AbortController().signal): Promise<DispatchReference> {
-  const ref = await captureReference(repo, signal, { argv, fs: nodeReferenceFs });
+  const ref = await captureReference(repo, signal, captureDeps());
   if (!ref) throw new Error("capture returned undefined");
   return ref;
 }
@@ -167,13 +215,13 @@ describe("captureReference", { timeout: 60_000 }, () => {
   it("submodules -> undefined", async () => {
     const head = (await git(repo, "rev-parse", "HEAD")).trim();
     await git(repo, "update-index", "--add", "--cacheinfo", `160000,${head},sub`);
-    expect(await captureReference(repo, new AbortController().signal, { argv, fs: nodeReferenceFs })).toBeUndefined();
+    expect(await captureReference(repo, new AbortController().signal, captureDeps())).toBeUndefined();
   });
 
   it("outside a git repo -> undefined", async () => {
     const outside = join(base, "not a repo");
     await fsp.mkdir(outside);
-    expect(await captureReference(outside, new AbortController().signal, { argv, fs: nodeReferenceFs })).toBeUndefined();
+    expect(await captureReference(outside, new AbortController().signal, captureDeps())).toBeUndefined();
   });
 
   it("abort mid-capture -> undefined, no partial state", async () => {
@@ -182,12 +230,77 @@ describe("captureReference", { timeout: 60_000 }, () => {
     const controller = new AbortController();
     const aborting: CaptureDeps["argv"] = async (file, args, opts) => {
       const result = await argv(file, args, opts);
-      if (args[0] === "stash") controller.abort();
+      if (args.includes("stash")) controller.abort();
       return result;
     };
-    expect(await captureReference(repo, controller.signal, { argv: aborting, fs: nodeReferenceFs })).toBeUndefined();
-    expect(await captureReference(repo, AbortSignal.abort(), { argv, fs: nodeReferenceFs })).toBeUndefined();
+    expect(await captureReference(repo, controller.signal, captureDeps({ argv: aborting }))).toBeUndefined();
+    expect(await captureReference(repo, AbortSignal.abort(), captureDeps())).toBeUndefined();
     expect(await repoState(repo)).toEqual(before);
+  });
+
+  it("QA-1.5-1: a tree kill of `git stash create` while it holds the index lock leaves the user's index untouched", async () => {
+    // A slow clean filter keeps stash create inside its stat refresh, which holds the
+    // index lock, so the kill below lands while the lock is held.
+    await fsp.writeFile(join(repo, ".gitattributes"), "slow.txt filter=slow\n");
+    await fsp.writeFile(join(repo, "slow.txt"), "slow\n");
+    await git(repo, "add", ".gitattributes", "slow.txt");
+    await git(repo, "commit", "-q", "-m", "slow");
+    // Short: on win32 the MSYS `sleep` escapes `taskkill /T` (its parent is a fork stub)
+    // and holds git's stderr pipe until it exits, so the seam resolves only after it.
+    await git(repo, "config", "filter.slow.clean", "sleep 3; cat");
+    const past = new Date(Date.now() - 60_000);
+    await fsp.utimes(join(repo, "slow.txt"), past, past); // stat-dirty, same size: the refresh re-cleans it
+    const userIndex = join(repo, ".git", "index");
+    const indexBefore = await fsp.readFile(userIndex);
+    const controller = new AbortController();
+    let stashOpts: SeamOptions;
+    let lockSeen = false;
+    const killing: CaptureDeps["argv"] = async (file, args, opts) => {
+      if (!args.includes("stash")) return argv(file, args, opts);
+      stashOpts = opts;
+      const kill = new AbortController();
+      const running = argv(file, args, { ...opts, signal: kill.signal });
+      const lock = `${opts?.env?.GIT_INDEX_FILE ?? userIndex}.lock`;
+      lockSeen = await waitFor(() => exists(lock), 15_000);
+      controller.abort(); // the caller gives up...
+      kill.abort(); // ...and git is tree-killed while it holds the lock, as a timeout would do
+      return running;
+    };
+    const started = Date.now();
+    expect(await captureReference(repo, controller.signal, captureDeps({ argv: killing }))).toBeUndefined();
+    expect(Date.now() - started).toBeLessThan(15_000);
+    expect(lockSeen).toBe(true);
+    expect(stashOpts?.signal).toBeUndefined();
+    const privateIndex = stashOpts?.env?.GIT_INDEX_FILE ?? "";
+    expect(privateIndex.toLowerCase().startsWith(tmp.toLowerCase())).toBe(true);
+    expect(await exists(`${userIndex}.lock`)).toBe(false);
+    expect(Buffer.compare(await fsp.readFile(userIndex), indexBefore)).toBe(0);
+    expect((await fsp.readdir(join(repo, ".git"))).filter((name) => name.startsWith("index.stash."))).toEqual([]);
+    // The producer's next index write still works.
+    await git(repo, "config", "--unset", "filter.slow.clean");
+    await git(repo, "add", "slow.txt");
+  });
+
+  it("QA-1.5-2: every git call carries --no-optional-locks; capture and materialize never write the user's index", async () => {
+    await fsp.writeFile(join(repo, "a.txt"), "a-dirty\n");
+    const past = new Date(Date.now() - 60_000);
+    await fsp.utimes(join(repo, "b.txt"), past, past); // stat-only change: a refresh would rewrite the index
+    const userIndex = join(repo, ".git", "index");
+    const indexBefore = await fsp.readFile(userIndex);
+    const calls: string[][] = [];
+    const recording: CaptureDeps["argv"] = (file, args, opts) => {
+      calls.push([...args]);
+      return argv(file, args, opts);
+    };
+    const ref = await captureReference(repo, new AbortController().signal, captureDeps({ argv: recording }));
+    expect(ref).toBeDefined();
+    if (!ref) return;
+    expect(await git(repo, "show", `${ref.commit}:a.txt`)).toBe("a-dirty\n");
+    const handle = await mat(ref, { argv: recording });
+    await handle.dispose();
+    expect(calls.length).toBeGreaterThan(5);
+    for (const args of calls) expect(args[0]).toBe("--no-optional-locks");
+    expect(Buffer.compare(await fsp.readFile(userIndex), indexBefore)).toBe(0);
   });
 });
 

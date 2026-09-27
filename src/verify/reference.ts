@@ -90,8 +90,12 @@
 // ----------------------------------------------------------------------------
 //   Budget: deps.timeoutMs (default DEFAULT_CAPTURE_TIMEOUT_MS, which equals the
 //   baselineTimeoutMs default of 15000). Each git call gets
-//   timeoutMs = min(remaining budget) and the caller's signal. File reads use
+//   timeoutMs = min(remaining budget) and the caller's signal, except
+//   `stash create` (step 4), which gets the timeout only. File reads use
 //   AbortSignal.any([signal, AbortSignal.timeout(remaining)]).
+//   Every git call in this module runs as `git --no-optional-locks ...`
+//   (QA-1.5-2), so a read-only call never refreshes, and so never rewrites,
+//   the user's index.
 //   1. `git rev-parse --show-toplevel` (cwd: the dispatch cwd) -> root. A
 //      non-zero exit (outside a repository, or a bare repository) returns
 //      undefined.
@@ -100,9 +104,31 @@
 //      snapshotTree makes (tree.ts).
 //   3. `git rev-parse --verify HEAD^{commit}` -> head. Failure (e.g. an unborn
 //      branch) returns undefined.
-//   4. `git stash create` -> trimmed stdout. Empty means commit = head. A 40-
-//      or 64-character hex SHA becomes commit. Anything else, or a non-zero
-//      exit (e.g. an unmerged index, or index.lock held), returns undefined.
+//   4. `git stash create` on a PRIVATE INDEX (QA-1.5-1/2) -> trimmed stdout.
+//      Empty means commit = head. A 40- or 64-character hex SHA becomes
+//      commit. Anything else, or a non-zero exit (e.g. an unmerged index),
+//      returns undefined.
+//      - `git rev-parse --git-path index` names the index file (the
+//        per-worktree one in a linked worktree). Its bytes are read with
+//        fs.readFile and written (mode 0o600, flag "wx") to <scratch>/index.
+//        scratch is a fresh omr-ref-<pid>-<16 hex> dir, made with
+//        mkdir(0o700) directly under realpath(deps.tmpdir ?? os.tmpdir())
+//        after assertSafeRefDir (R3), and kept in the in-use set meanwhile.
+//      - `git -c core.splitIndex=false stash create` then runs with env
+//        GIT_INDEX_FILE=<scratch>/index. Git takes its mandatory index lock,
+//        and writes its temporary `<index>.stash.<pid>`, next to the COPY.
+//        core.splitIndex=false makes git write the copy as one file, never a
+//        new sharedindex.* inside .git.
+//      - This one call gets the remaining budget as its timeout but NOT the
+//        caller's signal: an abort must not kill git while it holds a lock.
+//        If the caller aborted meanwhile, the result is discarded. A timeout
+//        kill can still strand a lock, but only on the copy.
+//      - The scratch dir is removed in a finally block by the section 6
+//        pipeline without its git steps. If that fails, the dir is left for
+//        GC, which treats it as an orphan without a .git file (section 11).
+//      Measured by QA on this host: the same tree as a plain `stash create`,
+//      and 0/120 producer `git add` failures against a capture loop, versus
+//      27/120 when stash create shared the user's index.
 //   5. `git ls-files --others --exclude-standard --full-name -z` (cwd: root).
 //      For each path, in sorted order: apply the RELPATH rules (section 10),
 //      then lstat. A regular file is read (with the signal) and hashed with
@@ -118,15 +144,17 @@
 //   - No ref is created (no pinning; see section 8 and D1).
 //   - `git stash create` writes unreferenced loose objects: the stash commit,
 //     its index commit, trees and blobs. `git gc` may later prune them.
-//   - `git stash create` REWRITES .git/index when tracked files are stat-dirty.
-//     Measured in 1.5.1: after touching a.txt and editing packages/a/index.js,
-//     "index bytes changed=True ; index mtime changed=True". The index CONTENT
-//     is unchanged (Spike E: `ls-files -s` identical). This is the same
-//     stat-cache refresh that `git status` does, and snapshotTree already runs
-//     `git status`. It holds .git/index.lock briefly, so a producer git command
-//     racing it can report "index.lock exists". See D2.
-//   - An abort mid-capture leaves nothing but such unreferenced objects, the
-//     same as an interrupted `git stash create`.
+//   - The user's index file is never written and its lock is never taken.
+//     `git stash create` refreshes the stat cache of the index it works on
+//     (measured in 1.5.1 on the shared index: "index bytes changed=True"),
+//     and that refresh needs the MANDATORY index lock. On the shared index, a
+//     tree kill during that window left .git/index.lock behind in 9 of 10 QA
+//     runs, and every later git write in the user's repository failed until
+//     the lock was removed by hand (QA-1.5-1). With the private copy, the
+//     refresh, the lock and the temporary stash index all live in scratch.
+//   - An abort or timeout mid-capture leaves nothing in the repository but
+//     such unreferenced objects (at most, a git object write interrupted by a
+//     timeout kill leaves a tmp_obj_* file, which git gc removes).
 //   Consistency: the capture is not atomic. Tracked state is taken at step 4
 //   and untracked state at step 5. Under §1.5-14 the caller (2.x) discards a
 //   capture that resolves after an edit was observed in an overlapping
@@ -183,9 +211,13 @@
 //      `unreproduced`. Nothing ignored is ever copied.
 //   6. Link each candidate (section 5), parents before children. Git's sorted
 //      output already puts them in that order.
-//   7. Drift checks (c) and (d) of section 2 (two git calls, cwd: root). Like
-//      `git status`, porcelain `git diff` may refresh the index stat cache
-//      (unverified); content is never changed.
+//   7. Drift checks (c) and (d) of section 2 (two git calls, cwd: root). The
+//      drift `git diff` runs on a private index copy, exactly like stash
+//      create (section 3 step 4, with the caller's signal here). Porcelain
+//      `git diff <commit>` rewrote .git/index after a stat-only change
+//      (QA-1.5-2), and re-measured while fixing it, it STILL did so under
+//      --no-optional-locks: its closing refresh_index_quietly() takes the
+//      index lock whenever it is free, whatever GIT_OPTIONAL_LOCKS says.
 //   8. Return { ok: true, reference: { dir, exact, inexactReasons,
 //      unreproduced, links, toRefPath, dispose } }. toRefPath(p) maps an
 //      absolute live path under root to the same relative path under dir, or
@@ -358,12 +390,17 @@
 // ----------------------------------------------------------------------------
 //   D1 No pinning ref for the stash commit (Spike E recommended one). The plan's
 //      capture acceptance criterion forbids ref changes. See section 8.
-//   D2 "Never modify the index": `git stash create` rewrites the index stat
-//      cache (measured in 1.5.1); index content is unchanged (Spike E). It is
-//      kept because the plan's S2 row (§1.3) names `git stash create`. The
-//      effect is the same class as the `git status` that snapshotTree already
-//      runs, and the acceptance commands (status, stash list, for-each-ref)
-//      are unaffected.
+//   D2 "Never modify the index": `git stash create` rewrites the stat cache of
+//      the index it runs on (measured in 1.5.1) and needs the mandatory index
+//      lock for it. That is NOT the same class as `git status`, whose refresh
+//      takes an optional lock and is skipped when the lock is busy: on the
+//      shared index, 27/120 producer `git add` calls failed against a capture
+//      loop (QA-1.5-2). So stash create and the drift `git diff` (which
+//      rewrites the index even under --no-optional-locks, section 4 step 7)
+//      run on a private copy of the index (section 3 step 4), and every git
+//      call carries --no-optional-locks. The user's index is never written.
+//      `git stash create` itself is kept because the plan's S2 row (§1.3)
+//      names it.
 //   D3 exact=false has more causes than §1.5-7: untracked symlinks, dependency
 //      drift and workspace-link drift (section 2, b to d). These only make the
 //      check stricter, and approximate still never excuses.
@@ -463,7 +500,8 @@ export interface ReferenceFs {
   realpath(path: string): Promise<string>;
   readFile(path: string, options: { signal?: AbortSignal }): Promise<Uint8Array>;
   writeFile(path: string, data: Uint8Array, options: { mode: number; flag: "wx" }): Promise<void>;
-  mkdir(path: string, options: { recursive: true }): Promise<unknown>;
+  /** `{ recursive: true }` for copy parents; `{ mode: 0o700 }` (non-recursive, fails on EEXIST) for our own dirs. */
+  mkdir(path: string, options: { recursive?: boolean; mode?: number }): Promise<unknown>;
   chmod(path: string, mode: number): Promise<void>;
   readdir(path: string): Promise<string[]>;
   symlink(target: string, path: string, type: "junction" | "dir"): Promise<void>;
@@ -482,12 +520,15 @@ export interface CaptureDeps {
   fs: ReferenceFs;
   /** Whole-operation budget in ms. capture: DEFAULT_CAPTURE_TIMEOUT_MS; materialize/GC: DEFAULT_MATERIALIZE_TIMEOUT_MS. */
   timeoutMs?: number;
+  /**
+   * Default os.tmpdir(). Reference dirs and capture's scratch dir (private
+   * index, section 3 step 4) are created directly under realpath(tmpdir).
+   */
+  tmpdir?: string;
 }
 
 export interface ReferenceDeps extends CaptureDeps {
   logger?: Pick<PluginLogger, "warn">;
-  /** Default os.tmpdir(). The reference dir is created directly under realpath(tmpdir). */
-  tmpdir?: string;
   /** Default process.pid; encoded in the dir name for crash GC. */
   pid?: number;
   /** Default Date.now. */
@@ -752,22 +793,32 @@ function makeBudget(signal: AbortSignal, timeoutMs: number): Budget {
   };
 }
 
-/** One git run through the seam; undefined on seam error, timeout or abort. */
-async function runGit(
-  argv: ArgvSeam,
-  args: readonly string[],
-  cwd: string,
-  timeoutMs: number,
-  signal?: AbortSignal,
-): Promise<ExecResult | undefined> {
-  if (timeoutMs <= 0 || signal?.aborted) return undefined;
+interface GitRun {
+  readonly cwd: string;
+  readonly timeoutMs: number;
+  /** Omitted only for `stash create` (section 3 step 4): a kill must never land while git holds a lock. */
+  readonly signal?: AbortSignal;
+  /** Merged over process.env by the seam. */
+  readonly env?: Record<string, string>;
+}
+
+/**
+ * One git run through the seam; undefined on timeout or abort. Every call is
+ * `git --no-optional-locks ...` (QA-1.5-2): read-only commands never refresh
+ * the user's index, and so never compete with the producer for index.lock.
+ */
+async function runGit(argv: ArgvSeam, args: readonly string[], run: GitRun): Promise<ExecResult | undefined> {
+  if (run.timeoutMs <= 0 || run.signal?.aborted) return undefined;
+  const opts: ExecOptions = { cwd: run.cwd, timeoutMs: run.timeoutMs };
+  if (run.signal) opts.signal = run.signal;
+  if (run.env) opts.env = run.env;
   try {
-    const result = await argv("git", args, { cwd, timeoutMs, signal });
-    if (result.timedOut || signal?.aborted) return undefined;
+    const result = await argv("git", ["--no-optional-locks", ...args], opts);
+    if (result.timedOut || run.signal?.aborted) return undefined;
     return result;
   } catch (error) {
     // The seam reports spawn failures and aborts by rejecting; both mean "no result".
-    return { code: -1, stdout: "", stderr: describeError(error), timedOut: signal?.aborted };
+    return { code: -1, stdout: "", stderr: describeError(error), timedOut: run.signal?.aborted };
   }
 }
 
@@ -847,7 +898,7 @@ async function sweepLinks(ctx: CleanupContext, dir: string): Promise<string | un
 }
 
 async function isRegistered(ctx: CleanupContext, dir: string): Promise<boolean | undefined> {
-  const list = await runGit(ctx.argv, ["worktree", "list", "--porcelain"], ctx.root, CLEANUP_GIT_TIMEOUT_MS);
+  const list = await runGit(ctx.argv, ["worktree", "list", "--porcelain"], { cwd: ctx.root, timeoutMs: CLEANUP_GIT_TIMEOUT_MS });
   if (!list || list.code !== 0) return undefined;
   const wanted = comparable(dir, ctx.platform);
   return parseWorktreeList(list.stdout).some((entry) => comparable(entry.path, ctx.platform) === wanted);
@@ -883,7 +934,7 @@ async function removeReferenceDir(
     if (stats && git) {
       assertSafeRefDir(dir, ctx.tmpRoots, ctx.platform);
       if (stats.isSymbolicLink() || !stats.isDirectory()) return leftInPlace(ctx, dir, "not a real directory");
-      const removed = await runGit(ctx.argv, ["worktree", "remove", "--force", dir], ctx.root, CLEANUP_GIT_TIMEOUT_MS);
+      const removed = await runGit(ctx.argv, ["worktree", "remove", "--force", dir], { cwd: ctx.root, timeoutMs: CLEANUP_GIT_TIMEOUT_MS });
       if (!removed || removed.code !== 0) {
         ctx.logger?.warn("git worktree remove failed; falling back to fs.rm", { dir, stderr: removed?.stderr.trim() });
       }
@@ -904,7 +955,7 @@ async function removeReferenceDir(
     if (git && (await isRegistered(ctx, dir)) !== false) {
       assertSafeRefDir(dir, ctx.tmpRoots, ctx.platform);
       if (await lstatOrMissing(ctx.fs, dir)) return leftInPlace(ctx, dir, "dir reappeared before admin-entry removal");
-      const removed = await runGit(ctx.argv, ["worktree", "remove", "--force", dir], ctx.root, CLEANUP_GIT_TIMEOUT_MS);
+      const removed = await runGit(ctx.argv, ["worktree", "remove", "--force", dir], { cwd: ctx.root, timeoutMs: CLEANUP_GIT_TIMEOUT_MS });
       if (!removed || removed.code !== 0) {
         ctx.logger?.warn("reference worktree admin entry left registered", { dir, stderr: removed?.stderr.trim() });
         return false;
@@ -938,7 +989,7 @@ async function captureInner(cwd: string, signal: AbortSignal, deps: CaptureDeps)
   const budget = makeBudget(signal, deps.timeoutMs ?? DEFAULT_CAPTURE_TIMEOUT_MS);
   const git = async (args: readonly string[], at: string) => {
     if (budget.spent()) return undefined;
-    const result = await runGit(deps.argv, args, at, budget.remaining(), budget.signal);
+    const result = await runGit(deps.argv, args, { cwd: at, timeoutMs: budget.remaining(), signal: budget.signal });
     return result && result.code === 0 && !budget.spent() ? result : undefined;
   };
 
@@ -950,9 +1001,20 @@ async function captureInner(cwd: string, signal: AbortSignal, deps: CaptureDeps)
   const headOut = await git(["rev-parse", "--verify", "HEAD^{commit}"], root);
   if (!headOut) return undefined;
   const head = headOut.stdout.trim();
-  const stash = await git(["stash", "create"], root);
-  if (!stash) return undefined;
-  const stashOut = stash.stdout.trim();
+  const scratchEnv: PrivateIndexEnv = {
+    argv: deps.argv, fs: deps.fs, root, tmpdir: deps.tmpdir ?? osTmpdir(), platform, pid: process.pid,
+  };
+  const stashOut = await withPrivateIndex(scratchEnv, budget, async (copy) => {
+    // No signal: an abort must never kill git while it holds a lock. The
+    // timeout still bounds it, and can strand a lock only on the copy.
+    const stash = await runGit(deps.argv, ["-c", "core.splitIndex=false", "stash", "create"], {
+      cwd: root,
+      timeoutMs: budget.remaining(),
+      env: { GIT_INDEX_FILE: copy },
+    });
+    return stash && stash.code === 0 && !budget.spent() ? stash.stdout.trim() : undefined;
+  });
+  if (stashOut === undefined) return undefined;
   let commit: string;
   if (stashOut === "") commit = head;
   else if (/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(stashOut)) commit = stashOut;
@@ -980,6 +1042,63 @@ async function captureInner(cwd: string, signal: AbortSignal, deps: CaptureDeps)
   }
   if (budget.spent()) return undefined;
   return { root, head, commit, untracked, capturedAt: Date.now() };
+}
+
+interface PrivateIndexEnv {
+  readonly argv: ArgvSeam;
+  readonly fs: ReferenceFs;
+  readonly root: string;
+  readonly tmpdir: string;
+  readonly platform: NodeJS.Platform;
+  readonly pid: number;
+  readonly logger?: Logger;
+}
+
+/**
+ * Section 3 step 4 (QA-1.5-1/2): run `use` with a private copy of the user's
+ * index, held in a scratch omr-ref dir that is removed afterwards. Every index
+ * write of that git run (stat refresh, lock, temporary stash index) lands next
+ * to the copy, never in the user's .git. Undefined when the copy cannot be made.
+ */
+async function withPrivateIndex<T>(
+  env: PrivateIndexEnv,
+  budget: Budget,
+  use: (copy: string) => Promise<T | undefined>,
+): Promise<T | undefined> {
+  const p = pathFor(env.platform);
+  if (budget.spent()) return undefined;
+  const indexOut = await runGit(env.argv, ["rev-parse", "--git-path", "index"], {
+    cwd: env.root, timeoutMs: budget.remaining(), signal: budget.signal,
+  });
+  if (!indexOut || indexOut.code !== 0 || budget.spent()) return undefined;
+  const indexFile = p.resolve(env.root, stripNewline(indexOut.stdout));
+  const tmpRoots = await tmpRootsFor(env.fs, env.tmpdir, env.platform);
+  const realTmp = p.resolve(await env.fs.realpath(env.tmpdir));
+  const scratch = p.join(realTmp, refDirName(env.pid, randomBytes(8).toString("hex")));
+  assertSafeRefDir(scratch, tmpRoots, env.platform);
+  const key = comparable(scratch, env.platform);
+  ACTIVE.add(key);
+  let created = false;
+  try {
+    // Non-recursive: EEXIST throws, and a dir we did not create is never cleaned up.
+    await env.fs.mkdir(scratch, { mode: 0o700 });
+    created = true;
+    if (env.platform !== "win32") await env.fs.chmod(scratch, 0o700);
+    const copy = p.join(scratch, "index");
+    const bytes = await env.fs.readFile(indexFile, { signal: budget.signal });
+    await env.fs.writeFile(copy, bytes, { mode: 0o600, flag: "wx" });
+    if (budget.spent()) return undefined;
+    return await use(copy);
+  } finally {
+    try {
+      if (created) {
+        const ctx: CleanupContext = { argv: env.argv, fs: env.fs, root: env.root, tmpRoots, platform: env.platform, logger: env.logger };
+        await removeReferenceDir(ctx, scratch, [], false);
+      }
+    } finally {
+      ACTIVE.delete(key);
+    }
+  }
 }
 
 
@@ -1050,7 +1169,7 @@ export async function materialize(
     return fail(reason, detail);
   };
   const git = async (args: readonly string[]) =>
-    budget.spent() ? undefined : runGit(deps.argv, args, root, budget.remaining(), budget.signal);
+    budget.spent() ? undefined : runGit(deps.argv, args, { cwd: root, timeoutMs: budget.remaining(), signal: budget.signal });
 
   try {
     // 0. Same-repository guard.
@@ -1184,8 +1303,15 @@ export async function materialize(
       linkTargets.push(target);
     }
 
-    // 7. Drift checks (section 2 c and d).
-    const diff = await git(["diff", "--name-only", "-z", "--no-renames", "--no-ext-diff", ref.commit, "--"]);
+    // 7. Drift checks (section 2 c and d). Porcelain `git diff` rewrites the index
+    //    it compares with even under --no-optional-locks, so it gets a private copy.
+    const scratchEnv: PrivateIndexEnv = {
+      argv: deps.argv, fs, root, tmpdir: tmp, platform, pid: deps.pid ?? process.pid, logger: deps.logger,
+    };
+    const diff = await withPrivateIndex(scratchEnv, budget, (copy) =>
+      runGit(deps.argv, ["-c", "core.splitIndex=false", "diff", "--name-only", "-z", "--no-renames", "--no-ext-diff", ref.commit, "--"], {
+        cwd: root, timeoutMs: budget.remaining(), signal: budget.signal, env: { GIT_INDEX_FILE: copy },
+      }));
     const nowUntracked = await git(["ls-files", "--others", "--exclude-standard", "-z"]);
     if (budget.spent()) return await abandon("aborted", "aborted during drift checks");
     if (!diff || diff.code !== 0 || !nowUntracked || nowUntracked.code !== 0) {
@@ -1316,7 +1442,8 @@ async function gcInner(
     }
   };
 
-  const list = await runGit(deps.argv, ["worktree", "list", "--porcelain"], absRoot, budget.remaining(), budget.signal);
+  const gitRun = (): GitRun => ({ cwd: absRoot, timeoutMs: budget.remaining(), signal: budget.signal });
+  const list = await runGit(deps.argv, ["worktree", "list", "--porcelain"], gitRun());
   if (!list || list.code !== 0) {
     deps.logger?.warn("reference GC skipped: git worktree list failed", { stderr: list?.stderr.trim() });
     return;
@@ -1342,7 +1469,7 @@ async function gcInner(
   }
 
   // 5. Orphans of this repository (D7).
-  const common = await runGit(deps.argv, ["rev-parse", "--git-common-dir"], absRoot, budget.remaining(), budget.signal);
+  const common = await runGit(deps.argv, ["rev-parse", "--git-common-dir"], gitRun());
   if (!common || common.code !== 0) return;
   const gitDir = p.resolve(absRoot, stripNewline(common.stdout));
   const gitDirs = [gitDir];
