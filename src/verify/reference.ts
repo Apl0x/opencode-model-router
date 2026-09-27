@@ -420,6 +420,8 @@
 // ============================================================================
 
 import * as fsp from "node:fs/promises";
+import { createHash, randomBytes } from "node:crypto";
+import { tmpdir as osTmpdir } from "node:os";
 import { posix as pathPosix, win32 as pathWin32 } from "node:path";
 import type { ExecResult } from "./types";
 import type { TreeSnapshot } from "./dispatch";
@@ -670,7 +672,251 @@ export function assertSafeRefDir(
   if (!underTmpRoot) fail("parent is not a temp root");
 }
 
-// --- Operations (contract stubs; implemented in 1.5.2) ------------------------
+// --- Shared helpers -------------------------------------------------------------
+
+/** Process-local set of live reference dirs (comparable form); gcStaleReferences skips them. */
+const ACTIVE = new Set<string>();
+
+type Logger = Pick<PluginLogger, "warn">;
+
+function errorCode(error: unknown): string | undefined {
+  if (typeof error === "object" && error !== null && "code" in error) {
+    const code = (error as { code: unknown }).code;
+    return typeof code === "string" ? code : undefined;
+  }
+  return undefined;
+}
+
+function describeError(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+
+/** lstat that maps ENOENT (and ENOTDIR) to undefined; every other error propagates. */
+async function lstatOrMissing(fs: ReferenceFs, path: string): Promise<ReferenceStats | undefined> {
+  try {
+    return await fs.lstat(path);
+  } catch (error) {
+    const code = errorCode(error);
+    if (code === "ENOENT" || code === "ENOTDIR") return undefined;
+    throw error;
+  }
+}
+
+/** Section 6: retry TRANSIENT_FS_CODES with exponential backoff, then rethrow. */
+async function withRetry<T>(op: () => Promise<T>): Promise<T> {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await op();
+    } catch (error) {
+      const code = errorCode(error);
+      if (attempt >= CLEANUP_RETRIES || code === undefined || !TRANSIENT_FS_CODES.has(code)) throw error;
+      await sleep(CLEANUP_RETRY_BASE_MS * 2 ** attempt);
+    }
+  }
+}
+
+/** Section 10. */
+function isSafeRelPath(rel: string, platform: NodeJS.Platform): boolean {
+  if (rel.length === 0 || rel.startsWith("/") || pathFor(platform).isAbsolute(rel)) return false;
+  if (platform === "win32" && (rel.includes(":") || rel.includes("\\"))) return false;
+  return rel.split("/").every((segment) => segment !== "" && segment !== "." && segment !== ".." && segment.toLowerCase() !== ".git");
+}
+
+function splitZ(stdout: string): string[] {
+  return stdout.split("\0").filter((entry) => entry.length > 0);
+}
+
+function stripNewline(stdout: string): string {
+  return stdout.replace(/\r?\n$/, "");
+}
+
+function sha256(bytes: Uint8Array): string {
+  return createHash("sha256").update(bytes).digest("hex");
+}
+
+interface Budget {
+  readonly signal: AbortSignal;
+  remaining(): number;
+  spent(): boolean;
+}
+
+function makeBudget(signal: AbortSignal, timeoutMs: number): Budget {
+  const deadline = Date.now() + timeoutMs;
+  const combined = AbortSignal.any([signal, AbortSignal.timeout(Math.max(1, timeoutMs))]);
+  return {
+    signal: combined,
+    remaining: () => deadline - Date.now(),
+    spent: () => combined.aborted || deadline - Date.now() <= 0,
+  };
+}
+
+/** One git run through the seam; undefined on seam error, timeout or abort. */
+async function runGit(
+  argv: ArgvSeam,
+  args: readonly string[],
+  cwd: string,
+  timeoutMs: number,
+  signal?: AbortSignal,
+): Promise<ExecResult | undefined> {
+  if (timeoutMs <= 0 || signal?.aborted) return undefined;
+  try {
+    const result = await argv("git", args, { cwd, timeoutMs, signal });
+    if (result.timedOut || signal?.aborted) return undefined;
+    return result;
+  } catch (error) {
+    // The seam reports spawn failures and aborts by rejecting; both mean "no result".
+    return { code: -1, stdout: "", stderr: describeError(error), timedOut: signal?.aborted };
+  }
+}
+
+function isAliveDefault(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return errorCode(error) === "EPERM";
+  }
+}
+
+async function tmpRootsFor(fs: ReferenceFs, tmp: string, platform: NodeJS.Platform): Promise<string[]> {
+  const p = pathFor(platform);
+  const roots = [p.resolve(tmp)];
+  try {
+    roots.push(p.resolve(await fs.realpath(tmp)));
+  } catch {
+    // realpath failed (e.g. tmp missing): only the resolved form can be a tmp root.
+    return roots;
+  }
+  return roots;
+}
+
+// --- Dispose pipeline (section 6) ---------------------------------------------
+
+interface CleanupContext {
+  readonly argv: ArgvSeam;
+  readonly fs: ReferenceFs;
+  readonly root: string;
+  readonly tmpRoots: readonly string[];
+  readonly platform: NodeJS.Platform;
+  readonly logger?: Logger;
+}
+
+function leftInPlace(ctx: CleanupContext, dir: string, reason: string): false {
+  ctx.logger?.warn(`reference worktree left in place: ${reason}`, { dir });
+  return false;
+}
+
+/** Step 2: unlink every link under dir without descending into links. Returns a failure reason or undefined. */
+async function sweepLinks(ctx: CleanupContext, dir: string): Promise<string | undefined> {
+  const p = pathFor(ctx.platform);
+  const root = await lstatOrMissing(ctx.fs, dir);
+  if (!root) return undefined;
+  if (root.isSymbolicLink() || !root.isDirectory()) return "reference dir is not a real directory";
+  const stack = [dir];
+  let entries = 0;
+  while (stack.length > 0) {
+    const current = stack.pop() as string;
+    let names: string[];
+    try {
+      names = await withRetry(() => ctx.fs.readdir(current));
+    } catch (error) {
+      if (errorCode(error) === "ENOENT") continue;
+      return `sweep could not read ${current}: ${describeError(error)}`;
+    }
+    for (const name of names) {
+      if (++entries > MAX_SWEEP_ENTRIES) return `sweep exceeded ${MAX_SWEEP_ENTRIES} entries`;
+      const entry = p.join(current, name);
+      if (!isStrictlyInside(entry, dir, ctx.platform)) return `sweep reached ${entry} outside the dir`;
+      const stats = await lstatOrMissing(ctx.fs, entry);
+      if (!stats) continue;
+      if (stats.isSymbolicLink()) {
+        try {
+          await withRetry(() => ctx.fs.unlink(entry));
+        } catch (error) {
+          if (errorCode(error) !== "ENOENT") return `link ${entry} could not be unlinked: ${describeError(error)}`;
+        }
+        if (await lstatOrMissing(ctx.fs, entry)) return `link ${entry} survived unlink`;
+      } else if (stats.isDirectory()) {
+        stack.push(entry);
+      }
+    }
+  }
+  return undefined;
+}
+
+async function isRegistered(ctx: CleanupContext, dir: string): Promise<boolean | undefined> {
+  const list = await runGit(ctx.argv, ["worktree", "list", "--porcelain"], ctx.root, CLEANUP_GIT_TIMEOUT_MS);
+  if (!list || list.code !== 0) return undefined;
+  const wanted = comparable(dir, ctx.platform);
+  return parseWorktreeList(list.stdout).some((entry) => comparable(entry.path, ctx.platform) === wanted);
+}
+
+/**
+ * Section 6 steps 1-5. Returns true when dir is gone (and, with `git`, unregistered).
+ * Never throws; every failure is logged and the leftover is left for GC.
+ */
+async function removeReferenceDir(
+  ctx: CleanupContext,
+  dir: string,
+  links: readonly string[],
+  git: boolean,
+): Promise<boolean> {
+  try {
+    // 1. Recorded links, newest first. R1: lstat, then single-entry unlink only.
+    for (const link of [...links].reverse()) {
+      if (!isStrictlyInside(link, dir, ctx.platform)) return leftInPlace(ctx, dir, `recorded link ${link} is outside the dir`);
+      const stats = await lstatOrMissing(ctx.fs, link);
+      if (!stats || !stats.isSymbolicLink()) continue;
+      try {
+        await withRetry(() => ctx.fs.unlink(link));
+      } catch (error) {
+        if (errorCode(error) !== "ENOENT") return leftInPlace(ctx, dir, `link ${link} could not be unlinked: ${describeError(error)}`);
+      }
+    }
+    // 2. Sweep: prove the tree link-free before any recursive removal (R2 iii).
+    const sweepFailure = await sweepLinks(ctx, dir);
+    if (sweepFailure) return leftInPlace(ctx, dir, sweepFailure);
+    // 3. git worktree remove --force on a link-free, guarded, real directory.
+    let stats = await lstatOrMissing(ctx.fs, dir);
+    if (stats && git) {
+      assertSafeRefDir(dir, ctx.tmpRoots, ctx.platform);
+      if (stats.isSymbolicLink() || !stats.isDirectory()) return leftInPlace(ctx, dir, "not a real directory");
+      const removed = await runGit(ctx.argv, ["worktree", "remove", "--force", dir], ctx.root, CLEANUP_GIT_TIMEOUT_MS);
+      if (!removed || removed.code !== 0) {
+        ctx.logger?.warn("git worktree remove failed; falling back to fs.rm", { dir, stderr: removed?.stderr.trim() });
+      }
+    }
+    // 4. Whatever is left: guarded recursive fs.rm (Spike D SAFE #5) on the link-free tree.
+    stats = await lstatOrMissing(ctx.fs, dir);
+    if (stats) {
+      assertSafeRefDir(dir, ctx.tmpRoots, ctx.platform);
+      if (stats.isSymbolicLink() || !stats.isDirectory()) return leftInPlace(ctx, dir, "not a real directory");
+      try {
+        await ctx.fs.rm(dir, { recursive: true, force: true, maxRetries: CLEANUP_RETRIES, retryDelay: CLEANUP_RETRY_BASE_MS });
+      } catch (error) {
+        return leftInPlace(ctx, dir, `fs.rm failed: ${describeError(error)}`);
+      }
+      if (await lstatOrMissing(ctx.fs, dir)) return leftInPlace(ctx, dir, "dir still exists after fs.rm");
+    }
+    // 5. Drop a still-registered admin entry; never `git worktree prune` (D5).
+    if (git && (await isRegistered(ctx, dir)) !== false) {
+      assertSafeRefDir(dir, ctx.tmpRoots, ctx.platform);
+      if (await lstatOrMissing(ctx.fs, dir)) return leftInPlace(ctx, dir, "dir reappeared before admin-entry removal");
+      const removed = await runGit(ctx.argv, ["worktree", "remove", "--force", dir], ctx.root, CLEANUP_GIT_TIMEOUT_MS);
+      if (!removed || removed.code !== 0) {
+        ctx.logger?.warn("reference worktree admin entry left registered", { dir, stderr: removed?.stderr.trim() });
+        return false;
+      }
+    }
+    return true;
+  } catch (error) {
+    return leftInPlace(ctx, dir, describeError(error));
+  }
+}
+
+// --- captureReference (section 3) ---------------------------------------------
 
 /** Section 3. Never throws; undefined = no reference (not a repo, submodules, abort, timeout, caps, error). */
 export async function captureReference(
@@ -678,7 +924,101 @@ export async function captureReference(
   signal: AbortSignal,
   deps: CaptureDeps,
 ): Promise<DispatchReference | undefined> {
-  throw new Error("not implemented: captureReference (task 1.5.2.a)");
+  try {
+    return await captureInner(cwd, signal, deps);
+  } catch {
+    // Section 3 step 6: every error (unreadable file, concurrent deletion, abort) means "no reference".
+    return undefined;
+  }
+}
+
+async function captureInner(cwd: string, signal: AbortSignal, deps: CaptureDeps): Promise<DispatchReference | undefined> {
+  const platform = process.platform;
+  const p = pathFor(platform);
+  const budget = makeBudget(signal, deps.timeoutMs ?? DEFAULT_CAPTURE_TIMEOUT_MS);
+  const git = async (args: readonly string[], at: string) => {
+    if (budget.spent()) return undefined;
+    const result = await runGit(deps.argv, args, at, budget.remaining(), budget.signal);
+    return result && result.code === 0 && !budget.spent() ? result : undefined;
+  };
+
+  const top = await git(["rev-parse", "--show-toplevel"], cwd);
+  if (!top) return undefined;
+  const root = p.resolve(stripNewline(top.stdout));
+  const stage = await git(["ls-files", "--stage"], root);
+  if (!stage || /^160000 /m.test(stage.stdout)) return undefined;
+  const headOut = await git(["rev-parse", "--verify", "HEAD^{commit}"], root);
+  if (!headOut) return undefined;
+  const head = headOut.stdout.trim();
+  const stash = await git(["stash", "create"], root);
+  if (!stash) return undefined;
+  const stashOut = stash.stdout.trim();
+  let commit: string;
+  if (stashOut === "") commit = head;
+  else if (/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(stashOut)) commit = stashOut;
+  else return undefined;
+
+  const listed = await git(["ls-files", "--others", "--exclude-standard", "--full-name", "-z"], root);
+  if (!listed) return undefined;
+  const paths = splitZ(listed.stdout).sort();
+  if (paths.length > MAX_UNTRACKED_FILES) return undefined;
+  const untracked = new Map<string, string>();
+  let bytes = 0;
+  for (const rel of paths) {
+    if (budget.spent() || !isSafeRelPath(rel, platform)) return undefined;
+    const absolute = p.join(root, rel);
+    const stats = await deps.fs.lstat(absolute);
+    if (stats.isSymbolicLink()) {
+      untracked.set(rel, UNTRACKED_SYMLINK);
+    } else if (stats.isFile()) {
+      bytes += stats.size;
+      if (bytes > MAX_UNTRACKED_BYTES) return undefined;
+      untracked.set(rel, sha256(await deps.fs.readFile(absolute, { signal: budget.signal })));
+    } else {
+      return undefined;
+    }
+  }
+  if (budget.spent()) return undefined;
+  return { root, head, commit, untracked, capturedAt: Date.now() };
+}
+
+
+// --- materialize (sections 4 and 5) -------------------------------------------
+
+function insideOrEqual(child: string, parent: string, platform: NodeJS.Platform): boolean {
+  return comparable(child, platform) === comparable(parent, platform) || isStrictlyInside(child, parent, platform);
+}
+
+function byCodeUnit(a: string, b: string): number {
+  return a < b ? -1 : a > b ? 1 : 0;
+}
+
+/** Section 2d: top-level entries of a node_modules dir plus one level under each `@scope`. */
+async function packageEntries(fs: ReferenceFs, nodeModules: string, platform: NodeJS.Platform): Promise<string[]> {
+  const p = pathFor(platform);
+  const readdirOrEmpty = async (dir: string) => {
+    try {
+      return await fs.readdir(dir);
+    } catch {
+      // Unreadable: nothing to inspect; drift through it cannot be detected (OPEN RISKS).
+      return [];
+    }
+  };
+  const result: string[] = [];
+  for (const name of await readdirOrEmpty(nodeModules)) {
+    const full = p.join(nodeModules, name);
+    if (!name.startsWith("@")) {
+      result.push(full);
+      continue;
+    }
+    const stats = await lstatOrMissing(fs, full);
+    if (stats && stats.isDirectory() && !stats.isSymbolicLink()) {
+      for (const inner of await readdirOrEmpty(full)) result.push(p.join(full, inner));
+    } else {
+      result.push(full);
+    }
+  }
+  return result;
 }
 
 /** Section 4. Never throws; on failure nothing is left behind (the dispose pipeline has run). */
@@ -688,10 +1028,374 @@ export async function materialize(
   signal: AbortSignal,
   deps: ReferenceDeps,
 ): Promise<MaterializeResult> {
-  throw new Error("not implemented: materialize (task 1.5.2.b/c)");
+  const platform = deps.platform ?? process.platform;
+  const p = pathFor(platform);
+  const fs = deps.fs;
+  const budget = makeBudget(signal, deps.timeoutMs ?? DEFAULT_MATERIALIZE_TIMEOUT_MS);
+  const root = p.resolve(ref.root);
+  const links: string[] = [];
+  let dir: string | undefined;
+  let ctx: CleanupContext | undefined;
+  const fail = (reason: MaterializeFailure, detail: string): MaterializeResult => ({ ok: false, reason, detail });
+  const cleanup = async () => {
+    if (!dir) return;
+    try {
+      if (ctx) await removeReferenceDir(ctx, dir, links, true);
+    } finally {
+      ACTIVE.delete(comparable(dir, platform));
+    }
+  };
+  const abandon = async (reason: MaterializeFailure, detail: string) => {
+    await cleanup();
+    return fail(reason, detail);
+  };
+  const git = async (args: readonly string[]) =>
+    budget.spent() ? undefined : runGit(deps.argv, args, root, budget.remaining(), budget.signal);
+
+  try {
+    // 0. Same-repository guard.
+    if (currentTree) {
+      const cwd = p.resolve(currentTree.cwd);
+      const realRoot = p.resolve(await fs.realpath(root));
+      if (!insideOrEqual(cwd, root, platform) && !insideOrEqual(cwd, realRoot, platform)) {
+        return fail("error", "currentTree is not inside the reference repository");
+      }
+    }
+    // 1. The unreferenced stash commit may have been pruned (section 8).
+    const exists = await git(["cat-file", "-e", `${ref.commit}^{commit}`]);
+    if (budget.spent()) return fail("aborted", "aborted before the worktree was created");
+    if (!exists || exists.code !== 0) return fail("commit-missing", `commit ${ref.commit} is not in the repository`);
+    // 2. Name and guard the dir before anything is created.
+    const tmp = deps.tmpdir ?? osTmpdir();
+    const tmpRoots = await tmpRootsFor(fs, tmp, platform);
+    const realTmp = p.resolve(await fs.realpath(tmp));
+    const suffix = (deps.randomSuffix ?? (() => randomBytes(8).toString("hex")))();
+    const candidate = p.join(realTmp, refDirName(deps.pid ?? process.pid, suffix));
+    assertSafeRefDir(candidate, tmpRoots, platform);
+    if (await lstatOrMissing(fs, candidate)) return fail("unsafe-path", `${candidate} already exists`);
+    dir = candidate;
+    ctx = { argv: deps.argv, fs, root, tmpRoots, platform, logger: deps.logger };
+    ACTIVE.add(comparable(dir, platform));
+    // 3. Hooks disabled (D9).
+    const added = await git([
+      "-c", `core.hooksPath=${p.join(dir, ".omr-no-hooks")}`,
+      "-c", "advice.detachedHead=false",
+      "worktree", "add", "--detach", dir, ref.commit,
+    ]);
+    if (budget.spent()) return await abandon("aborted", "aborted during git worktree add");
+    if (!added || added.code !== 0) return await abandon("worktree-add-failed", added?.stderr.trim() ?? "");
+    if (platform !== "win32") await fs.chmod(dir, 0o700);
+
+    // 4. Untracked files: the hashed buffer is the written buffer.
+    const reasons: InexactReason[] = [];
+    const changed = new Set<string>();
+    const inexact = (cause: InexactCause, path: string) => {
+      reasons.push({ cause, path });
+      changed.add(path);
+    };
+    for (const [rel, hash] of [...ref.untracked].sort(([a], [b]) => byCodeUnit(a, b))) {
+      if (budget.spent()) return await abandon("aborted", "aborted while copying untracked files");
+      if (!isSafeRelPath(rel, platform)) {
+        reasons.push({ cause: "untracked-unsafe-path", path: rel });
+        continue;
+      }
+      if (hash === UNTRACKED_SYMLINK) {
+        reasons.push({ cause: "untracked-symlink", path: rel });
+        continue;
+      }
+      const source = p.join(root, rel);
+      let stats: ReferenceStats | undefined;
+      let bytes: Uint8Array;
+      try {
+        stats = await lstatOrMissing(fs, source);
+        if (!stats) {
+          inexact("untracked-deleted", rel);
+          continue;
+        }
+        if (!stats.isFile() || stats.isSymbolicLink()) {
+          inexact("untracked-not-file", rel);
+          continue;
+        }
+        bytes = await fs.readFile(source, { signal: budget.signal });
+      } catch (error) {
+        if (budget.spent()) return await abandon("aborted", describeError(error));
+        inexact("untracked-unreadable", rel);
+        continue;
+      }
+      if (sha256(bytes) !== hash) {
+        inexact("untracked-modified", rel);
+        continue;
+      }
+      const dest = p.join(dir, rel);
+      const parent = p.dirname(dest);
+      await fs.mkdir(parent, { recursive: true });
+      if (!insideOrEqual(p.resolve(await fs.realpath(parent)), dir, platform)) {
+        inexact("untracked-unsafe-path", rel);
+        continue;
+      }
+      await fs.writeFile(dest, bytes, { mode: stats.mode & 0o777, flag: "wx" });
+    }
+
+    // 5. Discovery of ignored entries; nothing ignored is ever copied.
+    const ignored = await git(["ls-files", "--others", "--ignored", "--exclude-standard", "--directory", "-z"]);
+    if (budget.spent()) return await abandon("aborted", "aborted during ignored-file discovery");
+    if (!ignored || ignored.code !== 0) return await abandon("error", ignored?.stderr.trim() ?? "ignored-file discovery failed");
+    const unreproduced: string[] = [];
+    const candidates: string[] = [];
+    for (const entry of splitZ(ignored.stdout)) {
+      const rel = entry.replace(/\/$/, "");
+      if (rel.split("/").at(-1) === "node_modules" && isSafeRelPath(rel, platform)) candidates.push(entry);
+      else unreproduced.push(entry);
+    }
+
+    // 6. Link node_modules (section 5), parents before children (git's order).
+    const linkTargets: string[] = [];
+    for (const entry of candidates) {
+      if (budget.spent()) return await abandon("aborted", "aborted while linking node_modules");
+      const rel = entry.replace(/\/$/, "");
+      const source = p.join(root, rel);
+      const sourceStats = await lstatOrMissing(fs, source);
+      let target: string | undefined;
+      if (sourceStats && (sourceStats.isDirectory() || sourceStats.isSymbolicLink())) {
+        try {
+          target = p.resolve(await fs.realpath(source));
+        } catch {
+          // Dangling link: nothing to link to.
+          target = undefined;
+        }
+      }
+      const targetStats = target ? await lstatOrMissing(fs, target) : undefined;
+      const linkPath = p.join(dir, rel);
+      const parent = p.dirname(linkPath);
+      const parentStats = await lstatOrMissing(fs, parent);
+      const linkable =
+        target !== undefined &&
+        targetStats !== undefined && targetStats.isDirectory() && !targetStats.isSymbolicLink() &&
+        parentStats !== undefined && parentStats.isDirectory() && !parentStats.isSymbolicLink() &&
+        insideOrEqual(p.resolve(await fs.realpath(parent)), dir, platform) &&
+        isStrictlyInside(linkPath, dir, platform) &&
+        (await lstatOrMissing(fs, linkPath)) === undefined;
+      if (!linkable || target === undefined) {
+        unreproduced.push(entry);
+        continue;
+      }
+      links.push(linkPath);
+      await fs.symlink(target, linkPath, platform === "win32" ? "junction" : "dir");
+      linkTargets.push(target);
+    }
+
+    // 7. Drift checks (section 2 c and d).
+    const diff = await git(["diff", "--name-only", "-z", "--no-renames", "--no-ext-diff", ref.commit, "--"]);
+    const nowUntracked = await git(["ls-files", "--others", "--exclude-standard", "-z"]);
+    if (budget.spent()) return await abandon("aborted", "aborted during drift checks");
+    if (!diff || diff.code !== 0 || !nowUntracked || nowUntracked.code !== 0) {
+      return await abandon("error", (diff?.stderr ?? nowUntracked?.stderr ?? "drift check failed").trim());
+    }
+    for (const rel of splitZ(diff.stdout)) changed.add(rel);
+    for (const rel of splitZ(nowUntracked.stdout)) if (!ref.untracked.has(rel)) changed.add(rel);
+    const changedSorted = [...changed].sort(byCodeUnit);
+    for (const rel of changedSorted) {
+      if (DEPENDENCY_FILES.has(rel.split("/").at(-1) ?? "")) reasons.push({ cause: "dependency-drift", path: rel });
+    }
+    const realRoot = p.resolve(await fs.realpath(root));
+    const workspaceDirs = new Set<string>();
+    for (const target of linkTargets) {
+      for (const entry of await packageEntries(fs, target, platform)) {
+        const stats = await lstatOrMissing(fs, entry);
+        if (!stats || !stats.isSymbolicLink()) continue;
+        let real: string;
+        try {
+          real = p.resolve(await fs.realpath(entry));
+        } catch {
+          // Dangling package link: it cannot load code from the live tree.
+          continue;
+        }
+        const base = [realRoot, root].find((candidateRoot) => isStrictlyInside(real, candidateRoot, platform));
+        if (!base) continue;
+        const rel = p.relative(base, real).split(p.sep).join("/");
+        if (!rel.split("/").includes("node_modules")) workspaceDirs.add(rel);
+      }
+    }
+    const fold = (s: string) => (platform === "win32" ? s.toLowerCase() : s);
+    for (const rel of [...workspaceDirs].sort(byCodeUnit)) {
+      const prefix = fold(rel) + "/";
+      if (changedSorted.some((c) => fold(c) === fold(rel) || fold(c).startsWith(prefix))) {
+        reasons.push({ cause: "workspace-link-drift", path: rel });
+      }
+    }
+
+    // 8. The handle.
+    const refDir = dir;
+    let disposing: Promise<void> | undefined;
+    const reference: MaterializedReference = {
+      dir: refDir,
+      exact: reasons.length === 0,
+      inexactReasons: reasons,
+      unreproduced,
+      links: [...links],
+      toRefPath(livePath: string) {
+        if (!p.isAbsolute(livePath)) return undefined;
+        const absolute = p.resolve(livePath);
+        if (comparable(absolute, platform) === comparable(root, platform)) return refDir;
+        if (!isStrictlyInside(absolute, root, platform)) return undefined;
+        return p.join(refDir, p.relative(root, absolute));
+      },
+      dispose() {
+        disposing ??= cleanup();
+        return disposing;
+      },
+    };
+    return { ok: true, reference };
+  } catch (error) {
+    const reason: MaterializeFailure =
+      error instanceof UnsafeReferencePathError ? "unsafe-path" : budget.spent() ? "aborted" : "error";
+    return await abandon(reason, describeError(error));
+  }
+}
+
+// --- gcStaleReferences (section 11) -------------------------------------------
+
+interface WorktreeEntry {
+  path: string;
+  locked: boolean;
+  prunable: boolean;
+}
+
+function parseWorktreeList(stdout: string): WorktreeEntry[] {
+  const entries: WorktreeEntry[] = [];
+  let current: WorktreeEntry | undefined;
+  for (const line of stdout.split(/\r?\n/)) {
+    if (line.startsWith("worktree ")) {
+      current = { path: line.slice("worktree ".length), locked: false, prunable: false };
+      entries.push(current);
+    } else if (current && (line === "locked" || line.startsWith("locked "))) {
+      current.locked = true;
+    } else if (current && (line === "prunable" || line.startsWith("prunable "))) {
+      current.prunable = true;
+    }
+  }
+  return entries;
 }
 
 /** Section 11. Never throws; touches only stale omr-ref-* dirs directly under a tmp root. */
 export async function gcStaleReferences(root: string, deps: ReferenceDeps): Promise<GcReport> {
-  throw new Error("not implemented: gcStaleReferences (task 1.5.2.d)");
+  const report = { removed: [] as string[], kept: [] as string[], failed: [] as string[] };
+  try {
+    await gcInner(root, deps, report);
+  } catch (error) {
+    deps.logger?.warn("reference GC failed", { error: describeError(error) });
+  }
+  if (report.failed.length > 0) deps.logger?.warn("reference GC left dirs in place", { failed: report.failed.length });
+  return report;
+}
+
+async function gcInner(
+  root: string,
+  deps: ReferenceDeps,
+  report: { removed: string[]; kept: string[]; failed: string[] },
+): Promise<void> {
+  const platform = deps.platform ?? process.platform;
+  const p = pathFor(platform);
+  const fs = deps.fs;
+  const now = deps.now ?? Date.now;
+  const isAlive = deps.isAlive ?? isAliveDefault;
+  const ownPid = deps.pid ?? process.pid;
+  const budget = makeBudget(new AbortController().signal, deps.timeoutMs ?? DEFAULT_MATERIALIZE_TIMEOUT_MS);
+  const absRoot = p.resolve(root);
+  const tmpRoots = await tmpRootsFor(fs, deps.tmpdir ?? osTmpdir(), platform);
+  const ctx: CleanupContext = { argv: deps.argv, fs, root: absRoot, tmpRoots, platform, logger: deps.logger };
+  const stale = (pid: number, stats: ReferenceStats | undefined) =>
+    !stats || pid === ownPid || !isAlive(pid) || now() - stats.mtimeMs > STALE_REFERENCE_AGE_MS;
+  const isSafe = (dir: string) => {
+    try {
+      assertSafeRefDir(dir, tmpRoots, platform);
+      return true;
+    } catch {
+      // Not an omr reference dir under a tmp root: never a candidate (R3).
+      return false;
+    }
+  };
+
+  const list = await runGit(deps.argv, ["worktree", "list", "--porcelain"], absRoot, budget.remaining(), budget.signal);
+  if (!list || list.code !== 0) {
+    deps.logger?.warn("reference GC skipped: git worktree list failed", { stderr: list?.stderr.trim() });
+    return;
+  }
+  const entries = parseWorktreeList(list.stdout);
+  const registered = new Set(entries.map((entry) => comparable(entry.path, platform)));
+
+  // 1-4. Registered candidates.
+  for (const entry of entries) {
+    if (budget.spent()) return;
+    const dir = p.resolve(entry.path);
+    const parsed = parseRefDirName(p.basename(dir));
+    if (!parsed || !isSafe(dir)) continue;
+    if (entry.locked || ACTIVE.has(comparable(dir, platform))) {
+      report.kept.push(dir);
+      continue;
+    }
+    if (!stale(parsed.pid, await lstatOrMissing(fs, dir))) {
+      report.kept.push(dir);
+      continue;
+    }
+    (await removeReferenceDir(ctx, dir, [], true) ? report.removed : report.failed).push(dir);
+  }
+
+  // 5. Orphans of this repository (D7).
+  const common = await runGit(deps.argv, ["rev-parse", "--git-common-dir"], absRoot, budget.remaining(), budget.signal);
+  if (!common || common.code !== 0) return;
+  const gitDir = p.resolve(absRoot, stripNewline(common.stdout));
+  const gitDirs = [gitDir];
+  try {
+    gitDirs.push(p.resolve(await fs.realpath(gitDir)));
+  } catch {
+    // Only the resolved form is available.
+    gitDirs.push(gitDir);
+  }
+  const seenRoots = new Set<string>();
+  for (const tmpRoot of tmpRoots) {
+    const key = comparable(tmpRoot, platform);
+    if (seenRoots.has(key)) continue;
+    seenRoots.add(key);
+    let names: string[];
+    try {
+      names = await fs.readdir(tmpRoot);
+    } catch {
+      // Unreadable tmp root: no orphans can be found there.
+      continue;
+    }
+    for (const name of names) {
+      if (budget.spent()) return;
+      const parsed = parseRefDirName(name);
+      if (!parsed) continue;
+      const dir = p.join(tmpRoot, name);
+      if (!isSafe(dir)) continue;
+      const stats = await lstatOrMissing(fs, dir);
+      if (!stats || stats.isSymbolicLink() || !stats.isDirectory()) continue;
+      let realDir = dir;
+      try {
+        realDir = p.resolve(await fs.realpath(dir));
+      } catch {
+        // Vanished meanwhile: nothing to collect.
+        continue;
+      }
+      const keys = [comparable(dir, platform), comparable(realDir, platform)];
+      if (keys.some((k) => registered.has(k) || ACTIVE.has(k))) continue;
+      if (!stale(parsed.pid, stats)) {
+        report.kept.push(dir);
+        continue;
+      }
+      const dotGit = p.join(dir, ".git");
+      const dotGitStats = await lstatOrMissing(fs, dotGit);
+      if (dotGitStats) {
+        if (!dotGitStats.isFile() || dotGitStats.isSymbolicLink()) continue;
+        const text = new TextDecoder().decode(await fs.readFile(dotGit, {}));
+        const match = /^gitdir:\s*(.+?)\s*$/m.exec(text);
+        if (!match) continue;
+        const target = p.resolve(dir, match[1]);
+        if (!gitDirs.some((g) => isStrictlyInside(target, g, platform))) continue; // another repository's orphan
+      }
+      (await removeReferenceDir(ctx, dir, [], false) ? report.removed : report.failed).push(dir);
+    }
+  }
 }

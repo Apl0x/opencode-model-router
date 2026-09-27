@@ -158,3 +158,29 @@ export interface TreeSnapshot {
   files: ChangedFile[];
 }
 ```
+
+## Implementation notes (1.5.2 / 1.5.3)
+
+Header ambiguities resolved while implementing `src/verify/reference.ts`:
+- **Copy parent check (4.4).** The header says realpath(parent) must be "strictly inside dir"; a root-level
+  untracked file has parent == dir, so the check is *inside-or-equal*. A failure makes the path inexact
+  (`untracked-unsafe-path`) instead of aborting.
+- **Untracked drift (2c/2d).** "Hash differs" for still-present untracked files is taken from the step-4
+  read (modified/deleted/unreadable paths join the changed set), so each file is read once.
+- **Unlinkable node_modules candidates** (no parent at the reference, target not a real dir, path already
+  exists in the worktree) are listed in `unreproduced`, since they are absent from the reference.
+- **Pre-existing dir.** If `<tmp>/omr-ref-<pid>-<hex>` already exists, materialize returns `unsafe-path`
+  without cleanup, so it can never delete a dir it did not create.
+- **Step 5 of dispose** is also guarded by `assertSafeRefDir` + lstat (dir must be gone), in addition to
+  the git registration check. Registration is read from `git worktree list --porcelain`.
+- **GC.** `kept` lists only omr-ref candidates (live, young, locked, ACTIVE); non-candidates are not
+  reported. Orphans (no admin entry) skip the git steps: sweep, then R2 `fs.rm`. An orphan whose `.git`
+  is not a regular file, or whose `gitdir:` resolves outside root's `--git-common-dir`, is left alone and
+  not reported. The registered/ACTIVE checks compare both the tmp-root path and its realpath (8.3 vs long form).
+- **Seam failures.** A rejected `ArgvSeam` call is treated as a failed git run (code -1), never as success.
+- **capturedAt** uses `Date.now()`, because `CaptureDeps` has no `now` seam.
+
+Tests (`test/unit/reference.test.ts`, 21 cases) use real git repos under `mkdtemp(realpath(os.tmpdir()), "omr refs ü テスト ")`
+with `tmpdir` injected as a sibling `tmp ä dir`, so all paths contain spaces and non-ASCII characters. The
+ArgvSeam is a test-local `execFile` helper. `afterEach` asserts that exactly one worktree remains and that
+there are no `omr-ref-*` dirs in the injected tmp.
