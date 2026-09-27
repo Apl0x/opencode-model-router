@@ -2,12 +2,15 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { execFile, spawn } from "node:child_process";
 import * as fsp from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, relative } from "node:path";
 import {
+  assertSafeRefDir,
   captureReference,
   gcStaleReferences,
+  isStrictlyInside,
   materialize,
   nodeReferenceFs,
+  UnsafeReferencePathError,
   type CaptureDeps,
   type DispatchReference,
   type MaterializedReference,
@@ -493,17 +496,57 @@ describe("materialize / dispose", { timeout: 60_000 }, () => {
     expect(await fsp.readFile(join(repo, "node_modules", "sentinel.txt"), "utf8")).toBe("keep me");
   });
 
-  it.runIf(isWin)("dispose while a file is held open never throws; GC cleans up after close", async () => {
+  it.runIf(isWin)("QA-1.5-9a: a process whose cwd is inside the reference -> dispose resolves bounded and warns; GC removes it later", async () => {
     const handle = await mat(await capture());
-    const open = await fsp.open(join(handle.dir, "a.txt"), "r");
+    // A cwd handle blocks deleting that directory on win32 (a Node file handle does not).
+    const holder = spawn(process.execPath, ["-e", "setTimeout(() => {}, 120000)"], {
+      cwd: join(handle.dir, "packages"), stdio: "ignore", windowsHide: true,
+    });
+    const exited = new Promise((resolve) => holder.once("exit", resolve));
     try {
+      await new Promise((resolve, reject) => holder.once("spawn", resolve).once("error", reject));
+      const started = Date.now();
       await expect(handle.dispose()).resolves.toBeUndefined();
+      expect(Date.now() - started).toBeLessThan(20_000);
+      expect(warnings.some((w) => w.startsWith("reference worktree left in place"))).toBe(true);
+      expect(await exists(handle.dir)).toBe(true);
+      expect(await worktreeCount(repo)).toBe(2); // git never ran on the existing dir
+      for (const link of handle.links) expect(await exists(link)).toBe(false); // links went first
     } finally {
-      await open.close();
+      holder.kill();
+      await exited;
     }
-    await gcStaleReferences(repo, deps());
+    // The released dir is ours and stale at once, although this process is alive and it is fresh.
+    const report = await gcStaleReferences(repo, deps());
+    expect(report.removed.map((d) => d.toLowerCase())).toEqual([handle.dir.toLowerCase()]);
     expect(await exists(handle.dir)).toBe(false);
     expect(await fsp.readFile(join(repo, "node_modules", "sentinel.txt"), "utf8")).toBe("keep me");
+    expect(await fsp.readFile(join(repo, "packages", "a", "node_modules", "sentinel.txt"), "utf8")).toBe("keep me");
+  });
+
+  it("QA-1.5-9b: tmpdir given in os.tmpdir()'s own form (8.3 on this host): capture, materialize, GC and dispose agree", async () => {
+    const osTmp = tmpdir();
+    const shortTmp = join(osTmp, relative(await fsp.realpath(osTmp), tmp));
+    expect(await fsp.realpath(shortTmp)).toBe(tmp);
+    const ref = await captureReference(repo, new AbortController().signal, captureDeps({ tmpdir: shortTmp }));
+    expect(ref).toBeDefined();
+    if (!ref) return;
+    const handle = await mat(ref, { tmpdir: shortTmp });
+    try {
+      expect(handle.dir.startsWith(tmp)).toBe(true); // created under the long form
+      const report = await gcStaleReferences(repo, deps({ tmpdir: shortTmp, now: () => Date.now() + 10 * 60 * 60 * 1000 }));
+      expect(report.kept.map((d) => d.toLowerCase())).toEqual([handle.dir.toLowerCase()]);
+    } finally {
+      await handle.dispose();
+    }
+    expect(await exists(handle.dir)).toBe(false);
+    // A dead owner's worktree added through the short form is still found and collected.
+    const dead = join(shortTmp, "omr-ref-111111-0123456789abcdef");
+    await git(repo, "worktree", "add", "-q", "--detach", dead, "HEAD");
+    const report = await gcStaleReferences(repo, deps({ tmpdir: shortTmp, isAlive: () => false }));
+    expect(report.removed).toHaveLength(1);
+    expect(report.failed).toEqual([]);
+    expect(await exists(dead)).toBe(false);
   });
 
   it("dependency drift -> inexact with reason", async () => {
@@ -795,5 +838,89 @@ describe("gcStaleReferences", { timeout: 60_000 }, () => {
     }
     await new Promise((resolve) => setTimeout(resolve, 250));
     expect(warnings).toEqual([]);
+  });
+});
+
+// Pure R3 guards (QA-1.5-9b), checked with explicit platforms so they run on every host.
+describe("path guards (R3)", () => {
+  const NAME = "omr-ref-1234-0123456789abcdef";
+  const SHORT = "C:\\Users\\MARQUI~1\\AppData\\Local\\Temp";
+  const LONG = "C:\\Users\\Marquinho\\AppData\\Local\\Temp";
+
+  it("isStrictlyInside: case, separators, dot segments, prefix siblings, drives, UNC, roots, 8.3", () => {
+    const win: Array<[string, string, boolean]> = [
+      ["C:\\a\\b", "C:\\a", true],
+      ["C:\\A\\B", "c:\\a", true], // case-insensitive on win32
+      ["C:\\a", "C:\\a", false], // equal is not inside
+      ["C:\\a\\", "C:\\a", false], // a trailing separator does not make it a child
+      ["C:\\a\\b\\", "C:\\a\\", true],
+      ["C:\\a\\..\\b", "C:\\a", false], // `..` escaping the parent
+      ["C:\\a\\b\\..\\c", "C:\\a", true], // `..` staying inside
+      ["C:\\a\\.\\b", "C:\\a", true],
+      ["C:\\a2\\x", "C:\\a", false], // prefix sibling
+      ["C:\\Temp2\\" + NAME, "C:\\Temp", false],
+      ["D:\\a\\b", "C:\\a", false], // other drive
+      ["C:/a/b", "C:\\a", true], // `/`-separated input
+      ["\\\\srv\\share\\a\\b", "\\\\srv\\share\\a", true], // UNC
+      ["\\\\srv\\share2\\a", "\\\\srv\\share\\a", false],
+      ["C:\\x", "C:\\", true],
+      ["C:\\", "C:\\", false],
+      ["a\\b", "C:\\a", false], // relative child
+      ["C:\\a\\b", "a", false], // relative parent
+      [`${SHORT}\\x`, LONG, false], // lexical: an 8.3 form never matches its long form...
+      [`${SHORT}\\x`, SHORT.toLowerCase(), true], // ...so callers pass both (tmpRootsFor)
+    ];
+    for (const [child, parent, expected] of win) expect([child, parent, isStrictlyInside(child, parent, "win32")]).toEqual([child, parent, expected]);
+    const posix: Array<[string, string, boolean]> = [
+      ["/tmp/a", "/tmp", true],
+      ["/TMP/a", "/tmp", false], // case-sensitive on POSIX
+      ["/tmp2/a", "/tmp", false],
+      ["/tmp/../etc", "/tmp", false],
+      ["/tmp/a/", "/tmp", true],
+      ["/tmp", "/tmp/", false],
+      ["/a", "/", true],
+      ["/", "/", false],
+      ["tmp/a", "/tmp", false],
+    ];
+    for (const [child, parent, expected] of posix) expect([child, parent, isStrictlyInside(child, parent, "linux")]).toEqual([child, parent, expected]);
+  });
+
+  it("assertSafeRefDir accepts only a well-named direct child of a tmp root", () => {
+    const ok: Array<[string, string[]]> = [
+      [`${LONG}\\${NAME}`, [SHORT, LONG]],
+      [`${SHORT}\\${NAME}`, [SHORT, LONG]], // 8.3 form, matched by the 8.3 root
+      [`${LONG.toLowerCase()}\\${NAME}`, [LONG]], // case
+      [`${LONG}\\${NAME}\\`, [LONG]], // trailing separator
+      [`${LONG}\\${NAME}`, [`${LONG}\\`]], // root with a trailing separator
+      [`C:/Users/Marquinho/AppData/Local/Temp/${NAME}`, [LONG]], // `/`-separated
+      [`\\\\srv\\share\\tmp\\${NAME}`, ["\\\\srv\\share\\tmp"]], // UNC tmp root
+    ];
+    for (const [dir, roots] of ok) expect(() => assertSafeRefDir(dir, roots, "win32")).not.toThrow();
+    const refused: Array<[string, string[]]> = [
+      [`${LONG}\\${NAME}`, [SHORT]], // long form against an 8.3-only root list
+      [`${LONG}\\x\\..\\${NAME}`, [LONG]], // `..` segment
+      [`${LONG}\\.\\${NAME}`, [LONG]], // `.` segment
+      [`${LONG}\\sub\\${NAME}`, [LONG]], // nested
+      [LONG, [LONG]], // the tmp root itself
+      [`C:\\${NAME}`, ["C:\\"]], // a filesystem root is never a tmp root
+      [`\\\\srv\\share\\${NAME}`, ["\\\\srv\\share"]], // nor is a UNC share root
+      [`C:\\Temp2\\${NAME}`, ["C:\\Temp"]], // prefix sibling
+      [NAME, [LONG]], // relative
+      ["", [LONG]],
+      [`${LONG}\\${NAME}`, ["Temp"]], // a relative tmp root is ignored
+      [`${LONG}\\omr-ref-0-0123456789abcdef`, [LONG]], // pid 0
+      [`${LONG}\\omr-ref-1234-0123456789ABCDEF`, [LONG]], // uppercase hex
+      [`${LONG}\\omr-ref-1234-0123456789abcde`, [LONG]], // 15 hex
+      [`${LONG}\\${NAME}.x`, [LONG]],
+      [`${LONG}\\omr-refX`, [LONG]],
+    ];
+    for (const [dir, roots] of refused) {
+      expect(() => assertSafeRefDir(dir, roots, "win32"), JSON.stringify([dir, roots])).toThrow(UnsafeReferencePathError);
+    }
+    expect(() => assertSafeRefDir(`/tmp/${NAME}`, ["/tmp"], "linux")).not.toThrow();
+    expect(() => assertSafeRefDir(`/private/var/T/${NAME}`, ["/var/T", "/private/var/T"], "linux")).not.toThrow();
+    expect(() => assertSafeRefDir(`/TMP/${NAME}`, ["/tmp"], "linux")).toThrow(UnsafeReferencePathError); // case-sensitive
+    expect(() => assertSafeRefDir(`/${NAME}`, ["/"], "linux")).toThrow(UnsafeReferencePathError);
+    expect(() => assertSafeRefDir(`/tmp/../tmp/${NAME}`, ["/tmp"], "linux")).toThrow(UnsafeReferencePathError);
   });
 });
