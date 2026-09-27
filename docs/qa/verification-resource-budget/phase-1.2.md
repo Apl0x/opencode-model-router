@@ -560,3 +560,148 @@ temporary worktree has been removed.
    signal, the POSIX `exit` hook does not run.
 4. **An abort that races the exit counts as a kill.** An abort that lands between the OS ending
    the child and libuv delivering `exit` counts as a kill.
+
+## QA re-review (round 2)
+
+Reviewer: heavy QA, adversarial re-review of the fix round, `git diff 5e393dc..2e5cda9` on
+`vrb/p12` (`src/verify/exec.ts`, `src/verify/types.ts`, `test/unit/exec.test.ts`,
+`test/fixtures/exec/tree.cjs`), against plan Phase 1.2 and G4.
+
+**Setup.**
+- Host: Windows 11, 16 logical cores, node v24.21.0.
+- `npx vitest run --maxWorkers=2 test/unit/exec.test.ts` passed: 31 passed, 2 skipped (the
+  POSIX-only cases), 23.37 s.
+- The repro scripts lived in `%TEMP%\omr-qa-r2` and have been removed.
+  - `p12.mjs` imported `src/verify/exec.ts` directly.
+  - A `hook.mjs` ran first. It wrapped `child_process.spawn`/`execFile` through
+    `syncBuiltinESMExports`, so it could count and time every process `exec.ts` starts, including
+    the sweeper.
+  - The sweep cases used `test/fixtures/exec/tree.cjs early-exit`. They waited until the direct
+    child was dead at the OS level, then aborted either after about 30 ms (a **cold** sweep: the
+    sweeper is spawned by the kill) or after about 900 ms (a **pre-armed** sweep). They polled
+    the holder every 20 ms from the abort.
+  - Load runs started 16 `node` busy loops, one per logical core, before the cases.
+- The branch history was rewritten, so the Resolution lines above quote old SHAs. They map by
+  subject as follows:
+  - `20da594` → `aa902e8`;
+  - `a55731e` → `6367006`;
+  - `ce0d15e` → `810eaf3`;
+  - `48d88ca` → `90570a0`;
+  - `a1415e0` → `6966a5c`;
+  - `c2e4b8f` → `6edb7be`.
+
+**Result.**
+- All 11 round-1 findings are verified.
+- QA-1.2-1 holds on an idle machine and under the verification's own below-normal load. Under
+  normal-priority CPU saturation it does not: see QA-1.2-14.
+- There are 3 new findings: 1 minor and 2 nit.
+- The DoD (zero open findings) is **not met**.
+
+### Round-1 findings
+
+| Finding | Status | Evidence |
+|---|---|---|
+| QA-1.2-1 | verified, with a load limit (QA-1.2-14) | `exec.ts:239-248` never targets the exited PID: Windows calls `sweep()`, POSIX signals the group unless `groupGone`. Measured sweeps, holder dead after the abort: idle cold +1010/+1017/+1021 ms; idle pre-armed +277/+277/+322 ms; below-normal burners, the verification's own load: cold +1509/+1627/+1708 ms, pre-armed +923/+943/+1085 ms. All of these fall within G4's 3 s, and every result is `code 1, timedOut: true` with `[killed 1 process tree(s) left running by the exited command: …]`. Both lifecycle tests pass. |
+| QA-1.2-2 | verified | `onGrace` (`exec.ts:212-225`) destroys the pipes, SIGKILLs a direct child that did not exit, and settles. In every sweep run under normal-priority saturation (12 runs) the result arrived +2001 to +2032 ms after the abort, with `[output streams force-closed 2000 ms after the kill: a descendant still held them]`, so the run and its slot are bounded even when the sweep is late. The `broken-tree` test passes. |
+| QA-1.2-3 | verified | `mergeEnv` (`exec.ts:301-312`). Repro: `{"PATH":"X1","Path":"Y2"}` → the child sees `[["Path","Y2"]]`; `{"Path":"Y2","PATH":"X1"}` → `[["PATH","X1"]]`; `{"path":"Z3"}` → `[["path","Z3"]]`. There is exactly one key, and the last override wins, in a deterministic order. POSIX is unchanged. |
+| QA-1.2-4 | verified (code; not re-run: Windows host) | Both entry points pass `--` (`exec.ts:79`, `:91`). The mapping at `:183-187` applies only to `runArgv`, only when not killed, and only for exit 126/127 with a `nice:` prefix. The POSIX test at `exec.test.ts:214-234` passed in the recorded Linux CI run 36287282255. |
+| QA-1.2-5 | verified | `deadlineOf` (`exec.ts:287-293`). The `2 ** 31`, `MAX_SAFE_INTEGER`, `Infinity` and `-5` tests pass. |
+| QA-1.2-6 | verified (code; not re-run: Windows host) | `trackGroup`/`untrackGroup` and a single lazy `process.once("exit")` hook (`exec.ts:363-381`). The groups are untracked on settle and when seen empty at `exit`. The POSIX hook test passed in CI run 36287282255. |
+| QA-1.2-7 | verified (code); the test gap is QA-1.2-16 | `DEFAULT_TIMEOUT_MS = 120_000` is applied only when both `timeoutMs` and `signal` are absent (`exec.ts:289`). |
+| QA-1.2-8 | verified | `setEncoding("utf8")` is set on both streams (`exec.ts:163-164`). The UTF-8 split test passes. |
+| QA-1.2-9 | verified | The exact cap with surrogate protection and end-of-stderr markers (`exec.ts:320-340`, `:189-191`). The `maxBuffer: 1000` and surrogate tests pass. |
+| QA-1.2-10 | verified | The abort between `exit` and `close` is covered by the two lifecycle tests, and both pass. The no-op case resolves to `{ code: 0, stdout: "", stderr: "", timedOut: false }`. |
+| QA-1.2-11 | verified | `priorityOf` runs `powershell.exe` (`exec.test.ts:108-109`). The sweeper uses the `%SystemRoot%` path (`exec.ts:408-410`). |
+
+### Focus checks (no finding)
+
+- **The sweeper does not run on every exec.**
+  - Across 4 ordinary runs (`runShell echo`, `runArgv node`, `runShell npm.cmd --version` with
+    `lowPriority`, and `runShell node exit 3`), there were 0 PowerShell spawns.
+  - One spawn happens only when a pipe holder outlives the exit by more than `SWEEP_ARM_MS`. In the
+    test run, the child exited at once and a detached holder kept the pipes for 1.2 s. The result
+    was `code=0 timedOut=false`, with 1 spawn, and 0 sweepers alive 300 ms later: `dispose()`
+    ended it.
+- **No orphaned sweeper.**
+  - In all 30 sweep runs, including the ones where the sweeper hit `SWEEP_TIMEOUT_MS`, no sweeper
+    was alive after its run.
+  - The sweeper is a non-detached child, so it sits in libuv's kill-on-close job on opencode exit.
+  - EOF on its stdin ends `ReadLine`.
+- **No injection through the PID values.** The script interpolates only `pid` (`child.pid`, a
+  number) and `Math.floor`/`Math.ceil` results (`exec.ts:441-448`). Inside the script, `taskkill.exe`
+  is resolved by PowerShell, which never runs a command from the current directory. The
+  PowerShell path is absolute when `SystemRoot` is set.
+- **A missing `powershell.exe`.** An asynchronous `error` event leads to `end()` and then
+  `report([])`, so nothing is killed and nothing throws. That degradation is silent: see QA-1.2-15.
+- **PID pinning and the `+50 ms` slack.** A PID recycled within the `to` slack could expose a new
+  owner's child to the sweep. Measurement: 735 `cmd.exe` processes churned for 8 s gave 124 PID
+  reuses, and the minimum gap between the old owner's exit and the new owner's spawn was 1142 ms,
+  with 0 reuses within 200 ms. The slack is not a practical hazard on this host. Pinning plus
+  the `StartTime` re-check covers the query-to-kill window.
+- **The `nice` 126/127 mapping and false positives.** A misclassification needs a `runArgv` target
+  whose own first stderr bytes are `nice:` and whose exit is 126 or 127. For example, a wrapper
+  script whose first failing step is its own `nice` call. `runArgv` targets are adapter-built
+  (`process.execPath <runner entry>`, `pytest`, `uv`, per §1.5-1), and none of them prints that.
+  The worst case is still a failure (code 1 instead of 127). No finding.
+- **The timeout clamp, the 120 s default and the exit hook:** covered in the table above.
+
+### New findings
+
+| ID | Severity | Where | Evidence | Fix |
+|---|---|---|---|---|
+| QA-1.2-14 | minor | `exec.ts:67` (`SWEEP_TIMEOUT_MS = 5000`), `:440-505` (`armSweeper`) | **Normal-priority saturation.** Under 16 normal-priority busy loops (16 cores), the Windows sweep misses G4's 3 s, and sometimes it never kills. Holder dead after the abort, two runs of the unchanged code:<br>• cold: +3977, +4819, +4574, +3912 and +3716 ms, and **once alive after 9 s**; the sweeper had been ended by the 5 s limit (`exit signal SIGTERM`);<br>• pre-armed: +3850, +3284, +4361, +3775, +4129 and +4951 ms (the sweeper was SIGTERM'd at 5.7 s of life).<br>So all 12 runs missed 3 s, and 1 of the 12 never killed. Pre-arming does not help, because under this load PowerShell has not finished starting and pinning by exit + 0.9 s.<br>**Comparison under the same load.** The primary path (a live direct child, `taskkill /T /F` from node) killed the grandchild at +869, +1057 and +950 ms. The below-normal load results are in the QA-1.2-1 row.<br>**Experiment (not a proposed change).** Raising the sweeper to `PRIORITY_HIGH` right after spawn gave +2748, +2212, +2311 and +2111 ms, and 2 of 6 runs alive after 9 s. The CIM query runs in the WMI provider host, which is not raised, so priority alone does not fix it. The run itself stayed bounded at +2.0 s in every case (QA-1.2-2). | 1. Make `SWEEP_TIMEOUT_MS` bound only a hung sweeper, for example 30000 ms. By then the grace timer has already settled the run, so a late kill costs the run nothing, and it turns "never" into "late".<br>2. Record the load dependence in G4's wording and in the risk table (see the proposal below).<br>3. Optionally, `setPriority(ps.pid, PRIORITY_HIGH)` after the spawn: it lowers the median, not the tail.<br>No unit test: this is load-dependent. 3.1.2.d should run its no-orphans check once on the Windows runner with a normal-priority CPU burner. |
+| QA-1.2-15 | nit | `exec.ts:463-476` and `:478-497` | **Sweeper failures are silent.** Four causes all resolve as "nothing killed", and the result cannot tell them apart from "nothing to kill":<br>• the sweeper's stderr is `ignore`d;<br>• `error` and `close` both call `end()`;<br>• `report()` passes only `killedPids()`;<br>• the 5 s limit does the same.<br>Evidence:<br>• In the QA-1.2-14 run where the limit ended the sweeper, the result carried only the force-closed note.<br>• Under Constrained Language Mode (simulated with `$ExecutionContext.SessionState.LanguageMode = 'ConstrainedLanguage'` in `powershell.exe`), each construct the script needs fails: `[Diagnostics.Process]::GetProcessById` and `[Console]::Out.WriteLine` ("A invocação de método tem suporte apenas nos tipos principais deste modo de linguagem", pt-BR host: method invocation is supported only on core types), and the `[DateTimeOffset]` cast ("Esse modo de linguagem dá suporte apenas para os tipos principais": this language mode supports only core types). `Pin` swallows the error, so on an AppLocker/WDAC machine the QA-1.2-1 fix is inert with no trace. | 1. Have the script print a sentinel after pinning, for example `pinned <n>`.<br>2. Have `kill()` append `[orphan sweep unavailable: <spawn error \| exit <code> \| timed out after <n> ms \| no sentinel>]` to the notes when the sentinel is missing or the limit fires.<br>3. State the FullLanguage requirement in the `armSweeper` doc comment.<br>4. Test it by pointing the sweeper at a script that exits 1 before the sentinel, through a test-only override of the PowerShell path, and assert the note. |
+| QA-1.2-16 | nit | `exec.ts:289`, `test/unit/exec.test.ts` | **The 120 s default is untested.** `rg DEFAULT_TIMEOUT_MS test src` matches only `src/verify/exec.ts` (`:45`, `:59`, `:289`). Every `runShell`/`runArgv` call in the test file passes `timeoutMs`, so neither arm of `t === undefined` (no signal → 120000; signal only → no timer) runs. This counts against §4.2's ≥ 90 % branch target for `exec.ts`. | Add two tests with `vi.spyOn(globalThis, "setTimeout")`. With no `timeoutMs` and no `signal`, a quick `runArgv` arms a timer of `DEFAULT_TIMEOUT_MS`. With only a `signal`, it arms no deadline timer. Alternatively, export `deadlineOf` and test it pure. |
+
+### Residual limit: decision and plan wording (for 3.2 to apply)
+
+**Decision: the residual is acceptable**, as long as the wording below replaces the absolute claim
+and QA-1.2-14 fix 1 lands. The reasons:
+1. On Windows, a process whose parent has died cannot be attributed to the run in a PID-safe way
+   without a dedicated job object. On POSIX, the same holds for a `setsid` escapee without a
+   cgroup or subreaper. Node exposes neither.
+2. The resource goal still holds: the run and its slot are released `KILL_GRACE_MS` after the
+   deadline in every measured case.
+3. Node-forked workers die with their Node parent, through libuv's job.
+4. Survivors run at below-normal priority when `lowPriority` is on, which is the default.
+
+Proposed §4.1 G4 text:
+
+> **G4 — Nothing outlives its budget.** Every synchronous verification (a required gate in the
+> `delegate` and the native `task` paths, and each `router_verify` call) has one deadline
+> (`gateBudgetMs`). No slot wait, run, recheck or batch step outlives it by more than the 2 s kill
+> grace: the run resolves and releases its slot at most 2 s after the deadline, even when a
+> descendant still holds its output pipes. Its expiry kills every process still attributable to
+> the run, and no attributable process is alive 3 s after the deadline on a machine that is not
+> saturated by normal-priority load. Attributable means:
+> - on POSIX, a member of the run's process group;
+> - on Windows, a descendant reachable from the live direct child or, once the direct child has
+>   exited, a child it created during its lifetime and that child's live tree, found by the
+>   creation-time sweep.
+>
+> Known limits, each still bounded by the 2 s grace:
+> - (a) a descendant whose parent died before the kill (Windows) or that left the process group
+>   with `setsid` (POSIX) is not killed;
+> - (b) the Windows sweep needs Windows PowerShell 5.1 in FullLanguage mode, and where PowerShell
+>   is blocked or constrained it kills nothing;
+> - (c) under normal-priority CPU saturation the Windows sweep can finish after 3 s.
+>
+> Proven by 1.2, the 2.1 deadline and native-`task` tests, the 2.4 `router_verify` deadline test,
+> and 3.1.2.d.
+
+§5 risk table, a new row:
+
+> | A descendant escapes the deadline kill: its parent died first (Windows), it called `setsid` (POSIX), PowerShell is blocked or constrained, or normal-priority load starves the Windows sweep | The run and its slot are released 2 s after the deadline anyway (force-closed pipes, `timedOut: true` and a stderr note). POSIX process groups and pinned Windows trees are killed, and Node-forked workers die with their parent (libuv job). Verification descendants run below normal priority, so a survivor cannot starve the machine. The sweep's own failure is reported on stderr (QA-1.2-15). 3.1.2.d asserts the 3 s no-orphans rule for an attributable tree. |
+
+Also align 3.1.2.d ("3 s later no descendant is alive") to "no attributable descendant".
+
+### Deferred by plan (not open)
+
+- **deferred by plan (3.2):**
+  - QA-1.2-12, unchanged.
+  - Apply the G4 and risk-table wording above and the 3.1.2.d alignment. The plan file is not
+    owned by this phase.
+- **deferred by plan (2.1):** QA-1.2-13, unchanged. The 2.1 QA should confirm that `lowPriority`
+  reaches `runShell` and `runArgv`.
+- **deferred by plan (3.1):** 3.1.2.d's run under normal-priority load (QA-1.2-14), and the §4.2
+  coverage gate that QA-1.2-16 feeds into.
