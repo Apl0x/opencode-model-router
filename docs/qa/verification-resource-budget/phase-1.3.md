@@ -1127,3 +1127,102 @@ Cleanup: the 16 junctions under `%TEMP%\omr-qa13r6` (`node_modules` links into `
 with `rmdir` first, and the check found 0 reparse points left. Then the directory was deleted, including this round's uv venvs. The link
 targets are intact, and the Spike C venv and jest project were not modified. The final check found 0 `omr-verify-*` files and 0
 `bun-node-*` directories in `%TEMP%`, and no process referring to `omr-qa13r6`.
+
+### Resolutions (round 6)
+
+Gates after the last fix: `npx vitest run --maxWorkers=2 --coverage --coverage.include=src/verify/runner.ts test/unit/runner.test.ts test/unit/deterministic.test.ts`
+gave `Test Files 2 passed (2)`, `Tests 755 passed (755)`, and runner.ts coverage of 99.35% statements (2160/2174), 97.85% branches
+(1912/1954), 100% functions (235/235) and 99.88% lines (1704/1706). `npm run typecheck` was clean. runner.ts still imports no
+`child_process`. Contract changes are additive: `PytestFacts.freeArgs?` and its element type `PytestFreeArg` (QA-1.3-48), and
+`PlannerFs.readdir?` (QA-1.3-51, like `stat`; 2.1 should pass `fs.promises.readdir`). `ChangedPath`, `StaticScoping`, `DetectedRunner` and
+`S6Code` are unchanged, and no S6 code or reason template was added. Behaviour changes a consumer can see: a pytest spec can now carry no
+pin at all, or `-c <a table-less pyproject.toml>` with the `--rootdir`, where round 5 returned S6 (QA-1.3-49); a pytest command whose plugin
+option has a separate value that exists (`--cov src`) pins the config that value's lookup reaches (QA-1.3-48); vitest/jest configs that
+build a setup path in one call now trigger config-changed (QA-1.3-50).
+Real-runner checks: runner.ts at 664ebe1 ("before") and at each fix commit ("after") were bundled with `bun build --target node` into
+`%TEMP%\omr-fix13r6` and driven under node v24.21.0 (the QA-1.3-48/49 plans also under bun 1.3.14 on pytest 7.0.1 and 9.1.1: identical).
+The planners got the real fs (native realpath, bigint stat) and a search seam backed by `git ls-files` / `git grep`. Each fixture was a
+fresh directory with its own `git init` and commit, and the changed file was then broken. Specs were spawned with
+`spawnSync(file, args, {shell: false})`, and every run went through `readResult`. Runners: uv venvs (Python 3.12) with pytest 7.0.1,
+7.4.4, 8.0.2, 8.1.1, 8.4.2 and 9.1.1, each with pytest-cov 7.1.0; jest 30.5.2 (Spike C `node_modules`) and vitest 4.1.11
+(`D:\git\omr-p13\node_modules`), both by junction. "User's own" is the check command run in the fixture with `-p no:cacheprovider`, and
+`pin=` lists a pytest spec's arguments between `--maxfail=0` and `-n`/`--no-cov`/`--`, relative to the fixture.
+
+- QA-1.3-48 Resolution: 85068c0 — The user-run model now takes the free arguments of pytest's pre-plugin parse as the path arguments of
+  its config lookup. pytest 9.1.1 (`_pytest/config/__init__.py` 1532-1536, read in the venv) passes `ns.file_or_dir` from
+  `parse_known_and_unknown_args`, which is `parse_known_intermixed_args` on Python >= 3.12.8 / 3.13.1 and otherwise `parse_known_args`
+  with every non-flag unknown appended to `file_or_dir`; pytest 7.0-8.4 pass `file_or_dir + unknown_args`. Either way every free
+  positional counts, in token order, and `get_dirs_from_args` keeps the existing ones (`::` stripped, a file as its directory).
+  processArgs records, in order, the positional paths and the separate values of the plugin options in the pytest table
+  (`PY_PLUGIN_VALUE_OPTIONS`: `--cov`, `--cov-report`, `--cov-config`, `--cov-fail-under`, `--cov-context`, `--html`, `--json-report-file`,
+  `-n`/`--numprocesses`/`--maxprocesses`, `--timeout`, `--dist`); every other valued option in the table is builtin. detectRunner stores
+  them realpath'd in `PytestFacts.freeArgs` when a plugin value is present. Detection's python_files lookup and the spec-time lookup
+  (planScopedRun, planStaticScoping, planRerun, where the values move into the rerun tree and are checked there) take the existing values,
+  PYTEST_ADDOPTS ones first. The spawn's own lookup takes the values of the plugin options it keeps (`--timeout`, `--dist`) and of its
+  PYTEST_ADDOPTS, so the no-`-c` branch looks from their common ancestor with the inputs. Attached values (`--cov=src`) are one option
+  token and do not count, as in pytest. Real runs, QA layout (root `pytest.ini`, `tests/unit/pytest.ini` `-m "not slow"`, `.coveragerc`,
+  `src/`, broken `test_slow`), on all six pytest releases: `pytest --cov src tests/unit` and `pytest --cov=src --cov-config .coveragerc
+  tests/unit` before `pin=["-c","tests/unit/pytest.ini","--rootdir=tests/unit"] exit=0 total=1 failingIds=[] complete=true` (a pass);
+  after `pin=["-c","pytest.ini","--rootdir=."] exit=1 total=2 failingIds=["tests/unit/test_s.py::test_slow"] complete=true`; user's own
+  `rootdir: <fx>`, `configfile: pytest.ini`, `1 failed, 1 passed`. The same with `PYTEST_ADDOPTS="--cov-config .coveragerc"` and
+  `pytest --cov=src tests/unit`: the same before/after/user's own. Control `--cov-config=.coveragerc` (one token): before and after
+  `pin=["-c","tests/unit/pytest.ini","--rootdir=tests/unit"] exit=0 total=1`, user's own `rootdir: <fx>\tests\unit`, `1 passed, 1
+  deselected`. Unit tests: the QA commands, a `--html` value that does not exist, `--timeout -1`, the order and `::` of `freeArgs`,
+  PYTEST_ADDOPTS values (separate and attached), planStaticScoping reading the nested config only for `--cov=src`, planRerun with the
+  value present and gone in the reference tree, and a kept `--timeout` value, a PYTEST_ADDOPTS `--cov` value and a dropped `--cov` value
+  in the spawn's lookup. Residual (P): the adapter's own `-n N` is a free argument of the spawn's pre-plugin parse too, so a file or
+  directory named like the worker count in the runner's cwd would move the spawn's lookup where no `-c` is pinned; a DetectedRunner built
+  without pytestFacts keeps the path arguments alone, since its kept arguments no longer hold the dropped plugin options.
+- QA-1.3-49 Resolution: 85068c0 — Where the round-5 pins cannot work (the releases pick different rootdirs, a rootdir with `$`/`%`, or
+  the inputs' ancestor reaches another inifile), pytestPin now tries, before the S6: (a) no pin at all, when the spawn's own
+  determine_setup (its free arguments, nothing pinned, the same cwd and `--rootdir` as the user's run) gives every release the user's
+  inifile and rootdir; (b) `-c <pyproject.toml>` with the `--rootdir`, when that table-less file is the inifile of every release that has
+  one (pytest >= 8.1) and no release reads an accepted config, unless a conftest.py lies above the rootdir: pytest < 8.1 cuts no conftests
+  without an inifile, and with `-c` it cuts at the file's directory, which is the rootdir. The round-5 pins are still preferred where they
+  work, so no existing pin changed. The 18 layouts of this QA section, rebuilt, on pytest 7.0.1, 7.4.4, 8.0.2, 8.1.1, 8.4.2 and 9.1.1:
+  S6 **4/18 before, 1/18 after**, and no false pass. The 14 scoped layouts give identical before and after plans and results on all six
+  releases, each matching the user's own `rootdir:`/`configfile:` and failures. (i) uv workspace, `pytest`: before `S6 … packages\a\pyproject.toml
+  instead of …\pyproject.toml`; after `pin=["-c","pyproject.toml","--rootdir=."] exit=1 total=2
+  failingIds=["packages/a/tests/test_a.py::test_up"] complete=true`; user's own `1 failed, 1 passed` (`configfile: pyproject.toml` on
+  8.1.1+). (ii) `pytest packages/a` and (iii) `pytest backend`: before `S6 … the pytest releases pick …\packages\a or <fx>` (`…\backend`
+  for iii); after `pin=[] exit=1 total=2 failingIds=["<pkg>/tests/test_a.py::test_up"] complete=true`; user's own `rootdir: <fx>` on
+  7.0.1-8.0.2 and `rootdir: <fx>\<pkg>`, `configfile: pyproject.toml` on 8.1.1+, `1 failed, 1 passed`. (iv) `pytest` with only
+  `backend/pyproject.toml`: S6 before and after (`…\backend\pyproject.toml instead of none`), as recorded; the `--confcutdir` pin stays
+  unverified and was not added. Two extra layouts with a root conftest.py whose autouse fixture raises in teardown and an unbroken test
+  file: (i) `pytest`: after `pin=["-c","pyproject.toml","--rootdir=."] exit=1 failingIds=["…::test_other","…::test_up"]` on all six,
+  user's own `2 passed, 2 errors`; (ii) `pytest packages/a`: after `pin=[]`, `exit=1` with both ids on 7.0.1-8.0.2 (user's own `2 passed,
+  2 errors`) and `exit=0 total=2` on 8.1.1+ (user's own `rootdir: <fx>\packages\a`, `2 passed`). Unit tests: the four layouts through
+  planScopedRun, planStaticScoping and planRerun, a conftest.py above the rootdir, a `--rootdir` the run gives, a release that reads an
+  accepted config, and the rewritten round-5 cases that now resolve (QA-1.3-40's pytest.toml and table-less fallbacks, the `$`/`%`
+  rootdirs), each with an S6 variant that remains.
+- QA-1.3-50 Resolution: 36c9a0b — configLiterals keeps each call's arguments and also joins every run of lone literal arguments with
+  "/". A run that starts the call or follows `__dirname`, `import.meta.dirname` or `process.cwd()` resolves like any literal:
+  `path.join(__dirname, 'src', 'testing', 'bootstrap.js')` and `path.resolve(__dirname, 'src/testing', 'bootstrap.js')` name
+  `src/testing/bootstrap.js`. A run after any other argument (a variable, another call, a template with `${}`) fails closed, as the
+  dispatch preferred: its tail after the last `..` (or `<rootDir>`-like segment) is kept, and every changed file whose path ends with it
+  (with its extension, without it, or as a directory index) is a trigger. Array elements are never joined, and the tails count against
+  SETUP_REF_LIMIT. Real runs, `bootstrap.js` made to throw: jest `globalSetup: path.join(__dirname, 'src', 'testing', 'bootstrap.js')` and
+  `path.resolve(__dirname, 'src/testing', 'bootstrap.js')`: before `inputs=["src/testing/bootstrap.js"] exit=0 total=0 failingIds=[]
+  complete=true` (a pass); after `S6 config-changed: config file changed: src/testing/bootstrap.js`; user's own `exit=1 Error: Jest: Got
+  error running globalSetup - <fx>\src\testing\bootstrap.js, reason: setup broke`. The same before/after/user's own for
+  `path.join(ROOT, 'testing', 'bootstrap.js')` (ROOT a variable) and `path.join(__dirname, 'src', dir, 'bootstrap.js')`. vitest
+  `setupFiles: [path.join(__dirname, 'src', 'testing', 'bootstrap.mjs')]`: before `exit=1 total=0 failingIds=["test/a.test.mjs"]` (vitest
+  reran the suite: no false pass); after S6 config-changed. A plain source change under the same configs still ran scoped, e.g. jest
+  `inputs=["src/a.js"] exit=1 failingIds=["test/a.test.js > add"] complete=true`, as the user's own. Unit tests: two- and three-literal
+  `path.join`/`path.resolve` (with `__dirname`, `process.cwd()`, `import.meta.dirname`, a comment and a trailing comma), floating tails
+  (a variable, a call, `..`, a template, `<rootDir>`), a vitest directory index, no false trigger (another tail, another directory, array
+  elements, an empty tail), and the SETUP_REF_LIMIT bound.
+- QA-1.3-51 Resolution: 9a04eb5 — PlannerFs gets an optional `readdir`. With it, the G.7a probe lists each directory once per plan (all
+  listings started together, the configs still taken in directory order) instead of calling fileExists for each config name. A name the
+  listing has only in another case is confirmed with fileExists, so the answer stays the one fileExists gives on a case-sensitive or
+  case-insensitive file system, and a directory that cannot be listed falls back to fileExists. The pytest lookup keeps fileExists: it walks
+  above gitRoot to the filesystem root, where a directory such as `%TEMP%` can hold thousands of entries. `planStaticScoping`, vitest, real
+  fs, 3 runs, every outcome `scopable`: 40 packages each with a vitest.config.mjs and 200 changed modules (5 per package, each in its own
+  directory): node 438-499 ms -> 98-126 ms, bun 468-525 ms -> 208-255 ms, fileExists 3587 -> 203 plus 282 listings; 260 changed modules each
+  in its own 9-deep chain: node 2614-2831 ms -> 228-261 ms, bun 2559-2821 ms -> 527-584 ms, fileExists 28355 -> 263 plus 2341 listings.
+  The jest/vitest QA-1.3-50 runs above gave the same results with the listing seam. Unit tests: one listing per directory and plan with no
+  config-name fileExists, a name listed in another case (confirmed and refuted by fileExists), and a directory that cannot be listed.
+
+Cleanup: the junctions under `%TEMP%\omr-fix13r6` were removed with `rmdir` first, the check found 0 reparse points left, and then the
+directory was deleted, including the uv venvs. The link targets are intact, and the Spike C venv and jest project were not modified. The
+final check found 0 `omr-verify-*` files and 0 `bun-node-*` directories in `%TEMP%`, and no process referring to `omr-fix13r6`.
