@@ -78,7 +78,7 @@ import { access, readFile as fsReadFile } from "node:fs/promises";
 import { tool } from "@opencode-ai/plugin";
 import { scrubText } from "./guard/scrub";
 import { accept, unverifiableGateResult } from "./verify/gate";
-import { createVerificationWiring, dispatchDirectiveText, extractAssistantText, type DispatchStart } from "./verify/wiring";
+import { createVerificationWiring, dispatchDirectiveText, extractAssistantText, parseRouterVerifyArgs, type DispatchStart } from "./verify/wiring";
 import { appendRouterFooter } from "./verify/pending";
 import { createDeadline } from "./verify/deterministic";
 import {
@@ -355,7 +355,8 @@ const ModelRouterPlugin: Plugin = async (ctx: PluginInput) => {
     graderSessions, dispatchGrader, buildGateDeps, disposeChildSession,
     prepareVerification, startReferenceGc,
     sweepVerification, disposeVerification,
-    startDispatch, takeDispatch, isDeferred, finishDeferred, applyLineage, pending,
+    startDispatch, takeDispatch, isDeferred: wiringIsDeferred, finishDeferred, applyLineage, pending,
+    verifyHandles,
   } = createVerificationWiring({
     client: ctx.client,
     directory: ctx.directory,
@@ -439,6 +440,24 @@ const ModelRouterPlugin: Plugin = async (ctx: PluginInput) => {
   const enableDelegateTool =
     cfg.experimental?.verifiedDelegateTool === true ||
     process.env.MODEL_ROUTER_VERIFIED_DELEGATE === "1";
+
+  // 2.4.3b (plan 2.4.3 "Registration"): `router_verify` is registered whenever verification is
+  // enabled at plugin start, independent of enableDelegateTool: verify.require is not "never" and
+  // a verifying path exists (the native `task` path needs an enforcement mode other than "off";
+  // the delegate tool verifies in every mode). The tool map is fixed at start.
+  let routerVerifyEnabled = false;
+  try {
+    const startMode = resolveEnforcementMode({ config: cfg, env: process.env }).mode;
+    routerVerifyEnabled = cfg.enforcement?.verify?.require !== "never" && (startMode !== "off" || enableDelegateTool);
+  } catch (error) {
+    logger.warn("[verify] router_verify not registered: the enforcement mode could not be resolved", { error: scrubText(String(error)) });
+  }
+  /**
+   * 2.4.2 + 2.4.3b: a delegation defers only when `router_verify` exists to verify it later. A
+   * footer never names a tool this instance did not register; without it the delegation keeps the
+   * synchronous gate (never weaker).
+   */
+  const isDeferred: typeof wiringIsDeferred = (dod, directives) => routerVerifyEnabled && wiringIsDeferred(dod, directives);
 
   return {
     // Warnings post to /log fire-and-forget, which loses the message when the
@@ -847,6 +866,38 @@ const ModelRouterPlugin: Plugin = async (ctx: PluginInput) => {
               if (!(deferredOwnsBaseline && sid === baselineID)) changedFileStore.clear(sid);
               await disposeChildSession(sid);
             }
+          }
+        },
+      }) } : {}),
+      // 2.4.3b, section 1.5-18: verify deferred delegations on the orchestrator's terms.
+      ...(routerVerifyEnabled ? { router_verify: tool({
+        description:
+          "Verify delegations that returned 'unverified' with a vrf_ handle. Runs the same checks as a required verification (affected tests, batched, under the verification slot and one gate deadline) and returns one verdict per handle: pass, fail (with the introduced failures and a suggested next tier) or unverifiable. Nothing is retried or escalated for you. Pass exactly one of `handles` or `pending: true` (every unverified delegation of this session).",
+        args: {
+          handles: tool.schema
+            .array(tool.schema.string())
+            .optional()
+            .describe("The vrf_ handles from the delegations' [router] footers."),
+          pending: tool.schema
+            .boolean()
+            .optional()
+            .describe("true: verify every still-unverified delegation of this session."),
+        },
+        async execute(
+          args: { handles?: string[]; pending?: boolean },
+          toolCtx?: { sessionID?: string; abort?: AbortSignal },
+        ): Promise<string> {
+          // Never throws: every failure is a text answer (the tool result reaches the orchestrator).
+          try {
+            const target = parseRouterVerifyArgs(args);
+            if ("error" in target) return target.error;
+            // R6: handles are scoped by the calling session; without one, every handle is unknown.
+            const sessionID = typeof toolCtx?.sessionID === "string" ? toolCtx.sessionID : "";
+            const report = await verifyHandles(sessionID, target, toolCtx?.abort !== undefined ? { signal: toolCtx.abort } : {});
+            return report.text;
+          } catch (error) {
+            logger.warn("[verify] router_verify failed", { error: scrubText(String(error)) });
+            return `[router] router_verify failed; nothing was verified: ${scrubText(String(error))}`;
           }
         },
       }) } : {}),

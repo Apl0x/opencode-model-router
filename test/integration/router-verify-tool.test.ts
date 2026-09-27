@@ -15,7 +15,9 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cpSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { isAbsolute, join, relative } from "node:path";
+import { dirname, isAbsolute, join, relative } from "node:path";
+import ModelRouterPlugin from "../../src/index";
+import { invalidateConfigCache } from "../../src/router/config";
 import {
   createVerificationWiring,
   digestFiles,
@@ -132,6 +134,20 @@ vi.mock("../../src/verify/slot", async importOriginal => ({
     };
   },
 }));
+
+// The plugin's own wiring instance, so the tool tests can register pending entries in it.
+const plugin = vi.hoisted(() => ({ wiring: undefined as import("../../src/verify/wiring").VerificationWiring | undefined }));
+vi.mock("../../src/verify/wiring", async importOriginal => {
+  const actual = await importOriginal<typeof import("../../src/verify/wiring")>();
+  return {
+    ...actual,
+    createVerificationWiring: (...args: Parameters<typeof actual.createVerificationWiring>) => {
+      const wiring = actual.createVerificationWiring(...args);
+      plugin.wiring = wiring;
+      return wiring;
+    },
+  };
+});
 
 vi.mock("../../src/verify/reference", async importOriginal => ({
   ...(await importOriginal<typeof import("../../src/verify/reference")>()),
@@ -535,5 +551,162 @@ describe("verifyHandles (2.4.3a)", () => {
     expect(verdictOf(report.items[0]).result.retryable).toBe(true);
     expect(state.runs).toEqual([]);
     expect(wiring.pending.get("orch", h)).toMatchObject({ kind: "found", entry: { state: "unverified" } });
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// The plugin's router_verify tool (2.4.3b)
+// ---------------------------------------------------------------------------------------------
+
+interface ToolHooks {
+  tool: Record<string, { execute(args: unknown, ctx?: { sessionID?: string; abort?: AbortSignal }): Promise<string> } | undefined>;
+  "tool.execute.before": (input: unknown, output: unknown) => Promise<void>;
+  "tool.execute.after": (input: unknown, output: { output: string; metadata: unknown }) => Promise<void>;
+}
+
+describe("the router_verify tool (2.4.3b)", () => {
+  let home = "";
+  const saved = { HOME: process.env.HOME, USERPROFILE: process.env.USERPROFILE };
+
+  beforeEach(() => {
+    home = mkdtempSync(join(tmpdir(), "omr-rv-home-"));
+    process.env.HOME = home;
+    process.env.USERPROFILE = home;
+    process.env.MODEL_ROUTER_ENFORCE = "1";
+    delete process.env.MODEL_ROUTER_VERIFIED_DELEGATE;
+    invalidateConfigCache();
+    plugin.wiring = undefined;
+  });
+
+  afterEach(() => {
+    for (const key of ["HOME", "USERPROFILE"] as const) {
+      if (saved[key] === undefined) delete process.env[key];
+      else process.env[key] = saved[key];
+    }
+    delete process.env.MODEL_ROUTER_ENFORCE;
+    delete process.env.MODEL_ROUTER_VERIFIED_DELEGATE;
+    invalidateConfigCache();
+    rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+  });
+
+  function writeOverrides(verify: Record<string, unknown>): void {
+    const p = join(home, ".config/opencode/opencode-model-router.overrides.jsonc");
+    mkdirSync(dirname(p), { recursive: true });
+    writeFileSync(p, JSON.stringify({ enforcement: { verify } }), "utf-8");
+    invalidateConfigCache();
+  }
+
+  async function makePlugin(): Promise<{ hooks: ToolHooks; created: string[] }> {
+    const created: string[] = [];
+    const ctx = {
+      directory: state.root,
+      worktree: state.root,
+      project: {},
+      serverUrl: new URL("http://localhost"),
+      $: () => undefined,
+      client: {
+        session: {
+          get: async () => ({ data: {} }),
+          create: async () => {
+            const id = `sess_${created.length + 1}`;
+            created.push(id);
+            return { data: { id } };
+          },
+          prompt: async () => ({ data: { parts: [{ type: "text", text: "DONE" }] } }),
+          abort: async () => ({}),
+          delete: async () => ({}),
+        },
+      },
+    };
+    const hooks = (await ModelRouterPlugin(ctx as unknown as Parameters<typeof ModelRouterPlugin>[0])) as unknown as ToolHooks;
+    return { hooks, created };
+  }
+
+  const registry = (): PendingRegistry => {
+    if (plugin.wiring === undefined) throw new Error("the plugin built no wiring");
+    return plugin.wiring.pending;
+  };
+
+  const routerVerify = (hooks: ToolHooks) => {
+    const t = hooks.tool.router_verify;
+    if (t === undefined) throw new Error("router_verify is not registered");
+    return t;
+  };
+
+  it("is registered whenever verification is enabled, independent of the delegate tool", async () => {
+    expect((await makePlugin()).hooks.tool.router_verify).toBeDefined();
+    expect((await makePlugin()).hooks.tool.delegate).toBeUndefined();
+    process.env.MODEL_ROUTER_VERIFIED_DELEGATE = "1";
+    const both = (await makePlugin()).hooks.tool;
+    expect(Object.keys(both).sort()).toEqual(["delegate", "router_verify"]);
+    writeOverrides({ require: "never" });
+    expect((await makePlugin()).hooks.tool.router_verify).toBeUndefined();
+  });
+
+  it("without the tool (verification off at start) a later testsPass task is gated, never deferred", async () => {
+    process.env.MODEL_ROUTER_ENFORCE = "0";
+    const { hooks } = await makePlugin();
+    expect(hooks.tool.router_verify).toBeUndefined();
+    // Enforcement switched on at runtime: the native path verifies again, synchronously.
+    process.env.MODEL_ROUTER_ENFORCE = "1";
+    const prompt = `Implement it.\n[acceptance]\ncheck: testsPass command="npm test"\n[/acceptance]`;
+    const input = { tool: "task", sessionID: "orch", callID: "c1", args: { subagent_type: "fast", prompt, description: "the work" } };
+    const before = { args: { ...input.args } };
+    await hooks["tool.execute.before"](input, before);
+    const output = { output: "<task_result>\nDONE\n</task_result>", metadata: { sessionId: "child1" } };
+    await hooks["tool.execute.after"]({ ...input, args: before.args }, output);
+    expect(output.output).not.toMatch(/\[router\] unverified/);
+    expect(registry().listUnverified("orch")).toEqual([]);
+  });
+
+  it("requires exactly one of handles or pending: true, as text; it never throws", async () => {
+    const { hooks } = await makePlugin();
+    const t = routerVerify(hooks);
+    for (const bad of [{}, { handles: ["vrf_x"], pending: true }, { pending: false }, { handles: [] }]) {
+      await expect(t.execute(bad, { sessionID: "orch" })).resolves.toBe(ROUTER_VERIFY_ARGS_TEXT);
+    }
+    await expect(t.execute({ pending: true }, { sessionID: "orch" })).resolves.toBe(ROUTER_VERIFY_NO_PENDING_TEXT);
+    vi.spyOn(registry(), "markVerifying").mockImplementation(() => {
+      throw new Error("registry exploded");
+    });
+    const h = await register(registry(), "a");
+    const out = await t.execute({ handles: [h] }, { sessionID: "orch" });
+    expect(out).toContain("[router] router_verify failed; nothing was verified: registry exploded");
+  });
+
+  it("is scoped by the calling session: another session and the producer's own get unknown handle", async () => {
+    const { hooks, created } = await makePlugin();
+    const t = routerVerify(hooks);
+    const h = await register(registry(), "a");
+    for (const sessionID of ["other", "child-a", undefined]) {
+      const out = await t.execute({ handles: [h] }, sessionID === undefined ? {} : { sessionID });
+      expect(out).toContain(`- ${h} \u00b7 ${UNKNOWN_HANDLE_TEXT}`);
+    }
+    expect(state.runs).toEqual([]);
+    const out = await t.execute({ handles: [h] }, { sessionID: "orch" });
+    expect(out).toContain(`- ${h} \u00b7 work a \u00b7 pass`);
+    // No session was created: nothing retried, escalated or graded.
+    expect(created).toEqual([]);
+  });
+
+  it("end to end: a deferred native task's footer handle verifies through the tool", async () => {
+    const { hooks } = await makePlugin();
+    const prompt = `Implement it.\n[acceptance]\ncheck: testsPass command="npm test"\n[/acceptance]`;
+    const input = { tool: "task", sessionID: "orch", callID: "c1", args: { subagent_type: "fast", prompt, description: "the work" } };
+    const before = { args: { ...input.args } };
+    await hooks["tool.execute.before"](input, before);
+    const output = { output: "<task_result>\nDONE\n</task_result>", metadata: { sessionId: "child1" } };
+    await hooks["tool.execute.after"]({ ...input, args: before.args }, output);
+    const handle = /\[router\] unverified \u00b7 (vrf_[0-9a-f]{24}) \u00b7/.exec(output.output)?.[1];
+    expect(handle).toBeDefined();
+    const out = await routerVerify(hooks).execute({ pending: true }, { sessionID: "orch" });
+    expect(out).toContain(`- ${handle} \u00b7 the work \u00b7 `);
+    expect(registry().listUnverified("orch")).toEqual([]);
+    // A cancelled call (the host's abort) answers at once and judges nothing.
+    const h = await register(registry(), "b");
+    const controller = new AbortController();
+    controller.abort();
+    const cancelled = await routerVerify(hooks).execute({ handles: [h] }, { sessionID: "orch", abort: controller.signal });
+    expect(cancelled).toContain(`- ${h} \u00b7 work b \u00b7 not judged`);
   });
 });
