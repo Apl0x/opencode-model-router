@@ -253,7 +253,8 @@ Runs after the fixes:
   passed;
 - `npm run typecheck`: clean.
 
-QA-2.1-4 to -10 (minor, info and nit) are not addressed in this round.
+QA-2.1-4 to -10 (minor, info and nit) were not addressed in this pass; their resolutions follow the
+QA-2.1-12 entry below.
 
 Residual for round 2 (not a fix in this round): the QA-2.1-2 digests cover paths that were dirty or
 untracked at dispatch. A producer that edits a file clean at dispatch through the shell and then
@@ -287,3 +288,52 @@ compare `head`. Candidates are a `git diff --name-status <dispatch head> HEAD` a
   unchanged-HEAD test. `npx vitest run --maxWorkers=2 test/unit/baseline-wiring.test.ts
   test/unit/baseline.test.ts test/unit/tests-pass-pipeline.test.ts test/unit/tree.test.ts` gave
   4 files, 228 passed. `npm run typecheck` is clean.
+
+Round 1, minor, info and nit findings:
+
+- QA-2.1-4 Resolution: 135c565. Both gate sites in `index.ts` (delegate and native `task`) now
+  create the gate deadline before `prepareVerification` and pass it in. The grade snapshot and the
+  wait for a pending reference are bounded by it, and the gate's `withTimeout` gets
+  `gateDeadline.remaining()`, so preparation counts against `gateBudgetMs`. The deadline is
+  disposed if preparation throws and on the read-only early return; abort and dispose are otherwise
+  unchanged. Test in `delegate-timeout.test.ts`: with a 1500 ms snapshot and `gateBudgetMs: 2000`,
+  the native gate settles at 2000 ms, not 3500 ms. With the `src` change stashed, it fails
+  (`expected [] to have a length of 1`: no deadline exists during preparation).
+- QA-2.1-5 Resolution: 2f4c412. `buildGateDeps` passes `reference: { argv }` to `createScopeOpener`.
+  This argv seam forwards `lowPriority: budget.lowPriority` (true by default), so the recheck's GC,
+  materialize and dispose git processes run at low priority, like the capture and the start-up GC.
+  Test in `baseline-wiring.test.ts`: the scope opener's `reference.argv` is not the raw seam, and a
+  call through it reaches `runArgv` with `lowPriority: true`.
+- QA-2.1-6 Resolution: accepted; mitigated by 2.4's per-session rejection lineage (pending.ts
+  findLineage), plan note in 3.2.
+- QA-2.1-7 Resolution: 52e0b41. The two `deterministic.ts` comments now say "the deprecated
+  dispatch-time baseline key". `rg "testBaseline|baselines\.|compareTests" src` outside `config.ts`
+  now returns only `types.ts:152`. That line is in the frozen 2.1.1 types block, so it is an
+  accepted exception.
+- QA-2.1-8 Resolution: 30ebfac. `pathKey` (dispatch.ts) keys by the canonical path: the native
+  realpath of the path, or of its nearest existing ancestor with the missing tail appended (a
+  deleted file). When no ancestor resolves, it falls back to lexical `path.resolve`. Keys are
+  case-folded on win32. Tests in `baseline.test.ts` (real fs):
+  - a tool path through a junction or symlink alias is one entry with the real snapshot path;
+  - a deletion seen through the alias keeps the snapshot's ` D` status;
+  - an 8.3 short-name dispatch cwd is one entry (win32, when the volume has short names);
+  - win32 keys compare case-insensitively.
+
+  With the `src` change stashed, the first three fail.
+- QA-2.1-9 Resolution: accepted: fails closed (runner-not-installed → unusable).
+- QA-2.1-10 Resolution: cff2796. Each `INERT_UNREPRODUCED` pattern now has an anchor
+  (`INERT_UNREPRODUCED_SCOPES`):
+  - `logs/`, `.idea/`, `.vscode/`, `*.log` and `.eslintcache` match only at the reference root;
+  - `coverage/`, `.nyc_output/` and the `.pytest_cache`, `.mypy_cache` and `.ruff_cache` caches
+    match at the root or at a `<dir>/<pkg>/` package root, never under a test or fixture directory;
+  - `__pycache__/`, `*.pyc`, `.DS_Store`, `Thumbs.db` and `desktop.ini` match anywhere.
+
+  An ignored `test/fixtures/logs/`, `logs/debug.log` or `test/fixtures/app.log` is no longer inert,
+  so the recheck is `unreproduced-inputs`, which fails closed. The `isInertUnreproduced` cases in
+  `tests-pass-pipeline.test.ts` gained the anchored shapes. The inert-rerun case now uses `logs/`
+  and `debug.log` at the root.
+
+Runs after these fixes: `npx vitest run --maxWorkers=2 test/unit/tests-pass-pipeline.test.ts
+test/unit/baseline.test.ts test/unit/baseline-wiring.test.ts test/unit/deterministic.test.ts
+test/integration/delegate-timeout.test.ts test/integration/layer2-wiring.test.ts` gave 6 files,
+334 passed. `npm run typecheck` is clean.
