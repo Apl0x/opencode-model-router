@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { execFile, spawn } from "node:child_process";
 import * as fsp from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -588,13 +588,21 @@ describe("gcStaleReferences", { timeout: 60_000 }, () => {
     const plainLookalike = join(tmp, "omr-refX-plain");
     await fsp.mkdir(plainLookalike);
 
-    const report = await gcStaleReferences(repo, deps({ isAlive: (pid) => pid === LIVE }));
-    expect(report.removed.map((d) => d.toLowerCase()).sort()).toEqual([dead, orphan].map((d) => d.toLowerCase()).sort());
-    expect(report.kept.map((d) => d.toLowerCase())).toEqual([live.toLowerCase()]);
+    // QA-1.5-4: an alive owner whose heartbeat stopped an hour ago (PID reuse) is stale;
+    // our own PID alone no longer makes a fresh, not-in-use dir stale.
+    const staleLive = join(tmp, `omr-ref-${LIVE}-00000000000000aa`);
+    const ownFresh = join(tmp, `omr-ref-${process.pid}-00000000000000bb`);
+    for (const wt of [staleLive, ownFresh]) await git(repo, "worktree", "add", "-q", "--detach", wt, "HEAD");
+    const old = new Date(Date.now() - 2 * 60 * 60 * 1000);
+    await fsp.utimes(staleLive, old, old);
+
+    const report = await gcStaleReferences(repo, deps({ isAlive: (pid) => pid === LIVE || pid === process.pid }));
+    const lower = (dirs: readonly string[]) => dirs.map((d) => d.toLowerCase()).sort();
+    expect(lower(report.removed)).toEqual(lower([dead, orphan, staleLive]));
+    expect(lower(report.kept)).toEqual(lower([live, ownFresh]));
     expect(report.failed).toEqual([]);
-    expect(await exists(dead)).toBe(false);
-    expect(await exists(orphan)).toBe(false);
-    for (const kept of [live, lookalike, userWt, plainLookalike]) expect(await exists(kept)).toBe(true);
+    for (const gone of [dead, orphan, staleLive]) expect(await exists(gone)).toBe(false);
+    for (const kept of [live, ownFresh, lookalike, userWt, plainLookalike]) expect(await exists(kept)).toBe(true);
     expect(await fsp.readFile(join(repo, "node_modules", "sentinel.txt"), "utf8")).toBe("keep me");
     expect(await fsp.readFile(join(repo, "packages", "a", "node_modules", "sentinel.txt"), "utf8")).toBe("keep me");
     const list = await git(repo, "worktree", "list", "--porcelain");
@@ -602,7 +610,40 @@ describe("gcStaleReferences", { timeout: 60_000 }, () => {
     expect(list).toContain("user worktree");
 
     // Test cleanup of the kept worktrees (not the module under test).
-    for (const wt of [live, lookalike, userWt]) await git(repo, "worktree", "remove", "--force", wt);
+    for (const wt of [live, ownFresh, lookalike, userWt]) await git(repo, "worktree", "remove", "--force", wt);
     await fsp.rm(plainLookalike, { recursive: true });
+  });
+
+  it("QA-1.5-4: a second copy of the module (two install paths) keeps the first copy's live reference", async () => {
+    const handle = await mat(await capture());
+    try {
+      vi.resetModules();
+      const second = await import("../../src/verify/reference");
+      expect(second.gcStaleReferences).not.toBe(gcStaleReferences);
+      const report = await second.gcStaleReferences(repo, deps());
+      expect(report.kept.map((d) => d.toLowerCase())).toContain(handle.dir.toLowerCase());
+      expect(report.removed).toEqual([]);
+      // Even with the clock 10 h ahead: the dir is in use in this process.
+      const later = await second.gcStaleReferences(repo, deps({ now: () => Date.now() + 10 * 60 * 60 * 1000 }));
+      expect(later.removed).toEqual([]);
+      expect(await exists(handle.dir)).toBe(true);
+      expect(await fsp.readFile(join(handle.dir, "a.txt"), "utf8")).toBe("a0\n");
+    } finally {
+      await handle.dispose();
+    }
+  });
+
+  it("QA-1.5-4: the heartbeat keeps a live reference's mtime fresh, and dispose stops it", async () => {
+    const handle = await mat(await capture(), { heartbeatMs: 50 });
+    try {
+      const old = new Date(Date.now() - 2 * 60 * 60 * 1000);
+      await fsp.utimes(handle.dir, old, old);
+      const fresh = await waitFor(async () => Date.now() - (await fsp.stat(handle.dir)).mtimeMs < 60_000, 5_000);
+      expect(fresh).toBe(true);
+    } finally {
+      await handle.dispose();
+    }
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    expect(warnings).toEqual([]);
   });
 });

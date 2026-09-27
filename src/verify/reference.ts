@@ -184,7 +184,8 @@
 //      slashes ("C:/Users/Marquinho/AppData/..."), even when TEMP is an 8.3
 //      short path. dir = tmp/<refDirName(pid, 16 random hex)>. Call
 //      assertSafeRefDir(dir) before anything is created. Add dir to the
-//      process-local ACTIVE set, which gcStaleReferences skips. Then
+//      process-wide ACTIVE set, which gcStaleReferences skips (section 11),
+//      and start the heartbeat once the dir exists. Then
 //      mkdir(dir, { mode: 0o700 }), non-recursive (QA-1.5-10): EEXIST returns
 //      ok:false "unsafe-path" and nothing is cleaned up. On POSIX,
 //      chmod(dir, 0o700) follows, so the mode is exact whatever the umask.
@@ -305,7 +306,10 @@
 //      is never run (D5). Residual race: a dir recreated between that lstat
 //      and git's own check would be deleted by git; only this module creates
 //      omr-ref names, under an in-use entry.
-//   5. Remove dir from the in-use set.
+//   0. (Before step 1) stop the heartbeat (section 11).
+//   5. Remove dir from ACTIVE. If any step failed, add it to RELEASED, so
+//      that this process's next GC collects it without waiting for the age
+//      rule (section 11).
 //   Transient errors (TRANSIENT_FS_CODES: EBUSY, EPERM, EACCES, ENOTEMPTY,
 //   caused by Windows AV scans or open handles) are retried up to
 //   CLEANUP_RETRIES times with CLEANUP_RETRY_BASE_MS * 2^n backoff, then
@@ -368,7 +372,8 @@
 //     run GC before each materialize, to bound concurrent references and
 //     temp-dir use; 1.5 caps only the untracked copy.
 //   - Lifetime: disposed right after the recheck. Crash leftovers are removed
-//     by GC once the owner is dead or after 1 h.
+//     by GC once the owner is dead, or 1 h after the last heartbeat; a
+//     failed dispose is collected by this process's next GC (section 11).
 //   - Logs carry counts and reasons, never file contents. Paths appear only in
 //     the inexactReasons and unreproduced lists returned to the caller.
 //
@@ -393,15 +398,29 @@
 //   2. An entry is a candidate only if its basename matches REF_DIR_PATTERN
 //      and its parent is a tmp root (R3). Everything else is never touched:
 //      the main worktree and every user worktree. `locked` entries are kept.
+//      A dir in the in-use set (ACTIVE) is kept. ACTIVE lives on globalThis
+//      under Symbol.for("omr.reference.active"), so every copy of this module
+//      in the process shares it (QA-1.5-4: the plugin loaded from two install
+//      paths; before, the second copy's GC removed the first copy's live
+//      reference).
 //   3. A candidate is stale if any of these holds:
+//      - its dir is missing (prunable);
+//      - it is in RELEASED (Symbol.for("omr.reference.released")): a dir
+//        this process created, stopped using, and failed to remove (e.g.
+//        EBUSY from a process whose cwd is inside). Only this process can
+//        know that its own dir is abandoned, so it is collected at once;
 //      - its owner PID (taken from the name) is dead: deps.isAlive, default
 //        process.kill(pid, 0), where EPERM counts as alive;
-//      - it is older than STALE_REFERENCE_AGE_MS (1 h). Age = now() -
-//        lstat(dir).mtimeMs, which can only understate the age and so only
-//        delays GC. This covers PID reuse;
-//      - the name carries this process's PID but dir is not in ACTIVE (a
-//        previous process with a reused PID);
-//      - its dir is missing (prunable).
+//      - its HEARTBEAT is older than STALE_REFERENCE_AGE_MS (1 h): age =
+//        now() - lstat(dir).mtimeMs. While a materialized handle is in use,
+//        a timer (unref'd, every deps.heartbeatMs, default
+//        HEARTBEAT_INTERVAL_MS = 5 min) sets the dir's mtime to now, and
+//        dispose stops it. So the age rule never fires for an alive owner
+//        that still uses the dir; it only covers PID reuse (the heartbeat
+//        stopped when the real owner died). Capture's scratch dir lives for
+//        at most one capture budget and needs no heartbeat. Before QA-1.5-4,
+//        age alone, or merely carrying this process's PID, made a live
+//        reference stale.
 //   4. Each stale candidate goes through the section 6 pipeline with no
 //      recorded links. The sweep finds and unlinks every node_modules link,
 //      fs.rm removes the dir, step 4 then removes the missing-dir entry, and
@@ -575,6 +594,8 @@ export interface ReferenceDeps extends CaptureDeps {
   platform?: NodeJS.Platform;
   /** Default randomBytes(8).toString("hex"); must match the 16-hex suffix of REF_DIR_PATTERN. */
   randomSuffix?: () => string;
+  /** Default HEARTBEAT_INTERVAL_MS: how often a materialized dir's mtime is refreshed while in use. */
+  heartbeatMs?: number;
 }
 
 // --- Data types ---------------------------------------------------------------
@@ -647,6 +668,8 @@ export const REF_DIR_PREFIX = "omr-ref-";
 /** omr-ref-<owner pid>-<16 lowercase hex>. Anything else is never removed. */
 export const REF_DIR_PATTERN = /^omr-ref-(\d{1,10})-([0-9a-f]{16})$/;
 export const STALE_REFERENCE_AGE_MS = 60 * 60 * 1000;
+/** A live reference dir's mtime is refreshed this often, far below STALE_REFERENCE_AGE_MS (QA-1.5-4). */
+export const HEARTBEAT_INTERVAL_MS = 5 * 60 * 1000;
 /** Equals the baselineTimeoutMs default (§1.4); callers pass the configured value. */
 export const DEFAULT_CAPTURE_TIMEOUT_MS = 15_000;
 export const DEFAULT_MATERIALIZE_TIMEOUT_MS = 30_000;
@@ -751,8 +774,24 @@ export function assertSafeRefDir(
 
 // --- Shared helpers -------------------------------------------------------------
 
-/** Process-local set of live reference dirs (comparable form); gcStaleReferences skips them. */
-const ACTIVE = new Set<string>();
+/**
+ * A Set<string> shared by every copy of this module in the process (QA-1.5-4:
+ * the plugin can be loaded from two install paths). Kept on globalThis under a
+ * Symbol.for key; a foreign value under the key is replaced, never trusted.
+ */
+function processWideSet(name: string): Set<string> {
+  const key = Symbol.for(name);
+  const existing: unknown = Reflect.get(globalThis, key);
+  if (existing instanceof Set) return existing as Set<string>;
+  const created = new Set<string>();
+  Reflect.set(globalThis, key, created);
+  return created;
+}
+
+/** Reference and scratch dirs in use in this process (comparable form); GC never touches them. */
+const ACTIVE = processWideSet("omr.reference.active");
+/** Dirs this process created and stopped using but could not remove; GC treats them as stale at once. */
+const RELEASED = processWideSet("omr.reference.released");
 
 type Logger = Pick<PluginLogger, "warn">;
 
@@ -1134,7 +1173,7 @@ async function withPrivateIndex<T>(
     try {
       if (created) {
         const ctx: CleanupContext = { argv: env.argv, fs: env.fs, root: env.root, tmpRoots, platform: env.platform, logger: env.logger };
-        await removeReferenceDir(ctx, scratch, [], false);
+        if (!(await removeReferenceDir(ctx, scratch, [], false))) RELEASED.add(key);
       }
     } finally {
       ACTIVE.delete(key);
@@ -1196,13 +1235,16 @@ export async function materialize(
   const links: string[] = [];
   let dir: string | undefined;
   let ctx: CleanupContext | undefined;
+  let heartbeat: ReturnType<typeof setInterval> | undefined;
   const fail = (reason: MaterializeFailure, detail: string): MaterializeResult => ({ ok: false, reason, detail });
   const cleanup = async () => {
+    clearInterval(heartbeat);
     if (!dir) return;
+    const key = comparable(dir, platform);
     try {
-      if (ctx) await removeReferenceDir(ctx, dir, links, true);
+      if (ctx && !(await removeReferenceDir(ctx, dir, links, true))) RELEASED.add(key);
     } finally {
-      ACTIVE.delete(comparable(dir, platform));
+      ACTIVE.delete(key);
     }
   };
   const abandon = async (reason: MaterializeFailure, detail: string) => {
@@ -1247,6 +1289,16 @@ export async function materialize(
     }
     dir = candidate;
     ctx = { argv: deps.argv, fs, root, tmpRoots, platform, logger: deps.logger };
+    // Heartbeat (QA-1.5-4): while the handle is in use, the dir's mtime stays younger than
+    // STALE_REFERENCE_AGE_MS, so another process's GC never takes a live reference for a
+    // PID-reuse leftover. Cleared first thing in cleanup().
+    const beating = dir;
+    heartbeat = setInterval(() => {
+      const now = new Date();
+      fs.utimes(beating, now, now).catch((error: unknown) =>
+        deps.logger?.warn("reference heartbeat failed", { dir: beating, error: describeError(error) }));
+    }, deps.heartbeatMs ?? HEARTBEAT_INTERVAL_MS);
+    heartbeat.unref();
     if (platform !== "win32") await fs.chmod(dir, 0o700); // exact mode, whatever the umask
     // 3. Hooks disabled (D9).
     const added = await git([
@@ -1477,13 +1529,19 @@ async function gcInner(
   const fs = deps.fs;
   const now = deps.now ?? Date.now;
   const isAlive = deps.isAlive ?? isAliveDefault;
-  const ownPid = deps.pid ?? process.pid;
   const budget = makeBudget(new AbortController().signal, deps.timeoutMs ?? DEFAULT_MATERIALIZE_TIMEOUT_MS);
   const absRoot = p.resolve(root);
   const tmpRoots = await tmpRootsFor(fs, deps.tmpdir ?? osTmpdir(), platform);
   const ctx: CleanupContext = { argv: deps.argv, fs, root: absRoot, tmpRoots, platform, logger: deps.logger };
-  const stale = (pid: number, stats: ReferenceStats | undefined) =>
-    !stats || pid === ownPid || !isAlive(pid) || now() - stats.mtimeMs > STALE_REFERENCE_AGE_MS;
+  // Section 11 step 3 (QA-1.5-4). The caller skips ACTIVE dirs first. An alive owner's dir
+  // is stale only once its heartbeat (mtime) is older than STALE_REFERENCE_AGE_MS, i.e.
+  // the PID was reused. Our own PID has no special case: RELEASED names our own leftovers.
+  const released = (keys: readonly string[]) => keys.some((k) => RELEASED.has(k));
+  const stale = (pid: number, stats: ReferenceStats | undefined, keys: readonly string[]) =>
+    !stats || released(keys) || !isAlive(pid) || now() - stats.mtimeMs > STALE_REFERENCE_AGE_MS;
+  const collected = (keys: readonly string[]) => {
+    for (const k of keys) RELEASED.delete(k);
+  };
   const isSafe = (dir: string) => {
     try {
       assertSafeRefDir(dir, tmpRoots, platform);
@@ -1509,15 +1567,22 @@ async function gcInner(
     const dir = p.resolve(entry.path);
     const parsed = parseRefDirName(p.basename(dir));
     if (!parsed || !isSafe(dir)) continue;
-    if (entry.locked || ACTIVE.has(comparable(dir, platform))) {
+    const key = comparable(dir, platform);
+    const keys = [key];
+    if (entry.locked || ACTIVE.has(key)) {
       report.kept.push(dir);
       continue;
     }
-    if (!stale(parsed.pid, await lstatOrMissing(fs, dir))) {
+    if (!stale(parsed.pid, await lstatOrMissing(fs, dir), keys)) {
       report.kept.push(dir);
       continue;
     }
-    (await removeReferenceDir(ctx, dir, [], true) ? report.removed : report.failed).push(dir);
+    if (await removeReferenceDir(ctx, dir, [], true)) {
+      collected(keys);
+      report.removed.push(dir);
+    } else {
+      report.failed.push(dir);
+    }
   }
 
   // 5. Orphans of this repository (D7).
@@ -1560,7 +1625,7 @@ async function gcInner(
       }
       const keys = [comparable(dir, platform), comparable(realDir, platform)];
       if (keys.some((k) => registered.has(k) || ACTIVE.has(k))) continue;
-      if (!stale(parsed.pid, stats)) {
+      if (!stale(parsed.pid, stats, keys)) {
         report.kept.push(dir);
         continue;
       }
@@ -1574,7 +1639,12 @@ async function gcInner(
         const target = p.resolve(dir, match[1]);
         if (!gitDirs.some((g) => isStrictlyInside(target, g, platform))) continue; // another repository's orphan
       }
-      (await removeReferenceDir(ctx, dir, [], false) ? report.removed : report.failed).push(dir);
+      if (await removeReferenceDir(ctx, dir, [], false)) {
+        collected(keys);
+        report.removed.push(dir);
+      } else {
+        report.failed.push(dir);
+      }
     }
   }
 }
