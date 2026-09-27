@@ -77,6 +77,7 @@ import { tool } from "@opencode-ai/plugin";
 import { scrubText } from "./guard/scrub";
 import { accept, unverifiableGateResult } from "./verify/gate";
 import { createVerificationWiring, extractAssistantText } from "./verify/wiring";
+import { createDeadline } from "./verify/deterministic";
 import {
   DEFAULT_DELEGATE_PROMPT_TIMEOUT_MS,
   DEFAULT_GATE_BUDGET_MS,
@@ -597,7 +598,11 @@ const ModelRouterPlugin: Plugin = async (ctx: PluginInput) => {
               // Grader sessions opened by THIS accept() call, and only those.
               const gateGraderSessions = new Set<string>();
               const completedFailures: string[] = [];
-              const gateDeps = buildGateDeps(toolCtx?.sessionID, gateGraderSessions, verification);
+              // One deadline per gate invocation: every step inside the gate
+              // is bounded by it, and it is aborted (killing any spawned
+              // tree) when the gate's own withTimeout rejects.
+              const gateDeadline = createDeadline(gateBudgetMs);
+              const gateDeps = buildGateDeps(toolCtx?.sessionID, gateGraderSessions, verification, gateDeadline);
               gateDeps.deterministic.onFailure = reason => completedFailures.push(reason);
               let gateRes;
               try {
@@ -636,6 +641,9 @@ const ModelRouterPlugin: Plugin = async (ctx: PluginInput) => {
                 // someone else's delegation — reachable with the shipped
                 // config, where a deterministic check may run a command for up
                 // to 120s against a 90s gate budget.
+                gateDeadline.abort(
+                  error instanceof RouterTimeoutError ? "verification gate timed out" : "verification gate failed",
+                );
                 if (error instanceof RouterTimeoutError) {
                   for (const gsid of gateGraderSessions) {
                     try {
@@ -653,6 +661,8 @@ const ModelRouterPlugin: Plugin = async (ctx: PluginInput) => {
                   activeCfg.enforcement?.verify?.strictUnverifiable,
                   completedFailures,
                 );
+              } finally {
+                gateDeadline.dispose();
               }
 
               // Per-attempt cleanup (drop producer session tracking + state).
@@ -1110,22 +1120,63 @@ const ModelRouterPlugin: Plugin = async (ctx: PluginInput) => {
               return;
             }
 
-            const gateDeps = buildGateDeps(undefined, undefined, verification);
-            const res = await accept(
-              {
-                dod,
-                trivial,
-                mode: "modeA",
-                // The built-in task tool declares no cwd of its own, but if a
-                // caller supplies one it scopes verification the same way the
-                // delegate tool's does.
-                ...(typeof input?.args?.cwd === "string" && input.args.cwd
-                  ? { cwd: input.args.cwd }
-                  : {}),
-              },
-              artefact,
-              gateDeps,
+            // Same bound as the delegate gate: one deadline per invocation,
+            // a withTimeout ceiling, and abort-on-reject so a hung check or
+            // grader cannot hold the after-hook (and its process tree) open.
+            const gateBudgetMs = timeoutMs(
+              cfg.enforcement?.verify?.gateBudgetMs,
+              DEFAULT_GATE_BUDGET_MS,
             );
+            const gateGraderSessions = new Set<string>();
+            const completedFailures: string[] = [];
+            const gateDeadline = createDeadline(gateBudgetMs);
+            const gateDeps = buildGateDeps(undefined, gateGraderSessions, verification, gateDeadline);
+            gateDeps.deterministic.onFailure = reason => completedFailures.push(reason);
+            let res;
+            try {
+              res = await withTimeout(
+                accept(
+                  {
+                    dod,
+                    trivial,
+                    mode: "modeA",
+                    // The built-in task tool declares no cwd of its own, but if a
+                    // caller supplies one it scopes verification the same way the
+                    // delegate tool's does.
+                    ...(typeof input?.args?.cwd === "string" && input.args.cwd
+                      ? { cwd: input.args.cwd }
+                      : {}),
+                  },
+                  artefact,
+                  gateDeps,
+                ),
+                gateBudgetMs,
+                "verification gate",
+              );
+            } catch (error) {
+              gateDeadline.abort(
+                error instanceof RouterTimeoutError ? "verification gate timed out" : "verification gate failed",
+              );
+              if (error instanceof RouterTimeoutError) {
+                for (const gsid of gateGraderSessions) {
+                  try {
+                    await ctx.client.session.abort({ path: { id: gsid } });
+                  } catch {
+                    // best-effort: the gate result stands either way
+                  }
+                }
+              }
+              res = unverifiableGateResult(
+                error instanceof RouterTimeoutError
+                  ? `verification gate timed out after ${gateBudgetMs}ms`
+                  : `verification unavailable: ${scrubText(String(error))}`,
+                dod.source,
+                cfg.enforcement?.verify?.strictUnverifiable,
+                completedFailures,
+              );
+            } finally {
+              gateDeadline.dispose();
+            }
             if (!res.accepted && !res.verdict.skipped) {
               const ladder = cfg.enforcement?.escalate?.ladder ?? ["fast", "medium", "heavy"];
               const li = ladder.indexOf(producerTier);

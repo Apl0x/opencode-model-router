@@ -24,6 +24,19 @@ import { invalidateConfigCache } from "../../src/router/config";
 // checkouts; model the unavailable snapshot without introducing real processes
 // into a fake-timer test (which would make grader start times wall-clock dependent).
 vi.mock("../../src/verify/tree", () => ({ snapshotTree: async () => undefined }));
+// Record every gate deadline the plugin creates (the real implementation still runs).
+const createdDeadlines = vi.hoisted(() => [] as Array<{ budgetMs: number; signal: AbortSignal }>);
+vi.mock("../../src/verify/deterministic", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../../src/verify/deterministic")>();
+  return {
+    ...actual,
+    createDeadline: (...args: Parameters<typeof actual.createDeadline>) => {
+      const d = actual.createDeadline(...args);
+      createdDeadlines.push(d);
+      return d;
+    },
+  };
+});
 import {
   DEFAULT_DELEGATE_PROMPT_TIMEOUT_MS,
   DEFAULT_GATE_BUDGET_MS,
@@ -478,5 +491,76 @@ describe("delegate time-boxes (fake timers)", () => {
       expect(result).toContain("[router ✓ accepted:");
       expect(result).toContain("Verification caveats");
     }
+  });
+
+  it("aborts the delegate gate deadline when the gate budget expires", async () => {
+    writeOverrides(dir, { gateBudgetMs: 2000, graderTimeoutMs: 600000, strictUnverifiable: true });
+    createdDeadlines.length = 0;
+    const rec = newRecorder();
+    const hooks: any = await ModelRouterPlugin(
+      makeCtx(dir, rec, {
+        producer: () => Promise.resolve(textReply("producer output")),
+        grader: () => never(),
+      }) as any,
+    );
+
+    const pending: Promise<string> = hooks.tool.delegate.execute({
+      task: "do x",
+      tier: "heavy",
+      acceptance: ACCEPTANCE,
+    });
+    await vi.advanceTimersByTimeAsync(2000 * 8);
+    await pending;
+
+    const gate = createdDeadlines.filter((d) => d.budgetMs === 2000);
+    expect(gate.length).toBeGreaterThan(0);
+    for (const d of gate) expect(d.signal.aborted).toBe(true);
+  });
+
+  // -------------------------------------------------------------------------
+  // Native task gate (tool.execute.after)
+  // -------------------------------------------------------------------------
+
+  it("bounds the native task gate: a hung accept yields the unverifiable result and aborts its deadline", async () => {
+    process.env.MODEL_ROUTER_ENFORCE = "1";
+    writeOverrides(dir, { gateBudgetMs: 2000, graderTimeoutMs: 600000, strictUnverifiable: true });
+    createdDeadlines.length = 0;
+    const rec = newRecorder();
+    const hooks: any = await ModelRouterPlugin(
+      makeCtx(dir, rec, {
+        producer: () => Promise.resolve(textReply("unused")),
+        grader: () => never(),
+      }) as any,
+    );
+
+    const input = {
+      tool: "task",
+      sessionID: "orch",
+      callID: "call1",
+      args: { subagent_type: "fast", prompt: `Do the thing.\n${ACCEPTANCE}` },
+    };
+    const output = {
+      output: "<task_result>\nDONE: did the thing.\n</task_result>",
+      metadata: { sessionId: "child-native" },
+    };
+
+    let settled = false;
+    const pending = hooks["tool.execute.after"](input, output).then(() => {
+      settled = true;
+    });
+    await vi.advanceTimersByTimeAsync(1999);
+    expect(settled).toBe(false);
+    await vi.advanceTimersByTimeAsync(2000 * 4);
+    await pending;
+
+    expect(settled).toBe(true);
+    expect(rec.graderPrompts).toBe(1);
+    expect(output.output).toContain("verification gate timed out after 2000ms");
+    expect(output.output).toContain("NOT ACCEPTED");
+    // The grader this gate opened is aborted, and so is the gate's deadline.
+    expect(rec.aborted).toContain(rec.graderSessionIds[0]);
+    expect(createdDeadlines).toHaveLength(1);
+    expect(createdDeadlines[0]!.budgetMs).toBe(2000);
+    expect(createdDeadlines[0]!.signal.aborted).toBe(true);
   });
 });
