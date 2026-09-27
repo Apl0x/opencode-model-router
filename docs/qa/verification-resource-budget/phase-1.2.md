@@ -1272,3 +1272,17 @@ with no runtime API in the new code. It was not run under Bun on Linux.
 
 **Status: phase 1.2 QA is NOT CLEAN.** QA-1.2-28 and QA-1.2-29 (both nits) are open.
 QA-1.2-24 through QA-1.2-27 are verified.
+
+### Round-6 resolutions
+
+- **QA-1.2-28.** Resolution: c5b105e — comment-only change in `src/verify/exec.ts`. The header's G4 bullet no longer says "exactly when". It now says `timedOut` is true when the deadline or abort fired while something still held the run, so a kill was attempted. A case that cannot be told apart counts as a kill (fail-closed): on Windows, the grace settling the run while a sweep that pinned trees is still reporting, even if the leftover exited on its own during the grace. `ShellResult.timedOut` says the same. There is no logic change. The 3.2 G4 wording (item 3) stays deferred.
+- **QA-1.2-29.** Resolution: c5b105e — new `host.mjs` mode `unpinned-sweeper` (node only). It uses `setSweeperExecutableForTests` with a stand-in that never prints `pinned`, kills nothing and lives 5 s. The host releases the holder right after the abort and also reports `settledIn`, the time in ms from the abort. New Windows test (`runIf(isWin && typeStripping)`) beside the `late-sweeper` test. It asserts `{ code: 0, stderr: "", timedOut: false }` and `settledIn >= KILL_GRACE_MS - 50`, which proves the grace was reached with the sweep pending. Mutant check: with `&& sweeper.pinnedCount() > 0` removed from `onGrace`, the test fails with `expected { code: 1, stdout: '', …(2) } to match object { code: +0, stderr: '', …(1) }`. After the source was restored, the only diff in `exec.ts` was the QA-1.2-28 comments.
+
+Verification (Windows 11, node): `npm run typecheck` clean. `npx vitest run --maxWorkers=2 test/unit/exec.test.ts` was run 3 times on the final code:
+- Run 1: 41 passed | 1 failed | 2 skipped (44). The QA-1.2-19 test (`hung-sweeper`, unchanged in behaviour) failed.
+- Run 2: the same result. The error was an `EPERM` from `rmSync` of its scratch dir in `afterEach` (`exec.test.ts:14`).
+- Run 3: 42 passed | 2 skipped (44).
+- Run on its own, the QA-1.2-19 test passed.
+- The failure is in scratch-dir cleanup. It was not investigated further, and whether it happened before this change was not verified.
+
+No fixture or stand-in processes were left afterwards (`Win32_Process` query).
