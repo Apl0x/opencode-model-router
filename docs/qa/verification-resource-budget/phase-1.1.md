@@ -33,20 +33,21 @@
   - Booleans: `lowPriority`, `background`, `failureRecheck`.
   - Literals, case-sensitive: `testScope`, `defaultVerify`.
   - `null` is rejected for all new keys.
-- `resolveVerifyBudget(cfg, { cores?, logger? })` is exported with the `VerifyBudget` type. It is
-  synchronous and the only place defaults are applied.
+- `resolveVerifyBudget(cfg, { cores? })` is exported with the `VerifyBudget` type. It is pure and
+  synchronous (no logger, no module state) and the only place defaults are applied.
   - `maxConcurrentVerifications` defaults to `max(1, floor(cores / 8))`, which gives 1→1, 8→1,
     16→2 and 64→8. `cores` defaults to `os.availableParallelism()`, and a non-finite or `< 1` value
     counts as 1.
   - It reads own properties only, so a prototype-inherited value is never applied. `validateConfig`
     reads through `[]`, so inherited bad values are still rejected.
-- **Deviation (logger seam):** `config.ts` had no logger seam; it only uses `console.warn`. Following
-  the `warnAgentOptionsEffortOnce` pattern in `agent-options.ts`, the deprecation warning goes through
-  an optional `PluginLogger` passed in `opts.logger`, with no console fallback (the dispatch forbids
-  console).
-  - A resolve without a logger does not consume the once-per-process flag.
-  - `resetVerifyBudgetWarnings()` is the test-only reset hook.
-  - Phase 2.1 callers should pass the plugin logger.
+- **Deprecation warning (split out of the resolver, QA-1.1-4):** `config.ts` had no logger seam; it
+  only uses `console.warn`. The warning lives in a separate export,
+  `warnDeprecatedVerifyKeys(cfg, logger)`, which takes a **required** `PluginLogger` (no console
+  fallback) and owns a once-per-process flag.
+  - Resolving never warns and never touches the flag.
+  - `resetVerifyBudgetWarnings()` resets the flag; it is a test-only hook.
+  - Phase 2.1 must call `warnDeprecatedVerifyKeys(cfg, logger)` with the plugin logger after each
+    `loadConfig()`.
 - Coverage (`--coverage.include=src/router/config.ts`, the new test file only): no uncovered
   statements or branches in the new validation block or in `resolveVerifyBudget`/`VerifyBudget`.
   The whole file is at 92.41% statements and 90.64% branches when run with the existing config
@@ -235,7 +236,10 @@ scratch script that imports `src/router/config.ts`. The script is outside the re
   - `__proto__`/`constructor` are skipped in `deepMerge`, and there is no prototype pollution.
   - Values inherited through a prototype are validated and never applied.
   - The function is synchronous.
-- **Existing tests:** the diff adds only the new test file, so existing config tests are unchanged.
+- **Existing tests:** ~~the diff adds only the new test file, so existing config tests are
+  unchanged.~~ **Superseded by QA-1.1-1:** the permissive-skip test in
+  `test/unit/config.validate.test.ts` was deliberately split (orchestrator-approved) because a
+  non-object `enforcement.verify` now throws.
 - **Coverage:** re-run with `npx vitest run --maxWorkers=2 test/unit/config-verify-budget.test.ts --coverage --coverage.include=src/router/config.ts`
   (40/40 pass). The last uncovered range reported is `1119-1236`, so the new
   `VerifyBudget`/`resolveVerifyBudget` code (1238-1318) has no uncovered line. Branch coverage of
