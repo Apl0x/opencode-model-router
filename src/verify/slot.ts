@@ -164,7 +164,9 @@ function errCode(e: unknown): string | undefined {
 
 /** Sharing violations from antivirus/indexer handles: retried, never a verdict. */
 const TRANSIENT = new Set(["EBUSY", "EPERM", "EACCES"]);
-const UNWRITABLE = new Set(["EACCES", "EPERM", "EROFS", "ENOTDIR", "ENOENT", "EEXIST"]);
+/** `mkdir`/create errors that can mean "unwritable dir"; only the final ones count at once. */
+const UNWRITABLE = new Set(["EACCES", "EPERM", "EBUSY", "EROFS", "ENOTDIR", "ENOENT", "EEXIST"]);
+const FINAL_UNWRITABLE = new Set(["EROFS", "ENOTDIR", "EEXIST"]);
 
 /** Failures of the logger itself (a throwing logger must not break slot bookkeeping). */
 export let loggerFailures = 0;
@@ -569,18 +571,63 @@ function acquireLocal(opts: SlotOptions, cfg: Cfg): Promise<SlotResult> {
   });
 }
 
-async function dirWritable(dir: string): Promise<boolean> {
-  try {
-    await mkdir(dir, { recursive: true });
-    const probe = join(dir, `.probe-${randomUUID()}`);
-    const fh = await open(probe, "wx");
-    await fh.close();
-    await unlink(probe);
-    return true;
-  } catch (e) {
-    const code = errCode(e);
-    if (code && UNWRITABLE.has(code)) return false;
-    throw e;
+/** Unlink a uniquely named file (no identity to check), retrying transient errors. */
+async function unlinkRetry(path: string, cfg: Cfg): Promise<boolean> {
+  for (let i = 0; ; i++) {
+    try {
+      await cfg.unlink(path);
+      return true;
+    } catch (e) {
+      const code = errCode(e) ?? String(e);
+      if (code === "ENOENT") return true;
+      if (!TRANSIENT.has(code) || i >= cfg.unlinkRetries) {
+        warn(cfg, "verification slot: could not delete file", { path, code });
+        return false;
+      }
+    }
+    await sleep(cfg.unlinkRetryMs * 2 ** i);
+  }
+}
+
+/** Per slot dir, for the life of the process: file slots and local slots never mix for one dir. */
+const dirVerdicts = new Map<string, Promise<boolean>>();
+
+function dirWritable(cfg: Cfg): Promise<boolean> {
+  const dir = cfg.dir;
+  let verdict = dirVerdicts.get(dir);
+  if (!verdict) {
+    verdict = probeDir(cfg);
+    dirVerdicts.set(dir, verdict);
+    // An unexpected error is not a verdict: the next call probes again.
+    verdict.catch(() => dirVerdicts.delete(dir));
+  }
+  return verdict;
+}
+
+/**
+ * Judge the dir only from `mkdir`/exclusive-create errors. Once the probe file
+ * exists the dir is writable; removing the probe is housekeeping (retried, and a
+ * residual failure is logged, never a verdict). EACCES/EPERM/EBUSY/ENOENT can be
+ * transient (antivirus, a concurrent removal), so they are retried before they
+ * count; EROFS/ENOTDIR/EEXIST are final.
+ */
+async function probeDir(cfg: Cfg): Promise<boolean> {
+  for (let i = 0; ; i++) {
+    const probe = join(cfg.dir, `.probe-${randomUUID()}`);
+    let code: string | undefined;
+    try {
+      await mkdir(cfg.dir, { recursive: true });
+      await (await open(probe, "wx")).close();
+    } catch (e) {
+      code = errCode(e);
+      if (code === undefined || !UNWRITABLE.has(code)) throw e;
+    }
+    if (code === undefined) {
+      await unlinkRetry(probe, cfg);
+      return true;
+    }
+    if (FINAL_UNWRITABLE.has(code) || i >= 2) return false;
+    await sleep(cfg.unlinkRetryMs * 2 ** i);
   }
 }
 
@@ -742,7 +789,7 @@ export async function acquireSlot(opts: SlotOptions, deps?: SlotDeps): Promise<S
   if (opts.signal?.aborted) return { busy: true };
   const max = Math.max(1, Math.floor(opts.max));
   const o = { ...opts, max };
-  if (!(await dirWritable(cfg.dir))) {
+  if (!(await dirWritable(cfg))) {
     if (!degradedLogged.has(cfg.dir)) {
       degradedLogged.add(cfg.dir);
       warn(cfg, "verification slot: temp dir unwritable, using an in-process semaphore", { dir: cfg.dir });

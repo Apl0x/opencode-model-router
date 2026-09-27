@@ -1,8 +1,8 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
-import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { open as fsOpen, unlink as fsUnlink, utimes as fsUtimes } from "node:fs/promises";
-import { hostname, tmpdir } from "node:os";
+import { hostname, tmpdir, userInfo } from "node:os";
 import { join, resolve } from "node:path";
 import {
   acquireSlot,
@@ -666,5 +666,64 @@ describe("slot: unwritable temp dir", () => {
     await b.release();
     held(await acquireSlot({ max: 1, waitMs: 0, meta }, deps));
     expect(warns.filter((w) => w.includes("in-process"))).toHaveLength(1);
+  });
+
+  it.each(["EPERM", "EBUSY"])(
+    "a transient %s on the probe delete is not a verdict: exclusion with another process holds, no fallback, no leaked probe (QA-1.4-3)",
+    async (code) => {
+      const dir = freshDir();
+      const h = runHolder({ dir, max: 1, waitMs: 1_000, mode: "hang" });
+      expect(await h.waitFor(/^(HELD|BUSY)$/)).toBe("HELD");
+      const warns: string[] = [];
+      let probeDeletes = 0;
+      const flaky = async (path: string) => {
+        if (path.includes(".probe-") && probeDeletes++ === 0) throw Object.assign(new Error("scanner"), { code });
+        await fsUnlink(path);
+      };
+      const deps = fast(dir, { unlink: flaky, logger: { warn: (m) => warns.push(m) } });
+      expect(await acquireSlot({ max: 1, waitMs: 0, meta }, deps)).toEqual({ busy: true });
+      expect(await acquireSlot({ max: 1, waitMs: 0, meta }, deps)).toEqual({ busy: true });
+      expect(warns).toEqual([]);
+      expect(probeDeletes).toBe(2); // one transient failure and its retry; then the verdict is memoized
+      expect(readdirSync(dir).filter((n) => n.startsWith(".probe-"))).toEqual([]);
+      killHard(h.child);
+      await h.exit;
+    },
+    15_000,
+  );
+
+  const isRoot = typeof process.getuid === "function" && process.getuid() === 0;
+  it.skipIf(isRoot)("a read-only TEMP/TMPDIR (the default slot dir) falls back to the in-process semaphore and logs once (QA-1.4-12)", async () => {
+    const ro = freshDir();
+    const saved = { TEMP: process.env.TEMP, TMP: process.env.TMP, TMPDIR: process.env.TMPDIR };
+    const user = process.env.USERDOMAIN && process.env.USERNAME ? `${process.env.USERDOMAIN}\\${process.env.USERNAME}` : userInfo().username;
+    if (process.platform === "win32") {
+      // Non-elevated works: deny this user write (add file / add subdir) on the dir and its children.
+      const r = spawnSync("icacls", [ro, "/deny", `${user}:(OI)(CI)(W)`], { encoding: "utf8" });
+      expect(r.status, `${r.stdout}${r.stderr}`).toBe(0);
+    } else chmodSync(ro, 0o555);
+    try {
+      process.env.TEMP = ro;
+      process.env.TMP = ro;
+      process.env.TMPDIR = ro;
+      expect(tmpdir()).toBe(ro);
+      const warns: string[] = [];
+      const deps: SlotDeps = { logger: { warn: (m) => warns.push(m) } };
+      const a = held(await acquireSlot({ max: 1, waitMs: 0, meta }, deps));
+      expect(await acquireSlot({ max: 1, waitMs: 0, meta }, deps)).toEqual({ busy: true });
+      await a.release();
+      held(await acquireSlot({ max: 1, waitMs: 0, meta }, deps));
+      expect(warns.filter((w) => w.includes("in-process"))).toHaveLength(1);
+      expect(existsSync(join(ro, "opencode-model-router"))).toBe(false);
+    } finally {
+      for (const [k, v] of Object.entries(saved)) {
+        if (v === undefined) delete process.env[k];
+        else process.env[k] = v;
+      }
+      if (process.platform === "win32") {
+        const r = spawnSync("icacls", [ro, "/remove:d", user], { encoding: "utf8" });
+        expect(r.status, `${r.stdout}${r.stderr}`).toBe(0);
+      } else chmodSync(ro, 0o755);
+    }
   });
 });
