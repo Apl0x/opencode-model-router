@@ -1,11 +1,26 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import type { DoD } from "../../src/verify/dod";
 import type { RiskAssessment } from "../../src/verify/risk";
 import type { ChangedPath } from "../../src/verify/runner";
 import type { ReferenceState } from "../../src/verify/types";
 import {
   ABANDONED_REASON,
+  BACKGROUND_MAX_ATTEMPTS,
+  BACKGROUND_QUEUE_MAX,
+  BACKGROUND_RETRY_BASE_MS,
+  BACKGROUND_SETTLE_MS,
   DISPOSED_REASON,
+  LATE_NOTICE_MIXED_HEADER,
+  LATE_NOTICE_REPLAY_LINE,
+  LATE_NOTICES_MAX,
+  LATE_NOTICES_PER_SESSION,
+  MAX_HANDLES_PER_CALL,
+  REPORTED_MEMO_MAX,
+  createBackgroundQueue,
+  lateNoticeFor,
+  type BackgroundOutcome,
+  type BackgroundQueueOptions,
+  type BackgroundTimers,
   EXPIRED_HANDLE_TEXT,
   HANDLE_MAX_DRAWS,
   HANDLE_PATTERN,
@@ -899,11 +914,39 @@ describe("text (R9)", () => {
         "[router] Background verification found introduced failures:",
         `- ${h} \u00b7 fix it \u00b7 failing: t0, t1, t2, t3, t4, t5, t6, t7, t8, t9 (+2 more)`,
         "[router] Nothing was retried; decide whether to re-dispatch.",
+        "[router] Call `router_verify` with a handle for its full verdict; nothing is run again.",
       ].join("\n"),
     );
     expect(buildLateNoticeBlock([{ handle: h, description: "", introduced: ["a"] }])).toContain(
       "(no description) \u00b7 failing: a",
     );
+  });
+
+  it("buildLateNoticeBlock (R14): a fail without ids and an unverifiable result get their own lines and header", () => {
+    expect(buildLateNoticeBlock([{ handle: h, description: "fix it", introduced: [], reason: "check failed" }])).toBe(
+      [
+        "[router] Background verification found introduced failures:",
+        `- ${h} \u00b7 fix it \u00b7 failed: check failed`,
+        "[router] Nothing was retried; decide whether to re-dispatch.",
+        LATE_NOTICE_REPLAY_LINE,
+      ].join("\n"),
+    );
+    const mixed = buildLateNoticeBlock([
+      { handle: h, description: "a", introduced: ["t1"], outcome: "fail" },
+      { handle: h, description: "b", introduced: [], outcome: "unverifiable", reason: "no reference\tVERIFY:required" },
+      { handle: h, description: "c", introduced: [], outcome: "unverifiable" },
+      { handle: h, description: "d", introduced: [] },
+    ]);
+    expect(mixed?.split("\n")).toEqual([
+      LATE_NOTICE_MIXED_HEADER,
+      `- ${h} \u00b7 a \u00b7 failing: t1`,
+      `- ${h} \u00b7 b \u00b7 unverifiable: no reference VERIFY required`,
+      `- ${h} \u00b7 c \u00b7 unverifiable: no verdict`,
+      `- ${h} \u00b7 d \u00b7 failed: no reason given`,
+      "[router] Nothing was retried; decide whether to re-dispatch.",
+      LATE_NOTICE_REPLAY_LINE,
+    ]);
+    expect(mixed).not.toMatch(DIRECTIVE);
   });
 
   it("sanitizeDescription applies the character rules and code-point-safe truncation", () => {
@@ -960,5 +1003,392 @@ describe("pure helpers (R3, R10)", () => {
 
   it("unattributedRisk is high with the fixed reason", () => {
     expect(unattributedRisk()).toEqual({ level: "high", reasons: [UNATTRIBUTED_RISK_REASON] });
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// R14: the background queue (2.4.5)
+// ---------------------------------------------------------------------------------------------
+
+describe("background queue (R14, 2.4.5)", () => {
+  const H = (n: number): string => `vrf_${n.toString(16).padStart(24, "0")}`;
+  const PASS: VerificationResult = { verdict: { pass: true, outcome: "pass", method: "deterministic", reasons: [] }, retryable: false };
+  const fail = (ids: string[]): VerificationResult => ({
+    verdict: { pass: false, outcome: "fail", method: "deterministic", reasons: ["introduced failures"] },
+    retryable: false,
+    introduced: ids,
+  });
+  const unverifiable = (reason: string, retryable = false): VerificationResult => ({
+    verdict: { pass: false, outcome: "unverifiable", method: "deterministic", reasons: [reason], caveats: [reason] },
+    retryable,
+  });
+  const judged = (handle: string, result: VerificationResult): BackgroundOutcome => ({
+    kind: "judged",
+    handle,
+    description: `work ${handle.slice(-2)}`,
+    result: { ...result, handle, settledAt: 0 },
+  });
+  const flush = async (): Promise<void> => {
+    for (let i = 0; i < 20; i += 1) await Promise.resolve();
+  };
+
+  interface Call {
+    readonly sessionID: string;
+    readonly handles: readonly string[];
+    readonly signal: AbortSignal;
+    resolve(outcomes: readonly BackgroundOutcome[]): void;
+    reject(error: unknown): void;
+  }
+
+  function harness(over: Partial<BackgroundQueueOptions> = {}) {
+    const c = clock(0);
+    const scheduled: Array<{ at: number; cb: () => void; id: number }> = [];
+    let ids = 0;
+    const timers: BackgroundTimers = {
+      setTimeout(cb, ms) {
+        ids += 1;
+        scheduled.push({ at: c.now() + ms, cb, id: ids });
+        return ids;
+      },
+      clearTimeout(handle) {
+        const i = scheduled.findIndex(s => s.id === handle);
+        if (i >= 0) scheduled.splice(i, 1);
+      },
+    };
+    const calls: Call[] = [];
+    const verify = vi.fn(
+      (sessionID: string, handles: readonly string[], signal: AbortSignal) =>
+        new Promise<readonly BackgroundOutcome[]>((resolve, reject) => {
+          calls.push({ sessionID, handles: [...handles], signal, resolve, reject });
+        }),
+    );
+    const errors: unknown[] = [];
+    const queue = createBackgroundQueue({ verify, ttlMs: TTL, now: c.now, timers, platform: "linux", onError: e => errors.push(e), ...over });
+    /** Moves the clock and fires every timer due by then, in order. */
+    const advance = async (ms: number): Promise<void> => {
+      c.advance(ms);
+      for (;;) {
+        const due = scheduled.filter(s => s.at <= c.now()).sort((a, b) => a.at - b.at)[0];
+        if (due === undefined) break;
+        scheduled.splice(scheduled.indexOf(due), 1);
+        due.cb();
+        await flush();
+      }
+      await flush();
+    };
+    const add = (n: number, files: string[] = [`/src/${n}.ts`], sessionID = "orch"): string => {
+      queue.enqueue({ sessionID, handle: H(n), files });
+      return H(n);
+    };
+    return { queue, c, scheduled, calls, verify, errors, advance, add };
+  }
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("lateNoticeFor: nothing for a pass or a retryable result; a fail names its ids, an unverifiable its reason", () => {
+    expect(lateNoticeFor(H(1), "d", PASS)).toBeUndefined();
+    expect(lateNoticeFor(H(1), "d", unverifiable("verification slot busy", true))).toBeUndefined();
+    expect(lateNoticeFor(H(1), "d", fail(["t > a"]))).toEqual({
+      handle: H(1), description: "d", introduced: ["t > a"], outcome: "fail", reason: "introduced failures",
+    });
+    expect(lateNoticeFor(H(1), "d", unverifiable("no reference"))).toMatchObject({ outcome: "unverifiable", introduced: [], reason: "no reference" });
+    // A drift-downgraded pass has no reason of its own: the notice names the last caveat.
+    const drifted: VerificationResult = {
+      verdict: { pass: false, outcome: "unverifiable", method: "deterministic", reasons: [], caveats: ["n2 note", "tree drifted"] },
+      retryable: false,
+    };
+    expect(lateNoticeFor(H(1), "d", drifted)?.reason).toBe("tree drifted");
+    // outcome inferred from pass when absent; no reason at all -> no reason field.
+    const bare: VerificationResult = { verdict: { pass: false, method: "none", reasons: [] }, retryable: false };
+    expect(lateNoticeFor(H(1), "d", bare)).toEqual({ handle: H(1), description: "d", introduced: [], outcome: "fail" });
+    expect(lateNoticeFor(H(1), "d", { verdict: { pass: true, method: "deterministic", reasons: [] }, retryable: false })).toBeUndefined();
+  });
+
+  it("a fresh request runs after the settle delay; the session's requests share one run; no debounce", async () => {
+    const { queue, calls, advance, add } = harness();
+    add(1);
+    expect(queue.stats()).toMatchObject({ queued: 1, running: false, timerArmed: true });
+    await advance(BACKGROUND_SETTLE_MS / 2);
+    add(2);
+    await advance(BACKGROUND_SETTLE_MS / 2 - 1);
+    expect(calls).toHaveLength(0);
+    // The first request's timer is not pushed back by the second (no debounce), and 2 rides along.
+    await advance(1);
+    expect(calls.map(c => [c.sessionID, c.handles])).toEqual([["orch", [H(1), H(2)]]]);
+    expect(queue.stats()).toMatchObject({ queued: 0, running: true, runs: 1 });
+    calls[0].resolve([judged(H(1), PASS), judged(H(2), PASS)]);
+    await flush();
+    expect(queue.stats()).toMatchObject({ queued: 0, running: false, timerArmed: false, notices: 0 });
+    expect(queue.takeNotices("orch")).toEqual([]);
+  });
+
+  it("a fail or an unverifiable result is one late notice, delivered once; a pass is none; sessions are separate", async () => {
+    const { queue, calls, advance, add } = harness();
+    add(1);
+    add(2);
+    add(3);
+    await advance(BACKGROUND_SETTLE_MS);
+    calls[0].resolve([judged(H(1), fail(["t > a"])), judged(H(2), unverifiable("no reference")), judged(H(3), PASS)]);
+    await flush();
+    expect(queue.stats().notices).toBe(2);
+    expect(queue.takeNotices("other")).toEqual([]);
+    const notices = queue.takeNotices("orch");
+    expect(notices.map(n => [n.handle, n.outcome])).toEqual([[H(1), "fail"], [H(2), "unverifiable"]]);
+    expect(buildLateNoticeBlock(notices)?.split("\n")[0]).toBe(LATE_NOTICE_MIXED_HEADER);
+    expect(queue.takeNotices("orch")).toEqual([]);
+    expect(queue.stats().notices).toBe(0);
+  });
+
+  it("coalescing: a newer request with overlapping files drops a queued older one of the same session only", async () => {
+    const { queue, calls, advance, add } = harness();
+    add(1, ["/src/a.ts", "/src/b.ts"]);
+    add(2, ["/src/a.ts"], "orch2");
+    add(3, ["/src/b.ts", "/src/c.ts"]);
+    add(4, ["/src/d.ts"]);
+    expect(queue.stats()).toMatchObject({ queued: 3, superseded: 1 });
+    await advance(BACKGROUND_SETTLE_MS);
+    // FIFO: orch2's request came first and runs alone (verifyHandles is session-scoped).
+    expect(calls[0].handles).toEqual([H(2)]);
+    // Duplicates and empty ids are ignored.
+    queue.enqueue({ sessionID: "orch", handle: H(3), files: [] });
+    queue.enqueue({ sessionID: "", handle: H(9), files: [] });
+    queue.enqueue({ sessionID: "orch", handle: "", files: [] });
+    expect(queue.stats().queued).toBe(2);
+    calls[0].resolve([judged(H(2), PASS)]);
+    await flush();
+    await advance(0);
+    // H(1) is gone from the queue (it stays unverified in the registry).
+    expect(calls[1].handles).toEqual([H(3), H(4)]);
+  });
+
+  it("coalescing folds case and separators on win32", () => {
+    const { queue, add } = harness({ platform: "win32" });
+    add(1, ["C:\\Repo\\src\\A.ts"]);
+    add(2, ["c:/repo/src/a.ts"]);
+    expect(queue.stats()).toMatchObject({ queued: 1, superseded: 1 });
+  });
+
+  it("one run at a time: a request of another session waits for the run in flight, then runs alone", async () => {
+    const { queue, calls, advance, add } = harness();
+    add(1);
+    await advance(BACKGROUND_SETTLE_MS);
+    add(2, undefined, "orch2");
+    // A request for the handle being verified is not queued again.
+    queue.enqueue({ sessionID: "orch", handle: H(1), files: [] });
+    await advance(BACKGROUND_SETTLE_MS * 5);
+    expect(calls).toHaveLength(1);
+    expect(queue.stats()).toMatchObject({ running: true, queued: 1 });
+    calls[0].resolve([judged(H(1), PASS)]);
+    await flush();
+    await advance(0);
+    expect(calls.map(c => [c.sessionID, c.handles])).toEqual([["orch", [H(1)]], ["orch2", [H(2)]]]);
+  });
+
+  it("a retryable result backs off (no hot loop), is retried at most BACKGROUND_MAX_ATTEMPTS times, then stays unverified", async () => {
+    const { queue, calls, advance, add } = harness();
+    add(1);
+    await advance(BACKGROUND_SETTLE_MS);
+    for (let attempt = 1; attempt <= BACKGROUND_MAX_ATTEMPTS; attempt += 1) {
+      expect(calls).toHaveLength(attempt);
+      calls[attempt - 1].resolve([judged(H(1), unverifiable("verification slot busy", true))]);
+      await flush();
+      if (attempt === BACKGROUND_MAX_ATTEMPTS) break;
+      const wait = BACKGROUND_RETRY_BASE_MS * 2 ** (attempt - 1);
+      expect(queue.stats()).toMatchObject({ queued: 1, running: false, timerArmed: true });
+      // Quiet while backing off.
+      await expect(queue.whenIdle()).resolves.toBeUndefined();
+      await advance(wait - 1);
+      expect(calls).toHaveLength(attempt);
+      await advance(1);
+    }
+    expect(queue.stats()).toMatchObject({ queued: 0, running: false, timerArmed: false, notices: 0, runs: BACKGROUND_MAX_ATTEMPTS });
+  });
+
+  it("a handle missing from the outcomes, a rejected run and a throwing verify count as retryable; errors are reported", async () => {
+    let throwNow = false;
+    const { queue, calls, advance, add, errors } = harness({
+      verify: (sessionID, handles, signal) => {
+        if (throwNow) throw new Error("sync boom");
+        return new Promise((resolve, reject) => calls.push({ sessionID, handles: [...handles], signal, resolve, reject }));
+      },
+      maxAttempts: 4,
+      retryBaseMs: 10,
+      onError: e => {
+        errors.push(e);
+        throw new Error("the hook itself throws");
+      },
+    });
+    add(1);
+    add(2);
+    await advance(BACKGROUND_SETTLE_MS);
+    calls[0].resolve([judged(H(1), PASS)]);
+    await flush();
+    expect(queue.stats().queued).toBe(1);
+    await advance(10);
+    calls[1].reject(new Error("run rejected"));
+    await flush();
+    expect(errors).toHaveLength(1);
+    throwNow = true;
+    await advance(20);
+    expect(errors).toHaveLength(2);
+    expect(queue.stats()).toMatchObject({ queued: 1, running: false, runs: 3 });
+    // A retry is superseded by a newer overlapping request queued meanwhile.
+    throwNow = false;
+    add(3, ["/src/2.ts"]);
+    expect(queue.stats()).toMatchObject({ queued: 1, superseded: 1 });
+  });
+
+  it("a retry is dropped when a newer overlapping request of the session arrived during its run", async () => {
+    const { queue, calls, advance, add } = harness();
+    add(1, ["/src/a.ts"]);
+    await advance(BACKGROUND_SETTLE_MS);
+    add(2, ["/src/a.ts"]);
+    calls[0].resolve([judged(H(1), unverifiable("verification slot busy", true))]);
+    await flush();
+    expect(queue.stats()).toMatchObject({ queued: 1, superseded: 1 });
+    await advance(BACKGROUND_SETTLE_MS);
+    expect(calls[1].handles).toEqual([H(2)]);
+  });
+
+  it("reported and gone outcomes are dropped; markReported suppresses a notice before and after it exists", async () => {
+    const { queue, calls, advance, add } = harness();
+    add(1);
+    add(2);
+    add(3);
+    add(4);
+    queue.markReported([H(3)]);
+    await advance(BACKGROUND_SETTLE_MS);
+    calls[0].resolve([
+      { kind: "reported", handle: H(1) },
+      { kind: "gone", handle: H(2) },
+      judged(H(3), fail(["t > a"])),
+      judged(H(4), fail(["t > b"])),
+    ]);
+    await flush();
+    expect(queue.stats()).toMatchObject({ queued: 0, notices: 1 });
+    queue.markReported([H(4)]);
+    expect(queue.stats().notices).toBe(0);
+    expect(queue.takeNotices("orch")).toEqual([]);
+  });
+
+  it("forgetSession drops the session's requests and notices and aborts its run; that run's results are ignored", async () => {
+    const { queue, calls, advance, add } = harness();
+    add(1);
+    await advance(BACKGROUND_SETTLE_MS);
+    calls[0].resolve([judged(H(1), fail(["t > a"]))]);
+    await flush();
+    expect(queue.stats().notices).toBe(1);
+    add(2);
+    await advance(BACKGROUND_SETTLE_MS);
+    add(3);
+    add(4, undefined, "orch2");
+    queue.forgetSession("orch");
+    expect(calls[1].signal.aborted).toBe(true);
+    expect(queue.stats()).toMatchObject({ queued: 1, notices: 0, running: true });
+    calls[1].resolve([judged(H(2), fail(["t > b"]))]);
+    await flush();
+    expect(queue.stats()).toMatchObject({ notices: 0, running: false });
+    await advance(BACKGROUND_SETTLE_MS);
+    expect(calls[2].sessionID).toBe("orch2");
+    // Forgetting a session with nothing queued is harmless.
+    queue.forgetSession("nobody");
+  });
+
+  it("dispose aborts the run, clears the timer and drops everything; later calls are no-ops", async () => {
+    const { queue, calls, advance, add, scheduled } = harness();
+    add(1);
+    await advance(BACKGROUND_SETTLE_MS);
+    add(2, undefined, "orch2");
+    await advance(BACKGROUND_SETTLE_MS);
+    const idle = queue.whenIdle();
+    queue.dispose();
+    await idle;
+    expect(calls[0].signal.aborted).toBe(true);
+    expect(scheduled).toEqual([]);
+    expect(queue.stats()).toMatchObject({ queued: 0, timerArmed: false, notices: 0 });
+    calls[0].resolve([judged(H(1), fail(["t > a"]))]);
+    await flush();
+    add(3);
+    queue.dispose();
+    expect(queue.stats()).toMatchObject({ queued: 0, running: false, notices: 0, timerArmed: false });
+    await expect(queue.whenIdle()).resolves.toBeUndefined();
+  });
+
+  it("sweep drops notices older than the TTL; whenIdle waits for the run", async () => {
+    const { queue, calls, advance, add, c } = harness();
+    add(1);
+    let idle = false;
+    const waiting = queue.whenIdle().then(() => {
+      idle = true;
+    });
+    await advance(BACKGROUND_SETTLE_MS);
+    expect(idle).toBe(false);
+    calls[0].resolve([judged(H(1), fail(["t > a"]))]);
+    await waiting;
+    expect(idle).toBe(true);
+    expect(queue.sweep(c.now() + TTL - 1)).toBe(0);
+    expect(queue.sweep(c.now() + TTL)).toBe(1);
+    expect(queue.stats().notices).toBe(0);
+    expect(queue.sweep()).toBe(0);
+  });
+
+  it("caps: the queue, the notices per session and in total, and the reported memo are bounded", async () => {
+    const { queue, calls, advance, add } = harness();
+    for (let i = 0; i <= BACKGROUND_QUEUE_MAX; i += 1) add(i);
+    expect(queue.stats().queued).toBe(BACKGROUND_QUEUE_MAX);
+    queue.forgetSession("orch");
+
+    // 33 failing handles in one session: the oldest notice is dropped.
+    for (let i = 0; i <= LATE_NOTICES_PER_SESSION; i += 1) add(1000 + i);
+    await advance(BACKGROUND_SETTLE_MS);
+    expect(calls[0].handles).toHaveLength(MAX_HANDLES_PER_CALL);
+    calls[0].resolve(calls[0].handles.map(h => judged(h, fail(["t"]))));
+    await flush();
+    await advance(0);
+    calls[1].resolve(calls[1].handles.map(h => judged(h, fail(["t"]))));
+    await flush();
+    const mine = queue.takeNotices("orch");
+    expect(mine).toHaveLength(LATE_NOTICES_PER_SESSION);
+    expect(mine[0].handle).toBe(H(1001));
+
+    // More sessions than the global cap allows: the oldest notices go first.
+    const sessions = Math.ceil(LATE_NOTICES_MAX / LATE_NOTICES_PER_SESSION) + 1;
+    for (let s = 0; s < sessions; s += 1) {
+      for (let i = 0; i < LATE_NOTICES_PER_SESSION; i += 1) add(2000 + s * 100 + i, undefined, `s${s}`);
+    }
+    for (let s = 0; s < sessions; s += 1) {
+      await advance(BACKGROUND_SETTLE_MS);
+      const call = calls[calls.length - 1];
+      call.resolve(call.handles.map(h => judged(h, fail(["t"]))));
+      await flush();
+    }
+    expect(queue.stats().notices).toBe(LATE_NOTICES_MAX);
+    expect(queue.takeNotices("s0")).toEqual([]);
+
+    // The reported memo is FIFO-bounded: the oldest handle can be noticed again.
+    queue.markReported(Array.from({ length: REPORTED_MEMO_MAX + 1 }, (_, i) => H(5000 + i)));
+    add(5000);
+    add(5001);
+    await advance(BACKGROUND_SETTLE_MS);
+    const last = calls[calls.length - 1];
+    last.resolve([judged(H(5000), fail(["t"])), judged(H(5001), fail(["t"]))]);
+    await flush();
+    expect(queue.takeNotices("orch").map(n => n.handle)).toEqual([H(5000)]);
+  });
+
+  it("the default timers are unref'd real timers", async () => {
+    vi.useFakeTimers();
+    const verify = vi.fn(async (): Promise<readonly BackgroundOutcome[]> => []);
+    const queue = createBackgroundQueue({ verify, ttlMs: TTL, maxAttempts: 1 });
+    queue.enqueue({ sessionID: "orch", handle: H(1), files: [] });
+    await vi.advanceTimersByTimeAsync(BACKGROUND_SETTLE_MS - 1);
+    expect(verify).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(verify).toHaveBeenCalledTimes(1);
+    queue.enqueue({ sessionID: "orch", handle: H(2), files: [] });
+    queue.dispose();
+    expect(vi.getTimerCount()).toBe(0);
   });
 });

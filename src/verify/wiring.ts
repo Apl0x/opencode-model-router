@@ -33,6 +33,7 @@ import {
   ABSENT_DIGEST as PENDING_ABSENT_DIGEST,
   buildDeferredFooter,
   buildLineageCaveat,
+  createBackgroundQueue,
   createPendingRegistry,
   driftedPaths,
   EXPIRED_HANDLE_TEXT,
@@ -44,6 +45,9 @@ import {
   UNKNOWN_HANDLE_TEXT,
   VERIFYING_ELSEWHERE_TEXT,
   VERIFYING_GRACE_MS,
+  type BackgroundOutcome,
+  type BackgroundQueue,
+  type BackgroundQueueOptions,
   type FileDigests,
   type PendingEntry,
   type PendingRegistry,
@@ -561,11 +565,23 @@ export interface VerificationWiring {
    *   unprovable drift never lets a pass stand (DRIFT_NOTICE / DRIFT_UNCHECKED_NOTICE).
    * - claim.settle runs in a `finally`; a transient unverifiable (isRetryableVerdict) returns the
    *   entry to unverified. A fail carries buildForcingNote with the next tier, and nothing else.
-   * `signal` (the tool call's abort) aborts the deadline.
+   * `signal` (the tool call's abort) aborts the deadline. `background` (2.4.5, the background
+   * queue's own runs only) runs the gates at low priority whatever `lowPriority` says; any other
+   * call marks the handles it reported, so no late notice repeats a verdict the caller received.
    */
-  verifyHandles(sessionID: string, target: VerifyTarget, options?: { readonly signal?: AbortSignal }): Promise<VerifyReport>;
+  verifyHandles(
+    sessionID: string,
+    target: VerifyTarget,
+    options?: { readonly signal?: AbortSignal; readonly background?: boolean },
+  ): Promise<VerifyReport>;
   /** 2.4.1: the plugin instance's pending registry (sweep, forgetSession, dispose are wired in index.ts). */
   pending: PendingRegistry;
+  /**
+   * 2.4.5 (pending.ts R14): the background queue, constructed only when `background` is true at
+   * plugin start; undefined otherwise, and nothing then refers to one. The deferred finish feeds
+   * it; index.ts reads its late notices in the system transform and forgets a deleted session.
+   */
+  background: BackgroundQueue | undefined;
   /**
    * 2.1.5b: the crash GC of stale reference dirs, fire-and-forget. QA-2.1-11: it runs `delayMs`
    * (default REFERENCE_GC_START_DELAY_MS) after the call, on an unref'd timer, so plugin start
@@ -663,6 +679,8 @@ export function createVerificationWiring(deps: {
   batch?: Omit<BatchCoordinatorOptions, "logger">;
   /** Test seams of the pending registry (clock, random source). */
   pending?: Pick<PendingRegistryOptions, "now" | "random">;
+  /** Test seams of the 2.4.5 background queue; used only when `background` is true. */
+  background?: Pick<BackgroundQueueOptions, "now" | "timers" | "settleMs" | "retryBaseMs" | "maxAttempts" | "platform">;
 }): VerificationWiring {
   const { client, directory, getConfig } = deps;
   const logger: WiringLogger = deps.logger ?? { warn: (message, extra) => console.warn(message, extra ?? "") };
@@ -679,13 +697,13 @@ export function createVerificationWiring(deps: {
    * 2.4.1/2.4.2a: one pending registry per plugin instance. Its TTL and abandonment bound are read
    * from the config at plugin start (a reload applies after a restart; the registry holds no timer).
    */
-  let pendingBudget: Pick<VerifyBudget, "pendingTtlMs" | "gateBudgetMs">;
+  let pendingBudget: Pick<VerifyBudget, "pendingTtlMs" | "gateBudgetMs" | "background">;
   try {
     pendingBudget = resolveVerifyBudget(getConfig());
   } catch (err) {
-    // Plugin start never fails on config: the section 1.4 defaults.
+    // Plugin start never fails on config: the section 1.4 defaults (background off).
     logger.debug?.("[verify] pending registry uses default bounds: config unreadable", { error: errorText(err) });
-    pendingBudget = { pendingTtlMs: DEFAULT_PENDING_TTL_MS, gateBudgetMs: DEFAULT_GATE_BUDGET_MS };
+    pendingBudget = { pendingTtlMs: DEFAULT_PENDING_TTL_MS, gateBudgetMs: DEFAULT_GATE_BUDGET_MS, background: false };
   }
   const pending = createPendingRegistry({
     ttlMs: pendingBudget.pendingTtlMs,
@@ -694,6 +712,11 @@ export function createVerificationWiring(deps: {
     onEvict: (entry, cause) => logger.debug?.("[verify] pending delegation evicted", { handle: entry.handle, cause }),
   });
   const pendingNow = deps.pending?.now ?? Date.now;
+  /**
+   * 2.4.5: assigned once verifyHandles exists, and only when `background` is true at plugin start
+   * (pending.ts R14). With background off this stays undefined: no queue, no timer, no run.
+   */
+  let background: BackgroundQueue | undefined;
   /** 2.4.2b: native `task` dispatch starts, before hook -> after hook (bounded FIFO, swept). */
   const dispatchStarts = new Map<string, DispatchStart>();
   /**
@@ -933,9 +956,12 @@ export function createVerificationWiring(deps: {
     inFlight?: Set<string>,
     prepared?: PreparedVerification,
     deadline?: Deadline,
+    forceLowPriority = false,
   ): GateDeps => {
     const cfg = getConfig();
-    const budget = resolveVerifyBudget(cfg);
+    const resolved = resolveVerifyBudget(cfg);
+    // 2.4.5 (section 1.5-19): background runs are low priority whatever `lowPriority` says.
+    const budget: VerifyBudget = forceLowPriority ? { ...resolved, lowPriority: true } : resolved;
     // QA-2.1-5: the recheck's git processes (GC, materialize, dispose) run at the configured
     // priority too, like the capture and the start-up GC (QA-1.2-13).
     const referenceArgv: ArgvSeam = (file, args, opts) => argvSeam(file, args, { ...opts, lowPriority: budget.lowPriority });
@@ -1175,6 +1201,16 @@ export function createVerificationWiring(deps: {
         logger.warn("[verify] deferred delegation not registered", { code: reg.code, detail: reg.detail });
         return { footer: buildDeferredFooter({ handle: undefined, risk, unregistered: reg.code }), handle: undefined, risk };
       }
+      // 2.4.5 (pending.ts R14): queued, never awaited: the queue's own timer starts the run later.
+      // An unattributed change set is not queued (nothing could run; it stays listed instead).
+      if (background !== undefined && changedFiles !== "unavailable") {
+        try {
+          background.enqueue({ sessionID: input.orchestratorSessionID, handle: reg.handle, files: changedFiles.map(p => p.path) });
+        } catch (err) {
+          // The handle is registered: the delegation stays unverified and listed, as without background.
+          logger.warn("[verify] deferred delegation not queued for background verification", { handle: reg.handle, error: errorText(err) });
+        }
+      }
       return { footer: buildDeferredFooter({ handle: reg.handle, risk }), handle: reg.handle, risk };
     } catch (err) {
       logger.warn("[verify] deferred finish failed; the delegation has no handle", { error: errorText(err) });
@@ -1321,6 +1357,7 @@ export function createVerificationWiring(deps: {
     deadline: OwnedDeadline,
     cfg: RouterConfig,
     callSignal: AbortSignal | undefined,
+    lowPriority: boolean,
   ): Promise<VerificationResult> => {
     const dod = entry.dod;
     // A claimed entry is never released (release happens on a terminal settle only).
@@ -1328,7 +1365,7 @@ export function createVerificationWiring(deps: {
     const strict = cfg.enforcement?.verify?.strictUnverifiable ?? false;
     const inFlight = new Set<string>();
     const completedFailures: string[] = [];
-    const gateDeps = buildGateDeps(entry.orchestratorSessionID, inFlight, prep.prepared, deadline);
+    const gateDeps = buildGateDeps(entry.orchestratorSessionID, inFlight, prep.prepared, deadline, lowPriority);
     gateDeps.deterministic.onFailure = reason => completedFailures.push(reason);
     const artefact = {
       changedFiles: prep.prepared.changedFiles,
@@ -1486,7 +1523,7 @@ export function createVerificationWiring(deps: {
         try {
           const prep = await preparations[i];
           await allPrepared;
-          result = await judgeClaim(c.entry, prep, owned, cfg, callSignal);
+          result = await judgeClaim(c.entry, prep, owned, cfg, callSignal, options.background === true);
         } catch (error) {
           result = { verdict: unverifiableVerdict(`verification unavailable: ${errorText(error)}`), retryable: true };
         } finally {
@@ -1498,6 +1535,8 @@ export function createVerificationWiring(deps: {
       });
 
       const items = await Promise.all(slots.map(s => ("claim" in s ? runs[s.claim] : s)));
+      // 2.4.5: this caller receives these verdicts, so no late notice repeats them (R14).
+      if (options.background !== true) background?.markReported(items.flatMap(i => (i.kind === "verdict" ? [i.handle] : [])));
       return { items, excess, text: formatVerifyReport(items, excess, strict, h => cwds.get(h)) };
     } catch (error) {
       logger.warn("[verify] router_verify failed", { error: errorText(error) });
@@ -1507,6 +1546,29 @@ export function createVerificationWiring(deps: {
       deadline?.dispose();
     }
   };
+
+  // 2.4.5 (section 1.5-19, pending.ts R14): only when `background` is true at plugin start. A run is
+  // this instance's own verifyHandles, so it claims, gates, batches and settles exactly as
+  // router_verify does, at low priority.
+  if (pendingBudget.background) {
+    background = createBackgroundQueue({
+      ...deps.background,
+      ttlMs: pendingBudget.pendingTtlMs,
+      verify: async (sessionID, handles, signal) => {
+        const report = await verifyHandles(sessionID, { kind: "handles", handles }, { signal, background: true });
+        return report.items.map((item): BackgroundOutcome => {
+          if (item.kind === "verdict") {
+            return item.via === "run"
+              ? { kind: "judged", handle: item.handle, description: item.description, result: item.result }
+              : { kind: "reported", handle: item.handle };
+          }
+          if (item.kind === "elsewhere") return { kind: "reported", handle: item.handle };
+          return { kind: "gone", handle: item.kind === "unknown" ? item.input : item.handle };
+        });
+      },
+      onError: error => logger.warn("[verify] background verification run failed", { error: errorText(error) }),
+    });
+  }
 
   return {
     beginVerification,
@@ -1545,6 +1607,7 @@ export function createVerificationWiring(deps: {
     applyLineage,
     verifyHandles,
     pending,
+    background,
     beginVerificationBounded,
     startReferenceGc(delayMs = REFERENCE_GC_START_DELAY_MS) {
       if (!directory) {
@@ -1598,10 +1661,13 @@ export function createVerificationWiring(deps: {
           evicted += 1;
         }
       }
-      return evicted + coordinator.sweep();
+      // 2.4.5: undelivered late notices past pendingTtlMs; also the queue's idle trigger.
+      return evicted + coordinator.sweep() + (background?.sweep() ?? 0);
     },
     disposeVerification: () => {
       dispatchStarts.clear();
+      // 2.4.5: abort the background run first, so nothing re-queues while the coordinator stops.
+      background?.dispose();
       return coordinator.dispose();
     },
   };

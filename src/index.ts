@@ -79,7 +79,7 @@ import { tool } from "@opencode-ai/plugin";
 import { scrubText } from "./guard/scrub";
 import { accept, unverifiableGateResult } from "./verify/gate";
 import { createVerificationWiring, dispatchDirectiveText, extractAssistantText, parseRouterVerifyArgs, type DispatchStart } from "./verify/wiring";
-import { appendRouterFooter, buildPendingListBlock } from "./verify/pending";
+import { appendRouterFooter, buildLateNoticeBlock, buildPendingListBlock } from "./verify/pending";
 import { createDeadline } from "./verify/deterministic";
 import {
   DEFAULT_DELEGATE_PROMPT_TIMEOUT_MS,
@@ -357,6 +357,8 @@ const ModelRouterPlugin: Plugin = async (ctx: PluginInput) => {
     sweepVerification, disposeVerification,
     startDispatch, takeDispatch, isDeferred: wiringIsDeferred, finishDeferred, applyLineage, pending,
     verifyHandles,
+    // 2.4.5: undefined unless `background: true` at plugin start (pending.ts R14).
+    background,
   } = createVerificationWiring({
     client: ctx.client,
     directory: ctx.directory,
@@ -466,6 +468,8 @@ const ModelRouterPlugin: Plugin = async (ctx: PluginInput) => {
     // that dispose is both called and awaited, so flushing here is enough.
     dispose: async () => {
       stopReferenceGc();
+      // 2.4.5: abort a background run and drop its queue and notices before the registry goes.
+      background?.dispose();
       // 2.4.2b: evict every pending delegation; in-flight router_verify runs resolve (pending.ts R5).
       pending.dispose();
       // 2.2.3: settle batched testsPass requests and kill running batches (never rejects).
@@ -1431,6 +1435,8 @@ const ModelRouterPlugin: Plugin = async (ctx: PluginInput) => {
             sessionLookupFailedAt.delete(id);
             sessionStore.unregister(id);
             // 2.4.2b: a deleted orchestrator's handles, tombstones and lineage records go with it.
+            // 2.4.5: so do its background requests and late notices; its run in flight is aborted.
+            background?.forgetSession(id);
             pending.forgetSession(id);
           }
         } catch {
@@ -1712,12 +1718,24 @@ const ModelRouterPlugin: Plugin = async (ctx: PluginInput) => {
       // 2.4.4, section 1.5-20: this orchestrator's still-unverified delegations (at most 5 shown,
       // newest first), as one short block. Nothing is pushed when the list is empty, so the prompt
       // does not grow for sessions that never defer. Orchestrator path only: every child returned
-      // above. (2.4.5 adds the background late notices here, behind `background: true`.)
+      // above. With background mode on, an entry the queue is verifying right now is still
+      // unverified to the orchestrator, so it stays listed until its run settles.
       try {
-        const block = buildPendingListBlock(pending.listUnverified(sessionID));
+        const open = background !== undefined ? pending.listOpen(sessionID) : pending.listUnverified(sessionID);
+        const block = buildPendingListBlock(open);
         if (block !== undefined) output.system.push(block);
       } catch (error) {
         logger.warn("[verify] pending list not injected", { error: scrubText(String(error)) });
+      }
+      // 2.4.5, section 1.5-19 (`background: true` only): late notices of background runs that did
+      // not pass, each delivered once (takeNotices marks them delivered).
+      if (background !== undefined) {
+        try {
+          const late = buildLateNoticeBlock(background.takeNotices(sessionID));
+          if (late !== undefined) output.system.push(late);
+        } catch (error) {
+          logger.warn("[verify] late notices not injected", { error: scrubText(String(error)) });
+        }
       }
     },
 

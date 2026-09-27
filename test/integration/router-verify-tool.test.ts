@@ -32,15 +32,17 @@ import {
   type VerificationWiring,
 } from "../../src/verify/wiring";
 import {
+  buildLateNoticeBlock,
   EXPIRED_HANDLE_TEXT,
   MAX_HANDLES_PER_CALL,
   UNKNOWN_HANDLE_TEXT,
+  type BackgroundQueue,
   type PendingRegistration,
   type PendingRegistry,
 } from "../../src/verify/pending";
 import type { RouterConfig } from "../../src/router/config";
 import type { DoD } from "../../src/verify/dod";
-import type { TreeSnapshot } from "../../src/verify/dispatch";
+import { createChangedFileStore, type TreeSnapshot } from "../../src/verify/dispatch";
 import type { DispatchReference } from "../../src/verify/reference";
 import type { ReferenceState, Verdict } from "../../src/verify/types";
 
@@ -52,8 +54,18 @@ const state = vi.hoisted(() => ({
   failing: {} as Record<string, string[]>,
   /** The same at the exact reference (a failure listed here is pre-existing). */
   failingAtRef: {} as Record<string, string[]>,
-  /** Every scoped test run (non-git argv spawn): its inputs and the live slot holds. */
-  runs: [] as { inputs: string[]; holds: number }[],
+  /** Every scoped test run (non-git argv spawn): its inputs, the live slot holds and its priority. */
+  runs: [] as { inputs: string[]; holds: number; lowPriority: boolean | undefined }[],
+  /** While set, a scoped test run hangs until its signal aborts (the tree kill), which is counted. */
+  hang: false,
+  killed: 0,
+  /** createBackgroundQueue calls (2.4.5: never when background is off). */
+  queues: 0,
+  /** What the tree snapshot lists (a deferred finish attributes the files it adds). */
+  treeFiles: [] as TreeSnapshot["files"],
+  snapshotThrows: false,
+  /** The dispatch-time reference capture; default: an exact capture at once. */
+  capture: undefined as undefined | ((signal: AbortSignal) => Promise<DispatchReference>),
   git: 0,
   shells: 0,
   acquires: 0,
@@ -75,19 +87,31 @@ vi.mock("../../src/verify/exec", () => ({
     state.shells++;
     return { code: 0, stdout: "", stderr: "", timedOut: false };
   },
-  runArgv: async (file: string, args: readonly string[]): Promise<ExecOut> => {
+  runArgv: async (file: string, args: readonly string[], opts?: { signal?: AbortSignal; lowPriority?: boolean }): Promise<ExecOut> => {
     if (file === "git") {
       state.git++;
       return { code: 0, stdout: "", stderr: "", timedOut: false };
     }
-    return await fakeVitest(args);
+    return await fakeVitest(args, opts);
   },
 }));
+
+vi.mock("../../src/verify/pending", async importOriginal => {
+  const actual = await importOriginal<typeof import("../../src/verify/pending")>();
+  return {
+    ...actual,
+    createBackgroundQueue: (...args: Parameters<typeof actual.createBackgroundQueue>) => {
+      state.queues++;
+      return actual.createBackgroundQueue(...args);
+    },
+  };
+});
 
 vi.mock("../../src/verify/tree", () => ({
   snapshotTree: async (): Promise<TreeSnapshot> => {
     state.snapshots++;
-    return { cwd: state.root, root: state.root, head: "a".repeat(40), fingerprint: "now", dirty: true, files: [] };
+    if (state.snapshotThrows) throw new Error("git status failed");
+    return { cwd: state.root, root: state.root, head: "a".repeat(40), fingerprint: state.treeFiles.length === 0 ? "now" : `now${state.treeFiles.length}`, dirty: true, files: [...state.treeFiles] };
   },
 }));
 
@@ -152,6 +176,12 @@ vi.mock("../../src/verify/wiring", async importOriginal => {
 vi.mock("../../src/verify/reference", async importOriginal => ({
   ...(await importOriginal<typeof import("../../src/verify/reference")>()),
   gcStaleReferences: async () => ({ removed: [], kept: [], failed: [] }),
+  captureReference: async (_at: string, signal: AbortSignal): Promise<DispatchReference> => {
+    if (state.capture !== undefined) return await state.capture(signal);
+    const ref = captured();
+    if (ref.kind !== "captured") throw new Error("unreachable");
+    return ref.reference;
+  },
   materialize: async () => {
     const dir = state.refRoot;
     if (dir === "") return { ok: false as const, reason: "worktree-add-failed" as const, detail: "test seam: no worktree" };
@@ -174,13 +204,27 @@ vi.mock("../../src/verify/reference", async importOriginal => ({
 }));
 
 /** A vitest run over the fake project (or its reference copy): each source relates to its own test file. */
-async function fakeVitest(args: readonly string[]): Promise<ExecOut> {
+async function fakeVitest(args: readonly string[], opts?: { signal?: AbortSignal; lowPriority?: boolean }): Promise<ExecOut> {
   const atRef = state.refRoot !== "" && args.some(a => a.startsWith(state.refRoot));
   const root = atRef ? state.refRoot : state.root;
   const failingNow = atRef ? state.failingAtRef : state.failing;
   const report = args.find(a => a.startsWith("--outputFile="))?.slice("--outputFile=".length);
   const inputs = args.filter(a => isAbsolute(a) && a.startsWith(root) && !a.includes("node_modules"));
-  state.runs.push({ inputs: [...inputs].sort(), holds: state.holds });
+  state.runs.push({ inputs: [...inputs].sort(), holds: state.holds, lowPriority: opts?.lowPriority });
+  if (state.hang) {
+    // Like a real tree: it runs until the run's signal kills it, and writes no report.
+    await new Promise<void>(resolve => {
+      const signal = opts?.signal;
+      if (signal === undefined) return;
+      const kill = (): void => {
+        state.killed++;
+        resolve();
+      };
+      if (signal.aborted) kill();
+      else signal.addEventListener("abort", kill, { once: true });
+    });
+    return { code: 1, stdout: "", stderr: "killed", timedOut: false };
+  }
   const letters = [...new Set(inputs.map(a => /[\\/]([a-z])(?:\.test)?\.ts$/.exec(a)?.[1]).filter((x): x is string => x !== undefined))].sort();
   const testResults = letters.map(x => {
     const failing = failingNow[x] ?? [];
@@ -245,6 +289,7 @@ async function register(pending: PendingRegistry, x: string, over: Partial<Pendi
 function makeWiring(
   verify: NonNullable<NonNullable<RouterConfig["enforcement"]>["verify"]> = {},
   pendingSeams: Parameters<typeof createVerificationWiring>[0]["pending"] = undefined,
+  backgroundSeams: Parameters<typeof createVerificationWiring>[0]["background"] = undefined,
 ) {
   const cfg = config(verify);
   const client = { session: { create: vi.fn(async () => ({ data: { id: "never" } })), abort: vi.fn(async () => ({})), delete: vi.fn(async () => ({})) } };
@@ -255,12 +300,15 @@ function makeWiring(
     logger: { warn: () => {} },
     batch: { maxBatchSize: 5 },
     ...(pendingSeams !== undefined ? { pending: pendingSeams } : {}),
+    ...(backgroundSeams !== undefined ? { background: backgroundSeams } : {}),
   });
   return { wiring, client, cfg };
 }
 
 function resetCounters(): void {
-  Object.assign(state, { runs: [], git: 0, shells: 0, acquires: 0, releases: 0, holds: 0, maxHolds: 0, snapshots: 0, deadlines: 0, planGate: undefined });
+  Object.assign(state, {
+    runs: [], git: 0, shells: 0, acquires: 0, releases: 0, holds: 0, maxHolds: 0, snapshots: 0, deadlines: 0, planGate: undefined, killed: 0, queues: 0,
+  });
 }
 
 /** Holds each planScopedRun until `n` are waiting, then releases them together (W7: all in flight). */
@@ -310,6 +358,10 @@ beforeEach(() => {
   state.failingAtRef = {};
   state.slotBusy = false;
   state.refRoot = "";
+  state.hang = false;
+  state.capture = undefined;
+  state.treeFiles = [];
+  state.snapshotThrows = false;
   resetCounters();
 });
 
@@ -555,6 +607,214 @@ describe("verifyHandles (2.4.3a)", () => {
 });
 
 // ---------------------------------------------------------------------------------------------
+// Background mode (2.4.5, section 1.5-19; pending.ts R14) on the wiring
+// ---------------------------------------------------------------------------------------------
+
+describe("background mode (2.4.5)", () => {
+  const FAST = { settleMs: 5 } as const;
+
+  const queueOf = (wiring: VerificationWiring): BackgroundQueue => {
+    if (wiring.background === undefined) throw new Error("no background queue");
+    return wiring.background;
+  };
+  const enqueue = (wiring: VerificationWiring, handle: string, x: string, sessionID = "orch"): void =>
+    queueOf(wiring).enqueue({ sessionID, handle, files: [src(x)] });
+  const counts = () => ({ runs: state.runs.length, acquires: state.acquires, git: state.git, snapshots: state.snapshots });
+
+  it("off by default: no queue is constructed, so nothing can ever run in the background", async () => {
+    const { wiring } = makeWiring();
+    expect(wiring.background).toBeUndefined();
+    expect(state.queues).toBe(0);
+    const store = createChangedFileStore();
+    for (let i = 0; i < 3; i++) {
+      await wiring.startDispatch(store, `task:orch:${i}`, state.root, DOD, "", false);
+      state.treeFiles = [{ path: src("a"), status: " M" }];
+      await wiring.finishDeferred(store, { dispatchID: `task:orch:${i}`, orchestratorSessionID: "orch", producerSessionID: `child-${i}`, producerTier: "fast", description: "w", cwd: state.root, dod: DOD, dispatchedAt: 0 });
+      state.treeFiles = [];
+    }
+    await new Promise(resolve => setTimeout(resolve, 30));
+    expect(wiring.pending.listUnverified("orch")).toHaveLength(3);
+    expect(state.runs).toEqual([]);
+    expect(state.acquires).toBe(0);
+    expect(state.queues).toBe(0);
+  });
+
+  it("on: a deferred finish is queued and verified with no router_verify call; a pass makes no notice", async () => {
+    const { wiring, client } = makeWiring({ background: true }, undefined, FAST);
+    expect(state.queues).toBe(1);
+    const store = createChangedFileStore();
+    await wiring.startDispatch(store, "task:orch:1", state.root, DOD, "", false);
+    state.treeFiles = [{ path: src("a"), status: " M" }];
+    const finish = await wiring.finishDeferred(store, {
+      dispatchID: "task:orch:1", orchestratorSessionID: "orch", producerSessionID: "child-1", producerTier: "fast", description: "the work", cwd: state.root, dod: DOD, dispatchedAt: 0,
+    });
+    const h = finish.handle;
+    if (h === undefined) throw new Error(finish.footer);
+    const queue = queueOf(wiring);
+    expect(queue.stats().queued).toBe(1);
+    // The deferred result did not wait for the run: nothing has run yet.
+    expect(state.runs).toEqual([]);
+    await queue.whenIdle();
+    expect(inputsOf("a")).toBe(1);
+    expect(wiring.pending.get("orch", h)).toMatchObject({ kind: "found", entry: { state: "verified", result: { verdict: { outcome: "pass" } } } });
+    expect(queue.takeNotices("orch")).toEqual([]);
+    // Settled exactly as router_verify settles: a later call replays it and runs nothing.
+    const before = counts();
+    const replay = await wiring.verifyHandles("orch", { kind: "handles", handles: [h] });
+    expect(verdictOf(replay.items[0]).via).toBe("cached");
+    expect(counts()).toEqual(before);
+    expect(client.session.create).not.toHaveBeenCalled();
+  });
+
+  it("an introduced failure is one late notice, delivered once; router_verify replays the stored fail without a run", async () => {
+    exactReference();
+    state.failing = { a: ["t2"] };
+    const { wiring, client } = makeWiring({ background: true }, undefined, FAST);
+    const h = await register(wiring.pending, "a");
+    enqueue(wiring, h, "a");
+    const queue = queueOf(wiring);
+    await queue.whenIdle();
+    const notices = queue.takeNotices("orch");
+    expect(notices).toHaveLength(1);
+    expect(notices[0]).toMatchObject({ handle: h, description: "work a", outcome: "fail" });
+    expect(notices[0].introduced.join(" ")).toContain("t2");
+    expect(buildLateNoticeBlock(notices)).toContain(`- ${h} \u00b7 work a \u00b7 failing: `);
+    expect(queue.takeNotices("orch")).toEqual([]);
+    expect(queue.takeNotices("other")).toEqual([]);
+    expect(wiring.pending.get("orch", h)).toMatchObject({ kind: "found", entry: { state: "verified" } });
+    expect(wiring.pending.stats().rejections).toBe(1);
+    const before = counts();
+    const replay = await wiring.verifyHandles("orch", { kind: "handles", handles: [h] });
+    const item = verdictOf(replay.items[0]);
+    expect(item.via).toBe("cached");
+    expect(item.result.verdict.outcome).toBe("fail");
+    expect(item.result.nextTier).toBe("medium");
+    expect(replay.text).toContain(ROUTER_VERIFY_NO_RETRY_TEXT);
+    expect(counts()).toEqual(before);
+    // Nothing was retried or escalated.
+    expect(client.session.create).not.toHaveBeenCalled();
+  });
+
+  it("a router_verify call that joined the background run received the verdict: no late notice repeats it", async () => {
+    exactReference();
+    state.failing = { a: ["t2"] };
+    const { wiring } = makeWiring({ background: true }, undefined, FAST);
+    const h = await register(wiring.pending, "a");
+    const release = holdPlanning("a");
+    enqueue(wiring, h, "a");
+    await vi.waitFor(() => expect(wiring.pending.get("orch", h)).toMatchObject({ entry: { state: "verifying" } }));
+    const joined = wiring.verifyHandles("orch", { kind: "handles", handles: [h] });
+    release();
+    const report = await joined;
+    expect(verdictOf(report.items[0]).via).toBe("joined");
+    await queueOf(wiring).whenIdle();
+    expect(queueOf(wiring).takeNotices("orch")).toEqual([]);
+    expect(inputsOf("a")).toBe(1);
+  });
+
+  it("coalescing: a newer overlapping request supersedes a queued older one, which stays unverified and listed", async () => {
+    const { wiring } = makeWiring({ background: true }, undefined, FAST);
+    const older = await register(wiring.pending, "a");
+    const newer = await register(wiring.pending, "a", { dispatchID: "task:orch:a2", producerSessionID: "child-a2", description: "redo a" });
+    enqueue(wiring, older, "a");
+    enqueue(wiring, newer, "a");
+    const queue = queueOf(wiring);
+    expect(queue.stats()).toMatchObject({ queued: 1, superseded: 1 });
+    await queue.whenIdle();
+    expect(inputsOf("a")).toBe(1);
+    expect(wiring.pending.get("orch", newer)).toMatchObject({ entry: { state: "verified" } });
+    expect(wiring.pending.listUnverified("orch").map(e => e.handle)).toEqual([older]);
+  });
+
+  it("one run at a time, through the slot and one batch per session, at low priority whatever lowPriority says", async () => {
+    const { wiring } = makeWiring({ background: true, lowPriority: false }, undefined, FAST);
+    const ha = await register(wiring.pending, "a");
+    const hb = await register(wiring.pending, "b");
+    const hc = await register(wiring.pending, "c", { orchestratorSessionID: "orch2", dispatchID: "task:orch2:c" });
+    barrier(2);
+    enqueue(wiring, ha, "a");
+    enqueue(wiring, hb, "b");
+    enqueue(wiring, hc, "c", "orch2");
+    const queue = queueOf(wiring);
+    await queue.whenIdle();
+    expect(queue.stats().runs).toBe(2);
+    expect(state.runs.map(r => r.inputs)).toEqual([[src("a"), src("b")].sort(), [src("c")]]);
+    expect(state.acquires).toBe(2);
+    expect(state.maxHolds).toBe(1);
+    expect(state.runs.every(r => r.lowPriority === true)).toBe(true);
+    // router_verify itself keeps the configured priority.
+    const hd = await register(wiring.pending, "d");
+    await wiring.verifyHandles("orch", { kind: "handles", handles: [hd] });
+    expect(state.runs[state.runs.length - 1]?.lowPriority).toBe(false);
+  });
+
+  it("a retryable result (slot busy) returns to unverified and backs off: no hot retry loop", async () => {
+    state.slotBusy = true;
+    const { wiring } = makeWiring({ background: true }, undefined, { settleMs: 5, retryBaseMs: 40, maxAttempts: 2 });
+    const h = await register(wiring.pending, "a");
+    enqueue(wiring, h, "a");
+    const queue = queueOf(wiring);
+    await queue.whenIdle();
+    expect(queue.stats()).toMatchObject({ runs: 1, queued: 1, timerArmed: true });
+    expect(wiring.pending.listUnverified("orch").map(e => e.handle)).toEqual([h]);
+    await vi.waitFor(() => expect(queue.stats().runs).toBe(2));
+    await queue.whenIdle();
+    expect(queue.stats()).toMatchObject({ runs: 2, queued: 0, timerArmed: false, notices: 0 });
+    expect(state.runs).toEqual([]);
+    expect(wiring.pending.get("orch", h)).toMatchObject({ entry: { state: "unverified" } });
+  });
+
+  it("session deletion and dispose cancel a run in flight: its tree is killed and nothing is noticed", async () => {
+    state.hang = true;
+    const { wiring } = makeWiring({ background: true }, undefined, FAST);
+    const queue = queueOf(wiring);
+    const ha = await register(wiring.pending, "a");
+    enqueue(wiring, ha, "a");
+    await vi.waitFor(() => expect(state.runs).toHaveLength(1));
+    queue.forgetSession("orch");
+    await queue.whenIdle();
+    expect(state.killed).toBe(1);
+    expect(queue.stats()).toMatchObject({ queued: 0, running: false, notices: 0 });
+    expect(wiring.pending.get("orch", ha)).toMatchObject({ entry: { state: "unverified" } });
+
+    const hb = await register(wiring.pending, "b");
+    enqueue(wiring, hb, "b");
+    await vi.waitFor(() => expect(state.runs).toHaveLength(2));
+    await wiring.disposeVerification();
+    await vi.waitFor(() => expect(state.killed).toBe(2));
+    expect(queue.stats()).toMatchObject({ queued: 0, timerArmed: false, notices: 0 });
+    // A disposed queue takes nothing new.
+    enqueue(wiring, hb, "b");
+    expect(queue.stats().queued).toBe(0);
+  });
+
+  it("an unattributed change set is not queued (nothing could run; it stays listed); a failing enqueue keeps the handle", async () => {
+    const { wiring } = makeWiring({ background: true }, undefined, FAST);
+    const queue = queueOf(wiring);
+    const finish = (store: ReturnType<typeof createChangedFileStore>, id: string, child: string) =>
+      wiring.finishDeferred(store, { dispatchID: id, orchestratorSessionID: "orch", producerSessionID: child, producerTier: "fast", description: "w", cwd: state.root, dod: DOD, dispatchedAt: 0 });
+    const store = createChangedFileStore();
+    state.snapshotThrows = true;
+    await wiring.startDispatch(store, "task:orch:u", state.root, DOD, "", false);
+    const unattributed = await finish(store, "task:orch:u", "child-u");
+    state.snapshotThrows = false;
+    expect(unattributed.handle).toBeDefined();
+    expect(wiring.pending.listUnverified("orch")[0]?.changedFiles).toBe("unavailable");
+    expect(queue.stats().queued).toBe(0);
+
+    vi.spyOn(queue, "enqueue").mockImplementation(() => {
+      throw new Error("queue exploded");
+    });
+    await wiring.startDispatch(store, "task:orch:v", state.root, DOD, "", false);
+    state.treeFiles = [{ path: src("a"), status: " M" }];
+    const kept = await finish(store, "task:orch:v", "child-v");
+    expect(kept.handle).toBeDefined();
+    expect(kept.footer).toContain(`[router] unverified \u00b7 ${kept.handle} \u00b7`);
+    expect(wiring.sweepVerification()).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
 // The plugin's router_verify tool (2.4.3b)
 // ---------------------------------------------------------------------------------------------
 
@@ -562,6 +822,9 @@ interface ToolHooks {
   tool: Record<string, { execute(args: unknown, ctx?: { sessionID?: string; abort?: AbortSignal }): Promise<string> } | undefined>;
   "tool.execute.before": (input: unknown, output: unknown) => Promise<void>;
   "tool.execute.after": (input: unknown, output: { output: string; metadata: unknown }) => Promise<void>;
+  "experimental.chat.system.transform": (input: { sessionID?: string; model?: { providerID: string; modelID: string } }, output: { system: string[] }) => Promise<void>;
+  event: (input: { event: unknown }) => Promise<void>;
+  dispose: () => Promise<void>;
 }
 
 describe("the router_verify tool (2.4.3b)", () => {
@@ -708,5 +971,59 @@ describe("the router_verify tool (2.4.3b)", () => {
     controller.abort();
     const cancelled = await routerVerify(hooks).execute({ handles: [h] }, { sessionID: "orch", abort: controller.signal });
     expect(cancelled).toContain(`- ${h} \u00b7 work b \u00b7 not judged`);
+  });
+
+  it("background off (the default): the plugin builds no queue and the transform never reads one", async () => {
+    const { hooks } = await makePlugin();
+    expect(plugin.wiring?.background).toBeUndefined();
+    expect(state.queues).toBe(0);
+    const output = { system: [] as string[] };
+    await hooks["experimental.chat.system.transform"]({ sessionID: "orch", model: { providerID: "p", modelID: "m" } }, output);
+    expect(output.system.some(s => s.includes("Background verification"))).toBe(false);
+  });
+
+  it("background on (2.4.5): an entry being verified stays listed; a failure is noticed once; deleted sessions and dispose cancel", async () => {
+    writeOverrides({ background: true });
+    exactReference();
+    state.failing = { a: ["t2"] };
+    const { hooks } = await makePlugin();
+    const queue = plugin.wiring?.background;
+    if (queue === undefined) throw new Error("background: true built no queue");
+    const system = async (): Promise<string[]> => {
+      const output = { system: [] as string[] };
+      await hooks["experimental.chat.system.transform"]({ sessionID: "orch", model: { providerID: "p", modelID: "m" } }, output);
+      return output.system;
+    };
+    const h = await register(registry(), "a");
+    const release = holdPlanning("a");
+    queue.enqueue({ sessionID: "orch", handle: h, files: [src("a")] });
+    await vi.waitFor(() => expect(registry().get("orch", h)).toMatchObject({ entry: { state: "verifying" } }), { timeout: 5_000 });
+    // Being verified in the background is still unverified to the orchestrator.
+    expect((await system()).some(s => s.startsWith("[router] Unverified delegations") && s.includes(h))).toBe(true);
+    release();
+    await queue.whenIdle();
+    const first = await system();
+    const late = first.find(s => s.startsWith("[router] Background verification found introduced failures:"));
+    expect(late).toContain(`- ${h} \u00b7 work a \u00b7 failing: `);
+    expect(first.some(s => s.startsWith("[router] Unverified delegations"))).toBe(false);
+    // Delivered once.
+    expect((await system()).some(s => s.includes("Background verification"))).toBe(false);
+
+    // A deferred native task is queued by the plugin, and session.deleted drops it.
+    const prompt = `Implement it.\n[acceptance]\ncheck: testsPass command="npm test"\n[/acceptance]`;
+    const input = { tool: "task", sessionID: "orch", callID: "c9", args: { subagent_type: "fast", prompt, description: "more work" } };
+    const before = { args: { ...input.args } };
+    await hooks["tool.execute.before"](input, before);
+    state.treeFiles = [{ path: src("b"), status: " M" }];
+    const output = { output: "<task_result>\nDONE\n</task_result>", metadata: { sessionId: "child9" } };
+    await hooks["tool.execute.after"]({ ...input, args: before.args }, output);
+    expect(output.output).toMatch(/\[router\] unverified \u00b7 vrf_[0-9a-f]{24} \u00b7/);
+    expect(queue.stats().queued).toBe(1);
+    await hooks.event({ event: { type: "session.deleted", properties: { info: { id: "orch" } } } });
+    expect(queue.stats()).toMatchObject({ queued: 0, timerArmed: false });
+
+    const dispose = vi.spyOn(queue, "dispose");
+    await hooks.dispose();
+    expect(dispose).toHaveBeenCalled();
   });
 });

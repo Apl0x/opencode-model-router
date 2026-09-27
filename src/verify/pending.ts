@@ -13,7 +13,8 @@
 //   default): what a later `router_verify` call (2.4.3), the pending list (2.4.4) and background
 //   mode (2.4.5) need to verify one delegation after its producer has returned.
 //   - Pure in-memory state with an injected clock and an injected random source. It never spawns
-//     a process, never runs git, never touches the filesystem and owns no timer.
+//     a process, never runs git, never touches the filesystem and owns no timer. (The R14
+//     background queue in this file owns one timer; it exists only when `background: true`.)
 //   - It does not run verifications. It records who may verify what, hands the in-flight run to
 //     concurrent callers, and stores the settled result.
 //   - It does not parse directives, compute changed files, assess risk or build the scoped run.
@@ -213,11 +214,16 @@
 //     - ... and <n - m> more                              (only when n > m)
 //     [router] Before your final answer, call `router_verify` with the handles that matter, or with `pending: true` for all of them.
 //
-//   buildLateNoticeBlock(notices)  (section 1.5-19, background mode only; 2.4.5 owns the queue):
+//   buildLateNoticeBlock(notices)  (section 1.5-19, background mode only; R14 owns the queue):
 //     undefined when empty; otherwise
-//     [router] Background verification found introduced failures:
-//     - <handle> · <description> · failing: <id>, <id> (+<k> more)   (ids capped at 10)
+//     [router] Background verification found introduced failures:          (every notice a fail)
+//     [router] Background verification did not pass these delegations:    (otherwise)
+//     - <handle> · <description> · failing: <id>, <id> (+<k> more)   (a fail with ids, capped at 10)
+//     - <handle> · <description> · failed: <reason>                  (a fail that names no id)
+//     - <handle> · <description> · unverifiable: <reason>            (terminal unverifiable)
 //     [router] Nothing was retried; decide whether to re-dispatch.
+//     [router] Call `router_verify` with a handle for its full verdict; nothing is run again.
+//     <reason> goes through sanitizeDescription (80 code points, directive-safe).
 //
 //   sanitizeDescription(text): every C0/C1 control, U+2028/U+2029 and tab -> space; backtick ->
 //   `'`; runs of whitespace -> one space; trim; longer than MAX_DESCRIPTION_CHARS -> the first
@@ -307,9 +313,9 @@
 //           enabled (independent of enableDelegateTool). Tests: router-verify-tool.test.ts.
 //   2.4.4   index.ts system transform: buildPendingListBlock(listUnverified(sid)) appended only
 //           when defined. Tests: cap 5, newest first, leaves on verify/TTL, per-session.
-//   2.4.5   background (only when background: true): the queue factory in this file, coalescing,
-//           same coordinator/slot/caps, late notices via buildLateNoticeBlock once per handle;
-//           the queue is never constructed when false (assert). Tests: the plan's background set.
+//   2.4.5   (done, R14) background (only when background: true): the queue factory in this file,
+//           coalescing, same coordinator/slot/caps, late notices via buildLateNoticeBlock once per
+//           handle; the queue is never constructed when false (assert). Tests: the plan's set.
 //   2.4.6   remaining plan tests (latency under fake timers, capture after the wait, subagent
 //           cannot self-select, 50 deferred delegations spawn nothing).
 //
@@ -322,6 +328,41 @@
 //   - The registry lives in one plugin instance: a restarted opencode process loses its handles
 //     (router_verify then says "unknown handle"); nothing persists across processes by design.
 //   - Lineage (R11) is id-based: a renamed test id escapes it (the pass keeps 2.1's n2 note).
+//
+// R14. BACKGROUND QUEUE (task 2.4.5; section 1.5-19; `background: true` only)
+//
+//   - Construction: the wiring calls createBackgroundQueue only when `background` is true at plugin
+//     start. When it is false (the default) no queue, timer, notice store or run exists, and no
+//     code path reaches one (the wiring holds `undefined`).
+//   - Input: the wiring's deferred finish enqueues every registered entry whose change set is
+//     attributed ({ sessionID, handle, files }). An "unavailable" set is not queued: nothing could
+//     be run for it, and settling it would only move it out of the pending list.
+//   - Coalescing: a newer request of the same orchestrator session whose files overlap a QUEUED
+//     older one drops the older request (its producer's files changed again, so its verdict would
+//     be a drift notice at best). The older entry stays unverified and listed; it is never
+//     reported as verified. Requests of other sessions are never dropped by it.
+//   - Scheduling: one unref'd timer, armed at the earliest due request and never moved later (no
+//     debounce: a steady stream cannot starve the queue). A fresh request is due BACKGROUND_SETTLE_MS
+//     after it arrives, so delegations returning together share one run. One run per plugin
+//     instance at a time. A run takes the oldest due request, then every fresh or due request of
+//     the same session (at most MAX_HANDLES_PER_CALL): one verify call, i.e. one router_verify
+//     deadline and one S5 window.
+//   - The run is `verify` = the wiring's verifyHandles (the required gate's path, slot, caps, batch
+//     coordinator, low priority), so it claims and settles entries exactly as router_verify does:
+//     a later router_verify replays the stored verdict and runs nothing.
+//   - Outcomes: a terminal pass -> nothing; a terminal fail or unverifiable -> one late notice for
+//     the orchestrator session (lateNoticeFor); a retryable result -> requeued with backoff
+//     retryBaseMs * 2^(attempt-1), at most BACKGROUND_MAX_ATTEMPTS runs, then it just stays
+//     unverified (never a hot loop); "reported" (a router_verify call claimed or had settled it)
+//     and "gone" (unknown/expired) -> dropped. A handle missing from the outcomes, or a rejected
+//     verify, counts as retryable.
+//   - Notices: per session, one per handle, returned once by takeNotices (the system transform) and
+//     remembered as delivered. markReported(handles) (router_verify's verdict items) drops and
+//     suppresses a notice the orchestrator already saw. Bounded: LATE_NOTICES_PER_SESSION,
+//     LATE_NOTICES_MAX, REPORTED_MEMO_MAX; sweep drops notices older than ttlMs.
+//   - Cancellation: forgetSession (session.deleted) drops the session's requests and notices and
+//     aborts its run in flight (the deadline, so the batch's tree is killed); dispose aborts the run,
+//     clears the timer and drops everything. A cancelled run's results are ignored.
 // ===============================================================================================
 
 import { randomBytes } from "node:crypto";
@@ -369,6 +410,24 @@ export const RELEASED_REASON = "reference released after verification";
 export const ABANDONED_REASON = "verification run abandoned before it settled";
 export const DISPOSED_REASON = "verification registry disposed";
 export const UNATTRIBUTED_RISK_REASON = "changed files could not be attributed";
+/** R14: the late-notice header when a notice is not a plain failure (an unverifiable result). */
+export const LATE_NOTICE_MIXED_HEADER = "[router] Background verification did not pass these delegations:";
+/** R14: a settled handle replays its cached verdict (forcing note, next tier) with no new run. */
+export const LATE_NOTICE_REPLAY_LINE = "[router] Call `router_verify` with a handle for its full verdict; nothing is run again.";
+
+/** R14: a fresh background request waits this long, so delegations returning together share a run. */
+export const BACKGROUND_SETTLE_MS = 1_000;
+/** R14: the first retry of a retryable background result; each later retry doubles it. */
+export const BACKGROUND_RETRY_BASE_MS = 30_000;
+/** R14: background runs per request, retries included; then the entry just stays unverified. */
+export const BACKGROUND_MAX_ATTEMPTS = 3;
+/** R14: queued background requests; the oldest is dropped beyond it (it stays unverified). */
+export const BACKGROUND_QUEUE_MAX = MAX_ENTRIES_GLOBAL;
+/** R14: undelivered late notices per orchestrator session, and in total. */
+export const LATE_NOTICES_PER_SESSION = MAX_ENTRIES_PER_SESSION;
+export const LATE_NOTICES_MAX = MAX_ENTRIES_GLOBAL;
+/** R14: handles whose verdict reached the orchestrator (delivered, or through router_verify). */
+export const REPORTED_MEMO_MAX = TOMBSTONE_MAX;
 
 // ---------------------------------------------------------------------------------------------
 // Types
@@ -555,7 +614,12 @@ export interface FooterInput {
 export interface LateNotice {
   readonly handle: string;
   readonly description: string;
+  /** Proven-introduced test ids; empty when the run named none. */
   readonly introduced: readonly string[];
+  /** R14: "unverifiable" when the run could not judge the work (terminal). Default "fail". */
+  readonly outcome?: "fail" | "unverifiable";
+  /** R14: the first reason, shown for an unverifiable result and for a fail that names no id. */
+  readonly reason?: string;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1078,6 +1142,392 @@ export function createPendingRegistry(options: PendingRegistryOptions): PendingR
 }
 
 // ---------------------------------------------------------------------------------------------
+// Background queue (R14, task 2.4.5; section 1.5-19). Constructed only when `background: true`.
+// ---------------------------------------------------------------------------------------------
+
+/** One deferred delegation queued for background verification (the wiring's deferred finish). */
+export interface BackgroundRequest {
+  readonly sessionID: string;
+  readonly handle: string;
+  /** The entry's stored changed paths (absolute); coalescing compares them. */
+  readonly files: readonly string[];
+}
+
+/** What one background run reports per handle. */
+export type BackgroundOutcome =
+  /** This run claimed and settled the handle (router_verify's "run"). */
+  | { readonly kind: "judged"; readonly handle: string; readonly description: string; readonly result: SettledVerification }
+  /** A router_verify call judged it or is judging it: that caller has the verdict. */
+  | { readonly kind: "reported"; readonly handle: string }
+  /** Unknown or expired: the entry is gone. */
+  | { readonly kind: "gone"; readonly handle: string };
+
+/** The gate path of one background run: router_verify's verifyHandles for one session. Never rejects in production. */
+export type BackgroundVerify = (sessionID: string, handles: readonly string[], signal: AbortSignal) => Promise<readonly BackgroundOutcome[]>;
+
+export interface BackgroundTimers {
+  setTimeout(callback: () => void, ms: number): unknown;
+  clearTimeout(handle: unknown): void;
+}
+
+export interface BackgroundQueueOptions {
+  readonly verify: BackgroundVerify;
+  /** pendingTtlMs: an undelivered notice older than this is dropped by sweep. */
+  readonly ttlMs: number;
+  /** Injected clock; default Date.now. */
+  readonly now?: () => number;
+  /** Injected timers; default unref'd setTimeout. */
+  readonly timers?: BackgroundTimers;
+  readonly settleMs?: number;
+  readonly retryBaseMs?: number;
+  readonly maxAttempts?: number;
+  /** Paths compare case-folded (and slash-normalized) on win32; default process.platform. */
+  readonly platform?: NodeJS.Platform;
+  /** Logging hook for a rejected run; never throws into the queue. */
+  readonly onError?: (error: unknown) => void;
+}
+
+export interface BackgroundQueueStats {
+  readonly queued: number;
+  readonly running: boolean;
+  readonly timerArmed: boolean;
+  readonly notices: number;
+  readonly superseded: number;
+  readonly runs: number;
+}
+
+export interface BackgroundQueue {
+  /** Queues a deferred delegation; a queued older request of the session with overlapping files is dropped. */
+  enqueue(request: BackgroundRequest): void;
+  /** The session's undelivered notices, oldest first; each is returned once (delivered on read). */
+  takeNotices(sessionID: string): readonly LateNotice[];
+  /** A router_verify caller received these handles' verdicts: no late notice for them. */
+  markReported(handles: readonly string[]): void;
+  /** session.deleted: drops the session's requests and notices, and aborts its run in flight. */
+  forgetSession(sessionID: string): void;
+  /** Drops undelivered notices older than ttlMs; returns how many. The idle trigger (R14). */
+  sweep(nowMs?: number): number;
+  stats(): BackgroundQueueStats;
+  /** Resolves once no run is in flight and no request is fresh or due (tests, diagnostics). */
+  whenIdle(): Promise<void>;
+  /** Plugin dispose: aborts the run in flight, clears the timer, drops everything. Idempotent. */
+  dispose(): void;
+}
+
+const DEFAULT_BACKGROUND_TIMERS: BackgroundTimers = {
+  setTimeout(callback, ms) {
+    const handle = setTimeout(callback, ms);
+    handle.unref?.();
+    return handle;
+  },
+  clearTimeout(handle) {
+    clearTimeout(handle as ReturnType<typeof setTimeout>);
+  },
+};
+
+/** R14. */
+export function createBackgroundQueue(options: BackgroundQueueOptions): BackgroundQueue {
+  const now = options.now ?? Date.now;
+  const timers = options.timers ?? DEFAULT_BACKGROUND_TIMERS;
+  const settleMs = Math.max(0, options.settleMs ?? BACKGROUND_SETTLE_MS);
+  const retryBaseMs = Math.max(0, options.retryBaseMs ?? BACKGROUND_RETRY_BASE_MS);
+  const maxAttempts = Math.max(1, Math.floor(options.maxAttempts ?? BACKGROUND_MAX_ATTEMPTS));
+  const foldCase = (options.platform ?? process.platform) === "win32";
+  const pathKey = (p: string): string => (foldCase ? p.replace(/\\/g, "/").toLowerCase() : p);
+
+  interface QueuedItem {
+    readonly sessionID: string;
+    readonly handle: string;
+    readonly files: ReadonlySet<string>;
+    /** Runs already made for this request (0 = fresh). */
+    readonly attempts: number;
+    readonly notBefore: number;
+  }
+  interface Run {
+    readonly sessionID: string;
+    readonly items: readonly QueuedItem[];
+    readonly controller: AbortController;
+    cancelled: boolean;
+  }
+  interface StoredNotice {
+    readonly notice: LateNotice;
+    readonly at: number;
+  }
+
+  /** handle -> request; insertion order = FIFO. */
+  const queue = new Map<string, QueuedItem>();
+  /** orchestrator session -> handle -> notice; insertion order = settle order. */
+  const notices = new Map<string, Map<string, StoredNotice>>();
+  const reported = new Set<string>();
+  const idleWaiters: Array<() => void> = [];
+  const counters = { superseded: 0, runs: 0, notices: 0, hookFailures: 0 };
+  let running: Run | undefined;
+  let timer: { readonly handle: unknown; readonly at: number } | undefined;
+  let disposed = false;
+
+  function report(error: unknown): void {
+    try {
+      options.onError?.(error);
+    } catch {
+      // A logging hook must never break the queue (BackgroundQueueOptions.onError).
+      counters.hookFailures += 1;
+    }
+  }
+
+  function overlaps(a: ReadonlySet<string>, b: ReadonlySet<string>): boolean {
+    for (const f of a) if (b.has(f)) return true;
+    return false;
+  }
+
+  function remember(handle: string): void {
+    reported.delete(handle);
+    reported.add(handle);
+    while (reported.size > REPORTED_MEMO_MAX) {
+      const oldest = reported.values().next();
+      if (oldest.done === true) break;
+      reported.delete(oldest.value);
+    }
+  }
+
+  function removeNotice(sessionID: string, handle: string): void {
+    const list = notices.get(sessionID);
+    if (list === undefined || !list.delete(handle)) return;
+    counters.notices -= 1;
+    if (list.size === 0) notices.delete(sessionID);
+  }
+
+  function addNotice(sessionID: string, notice: LateNotice): void {
+    if (reported.has(notice.handle)) return;
+    const list = notices.get(sessionID) ?? new Map<string, StoredNotice>();
+    if (list.has(notice.handle)) return;
+    list.set(notice.handle, { notice, at: now() });
+    notices.set(sessionID, list);
+    counters.notices += 1;
+    if (list.size > LATE_NOTICES_PER_SESSION) removeNotice(sessionID, list.keys().next().value ?? "");
+    while (counters.notices > LATE_NOTICES_MAX) {
+      let victim: { readonly sessionID: string; readonly handle: string; readonly at: number } | undefined;
+      for (const [sid, stored] of notices) {
+        const first = stored.entries().next();
+        if (first.done === true) continue;
+        const [handle, oldest] = first.value;
+        if (victim === undefined || oldest.at < victim.at) victim = { sessionID: sid, handle, at: oldest.at };
+      }
+      if (victim === undefined) break;
+      removeNotice(victim.sessionID, victim.handle);
+    }
+  }
+
+  function wakeIdle(): void {
+    for (const resolveIdle of idleWaiters.splice(0)) resolveIdle();
+  }
+
+  /** Quiet: no run in flight, and every queued request is backing off into the future. */
+  function isQuiet(at: number): boolean {
+    if (running !== undefined) return false;
+    for (const item of queue.values()) if (item.attempts === 0 || item.notBefore <= at) return false;
+    return true;
+  }
+
+  /** One timer at a time, at the earliest due request; never moved later (no debounce). */
+  function arm(at: number): void {
+    if (disposed) return;
+    if (timer !== undefined) {
+      if (timer.at <= at) return;
+      timers.clearTimeout(timer.handle);
+    }
+    const handle = timers.setTimeout(() => {
+      timer = undefined;
+      runNext();
+    }, Math.max(0, at - now()));
+    timer = { handle, at };
+  }
+
+  function reschedule(): void {
+    if (disposed || running !== undefined) return;
+    let next: number | undefined;
+    for (const item of queue.values()) next = next === undefined ? item.notBefore : Math.min(next, item.notBefore);
+    if (next !== undefined) arm(next);
+    else if (timer !== undefined) {
+      timers.clearTimeout(timer.handle);
+      timer = undefined;
+    }
+    if (isQuiet(now())) wakeIdle();
+  }
+
+  function enforceCap(): void {
+    while (queue.size > BACKGROUND_QUEUE_MAX) {
+      const oldest = queue.keys().next();
+      if (oldest.done === true) break;
+      queue.delete(oldest.value);
+    }
+  }
+
+  /** A retryable result: back off, never a hot loop; after maxAttempts it stays unverified. */
+  function retry(item: QueuedItem): void {
+    const attempts = item.attempts + 1;
+    if (attempts >= maxAttempts) return;
+    for (const other of queue.values()) {
+      if (other.sessionID === item.sessionID && overlaps(other.files, item.files)) {
+        counters.superseded += 1;
+        return;
+      }
+    }
+    queue.set(item.handle, { ...item, attempts, notBefore: now() + retryBaseMs * 2 ** (attempts - 1) });
+    enforceCap();
+  }
+
+  function apply(run: Run, outcomes: readonly BackgroundOutcome[]): void {
+    const byHandle = new Map(outcomes.map(o => [o.handle, o] as const));
+    for (const item of run.items) {
+      const outcome = byHandle.get(item.handle);
+      if (outcome === undefined) retry(item);
+      else if (outcome.kind !== "judged") continue;
+      else if (outcome.result.retryable) retry(item);
+      else {
+        const notice = lateNoticeFor(item.handle, outcome.description, outcome.result);
+        if (notice !== undefined) addNotice(run.sessionID, notice);
+      }
+    }
+  }
+
+  function finish(run: Run, outcomes: readonly BackgroundOutcome[]): void {
+    try {
+      if (!disposed && !run.cancelled) apply(run, outcomes);
+    } finally {
+      if (running === run) running = undefined;
+      reschedule();
+    }
+  }
+
+  function runNext(): void {
+    if (disposed || running !== undefined) return;
+    const at = now();
+    let first: QueuedItem | undefined;
+    for (const item of queue.values()) {
+      if (item.notBefore <= at && (first === undefined || item.notBefore < first.notBefore)) first = item;
+    }
+    if (first === undefined) {
+      reschedule();
+      return;
+    }
+    const lead = first;
+    // One session per run (verifyHandles is session-scoped): its fresh and due requests ride along.
+    const riders = [...queue.values()].filter(i => i !== lead && i.sessionID === lead.sessionID && (i.attempts === 0 || i.notBefore <= at));
+    const items = [lead, ...riders].slice(0, MAX_HANDLES_PER_CALL);
+    for (const item of items) queue.delete(item.handle);
+    const run: Run = { sessionID: lead.sessionID, items, controller: new AbortController(), cancelled: false };
+    running = run;
+    counters.runs += 1;
+    let outcome: Promise<readonly BackgroundOutcome[]>;
+    try {
+      outcome = options.verify(run.sessionID, items.map(i => i.handle), run.controller.signal);
+    } catch (error) {
+      outcome = Promise.reject(error);
+    }
+    outcome
+      .then(
+        outcomes => finish(run, outcomes),
+        (error: unknown) => {
+          report(error);
+          finish(run, []);
+        },
+      )
+      .catch(report);
+  }
+
+  return {
+    enqueue(request) {
+      if (disposed || !isNonEmptyString(request.sessionID) || !isNonEmptyString(request.handle)) return;
+      if (queue.has(request.handle) || running?.items.some(i => i.handle === request.handle) === true) return;
+      const files = new Set(request.files.map(pathKey));
+      // Section 1.5-19: a newer request for an overlapping file set supersedes a queued older one.
+      // The older entry stays unverified (and listed); it is never reported as verified.
+      for (const other of [...queue.values()]) {
+        if (other.sessionID === request.sessionID && overlaps(other.files, files)) {
+          queue.delete(other.handle);
+          counters.superseded += 1;
+        }
+      }
+      const at = now();
+      queue.set(request.handle, { sessionID: request.sessionID, handle: request.handle, files, attempts: 0, notBefore: at + settleMs });
+      enforceCap();
+      if (running === undefined) arm(at + settleMs);
+    },
+    takeNotices(sessionID) {
+      const list = notices.get(sessionID);
+      if (list === undefined) return [];
+      notices.delete(sessionID);
+      counters.notices -= list.size;
+      const out = [...list.values()].map(s => s.notice);
+      for (const n of out) remember(n.handle);
+      return out;
+    },
+    markReported(handles) {
+      for (const handle of handles) {
+        remember(handle);
+        for (const sid of [...notices.keys()]) removeNotice(sid, handle);
+      }
+    },
+    forgetSession(sessionID) {
+      for (const item of [...queue.values()]) if (item.sessionID === sessionID) queue.delete(item.handle);
+      const list = notices.get(sessionID);
+      if (list !== undefined) {
+        counters.notices -= list.size;
+        notices.delete(sessionID);
+      }
+      if (running?.sessionID === sessionID) {
+        running.cancelled = true;
+        running.controller.abort();
+      }
+      reschedule();
+    },
+    sweep(nowMs) {
+      const at = nowMs ?? now();
+      let dropped = 0;
+      for (const [sid, list] of [...notices]) {
+        for (const [handle, stored] of [...list]) {
+          if (at - stored.at < options.ttlMs) continue;
+          removeNotice(sid, handle);
+          dropped += 1;
+        }
+      }
+      reschedule();
+      return dropped;
+    },
+    stats() {
+      return {
+        queued: queue.size,
+        running: running !== undefined,
+        timerArmed: timer !== undefined,
+        notices: counters.notices,
+        superseded: counters.superseded,
+        runs: counters.runs,
+      };
+    },
+    whenIdle() {
+      if (disposed || isQuiet(now())) return Promise.resolve();
+      return new Promise<void>(resolveIdle => idleWaiters.push(resolveIdle));
+    },
+    dispose() {
+      if (disposed) return;
+      disposed = true;
+      if (timer !== undefined) {
+        timers.clearTimeout(timer.handle);
+        timer = undefined;
+      }
+      if (running !== undefined) {
+        running.cancelled = true;
+        running.controller.abort();
+      }
+      queue.clear();
+      notices.clear();
+      counters.notices = 0;
+      wakeIdle();
+    },
+  };
+}
+
+// ---------------------------------------------------------------------------------------------
 // Pure builders (R2, R9, R10, R11)
 // ---------------------------------------------------------------------------------------------
 
@@ -1143,17 +1593,41 @@ export function buildPendingListBlock(entries: readonly PendingEntry[]): string 
   return lines.join("\n");
 }
 
-/** R9, section 1.5-19 (background mode only). undefined when empty. */
+/** R9, section 1.5-19 (background mode only; R14). undefined when empty. */
 export function buildLateNoticeBlock(notices: readonly LateNotice[]): string | undefined {
   if (notices.length === 0) return undefined;
-  const lines = ["[router] Background verification found introduced failures:"];
+  const allFailures = notices.every(n => (n.outcome ?? "fail") === "fail");
+  const lines = [allFailures ? "[router] Background verification found introduced failures:" : LATE_NOTICE_MIXED_HEADER];
   for (const n of notices) {
-    lines.push(
-      `- ${n.handle} \u00b7 ${sanitizeDescription(n.description)} \u00b7 failing: ${formatIds(n.introduced, LATE_NOTICE_MAX_IDS)}`,
-    );
+    const head = `- ${n.handle} \u00b7 ${sanitizeDescription(n.description)} \u00b7 `;
+    if ((n.outcome ?? "fail") === "unverifiable") lines.push(`${head}unverifiable: ${sanitizeDescription(n.reason ?? "no verdict")}`);
+    else if (n.introduced.length > 0) lines.push(`${head}failing: ${formatIds(n.introduced, LATE_NOTICE_MAX_IDS)}`);
+    else lines.push(`${head}failed: ${sanitizeDescription(n.reason ?? "no reason given")}`);
   }
   lines.push("[router] Nothing was retried; decide whether to re-dispatch.");
+  lines.push(LATE_NOTICE_REPLAY_LINE);
   return lines.join("\n");
+}
+
+/**
+ * R14: the late notice of a background run's OWN terminal result; undefined for a pass and for a
+ * retryable result (the entry stays unverified and listed). An unverifiable result gets a notice
+ * too: it leaves the pending list at its settle, and silence would read like a pass. Pure.
+ */
+export function lateNoticeFor(handle: string, description: string, result: VerificationResult): LateNotice | undefined {
+  if (result.retryable) return undefined;
+  const verdict = result.verdict;
+  const outcome = verdict.outcome ?? (verdict.pass ? "pass" : "fail");
+  if (outcome === "pass") return undefined;
+  // A drift or lineage downgrade appends its caveat last; a gate's own cause is its first reason.
+  const reason = verdict.reasons.find(r => r.trim() !== "") ?? [...(verdict.caveats ?? [])].reverse().find(r => r.trim() !== "");
+  return {
+    handle,
+    description,
+    introduced: outcome === "fail" ? [...(result.introduced ?? [])] : [],
+    outcome,
+    ...(reason !== undefined ? { reason } : {}),
+  };
 }
 
 /**
