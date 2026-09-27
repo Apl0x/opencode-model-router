@@ -275,6 +275,23 @@ describe("timeoutMs", () => {
   }, 20000);
 });
 
+describe("process lifecycle", () => {
+  it.runIf(!isWin)("kills live process groups from a single process 'exit' hook (POSIX-only: detached groups escape a hang-up; Windows children die with libuv's job)", async () => {
+    const f = forkingFixture();
+    const pending = runArgv(process.execPath, [f.script, f.pidFile], { cwd: f.dir, timeoutMs: 30000 });
+    await waitForFile(f.pidFile);
+    await Promise.all([1, 2, 3].map(() => runArgv(process.execPath, ["-e", ""], { cwd: tmpdir(), timeoutMs: 20000 })));
+    const hooks = process.listeners("exit").filter(l => l.name === "killTrackedProcessGroups");
+    expect(hooks).toHaveLength(1);
+    // What runs when opencode exits mid-run.
+    hooks[0](0);
+    const r = await pending;
+    expect(r.code).not.toBe(0);
+    expect(await waitForExit(f.grandchild())).toBe(true);
+    expect(process.listeners("exit").filter(l => l.name === "killTrackedProcessGroups")).toHaveLength(1);
+  }, 30000);
+});
+
 describe("lowPriority", () => {
   // Windows: BELOW_NORMAL base priority is 6 (normal 8). POSIX: `nice -n 10`.
   const lowered = (p: number) => (isWin ? p <= 6 : p >= 10);

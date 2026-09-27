@@ -101,6 +101,8 @@ function run(file: string, args: string[], shell: boolean, opts: RunOptions, nic
       resolve({ code: 1, stdout: "", stderr: `exec failed: ${String(e)}`, timedOut: false });
       return;
     }
+    const pid = child.pid;
+    if (!isWin && pid) trackGroup(pid);
     if (opts.lowPriority && isWin && child.pid) {
       // Windows low priority (Spike A, docs/qa/verification-resource-budget/phase-1.2.md):
       // lower the direct child right after spawn; descendants inherit the class
@@ -144,6 +146,7 @@ function run(file: string, args: string[], shell: boolean, opts: RunOptions, nic
       settled = true;
       clearTimeout(timer);
       opts.signal?.removeEventListener("abort", kill);
+      if (!isWin && pid) untrackGroup(pid);
       let finalCode = killed ? code || 1 : code ?? 1;
       let stderr = err.text;
       if (niceTarget && !killed && (code === 126 || code === 127) && stderr.startsWith("nice:")) {
@@ -232,10 +235,41 @@ function killTree(child: ChildProcess): void {
     });
     return;
   }
+  // No group (already reaped or never detached): fall back to the direct child.
+  if (!signalGroup(pid, "SIGKILL")) child.kill("SIGKILL");
+}
+
+// POSIX: detached children lead their own process group and session, so a
+// terminal hang-up or Ctrl-C that ends opencode never reaches them. Groups of
+// runs still in flight are killed when opencode exits. Death by an unhandled
+// signal (the host's SIGTERM/SIGHUP policy) skips `exit` hooks and remains
+// opencode's concern. On Windows, non-detached children sit in libuv's
+// kill-on-close job instead.
+const liveGroups = new Set<number>();
+let exitHookInstalled = false;
+
+function trackGroup(pgid: number): void {
+  liveGroups.add(pgid);
+  if (exitHookInstalled) return;
+  exitHookInstalled = true;
+  process.once("exit", killTrackedProcessGroups);
+}
+
+function untrackGroup(pgid: number): void {
+  liveGroups.delete(pgid);
+}
+
+/** The `exit` hook: synchronous, as `exit` listeners must be. */
+function killTrackedProcessGroups(): void {
+  for (const pgid of liveGroups) signalGroup(pgid, "SIGKILL");
+  liveGroups.clear();
+}
+
+function signalGroup(pgid: number, signal: NodeJS.Signals): boolean {
   try {
-    process.kill(-pid, "SIGKILL");
+    process.kill(-pgid, signal);
+    return true;
   } catch {
-    // No group (already reaped or never detached): fall back to the direct child.
-    child.kill("SIGKILL");
+    return false;
   }
 }
