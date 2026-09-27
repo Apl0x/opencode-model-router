@@ -182,3 +182,132 @@ only indirectly does not run. The indirect routes are another source module (`ap
 `app/mod01.py`) and a dynamic import. The direct importers still run. A full reverse-import closure
 would multiply the git processes, bounded by SEARCH_LIMIT. Making every non-leaf module S6 would have
 turned the green control unverifiable.
+
+### E2E-2 — major — an 8.3 short path disabled every reference recheck
+
+**Found by** both e2e files, which worked around it by creating their root under
+`realpathSync.native(os.tmpdir())`. On this host `os.tmpdir()` is `C:\Users\MARQUI~1\AppData\Local\Temp`.
+With the raw spelling, the plugin directory, TEMP and the reference worktrees are all short. The
+required gate on an introduced failure then said:
+
+```
+[router ✓ accepted: deterministic]
+Verification caveats — NOT verified (acceptance is not a passing check):
+- testsPass: cannot attribute failures: reference unusable (rerun-unplannable): runner not installed: vitest; observed failures: test/m20-1.test.js > m20 (1) > double doubles the value, ...
+```
+
+Introduced failures were accepted with a caveat, and pre-existing ones were never excused. This is
+QA-2.4-23 (`ctx.directory` in 8.3 form), now confirmed on a real host setup.
+
+**Root cause** (line numbers at 84d1e48).
+
+- The implementer's note blamed the `node_modules` link check in materialize
+  (`reference.ts:1766-1772`). A probe refuted that. With an 8.3 tmpdir and an 8.3 repository path,
+  materialize linked `node_modules` (`links` held the entry and `unreproduced` was empty). The reason
+  is that the reference dir is built under `fs.promises.realpath(tmpdir)` (`:1611`), which is the
+  native realpath (long form), so `realpath(parent)` and `dir` agree. Measured on this host:
+  `fs.realpathSync` keeps `MARQUI~1`, while `realpathSync.native` and `fs.promises.realpath` give
+  `Marquinho`.
+- The message came from `resolveEntry` (`runner.ts:3458`), called by the recheck at
+  `deterministic.ts:1075` with the raw request cwd (the plugin directory, short). `detectRunner`
+  returns `gitRoot` realpath'd (long). `ancestors(ctx, cwd, req.gitRoot)` (`runner.ts:1625-1626`)
+  returns nothing when cwd is not lexically inside gitRoot, so `node_modules/vitest/package.json` was
+  never found. Every internal caller of `resolveEntryImpl` canonicalises its cwd first
+  (`canonicalCwd`); the exported `resolveEntry` was the only one that did not. Probe:
+  `resolveEntry(runner, <8.3 repo>)` gave `{"code":"runner-not-installed","reason":"runner not
+  installed: vitest"}`, and `resolveEntry(runner, runner.runnerCwd)` gave the entry.
+- A second, latent gap: `toRefPath` mapped only paths lexically under `ref.root`, which is git's
+  spelling. The planner's paths (runner cwd, failing files) are realpath'd, so a root that git spells
+  through an 8.3 name, a junction or a subst drive mapped nothing ("the runner cwd is outside the
+  reference root"). It did not fire here: git printed the long root (`C:/Users/Marquinho/...`) from an
+  8.3 cwd.
+
+**Resolution** (29760a6, `fix(verify): canonicalise 8.3 short paths in the reference recheck`; the
+deferred e2e workaround removal is 4892535, the matrix one went in with 84d1e48).
+
+- `runner.ts:4576-4586`: the exported `resolveEntry` canonicalises cwd and gitRoot with the native
+  realpath (`canonicalCwd`). Its fs parameter is now `PlannerFs` (an `FsSeam` still fits).
+- `deterministic.ts:1079`: the recheck resolves the entry from `runner.runnerCwd`, the canonical start
+  the scoped plan used (`planScopedRun`), instead of the raw liveCwd. The T4.i design note says so.
+- `reference.ts:1894-1905`: `toRefPath` maps paths under the root or under its native realpath.
+  `ReferenceFs.realpath` is documented as the native realpath.
+- Checked and unchanged. materialize creates the dir directly under `realpath(tmpdir)` (`:1623`).
+  `assertSafeRefDir` takes both `resolve(tmpdir)` and `realpath(tmpdir)` as tmp roots (`tmpRootsFor`),
+  so both spellings pass R3; the existing R3 tests cover both. GC scans both tmp roots and matches
+  ACTIVE, RELEASED and registered entries by the realpath key. R1–R4 are untouched: no removal path
+  changed, dispose still unlinks the junction first, and the new tests check that the store behind
+  the junction survives.
+
+**Evidence.**
+
+- Unit tests (real git, a real `node_modules` junction, real 8.3 spellings from `cmd.exe /d /s /c "for
+  %I in ("<long>") do @echo %~sI"` spawned with an argv; skipped with a console message only when the
+  volume has 8.3 names disabled):
+  - `test/unit/reference.test.ts` "8.3 short paths (E2E-2)": capture from the 8.3 cwd, materialize
+    with an 8.3 tmpdir, and both root spellings.
+  - `test/unit/tests-pass-pipeline.test.ts` "scope.rechecker under 8.3 short paths (E2E-2)": the real
+    opener with the real detectRunner, resolveEntry, planRerun, materialize and GC; only the rerun
+    spawn and its report are stubbed. Also a direct resolveEntry test.
+- Against the unfixed product in a separate worktree, all three fail. The recheck returns `unusable`,
+  resolveEntry returns `runner not installed: vitest`, and toRefPath returns undefined for the long
+  path under an 8.3 root. With only the runner.ts hunk, the two runner tests pass and the toRefPath
+  test still fails. With the whole fix, all pass.
+- The affected unit suites (reference, tests-pass-pipeline, baseline-wiring, baseline, dispatch,
+  runner, deterministic) at 84d1e48 plus the fixes: 1148/1148. `tsc --noEmit` passes.
+- reference.ts coverage, from reference.test.ts alone: statements 83.41 → 83.56, branches
+  77.04 → 77.38, functions 95.5 → 95.5, lines 89.76 → 89.77.
+- e2e. Before the fix, with the raw `os.tmpdir()`, "VERIFY:required blocks until a verdict" failed
+  with the caveat quoted above. After it, both e2e files under the raw `os.tmpdir()` pass 42/42
+  (168 s), the pytest scenarios included.
+
+### E2E-3 — major — an edit by a tool the plugin did not know could seed the dispatch baseline
+
+**Found by** 3.1.2.g. With `VERIFY_WAIT:0s`, the harness producer edited files at once by direct fs
+writes, with no tool events. The dispatch snapshot settled after the edit, so the baseline already
+held it. The gate said `[router ✓ accepted: deterministic] … no changed files, no affected tests`,
+with no handle. The e2e producer now waits 1.5 s before editing.
+
+**Assessment: reachable in real use.**
+
+- Not reachable through the tools the plugin already knew. `beginDispatch` runs synchronously before
+  the before hook's first await (`wiring.ts:1148` in `beginVerification`, reached from
+  `startDispatch`). So the record with `snapshotPending` exists before the producer starts, even at
+  `VERIFY_WAIT:0s`. `tool.execute.before` calls `observeEdit` for every tool (`index.ts:1079`). An
+  observed write while the snapshot is pending sets `snapshotContaminated` (`dispatch.ts:191`), the
+  snapshot is dropped (`:257`), and the delta is `changeBaseline: "unavailable"` (`:334`), so the
+  verdict is unverifiable. A contaminated capture gives no reference.
+- Reachable through every other tool. `observeEdit` acted only on a fixed list of writers (write,
+  edit, patch, multiedit, apply_patch, bash, shell, powershell, exec). opencode fires
+  `tool.execute.before` for MCP tools too, named `<server>_<tool>`
+  (`packages/opencode/src/session/tools.ts:390-421`, dev branch, read on 2026-09-27), and the
+  registry fires it for plugin and custom tools. An MCP `write_file`, a custom editor or `batch` was
+  ignored. If such an edit lands before the snapshot settles (`VERIFY_WAIT:0s`, or a snapshot slower
+  than the wait on a large repository), the baseline contains it. Probe at 84d1e48: `beginDispatch`
+  with a held snapshot, `observeEdit("filesystem_write_file")`, then the snapshot resolves with the
+  edited tree. The delta was `{"changeBaseline":"available","changedFiles":[]}`, which is the "no
+  changed files" pass. The same race on the capture makes the failure that the edit causes look
+  pre-existing at the reference, so it is excused.
+- Other paths considered, not false passes of the producer's own edit. A background process started
+  by the producer goes through a shell call, whose before hook contaminates a pending snapshot; its
+  later writes land after the baseline and the delta sees them. A process started before the dispatch
+  is not the producer's edit. The user's own `!` shell has no tool hook, and its edits are the user's.
+
+**Resolution** (495529a, `fix(verify): count unknown tools as writes while a dispatch capture runs`):
+fail closed. Only a tool in `NON_WRITING_TOOLS` (`dispatch.ts:100-117`, checked at `:185`) leaves an
+in-flight snapshot or capture alone. That set is read, glob, grep, list, ls, codesearch, webfetch,
+websearch, lsp, todoread, todowrite, question, skill, plan_enter, plan_exit, invalid, task, the three
+MCP resource readers, delegate and router_verify. Any other tool name contaminates: the change set is
+unavailable, the reference is none, and the verdict is unverifiable, never a pass. `task` and
+`delegate` start sessions whose own tool calls are observed, so parallel dispatches still do not
+contaminate each other (3.1.2.f passes). Tool-observed file attribution (`WRITE_TOOLS`, `record`) is
+unchanged. Cost: an unknown tool inside the capture window makes that dispatch unverifiable. Outside
+the window nothing changes.
+
+**Evidence.** `test/unit/baseline.test.ts` has four E2E-3 cases (filesystem_write_file, morph_edit,
+batch, Serena_replace_symbol_body). All four fail at 84d1e48, because the capture is not aborted,
+and pass after the fix. Ten non-writing tools keep both the baseline and the reference. The suites and
+the e2e run are the ones listed under E2E-2.
+
+**Residual risk (not fixed).** A tool that writes under a non-writing name (for example a custom tool
+called `lsp`) is not caught. A write with no tool event at all (an MCP server that writes after its
+tool returned, an external editor) cannot be seen by any hook.
