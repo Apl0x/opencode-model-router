@@ -598,8 +598,13 @@ export interface VerificationWiring {
    * 2.4.2a: whether this delegation defers (section 1.5-16): mode "deferred", a testsPass check
    * in the DoD, and verification not disabled (`require: "never"`). Everything else is gated
    * exactly as before 2.4.
+   * QA-2.4-10: only what the required gate would actually judge defers. `trivial` is the gate's own
+   * input (the native path's dispatch-time classification; delegate passes none): the gate skips a
+   * trivial dispatch whose DoD was inferred (gate.ts), so that one is not deferred and takes the
+   * required path, with the same outcome. (An attributed empty change set is the other case;
+   * finishDeferred answers "no-change" for it.)
    */
-  isDeferred(dod: DoD, directives: VerifyDirectives): boolean;
+  isDeferred(dod: DoD, directives: VerifyDirectives, trivial?: boolean): boolean;
   /**
    * 2.4.2a: the deferred finish. No gate, no test command, no slot: a tree snapshot and the commit
    * diff (git only, as prepareVerification) under DEFERRED_FINISH_MS, the static scoping plan
@@ -1244,6 +1249,11 @@ export function createVerificationWiring(deps: {
     let deferred = false;
     try {
       const change = await observeChange(store, input.dispatchID, input.producerSessionID, input.cwd, deadline);
+      // QA-2.4-10: an attributed empty change set is passed by the required gate with no process
+      // (section 1.5-6): nothing to defer. The caller runs that gate, with the same outcome.
+      if (change.changeBaseline === "available" && change.changedFiles.length === 0 && !deadline.signal.aborted) {
+        return { deferred: false, reason: "no-change", detail: "the producer changed no file" };
+      }
       let changedFiles: ChangedPath[] | "unavailable" = "unavailable";
       let digests: Promise<FileDigests | undefined> | undefined;
       // Section 1.5-6 / QA-1.6-14: without a change baseline the set is unknown, never [].
@@ -1720,8 +1730,10 @@ export function createVerificationWiring(deps: {
       }
       return { directives: resolveDirectives(text), dispatchedAt: pendingNow() };
     },
-    isDeferred(dod, directives) {
+    isDeferred(dod, directives, trivial = false) {
       if (directives.mode !== "deferred" || !hasTestsPass(dod)) return false;
+      // QA-2.4-10: gate.ts skips exactly this case ("trivial dispatch; verification skipped").
+      if (trivial && dod.source === "inferred") return false;
       try {
         return getConfig().enforcement?.verify?.require !== "never";
       } catch {

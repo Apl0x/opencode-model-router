@@ -540,6 +540,16 @@ describe("verifyHandles (2.4.3a)", () => {
     expect(wiring.pending.get("orch", h)).toMatchObject({ kind: "found", entry: { state: "verified" } });
   });
 
+  it("QA-2.4-10 (M22): a deferred delegation with an inferred DoD is judged in full, never skipped as trivial", async () => {
+    const { wiring } = makeWiring();
+    const h = await register(wiring.pending, "a", { dod: { ...DOD, source: "inferred" } });
+    const item = verdictOf((await wiring.verifyHandles("orch", { kind: "handles", handles: [h] })).items[0]);
+    expect(item.result.verdict.skipped).toBeUndefined();
+    expect(item.result.verdict.outcome).toBe("pass");
+    expect(item.result.retryable).toBe(false);
+    expect(inputsOf("a")).toBe(1);
+  });
+
   it("an unattributed change set is unverifiable, never scoped over []", async () => {
     const { wiring } = makeWiring();
     const h = await register(wiring.pending, "a", { changedFiles: "unavailable", digests: undefined });
@@ -1225,6 +1235,8 @@ describe("the router_verify tool (2.4.3b)", () => {
     const input = { tool: "task", sessionID: "orch", callID: "c1", args: { subagent_type: "fast", prompt, description: "the work" } };
     const before = { args: { ...input.args } };
     await hooks["tool.execute.before"](input, before);
+    // The producer changed src/a.ts (QA-2.4-10: a dispatch that changed nothing is not deferred).
+    state.treeFiles = [{ path: src("a"), status: " M" }];
     const output = { output: "<task_result>\nDONE\n</task_result>", metadata: { sessionId: "child1" } };
     await hooks["tool.execute.after"]({ ...input, args: before.args }, output);
     const handle = /\[router\] unverified \u00b7 (vrf_[0-9a-f]{24}) \u00b7/.exec(output.output)?.[1];

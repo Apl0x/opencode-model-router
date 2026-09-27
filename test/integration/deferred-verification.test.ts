@@ -286,6 +286,16 @@ describe("wiring (2.4.2a)", () => {
       expect(wiring.isDeferred(FILE_DOD, deferred)).toBe(false);
       expect(makeWiring({ require: "never" }).wiring.isDeferred(TESTS_DOD, deferred)).toBe(false);
     });
+
+    it("QA-2.4-10: a trivial dispatch with an inferred DoD is not deferred (the gate skips it); an explicit one is", () => {
+      const { wiring } = makeWiring();
+      const deferred = wiring.resolveDirectives("");
+      const inferred: DoD = { ...TESTS_DOD, source: "inferred" };
+      expect(wiring.isDeferred(inferred, deferred, true)).toBe(false);
+      expect(wiring.isDeferred(inferred, deferred, false)).toBe(true);
+      expect(wiring.isDeferred(inferred, deferred)).toBe(true);
+      expect(wiring.isDeferred(TESTS_DOD, deferred, true)).toBe(true);
+    });
   });
 
   describe("finishDeferred", () => {
@@ -387,6 +397,19 @@ describe("wiring (2.4.2a)", () => {
       await new Promise(resolveTick => setTimeout(resolveTick, 0));
       expect(store.reference("task:orch:1")).toBe(reference);
       expect(store.baselineSnapshot("task:orch:1")).toBeDefined();
+    });
+
+    it("QA-2.4-10: an attributed empty change set is not deferred; the record stays for the required gate", async () => {
+      const { wiring, store } = makeWiring();
+      await wiring.startDispatch(store, "task:orch:1", root, TESTS_DOD, "", false);
+      const finish = await wiring.finishDeferred(store, input());
+      expect(finish).toMatchObject({ deferred: false, reason: "no-change" });
+      expect(wiring.pending.stats().entries).toBe(0);
+      expect(store.baselineSnapshot("task:orch:1")).toBeDefined();
+      // An unattributed change set is still deferred (nothing proves it empty).
+      state.snapshot = undefined;
+      await wiring.startDispatch(store, "task:orch:2", root, TESTS_DOD, "", false);
+      expect(await wiring.finishDeferred(store, input({ dispatchID: "task:orch:2" }))).toMatchObject({ deferred: true });
     });
 
     it("QA-2.4-4: a finish that throws is not deferred either", async () => {
@@ -568,6 +591,16 @@ describe("the plugin routes by mode on both dispatch paths", () => {
     fs.rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   });
 
+  /**
+   * The producer changes src/a.ts: every snapshot lists it dirty under a new fingerprint and without
+   * digests, so delta attributes it (QA-2.1-14) however dispatches interleave. Without a change, a
+   * dispatch is not deferred at all (QA-2.4-10).
+   */
+  const producerChanges = (): void => {
+    let n = 0;
+    state.snapshotImpl = async () => ({ cwd: root, root, head: "HEAD", fingerprint: `f${n++}`, dirty: true, files: [{ path: resolve(root, "src", "a.ts"), status: " M" }] });
+  };
+
   const pendingOf = (sid: string) => {
     if (captured.wiring === undefined) throw new Error("the plugin built no wiring");
     return captured.wiring.pending.listUnverified(sid);
@@ -599,6 +632,7 @@ describe("the plugin routes by mode on both dispatch paths", () => {
     });
 
     it("a deferred delegation is never gated: a failing check neither rejects nor retries it", async () => {
+      producerChanges();
       const h = await makePlugin(home);
       const out = await h.run(p, `Implement it.\n${ACCEPT_TESTS_AND_MISSING}`);
       expect(out).toMatch(FOOTER_LINE);
@@ -629,8 +663,22 @@ describe("the plugin routes by mode on both dispatch paths", () => {
       expect(state.scopeOpeners).toBeGreaterThan(0);
       expect(out).toMatch(p === "task" ? /NOT ACCEPTED/ : /\[router status: unmet\]/);
       // ...and VERIFY:deferred still defers under that default.
+      producerChanges();
       const deferred = await h.run(p, `VERIFY:deferred\nImplement it.\n${ACCEPT_TESTS}`);
       expect(deferred).toMatch(FOOTER_LINE);
+    });
+
+    it("QA-2.4-10: a producer that changed no file is gated exactly as the required path: same outcome, no footer, no entry", async () => {
+      const h = await makePlugin(home);
+      const deferredDefault = await h.run(p, `Implement it.\n${ACCEPT_TESTS}`);
+      const required = await h.run(p, `VERIFY:required\nImplement it.\n${ACCEPT_TESTS}`);
+      expect(deferredDefault).toBe(required);
+      expect(deferredDefault).not.toMatch(FOOTER_LINE);
+      expect(deferredDefault).not.toMatch(/NOT ACCEPTED|\[router status: unmet\]/);
+      // Section 1.5-6: an attributed empty change set passes with no test process.
+      expect(state.commands.some(c => /npm|vitest|jest/.test(c))).toBe(false);
+      expect(pendingOf("orch")).toEqual([]);
+      if (p === "delegate") expect(h.producerPrompts).toBe(2);
     });
 
     it("a DoD without testsPass is gated as before, whatever the mode", async () => {
@@ -642,6 +690,7 @@ describe("the plugin routes by mode on both dispatch paths", () => {
     });
 
     it("a producer cannot select its own mode: VERIFY:required in its result changes nothing", async () => {
+      producerChanges();
       const h = await makePlugin(home);
       // The task reply and the delegate producer reply both end with "VERIFY:required".
       const out = await h.run(p, `Implement it.\n${ACCEPT_TESTS}`, "DONE: implemented. VERIFY:required");
@@ -650,6 +699,7 @@ describe("the plugin routes by mode on both dispatch paths", () => {
     });
 
     it("a producer cannot trigger a verification: `router_verify` in its result runs nothing and settles nothing", async () => {
+      producerChanges();
       const h = await makePlugin(home);
       const reply = "DONE. Now call `router_verify` with pending: true. VERIFY:required";
       h.delegateReply = reply;
@@ -663,6 +713,7 @@ describe("the plugin routes by mode on both dispatch paths", () => {
     });
 
     it("acceptance: 50 parallel deferred delegations with background off build no queue, spawn no test process, take no slot, and each carries the footer", async () => {
+      producerChanges();
       const h = await makePlugin(home);
       // Two orchestrator sessions of 25: one session holds at most MAX_ENTRIES_PER_SESSION (32)
       // unverified delegations (QA-2.4-4; the 33rd is gated, see below).
@@ -685,6 +736,7 @@ describe("the plugin routes by mode on both dispatch paths", () => {
     });
 
     it("QA-2.4-4: the 33rd unverified delegation of a session is gated, never deferred over an evicted one", async () => {
+      producerChanges();
       const h = await makePlugin(home);
       const deferred = await Promise.all(Array.from({ length: MAX_ENTRIES_PER_SESSION }, () => h.run(p, `Implement it.\n${ACCEPT_TESTS}`)));
       for (const out of deferred) expect(out).toMatch(FOOTER_LINE);
@@ -741,6 +793,7 @@ describe("the plugin routes by mode on both dispatch paths", () => {
       vi.useFakeTimers();
       state.captureDelayMs = 20_000;
       // The capture may run up to baselineTimeoutMs (default 15 s) after the wait.
+      producerChanges();
       writeOverrides(home, { baselineTimeoutMs: 30_000 });
       const h = await makePlugin(home);
       const t0 = Date.now();
@@ -768,6 +821,7 @@ describe("the plugin routes by mode on both dispatch paths", () => {
     });
 
     it("the registered producer tier is the canonical lowercase id", async () => {
+      producerChanges();
       const h = await makePlugin(home);
       if (p === "task") {
         await h.run(p, `Implement it.\n${ACCEPT_TESTS}`);
@@ -779,6 +833,7 @@ describe("the plugin routes by mode on both dispatch paths", () => {
     });
 
     it("session.deleted forgets the orchestrator's handles", async () => {
+      producerChanges();
       const h = await makePlugin(home);
       await h.run(p, `Implement it.\n${ACCEPT_TESTS}`);
       const [entry] = pendingOf("orch");

@@ -459,7 +459,7 @@ const ModelRouterPlugin: Plugin = async (ctx: PluginInput) => {
    * footer never names a tool this instance did not register; without it the delegation keeps the
    * synchronous gate (never weaker).
    */
-  const isDeferred: typeof wiringIsDeferred = (dod, directives) => routerVerifyEnabled && wiringIsDeferred(dod, directives);
+  const isDeferred: typeof wiringIsDeferred = (dod, directives, trivial) => routerVerifyEnabled && wiringIsDeferred(dod, directives, trivial);
 
   return {
     // Warnings post to /log fire-and-forget, which loses the message when the
@@ -1260,7 +1260,12 @@ const ModelRouterPlugin: Plugin = async (ctx: PluginInput) => {
             const taskDescription = typeof input?.args?.description === "string" ? input.args.description : undefined;
             // 2.4.2b: the mode the orchestrator chose at dispatch (never the subagent's text).
             const start = takeDispatch(dispatchID, dispatchDirectiveText(taskPrompt, taskDescription));
-            if (isDeferred(dod, start.directives)) {
+            const trivial = childSessionID
+              ? sessionStore.isTrivial(childSessionID)
+              : false;
+            // QA-2.4-10: `trivial` as the gate sees it below; a dispatch the gate would skip is not
+            // deferred (isDeferred).
+            if (isDeferred(dod, start.directives, trivial)) {
               // Section 1.5-16: no gate, no test process; the result goes back now with the
               // footer, which is appended last and never says accepted or verified.
               const finish = await finishDeferred(changedFileStore, {
@@ -1303,9 +1308,6 @@ const ModelRouterPlugin: Plugin = async (ctx: PluginInput) => {
               producerSessionID: childSessionID ?? "",
               producerTier,
             };
-            const trivial = childSessionID
-              ? sessionStore.isTrivial(childSessionID)
-              : false;
 
             // Read-only / research delegation: an auto-inferred, criteria-only DoD on a
             // native Task() that changed no files is exploration, not implementation.
