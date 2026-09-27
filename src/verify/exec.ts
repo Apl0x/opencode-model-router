@@ -419,7 +419,14 @@ function capture(limit: number): Capture {
 function killTree(child: ChildProcess): void {
   const pid = child.pid;
   if (!pid) {
-    child.kill("SIGKILL");
+    // The spawn failed and its `error` (which settles the run) is still to be
+    // emitted on a later tick. Node throws EINVAL for a kill of a process that
+    // never started; it must not escape the abort listener or the timer.
+    try {
+      child.kill("SIGKILL");
+    } catch {
+      // Nothing is running; the pending `error` settles the run.
+    }
     return;
   }
   if (isWin) {
