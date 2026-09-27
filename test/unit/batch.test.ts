@@ -1481,6 +1481,55 @@ describe("createBatchCoordinator: windows and the union run", () => {
     expect(c.stats().runningBatches).toBe(0);
   });
 
+  it("QA-2.2-4: a seam that returns after its batch was evicted does not release the slot a second time", async () => {
+    const late = deferred<ScopedOutcome>();
+    const { calls, runtime } = harness(MODEL, { execute: () => late.promise });
+    const c = createBatchCoordinator({ platform: "linux" });
+    const members = [req(["src/a.ts"]), req(["src/b.ts"])];
+    const outs = members.map((m) => c.hook(runtime)(m));
+    await vi.advanceTimersByTimeAsync(WINDOW);
+    for (const m of members) m.deadline.abort();
+    await Promise.all(outs);
+    await vi.advanceTimersByTimeAsync(BATCH_STALE_GRACE_MS + 1);
+    expect(c.sweep()).toBe(1);
+    await flush();
+    expect(calls.closes).toEqual([0]);
+    late.resolve({ kind: "aborted", reason: "tree killed" });
+    await flush();
+    expect(calls.closes).toEqual([0]);
+    await c.dispose();
+    expect(c.stats()).toMatchObject({ runningBatches: 0, pendingRequests: 0 });
+  });
+
+  it("dispose while a request is planning answers it disposed; a seam that throws a non-Error is reported; the platform defaults", async () => {
+    const gate = deferred<void>();
+    const planning = harness(MODEL, {
+      plan: async (input) => {
+        await gate.promise;
+        return planModel(input);
+      },
+    });
+    const c = createBatchCoordinator();
+    const out = c.hook(planning.runtime)(req(["src/a.ts"]));
+    await flush();
+    await c.dispose();
+    gate.resolve();
+    expect(await out).toEqual(aborted(BATCH_REASONS.disposed));
+    expect(planning.calls.opens).toHaveLength(0);
+
+    const throwing = harness(MODEL, {
+      execute: () => {
+        // A seam may throw anything, not only an Error.
+        throw "string failure";
+      },
+    });
+    const c2 = createBatchCoordinator({ platform: "linux" });
+    const run = c2.hook(throwing.runtime)(req(["src/a.ts"]));
+    await vi.advanceTimersByTimeAsync(WINDOW);
+    expect(await run).toEqual({ scoped: { kind: "error", reason: "scoped run failed: string failure" }, recheck: undefined });
+    await c2.dispose();
+  });
+
   it("QA-2.2-4: dispose waits at most the grace period for a hung seam, then releases its slot and logs it", async () => {
     const { calls, runtime } = harness(MODEL, { execute: () => new Promise<ScopedOutcome>(() => undefined) });
     const warn = vi.fn();
@@ -2105,6 +2154,73 @@ describe("createBatchCoordinator: attribution and rechecks", () => {
     expect(c.stats().taints).toBe(0);
     expect(warn).not.toHaveBeenCalled();
     await c.dispose();
+  });
+
+  it("QA-2.2-3: mode B with a member that left during the union run: the others run their own specs, and its unreproduced failure taints them", async () => {
+    const model: Model = { ...MODEL, failing: { "test/a.test.ts": ["x"] }, atRef: { "test/a.test.ts": [] } };
+    const gate = deferred<void>();
+    const { calls, runtime } = harness(model, {
+      execute: async (spec, _d, n) => {
+        if (n === 0) await gate.promise;
+        return ranModel(model, spec);
+      },
+    });
+    const c = createBatchCoordinator({ platform: "linux" });
+    const hook = c.hook(runtime);
+    const a = req(["src/a.ts"]);
+    const outs = [hook(a), hook(req(["src/b.ts"])), hook(req(["src/c.ts"]))];
+    await vi.advanceTimersByTimeAsync(WINDOW);
+    a.deadline.abort();
+    gate.resolve();
+    const runs = await Promise.all(outs);
+    expect(runs[0]).toEqual(aborted(BATCH_REASONS.run));
+    // a's related failure is reproduced by no remaining own run: b and c cannot pass on the batch's word.
+    expect(calls.executes.slice(1).map((e) => e.spec.inputs)).toEqual([[at("src/b.ts")], [at("src/c.ts")]]);
+    for (const run of runs.slice(1)) expect(ran(run).result).toMatchObject({ failingIds: [], complete: false });
+    expect(c.stats().taints).toBe(1);
+    await c.dispose();
+  });
+
+  it("QA-2.2-3: a green member held for another member's failure settles incomplete, with no recheck, when it aborts", async () => {
+    const model: Model = { ...MODEL, failing: { "test/b.test.ts": ["new"] }, atRef: { "test/b.test.ts": [] } };
+    const gate = deferred<void>();
+    const { runtime } = harness(model, {
+      execute: async (spec, _d, n) => {
+        if (n === 2) await gate.promise;
+        return ranModel(model, spec);
+      },
+    });
+    const c = createBatchCoordinator({ platform: "linux" });
+    const hook = c.hook(runtime);
+    const a = req(["src/a.ts"]);
+    const outs = [hook(a), hook(req(["src/b.ts"]))];
+    await vi.advanceTimersByTimeAsync(WINDOW);
+    a.deadline.abort();
+    expect(await outs[0]).toMatchObject({
+      scoped: { kind: "ran", result: { failingIds: [], complete: false, note: "batched run failure not reproduced by any request's own run: test/b.test.ts > new" } },
+      recheck: undefined,
+    });
+    gate.resolve();
+    expect((await outs[1])?.recheck?.kind).toBe("exact");
+    await c.dispose();
+  });
+
+  it("B8.6: a recorded recheck that does not cover a later member's files is not reused; that member rechecks its own", async () => {
+    const model: Model = { ...MODEL, failing: { "test/a.test.ts": ["x"], "test/b.test.ts": ["y"] }, atRef: { "test/a.test.ts": [], "test/b.test.ts": ["y"] } };
+    const { calls, runtime } = harness(model, { argvCap: 1 });
+    const { runs, stats } = await batch(runtime, [req(["src/a.ts"]), req(["src/b.ts"])]);
+    expect(stats).toMatchObject({ splits: 1, ownRuns: 2, rechecks: 2 });
+    expect(calls.rechecks.map((r) => r.files)).toEqual([[at("test/a.test.ts")], [at("test/b.test.ts")]]);
+    expect(runs.map((r) => judgeStandIn(r).verdict)).toEqual(["fail", "pass"]);
+  });
+
+  it("two members sharing one Deadline (one router_verify call): it stays attached until the last of them settles", async () => {
+    const model: Model = { ...MODEL, failing: { "test/b.test.ts": ["y"] }, atRef: { "test/b.test.ts": ["y"] } };
+    const { calls, runtime } = harness(model);
+    const shared = liveDeadline();
+    const { runs } = await batch(runtime, [req(["src/a.ts"], { deadline: shared }), req(["src/b.ts"], { deadline: shared })]);
+    expect(runs.map((r) => r.recheck?.kind)).toEqual([undefined, "exact"]);
+    expect(calls.rechecks[0]?.deadline.signal.aborted).toBe(false);
   });
 
   it("B8.6: only outcomes that hold for any member are reused; a deadline-bound one is not", async () => {
