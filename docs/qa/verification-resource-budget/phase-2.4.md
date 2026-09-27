@@ -1,8 +1,8 @@
 # Phase 2.4 — Deferred verification, `router_verify`, pending list (QA notes)
 
-Branch `vrb/p24`, worktree `D:\git\omr-p24`. Task 2.4.1 (design) and 2.4.1b (`src/verify/pending.ts`
-plus `test/unit/pending.test.ts`) are done. 2.1 and 2.2 (through 2.2.3) are merged into this branch
-(`24008e5`, `origin/vrb/wave-2` `fdb319c`), so 2.4.2–2.4.6 can proceed.
+Branch `vrb/p24`, worktree `D:\git\omr-p24`. Every 2.4 task (2.4.1–2.4.6) is done; see the task
+breakdown at the end. 2.1 and 2.2 (through 2.2.3) are merged into this branch (`24008e5`,
+`origin/vrb/wave-2` `fdb319c`). Next: the phase 2.4 QA review, then 2.3.
 
 ## Pre-flight
 
@@ -682,22 +682,241 @@ vitest-shaped project on disk, like `batch-wiring.test.ts`.
   - sessions never see each other's entries;
   - never for a subagent or without a session id.
 
-### Left in 2.4
+### Left in 2.4 (as of 2.4.4)
 
-- **2.4.5 background mode** (`background: true` only):
-  - the queue factory, coalescing, the same coordinator, slot and caps;
-  - late notices once per handle, injected at the marked place in the system transform
-    (`buildLateNoticeBlock`);
-  - a test that asserts the queue is never constructed when `background` is false.
-- **2.4.6 remaining tests:**
-  - `router_verify` with a deadline that expires mid-run: `unverifiable` for the handles not yet
-    judged, and the tree killed;
-  - a capture that resolves after the wait but was invalidated by an edit, followed by
-    `router_verify` → "no reference";
-  - 50 deferred delegations with `background: false` spawn nothing.
+2.4.5 and 2.4.6 were still open here; both are done below.
 
-  Latency and "subagent cannot self-select" are already covered by 2.4.2.
-- **2.3** must describe `router_verify` in the protocol text and in `COMMAND_REFERENCE_INDEX.md`.
+## Implementation notes (2.4.5, 2.4.6)
+
+Commits on `vrb/p24`: 2.4.5 `3ac41f1`, 2.4.6 `3644950`. Tests: `test/unit/pending.test.ts`
+("background queue (R14, 2.4.5)"), `test/integration/router-verify-tool.test.ts` ("router_verify
+edge cases (2.4.6)", "background mode (2.4.5)", and two plugin cases in "the router_verify tool"),
+`test/integration/deferred-verification.test.ts` and `test/integration/pending-list-transform.test.ts`.
+
+### Background queue (`src/verify/pending.ts` R14)
+
+The plan puts the queue factory in `pending.ts`. `createBackgroundQueue` does no I/O: it takes a
+`verify` callback, a clock and timers (default: an unref'd `setTimeout`). The registry itself still
+owns no timer. The contract is header section R14.
+
+- **Construction.** The wiring calls `createBackgroundQueue` only when `background` is true at
+  plugin start. Otherwise `wiring.background` is `undefined`, and every use is `background?.…`:
+  no queue, timer, notice store or run exists. This is asserted in three places (see the map
+  below): directly on the wiring, on the plugin, and across 50 deferred delegations. In each case
+  a spy counts `createBackgroundQueue` calls.
+- **Input.** `finishDeferred` enqueues `{ sessionID, handle, files }` after a successful
+  `register`, never awaited. An `"unavailable"` change set is not queued (decision 3). A throwing
+  `enqueue` is logged, and the footer keeps its handle.
+- **Scheduling.**
+  - One timer at a time, armed at the earliest due request. It is only ever moved earlier (no
+    debounce), so a steady stream of requests cannot starve the queue.
+  - A fresh request is due `BACKGROUND_SETTLE_MS` (1 s) after it arrives.
+  - One run per plugin instance. A run takes the oldest due request, then every fresh or due
+    request of the same orchestrator session (at most `MAX_HANDLES_PER_CALL`). That is one
+    `verifyHandles` call: one deadline and one S5 window.
+- **Run path.** `verify` is the wiring's own `verifyHandles(session, { handles }, { signal,
+  background: true })`: the required gate's path, with the claim, the slot, the caps and the batch
+  coordinator. So a background run settles an entry exactly as `router_verify` does, and a later
+  `router_verify` replays the stored verdict ("cached") without running anything.
+  - `background: true` forces `lowPriority` into the gate's budget (`buildGateDeps` has a fifth,
+    internal parameter). `router_verify` keeps the configured priority.
+- **Outcomes** (`backgroundOutcomes` in `wiring.ts`, then R14's `apply`):
+
+  | outcome | action |
+  |---|---|
+  | this run's terminal pass | nothing |
+  | this run's terminal fail or unverifiable | one late notice for the orchestrator session (`lateNoticeFor`) |
+  | retryable | requeued with backoff `30 s × 2^(attempt−1)`, at most `BACKGROUND_MAX_ATTEMPTS` (3) runs; then it stays unverified and listed |
+  | `joined`, `cached`, `elsewhere` (a `router_verify` call has or will have the verdict) | dropped (`reported`) |
+  | unknown or expired | dropped (`gone`) |
+  | a handle missing from the outcomes, or a rejected `verify` | treated as retryable |
+
+- **Notices.**
+  - Notices are kept per session, one per handle. `takeNotices(session)` returns them oldest first
+    and marks them delivered.
+  - `verifyHandles` without `background` calls `markReported` with the handles of its verdict
+    items. That drops an undelivered notice for those handles and suppresses a later one, so a
+    verdict the orchestrator already received through `router_verify` is never noticed again.
+  - Bounds: 32 notices per session, 128 in total, and a reported memo of 512. `sweep` drops
+    notices older than `pendingTtlMs`.
+- **Cancellation.**
+  - `forgetSession` drops the session's requests and notices and aborts its run in flight: the
+    `verifyHandles` deadline, and with it the batch's tree.
+  - `dispose` aborts the run, clears the timer and drops everything; later calls are no-ops.
+  - The results of a cancelled run are ignored.
+
+### Plugin (`src/index.ts`) and wiring hooks
+
+- **System transform, orchestrator path only.** It pushes the pending list first, then, only when
+  a queue exists, `buildLateNoticeBlock(background.takeNotices(sessionID))`. With a queue, the
+  pending list is built from `listOpen` rather than `listUnverified` (decision 4).
+- **Lifecycle hooks.**
+  - `session.deleted` calls `background?.forgetSession(id)` before `pending.forgetSession(id)`.
+  - Plugin `dispose` calls `background?.dispose()` before `pending.dispose()`.
+    `disposeVerification` calls it too; the call is idempotent.
+  - `sweepVerification` adds `background?.sweep()`. That call also re-arms a due request (the idle
+    trigger; a safety net only).
+
+### Decisions (QA may challenge)
+
+1. **An unverifiable background result gets a late notice too**, not only introduced failures
+   (§1.5-19 names failures only).
+   - A terminal settle takes the entry out of the pending list. A silent unverifiable would then
+     look exactly like a silent pass, which is weaker than a required gate: that gate shows its
+     unverifiable caveat.
+   - `LateNotice` gains optional `outcome` and `reason` fields:
+     - a fail with ids keeps the plan's wording verbatim (`failing: <ids>`);
+     - a fail without ids reads `failed: <reason>`;
+     - an unverifiable result reads `unverifiable: <reason>`;
+     - the header changes to `LATE_NOTICE_MIXED_HEADER` when any notice is not a fail.
+   - Every block ends with `LATE_NOTICE_REPLAY_LINE`, which points to `router_verify`: its cached
+     replay carries the forcing note and the next tier, and runs nothing.
+2. **Coalescing drops only QUEUED requests, and only within one orchestrator session.**
+   - The superseded entry stays unverified and listed; it is never reported as verified.
+   - Its producer's files changed again after it, so its verdict could at best carry a drift
+     notice.
+   - Other sessions are never affected. This avoids cross-session interference (the QA focus on
+     leakage).
+   - A request that is running is never superseded. A retry of an older request is dropped when
+     a newer overlapping request was queued during its run.
+3. **Unattributed change sets are not queued.** Nothing could run for them (§1.5-6 makes them
+   unverifiable). Settling them would only move them from the persistent pending list to a
+   one-shot notice.
+4. **With background on, the pending list shows entries in `verifying` as well.** A background
+   claim can last up to `gateBudgetMs`. During that time the entry would otherwise vanish from
+   the list, and the orchestrator could give its final answer without seeing it at all. With
+   background off, 2.4.4's behaviour is unchanged (the transform test still asserts that
+   verifying entries are not listed).
+5. **No hot loop.**
+   - Retries back off at 30 s, then 60 s, with at most 3 runs in total. After that the entry just
+     stays unverified and listed.
+   - No retry is tied to a dispatch.
+   - The idle sweep only re-arms the timer; it never bypasses a backoff.
+6. **`background` is read once at plugin start,** like the registry bounds and the tool map.
+   Turning it on or off takes effect after a restart.
+7. **`backgroundOutcomes` is exported and pure** (extracted in 2.4.6), so the mapping is tested
+   directly.
+
+### Residuals
+
+- **Slot contention.** A background run holds the machine-wide slot like any verification (S3).
+  A required gate that arrives meanwhile waits up to `slotWaitMs`. It can then end
+  `unverifiable`, which is accepted with a caveat unless `strictUnverifiable`. This is the same as
+  any concurrent verification (another `router_verify`, another opencode instance), and background
+  is opt-in. 3.1 should measure it.
+- **Mixed batches.** If a `router_verify` call and a background run meet in one S5 window, the
+  batch runs at the priority of the member whose scope opens it.
+- **Lost notices.** A notice counts as delivered when the transform reads it. If that model
+  request then fails, the notice is lost. The entry has already left the pending list, and its
+  verdict is still available from `router_verify` (cached).
+- **A queue that is never fed.** With `background: true` but no `router_verify` tool
+  (`require: "never"`, or enforcement off without the delegate tool), nothing defers. The queue
+  exists but is never fed and arms no timer.
+- **Untested log line.** The queue's `onError` logging line in the wiring is unreachable in
+  practice (`verifyHandles` never rejects), so it is uncovered.
+
+### Test coverage (2.4.5, 2.4.6)
+
+- `pending.test.ts`, "background queue (R14, 2.4.5)". Fake clock and timers throughout:
+  - `lateNoticeFor`;
+  - the settle delay, with no debounce;
+  - one notice per handle, delivered once;
+  - coalescing: same session only, with case folding on win32;
+  - one run at a time;
+  - the backoff schedule up to `BACKGROUND_MAX_ATTEMPTS`;
+  - a missing outcome, a rejected run and a throwing `verify` all count as retryable;
+  - a retry superseded by a newer request;
+  - re-arming earlier;
+  - an early timer that finds nothing due;
+  - `reported`, `gone` and `markReported`, before and after the notice exists;
+  - `forgetSession` and `dispose`;
+  - `sweep` and `whenIdle`;
+  - every cap;
+  - the default unref'd timers;
+  - the new `buildLateNoticeBlock` lines, verbatim and directive-free.
+- `router-verify-tool.test.ts`, "background mode (2.4.5)", on the real 2.1/2.2 pipeline: the
+  map below, plus low priority forced and one batch per session.
+- `router-verify-tool.test.ts`, "router_verify edge cases (2.4.6)": the deadline mid-run, and the
+  contaminated capture with a valid-capture control.
+- `deferred-verification.test.ts`, on both paths: 50 parallel delegations, the result-latency
+  bound, and a producer that names `router_verify`.
+- `pending-list-transform.test.ts`: TTL expiry at read time, with no sweep.
+
+### Plan tests and acceptance criteria → tests
+
+`RV` = `test/integration/router-verify-tool.test.ts`, `DV` =
+`test/integration/deferred-verification.test.ts` (plugin cases run on both `task` and `delegate`),
+`PL` = `test/integration/pending-list-transform.test.ts`, `PU` = `test/unit/pending.test.ts`.
+
+| Plan item | Covered by |
+|---|---|
+| **Acceptance 1:** N parallel delegations, default config, spawn no verification process | DV "acceptance: 50 parallel deferred delegations with background off build no queue, spawn no test process, take no slot, and each carries the footer" |
+| Acceptance 1: at most `VERIFY_WAIT` added to dispatch latency | DV wiring "a capture that resolves after 20 s under VERIFY_WAIT:5s releases the dispatch at 5 s", "VERIFY_WAIT:0s releases the dispatch at once", "a capture that resolves at 2 s under a 5 s wait releases the dispatch at 2 s"; DV plugin "VERIFY_WAIT:5s with a capture that takes 20 s: the producer starts at 5 s" |
+| Acceptance 1: 0 ms added to result latency (the only wait is the git-only snapshot, cut at 2 s) | DV plugin "result latency: a deferred return waits for nothing but the git-only snapshot, cut at DEFERRED_FINISH_MS"; DV plugin "VERIFY_WAIT:0s with a capture that never settles: …the result is not held"; DV wiring "a capture still in flight at return counts as no reference…", "a snapshot slower than DEFERRED_FINISH_MS -> unavailable…" |
+| **Acceptance 2:** every deferred result carries the footer and is never labelled accepted or verified | DV "acceptance: 50 parallel…" (each of the 50 outputs); DV "default deferred: returns at once with the footer…"; DV wiring "registers the delegation and returns the footer…"; PU footer label-rule tests |
+| Default deferred, zero cost (zero spawns, no slot, git-only capture) | DV "default deferred: returns at once with the footer; zero test spawns, no slot, a pending entry"; DV "acceptance: 50 parallel…" (`acquireSlot` spy = 0) |
+| Latency (20 s capture with a 5 s wait → 5 s; 0 → 0; 2 s → 2 s) | DV wiring "VERIFY_WAIT bounds the capture wait (section 1.5-14)" (three cases, fake timers) |
+| Capture after the wait: valid without an edit, discarded with one; `router_verify` says "no reference" | RV "a capture that resolves after the wait: valid without an edit in between; an edit discards it and router_verify says no reference, never a pass"; DV plugin "VERIFY_WAIT:5s with a capture that takes 20 s…" (a late capture stays valid) |
+| Required: `VERIFY:required` and `defaultVerify: "required"` → the gate and escalation | DV "VERIFY:required runs today's gate…", "defaultVerify \"required\" with no directive is the same as VERIFY:required" |
+| `router_verify`: a single handle and `pending: true` | RV "pass: judged once, verified…", "pending: true verifies every open delegation…"; RV tool "end to end: a deferred native task's footer handle verifies through the tool" |
+| `router_verify`: an unknown handle, another session's, an expired one | RV "scoping (R6)…", "an expired handle (TTL) gets the expired text…"; RV tool "is scoped by the calling session…" |
+| `router_verify`: two concurrent calls → one run | RV "two concurrent calls for one handle make one run; the second joins it" |
+| `router_verify`: several handles → one batched run | RV "several handles share one deadline and meet in one window: one union run under one slot hold" |
+| `router_verify`: drift → the notice | RV "drift: a producer file edited after it returned…", "drift that cannot be checked…" |
+| `router_verify`: the deadline expires mid-run → unverifiable, tree killed | RV "the deadline expires mid-run: nothing is judged, the tree is killed, and the entries go back to unverified" |
+| `router_verify`: rejected → forcing note and next tier, no retry, no new session | RV "fail: the forcing note with the next tier, no retry and no session…" |
+| Pending list: only when non-empty, capped at 5, newest first | PL "is absent when…", "lists the orchestrator's entries as one block after the protocol: at most 5, newest first" |
+| Pending list: a verified entry leaves; a TTL-expired entry leaves; sessions are separate | PL "a verified entry leaves the list…", "a TTL-expired entry leaves the list at read time, with no sweep", "sessions never see each other's entries" |
+| Background: a queued deferred delegation is verified with no `router_verify` call | RV "on: a deferred finish is queued and verified with no router_verify call; a pass makes no notice" |
+| Background: an introduced failure → exactly one late notice on the next transform | RV "an introduced failure is one late notice, delivered once…"; RV tool "background on (2.4.5): an entry being verified stays listed; a failure is noticed once…" |
+| Background: a green result → no notice | RV "on: a deferred finish is queued…; a pass makes no notice"; PU "a fail or an unverifiable result is one late notice…; a pass is none…" |
+| Background: coalescing drops a superseded queued request | RV "coalescing: a newer overlapping request supersedes a queued older one, which stays unverified and listed"; PU "coalescing: …" |
+| Background off: the queue does not exist, and 50 deferred delegations spawn nothing | RV "off by default: no queue is constructed…"; RV tool "background off (the default): the plugin builds no queue…"; DV "acceptance: 50 parallel…" |
+| Background: slot, batch coordinator, one run at a time, low priority | RV "one run at a time, through the slot and one batch per session, at low priority whatever lowPriority says" |
+| Background: retryable → unverified, with backoff and no hot loop | RV "a retryable result (slot busy) returns to unverified and backs off: no hot retry loop"; PU "a retryable result backs off…" |
+| Background: cancelled on `session.deleted` and on dispose | RV "session deletion and dispose cancel a run in flight: its tree is killed and nothing is noticed"; RV tool "background on (2.4.5): …deleted sessions and dispose cancel" |
+| Background: a later `router_verify` replays the stored verdict without spawning | RV "an introduced failure is one late notice…; router_verify replays the stored fail without a run", "on: a deferred finish is queued…" |
+| Subagent cannot self-select (`VERIFY:required` or `router_verify` in the producer's text) | DV "a producer cannot select its own mode…", "a producer cannot trigger a verification: `router_verify` in its result runs nothing and settles nothing"; RV "scoping (R6)…" (the producer's own session is "unknown") |
+
+### Coverage (scoped)
+
+`npx vitest run --coverage --coverage.include=src/verify/pending.ts
+--coverage.include=src/verify/wiring.ts` over the final scoped test list (without `test/golden`):
+
+| File | Lines | Statements | Branches | Functions |
+|---|---|---|---|---|
+| `src/verify/pending.ts` | 99.18% | 97.17% | 94.73% | 98.97% |
+| `src/verify/wiring.ts` (whole file) | 94.69% | 92.94% | 86.29% | 94.01% |
+| both (the repository's `src/verify/**` thresholds pass) | 96.82% | 94.99% | 90.07% | 96.27% |
+
+Lines changed since `09c998c` (executable statements, `git diff -U0` against the V8 JSON report):
+
+| File | Statements covered | Not covered | Branches covered |
+|---|---|---|---|
+| `src/verify/pending.ts` | 189/189 (100%) | none | 121/130 (93.1%): defensive guards (`done === true` breaks, disposed or running early returns) |
+| `src/verify/wiring.ts` | 20/21 (95.2%) | the queue's `onError` log line (unreachable) | 17/18 |
+| `src/index.ts` | 8/9 (88.9%) | the late-notice injection's `catch` log | 4/4 |
+| new wiring code (`wiring.ts` + `index.ts`) | 28/30 (93.3%) | | 21/22 |
+
+The file's remaining uncovered `wiring.ts` branches are in earlier code: the 2.1/2.2 grader, GC
+and commit-diff error paths, and some 2.4.2/2.4.3 defensive and error branches.
+
+### Left for 2.3 and 3.1
+
+- **2.3** (protocol, docs, README; not touched here):
+  - describe `router_verify`, the pending list, `background` and the late notices, with their
+    exact texts (the `LATE_NOTICE_*` lines are new in R14);
+  - reword the `delegate` tool description, which still says "INDEPENDENTLY VERIFIED … before it
+    is returned" (see the 2.4.2 follow-ups);
+  - document `background` and its restart-to-apply rule;
+  - update `COMMAND_REFERENCE_INDEX.md`.
+- **3.1** (live checks):
+  - Spike F (a), (b) and (d);
+  - 3.1.2.h: with `background: true`, an introduced failure in a deferred delegation reaches the
+    orchestrator as one late notice, verbatim through the host; with `background: false`, nothing
+    runs;
+  - slot contention between a background run and a required gate (residual above);
+  - the optional `experimental.primary_tools` hardening.
 
 ## Task breakdown
 
@@ -706,12 +925,12 @@ Each task is ≤ ~20 tool calls. Commit and push each one when green. Run only s
 
 | Task | When | Scope |
 |---|---|---|
-| 2.4.1b | now | Implement pending.ts R2–R11 + `test/unit/pending.test.ts`. Cover the R6 scoping matrix, every R4 transition, join (N calls → one claim), single-use settle, reaping, TTL at read without a sweep, caps, eviction order and weight, `registry-full`, release on terminal settle, a rejected reference promise normalized, `forgetSession`, dispose resolving joiners, every R9 text verbatim, and the lineage matrix. |
+| 2.4.1b | **done** `2c0f9c8` | Implement pending.ts R2–R11 + `test/unit/pending.test.ts`. Cover the R6 scoping matrix, every R4 transition, join (N calls → one claim), single-use settle, reaping, TTL at read without a sweep, caps, eviction order and weight, `registry-full`, release on terminal settle, a rejected reference promise normalized, `forgetSession`, dispose resolving joiners, every R9 text verbatim, and the lineage matrix. |
 | 2.4.2a | **done** `7eeb91a` | wiring.ts: parse directives from the orchestrator prompt only; `VERIFY_WAIT` bounds the capture wait; deferred-finish helper (snapshot → changed files or `"unavailable"`, static scoping, risk, digests, register, footer). |
 | 2.4.2b | **done** `80598f5` | index.ts native `task`: mode routing; required path unchanged; deferred footer; `recordRejection` on required rejections; `pending.sweep` in `createIdleTtlSweeper`. |
 | 2.4.2c | **done** `d414687` | index.ts `delegate`: same routing; footer on the tool return; no ladder for deferred. |
 | 2.4.3a | **done** `e1f8cee` | wiring.ts `verifyHandles`: normalize, claim/join, one `Deadline`, one batch via the 2.2 coordinator, drift, per-handle verdict with forcing note and next tier, lineage caveat, settle in `finally`, no retry ever. Spike F's live items remain for 3.1. |
 | 2.4.3b | **done** `da6eb9b` | index.ts: register `router_verify` whenever verification is enabled (independent of `enableDelegateTool`); `test/integration/router-verify-tool.test.ts`. |
 | 2.4.4 | **done** `be8dcf5` | System transform: `buildPendingListBlock(listUnverified(sid))`, appended only when defined; `test/integration/pending-list-transform.test.ts`. |
-| 2.4.5 | after 2.4.3 | Background mode (only `background: true`): queue factory in pending.ts, coalescing, same coordinator, slot and caps, late notices once per handle; never constructed when false. |
-| 2.4.6 | last | Remaining plan tests in `test/unit/deferred-verification.test.ts`: latency under fake timers, capture after the wait, subagent cannot self-select, 50 deferred delegations spawn nothing. |
+| 2.4.5 | **done** `3ac41f1` | Background mode (only `background: true`): queue factory in pending.ts (R14), coalescing, same coordinator, slot and caps, late notices once per handle; never constructed when false. |
+| 2.4.6 | **done** `3644950` | Remaining plan tests (in `test/integration/…`, see the map above): deadline mid-run, capture after the wait, 50 deferred delegations spawn nothing, the result-latency bound, a producer naming `router_verify`, TTL in the pending list. |
