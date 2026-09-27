@@ -186,6 +186,23 @@ describe("parseVerifyDirectives", () => {
     }
   });
 
+  it("QA-1.6-34: alternating valued/value-less keys before a long trailing run stay linear", () => {
+    const t = "verify:1,verify:a,".repeat(27_778) + " ".repeat(500_000) + "x";
+    const t0 = performance.now();
+    parseVerifyDirectives(t, D);
+    expect(performance.now() - t0).toBeLessThan(500);
+  });
+
+  it("QA-1.6-35: a following key only terminates the tail when it carries a valid value", () => {
+    const R: VerifyDirectiveDefaults = { ...D, defaultVerify: "required" };
+    expect(parseVerifyDirectives("please verify: required cap: the budget is tight", D)).toEqual(DEFAULT);
+    expect(parseVerifyDirectives("Things to verify: deferred. Cap: the budget matters.", R).mode).toBe("required");
+    expect(parseVerifyDirectives("Things to verify: deferred. Cap: the budget matters.", R).modeSource).toBe("default");
+    expect(parseVerifyDirectives("verify:required CAP:", D)).toEqual(DEFAULT);
+    expect(parseVerifyDirectives("verify:required cap:3", D)).toEqual(REQUIRED);
+    expect(parseVerifyDirectives("verify: required VERIFY_WAIT: 2s", D)).toEqual({ ...REQUIRED, waitMs: 2000, waitSource: "directive" });
+  });
+
   it("QA-1.6-29: logged values escape everything outside printable ASCII", () => {
     const log = vi.fn();
     parseVerifyDirectives("VERIFY:x\u{E0049}\u034f\u202e", D, log);

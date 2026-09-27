@@ -146,7 +146,7 @@ export function isTestPath(p: string): boolean {
  * `*setup*` names (`src/setup.ts`, `SetupWizard.tsx`) are application code, not config.
  */
 const SETUP_FILE =
-  /\.setup\.[cm]?[jt]sx?$|^(setupTests|setup-tests|test-setup|global-setup|globalSetup|vitest\.setup|jest\.setup|setup-jest|jest-setup|vitest-setup|global-teardown)\.[cm]?[jt]sx?$/i;
+  /\.setup\.[cm]?[jt]sx?$|^(setupTests|setup-tests|test-setup|global-setup|globalSetup|vitest\.setup|jest\.setup|setup-jest|jest-setup|vitest-setup|global-teardown|globalTeardown|setupVitest|setup-vitest|testSetup)\.[cm]?[jt]sx?$/i; // QA-1.6-36
 
 export function isConfigPath(p: string): boolean {
   const n = norm(p);
@@ -180,7 +180,7 @@ export function isConfigPath(p: string): boolean {
     b === "CMakeLists.txt" ||
     /^(requirements|constraints).*\.txt$/.test(b) ||
     /^requirements.*\.in$/.test(b) || // pip-tools sources (QA-1.6-31)
-    /(^|\/)requirements\/[^/]*\.txt$/.test(n)
+    /(^|\/)requirements\/[^/]*\.(txt|in)$/i.test(n) // any-case folder, .in sources (QA-1.6-36)
   );
 }
 

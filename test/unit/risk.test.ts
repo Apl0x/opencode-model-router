@@ -226,6 +226,17 @@ describe("assessRisk", () => {
     expect(isConfigPath("src/Pipfile.md")).toBe(false);
   });
 
+  it("QA-1.6-36: requirements/*.in, any-case requirements folder, more setup basenames", () => {
+    for (const p of [
+      "requirements/base.in", "Requirements/base.txt", "REQUIREMENTS/dev.in", "setupVitest.ts", "setup-vitest.ts",
+      "src/testSetup.ts", "globalTeardown.js", "e2e/globalteardown.mjs",
+    ]) {
+      expect(isConfigPath(p)).toBe(true);
+    }
+    expect(isConfigPath("src/requirements/notes.md")).toBe(false);
+    expect(isConfigPath("setupVitest.json")).toBe(false);
+  });
+
   it("QA-1.6-32: root trailing-slash trim is linear", () => {
     const t0 = performance.now();
     run({ root: `${"/".repeat(1_000_000)}x`, changedFiles: [{ path: "src/a.ts" }] });

@@ -93,11 +93,12 @@ const MODE_VALUE = /([a-z]+)\b/iy;
 const WAIT_VALUE = /(\d+)(ms|s)\b/iy;
 /**
  * After a non-upper-case key the value must end the line (QA-1.6-18), bar closing marks and a
- * table pipe, or be followed by another directive key (QA-1.6-27). Tested with a sticky regex on
+ * table pipe, or be followed by another directive key carrying a valid value for that key
+ * (QA-1.6-27, QA-1.6-35). Tested with a sticky regex on
  * the text itself (no slice, no length limit); linear: one character class, then a fixed alternative.
  */
 const LINE_TAIL = new RegExp(
-  `(?:["'\`*_.,;:!?)\\]|]|[^\\S\\r\\n\\u2028\\u2029])*(?:[\\r\\n\\u2028\\u2029]|$|(?:VERIFY(?:_WAIT)?|CAP)${HWS}:)`,
+  `(?:["'\`*_.,;:!?)\\]|]|[^\\S\\r\\n\\u2028\\u2029])*(?:[\\r\\n\\u2028\\u2029]|$|\\b(?:VERIFY${HWS}:${HWS}["'\`*_]?(?:required|deferred)\\b|VERIFY_WAIT${HWS}:${HWS}["'\`*_]?\\d+(?:ms|s)\\b|CAP${HWS}:${HWS}(?:none|\\d+)\\b))`,
   "iy",
 );
 const MAX_LOGGED = 32;
@@ -135,11 +136,13 @@ function scan<T>(
   let tokEnd = -1;
   let tailAt = -1;
   let tailOk = false;
+  let tokTail: boolean | null = null; // tail result at tokEnd, once per run (QA-1.6-34)
   for (let m = re.exec(text); m !== null; m = re.exec(text)) {
     const start = m.index + m[0].length;
     if (start >= tokEnd) {
       token.lastIndex = start;
       tokEnd = start + (token.exec(text)?.[0].length ?? 0);
+      tokTail = null;
     }
     if (start === tokEnd) continue;
     const pos = start + (LEAD_CHARS.includes(text.charAt(start)) ? 1 : 0);
@@ -151,9 +154,13 @@ function scan<T>(
       // Prose guard: `Things to verify: deferred loading works` is not a directive.
       const end = v ? pos + v[0].length : tokEnd;
       if (end !== tailAt) {
-        tail.lastIndex = end;
         tailAt = end;
-        tailOk = tail.test(text);
+        if (end === tokEnd && tokTail !== null) tailOk = tokTail;
+        else {
+          tail.lastIndex = end;
+          tailOk = tail.test(text);
+          if (end === tokEnd) tokTail = tailOk;
+        }
       }
       if (!tailOk) continue;
     }
