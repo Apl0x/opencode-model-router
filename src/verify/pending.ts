@@ -628,18 +628,28 @@ export interface LateNotice {
 
 // Every C0/C1 control (tab included), U+2028 and U+2029.
 const CONTROL_CHARS = /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/g;
-// A directive key followed by its colon, as directives.ts scans it (anywhere, any case).
-const DIRECTIVE_KEY = /\b(VERIFY_WAIT|VERIFY|CAP)[^\S\r\n]*:/gi;
+// A directive key and EVERY colon that follows it on the same line, as directives.ts scans keys
+// (anywhere, any case, horizontal whitespace around the colon). All colons go: dropping only the
+// first would turn `VERIFY::required` into `VERIFY :required`, which parses again (QA-2.4-6).
+const DIRECTIVE_KEY = /\b(VERIFY_WAIT|VERIFY|CAP)(?:[^\S\r\n\u2028\u2029]*:)+/gi;
+
+/**
+ * R9 directive safety (QA-2.4-6): every `VERIFY:` / `VERIFY_WAIT:` / `CAP:` key (any case) loses
+ * its colons, so neither parseVerifyDirectives nor parseCapDirective finds a directive in the
+ * result. Line breaks and everything else are kept, so it applies to multi-line router text
+ * (router_verify reports, forcing notes, accepted suffixes) that quotes producer-derived text such
+ * as failing test ids. Pure.
+ */
+export function neutralizeDirectives(text: string): string {
+  return text.replace(DIRECTIVE_KEY, "$1 ");
+}
 
 /**
  * The character rules shared by every dynamic fragment: controls -> space, backtick -> `'`,
- * directive keys lose their colon (R9 directive safety), whitespace runs -> one space, trim.
+ * directive keys lose their colons (R9 directive safety), whitespace runs -> one space, trim.
  */
 function sanitizeInline(text: string): string {
-  return text
-    .replace(CONTROL_CHARS, " ")
-    .replace(/`/g, "'")
-    .replace(DIRECTIVE_KEY, "$1 ")
+  return neutralizeDirectives(text.replace(CONTROL_CHARS, " ").replace(/`/g, "'"))
     .replace(/\s+/g, " ")
     .trim();
 }

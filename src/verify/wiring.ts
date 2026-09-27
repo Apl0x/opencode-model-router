@@ -39,6 +39,7 @@ import {
   EXPIRED_HANDLE_TEXT,
   MAX_HANDLES_PER_CALL,
   MAX_STORED_CHANGED_FILES,
+  neutralizeDirectives,
   normalizeHandle,
   sanitizeDescription,
   unattributedRisk,
@@ -419,7 +420,11 @@ export function formatVerifyReport(
   if (excess > 0) {
     blocks.push(`- ${excess} more handle(s) not run: at most ${MAX_HANDLES_PER_CALL} per call; call \`router_verify\` again with the rest.`);
   }
-  return [`[router] router_verify: one verdict per handle (${items.length}${excess > 0 ? ` of ${items.length + excess}` : ""}).`, ...blocks].join("\n");
+  // QA-2.4-6 (R9): reasons, caveats and notes quote producer-controlled text (failing test ids).
+  // An orchestrator that quotes this report before its own `VERIFY:` must not change its mode.
+  return neutralizeDirectives(
+    [`[router] router_verify: one verdict per handle (${items.length}${excess > 0 ? ` of ${items.length + excess}` : ""}).`, ...blocks].join("\n"),
+  );
 }
 
 /**

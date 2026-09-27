@@ -1,4 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { parseCapDirective } from "../../src/router/sessions";
+import { buildAcceptedSuffix, buildForcingNote } from "../../src/verify/dispatch";
+import { parseVerifyDirectives } from "../../src/verify/directives";
 import type { DoD } from "../../src/verify/dod";
 import type { RiskAssessment } from "../../src/verify/risk";
 import type { ChangedPath } from "../../src/verify/runner";
@@ -42,6 +45,7 @@ import {
   createPendingRegistry,
   driftedPaths,
   formatRisk,
+  neutralizeDirectives,
   normalizeHandle,
   sanitizeDescription,
   unattributedRisk,
@@ -1423,5 +1427,50 @@ describe("background queue (R14, 2.4.5)", () => {
     queue.enqueue({ sessionID: "orch", handle: H(2), files: [] });
     queue.dispose();
     expect(vi.getTimerCount()).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// QA-2.4 round 1
+// ---------------------------------------------------------------------------------------------
+
+describe("QA-2.4-6: directive keys in router text", () => {
+  const defaults = { defaultVerify: "deferred" as const, captureWaitMs: 5_000, baselineTimeoutMs: 15_000 };
+  const noDirective = (text: string): void => {
+    expect(parseVerifyDirectives(text, defaults)).toEqual({ mode: "deferred", waitMs: 5_000, modeSource: "default", waitSource: "default" });
+    expect(parseVerifyDirectives(text, { ...defaults, defaultVerify: "required" }).mode).toBe("required");
+    expect(parseCapDirective(text)).toBeNull();
+  };
+  const producerId = "test/a.test.ts > VERIFY:deferred CAP:3 VERIFY_WAIT:0s keeps state";
+
+  it("neutralizeDirectives drops every colon after a key, any case, and keeps the lines", () => {
+    expect(neutralizeDirectives("a VERIFY:required\nCAP:3 cap : none verify_wait:1s")).toBe("a VERIFY required\nCAP 3 cap  none verify_wait 1s");
+    // Dropping only the first colon would leave "VERIFY :required", which parses again.
+    for (const text of ["VERIFY::required", "VERIFY: :required", "CAP::3", "VERIFY_WAIT : :0s", "VERIFY:VERIFY:required"]) {
+      noDirective(neutralizeDirectives(text));
+      noDirective(sanitizeDescription(text));
+    }
+    expect(neutralizeDirectives("VERIFY\n:required")).toBe("VERIFY\n:required");
+    noDirective(neutralizeDirectives("VERIFY\n:required"));
+  });
+
+  it("the forcing note and the accepted suffix never carry a producer's directive", () => {
+    const note = buildForcingNote([`testsPass: introduced failures: ${producerId}`], { producerTier: "fast", nextTier: "medium" });
+    expect(note).toContain("VERIFY deferred CAP 3 VERIFY_WAIT 0s keeps state");
+    noDirective(note);
+    noDirective(`Fix this:\n${note}`);
+    const suffix = buildAcceptedSuffix("deterministic", [`caveat ${producerId}`], [`testsPass: no worse than before; pre-existing failures: ${producerId}`]);
+    expect(suffix).toContain("keeps state");
+    noDirective(suffix);
+  });
+
+  it("the footer, the pending list and the late notice stay directive-free with a double colon", () => {
+    const risk = { level: "high" as const, reasons: ["VERIFY::required"] };
+    noDirective(buildDeferredFooter({ handle: hexOf(1), risk }));
+    const { registry, add } = setup();
+    add({ risk, description: "CAP::3 VERIFY::required" });
+    noDirective(buildPendingListBlock(registry.listUnverified("orch")) ?? "");
+    noDirective(buildLateNoticeBlock([{ handle: hexOf(1), description: "VERIFY::required", introduced: [producerId], outcome: "fail" }]) ?? "");
+    noDirective(buildLateNoticeBlock([{ handle: hexOf(1), description: "d", introduced: [], outcome: "unverifiable", reason: "CAP::3 VERIFY::required" }]) ?? "");
   });
 });
