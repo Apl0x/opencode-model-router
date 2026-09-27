@@ -16,6 +16,7 @@ import { existsSync, realpathSync } from "node:fs";
 import type { ReferenceState } from "./types";
 import type { DispatchReference } from "./reference";
 import { REFERENCE_NONE } from "./baseline";
+import { neutralizeDirectives } from "./pending";
 import { withTimeout } from "./timeout";
 
 export interface TreeSnapshot {
@@ -489,14 +490,20 @@ export function shouldVerifyTask(
   return true;
 }
 
-/** Build the advisory forcing note appended to a task result the gate did not accept. */
+/**
+ * Build the advisory forcing note appended to a task result the gate did not accept.
+ *
+ * QA-2.4-6: the reasons quote producer-controlled text (failing test ids), and an orchestrator may
+ * quote this note in its next dispatch before its own `VERIFY:` directive (the first valid one
+ * wins). So every directive key loses its colons (pending.ts neutralizeDirectives).
+ */
 export function buildForcingNote(
   reasons: string[],
   escalation?: { producerTier?: string; nextTier?: string | null },
 ): string {
   const body =
     reasons.length > 0
-      ? reasons.map((r) => `- ${r}`).join("\n")
+      ? reasons.map((r) => `- ${neutralizeDirectives(r)}`).join("\n")
       : "- (no reasons provided)";
   const next =
     escalation?.nextTier
@@ -511,9 +518,13 @@ export function buildForcingNote(
   );
 }
 
-/** Suffix appended to an accepted delegate-tool result. */
+/**
+ * Suffix appended to an accepted delegate-tool result. Caveats and notes can name producer test ids
+ * ("no worse than before; pre-existing failures: <ids>"), so directive keys lose their colons as in
+ * buildForcingNote (QA-2.4-6).
+ */
 export function buildAcceptedSuffix(method: string, caveats: string[] = [], notes: string[] = []): string {
   return `\n\n[router \u2713 accepted: ${method}]` + (caveats.length
-    ? `\nVerification caveats — NOT verified (acceptance is not a passing check):\n${caveats.map(r => `- ${r}`).join("\n")}`
-    : "") + (notes.length ? `\nVerification notes:\n${notes.map(r => `- ${r}`).join("\n")}` : "");
+    ? `\nVerification caveats — NOT verified (acceptance is not a passing check):\n${caveats.map(r => `- ${neutralizeDirectives(r)}`).join("\n")}`
+    : "") + (notes.length ? `\nVerification notes:\n${notes.map(r => `- ${neutralizeDirectives(r)}`).join("\n")}` : "");
 }

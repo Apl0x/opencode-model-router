@@ -13,10 +13,12 @@
  * settings that were active when the plugin loaded, and `/preset` would
  * silently stop applying to graded work.
  */
+import { createHash } from "node:crypto";
 import { access, readdir, readFile as fsReadFile, realpath, stat, unlink } from "node:fs/promises";
-import { isAbsolute, join, resolve } from "node:path";
+import { isAbsolute, join, relative, resolve } from "node:path";
 import { createBatchCoordinator, type BatchCoordinatorOptions, type BatchPlanner } from "./batch";
 import {
+  createDeadline,
   createDirectTestsPassHook,
   createMutexRegistry,
   createScopeOpener,
@@ -24,8 +26,44 @@ import {
   isCommandAllowed,
   RECHECK_MIN_REMAINING_MS,
   resolveRepoCommand,
+  type OwnedDeadline,
 } from "./deterministic";
+import { parseVerifyDirectives, type VerifyDirectives } from "./directives";
 import {
+  ABANDONED_REASON,
+  ABSENT_DIGEST as PENDING_ABSENT_DIGEST,
+  buildDeferredFooter,
+  DISPOSED_REASON,
+  buildLineageCaveat,
+  createBackgroundQueue,
+  createPendingRegistry,
+  driftedPaths,
+  EXPIRED_HANDLE_TEXT,
+  MAX_HANDLES_PER_CALL,
+  MAX_STORED_CHANGED_FILES,
+  neutralizeDirectives,
+  normalizeHandle,
+  sanitizeDescription,
+  unattributedRisk,
+  UNKNOWN_HANDLE_TEXT,
+  VERIFYING_ELSEWHERE_TEXT,
+  VERIFYING_GRACE_MS,
+  type BackgroundOutcome,
+  type BackgroundQueue,
+  type BackgroundQueueOptions,
+  type FileDigests,
+  type PendingEntry,
+  type PendingRegistry,
+  type PendingRegistryOptions,
+  type SettledVerification,
+  type VerificationResult,
+} from "./pending";
+import { assessRisk, type RiskAssessment } from "./risk";
+import { resolveBaseDir } from "./paths";
+import { DEFAULT_IDLE_TTL_MS } from "../router/idle-sweep";
+import {
+  buildAcceptedSuffix,
+  buildForcingNote,
   tierModel,
   type ChangedFile,
   type createChangedFileStore,
@@ -39,14 +77,16 @@ import type { PluginLogger } from "../router/logger";
 import { REFERENCE_NONE } from "./baseline";
 import { scrubText } from "../guard/scrub";
 import type { DoD } from "./dod";
-import type { ArgvSeam, Deadline, ExecOptions, ExecResult as SeamResult, ExecSeam, ReferenceState, TestsPassHook } from "./types";
-import { planScopedRun, type RunnerFs, type TestSearchSeam } from "./runner";
+import type { ArgvSeam, Deadline, ExecOptions, ExecResult as SeamResult, ExecSeam, ReferenceState, TestsPassHook, Verdict } from "./types";
+import { planScopedRun, planStaticScoping, type ChangedPath, type RunnerFs, type StaticScoping, type TestSearchSeam } from "./runner";
 import {
+  DEFAULT_GATE_BUDGET_MS,
   graderTimeoutMs,
+  RouterTimeoutError,
   withTimeout,
 } from "./timeout";
 import { resolveVerifyBudget, type RouterConfig, type VerifyBudget } from "../router/config";
-import type { GateDeps } from "./gate";
+import { accept, gateResult, unverifiableGateResult, type GateDeps, type GateResult } from "./gate";
 // The grader request shape is owned by checker.ts, which builds it. Re-exported
 // here because this module is where it is consumed, and because keeping a
 // second local copy is exactly how `cwd` got dropped: the checker set it, the
@@ -120,6 +160,368 @@ export const BATCH_WINDOW_BUDGET_DIVISOR = 10;
 export function effectiveBatchWindowMs(budget: Pick<VerifyBudget, "batchWindowMs" | "gateBudgetMs">): number {
   return Math.min(budget.batchWindowMs, Math.floor(budget.gateBudgetMs / BATCH_WINDOW_BUDGET_DIVISOR));
 }
+
+// -----------------------------------------------------------------------------------------------
+// 2.4.2 deferred verification (plan Phase 2.4, sections 1.5-14..17; pending.ts R3, R10, R11)
+// -----------------------------------------------------------------------------------------------
+
+/**
+ * phase-2.4.md gather item 11: the bound on a deferred finish (tree snapshot, commit diff, static
+ * scoping). On expiry the change set is "unavailable" and the risk is unattributedRisk(), never [].
+ */
+export const DEFERRED_FINISH_MS = 2_000;
+/** Upper bound on remembered native `task` dispatch starts (before hook -> after hook). */
+export const DISPATCH_STARTS_MAX = 1_024;
+/** Drift digests read at most this many bytes in total (tree.ts MAX_DIGEST_BYTES); beyond it: no digests. */
+export const DRIFT_DIGEST_MAX_BYTES = 64 * 1024 * 1024;
+/** Static scoping could not finish inside DEFERRED_FINISH_MS: counted as impossible (conservative). */
+export const STATIC_SCOPING_UNFINISHED_REASON = "static scoping did not finish within the deferred-finish bound";
+/** Section 1.4 pendingTtlMs default, used when the config cannot be read at plugin start. */
+export const DEFAULT_PENDING_TTL_MS = 3_600_000;
+/**
+ * QA-2.4-9: the capture wait when the config cannot be read: section 1.4's captureWaitMs default
+ * (5000 ms), clamped to the default baselineTimeoutMs (DEFAULT_CAPTURE_TIMEOUT_MS), as config.ts does.
+ */
+export const FALLBACK_CAPTURE_WAIT_MS = Math.min(5_000, DEFAULT_CAPTURE_TIMEOUT_MS);
+
+/** What the orchestrator asked for at dispatch (directives.ts, parsed from its own prompt only). */
+export interface DispatchStart {
+  readonly directives: VerifyDirectives;
+  /** Clock value when the dispatch started (pending.ts R3 dispatchedAt, R11 lineage). */
+  readonly dispatchedAt: number;
+}
+
+/** What a deferred producer's return hands to finishDeferred (pending.ts R3). */
+export interface DeferredFinishInput {
+  readonly dispatchID: string;
+  /** The session that called `task` / `delegate`; never the producer. */
+  readonly orchestratorSessionID: string;
+  readonly producerSessionID: string;
+  /** As received; canonicalised here (canonicalTier, 1.6 handoff item 8). */
+  readonly producerTier: string;
+  readonly description: string;
+  readonly cwd: string | undefined;
+  readonly dod: DoD;
+  readonly dispatchedAt: number;
+}
+
+/**
+ * What finishDeferred decided. `deferred: false` means the delegation is NOT deferred and the
+ * caller runs today's required gate on it (QA-2.4-4, QA-2.4-10): the dispatch record is left in the
+ * store for that gate. Deferred or background verification is never weaker than that gate.
+ */
+export type DeferredFinish =
+  | {
+      readonly deferred: true;
+      /** The section 1.5-16 footer, naming the handle. */
+      readonly footer: string;
+      readonly handle: string;
+      readonly risk: RiskAssessment;
+    }
+  | {
+      readonly deferred: false;
+      /**
+       * "unregistered": the registry refused the entry (registry-full, handle-collision,
+       * invalid-input); "no-change": an attributed empty change set, which the required gate passes
+       * with no process (section 1.5-6); "error": the finish itself failed.
+       */
+      readonly reason: "unregistered" | "no-change" | "error";
+      readonly detail: string;
+    };
+
+/** What R11 lineage needs from a required gate's dispatch. */
+export interface LineageContext {
+  readonly orchestratorSessionID: string;
+  /** Git top-level of the gate-time snapshot (TreeSnapshot.root); undefined -> no lineage either way. */
+  readonly root: string | undefined;
+  readonly dispatchID: string;
+  readonly dispatchedAt: number;
+  /** When the producer returned: the landedAt of a rejection recorded now. */
+  readonly returnedAt: number;
+  readonly strictUnverifiable: boolean | undefined;
+}
+
+/** 1.6 handoff item 8: the canonical tier id is lowercase and trimmed. */
+export function canonicalTier(tier: string): string {
+  return tier.trim().toLowerCase();
+}
+
+/**
+ * The text directives are parsed from: the orchestrator-authored `prompt` argument, or its
+ * `description` when the prompt is blank (the prompt-repair hook copies it in that case). Never a
+ * tool result or a subagent's text (directives.ts SECURITY).
+ */
+export function dispatchDirectiveText(prompt: string | undefined, description: string | undefined): string {
+  return prompt !== undefined && prompt.trim() !== "" ? prompt : (description ?? "");
+}
+
+/** A DoD whose deferral section 1.5-14/16 governs: it carries a testsPass check. */
+export function hasTestsPass(dod: DoD): boolean {
+  return dod.checks.some(c => c.kind === "testsPass");
+}
+
+/**
+ * pending.ts R3 `digests`: sha256 hex of each path's bytes, ABSENT_DIGEST for a missing path.
+ * fs reads only. Undefined (no drift claim either way) when a path is not a regular file or cannot
+ * be read, or when the set exceeds MAX_STORED_CHANGED_FILES paths or DRIFT_DIGEST_MAX_BYTES bytes.
+ * Never rejects. 2.4.3 computes the "after" side with the same function.
+ */
+export async function digestFiles(paths: readonly string[]): Promise<FileDigests | undefined> {
+  if (paths.length > MAX_STORED_CHANGED_FILES) return undefined;
+  const out = new Map<string, string>();
+  let total = 0;
+  for (const path of paths) {
+    try {
+      const info = await stat(path);
+      if (!info.isFile()) return undefined;
+      total += info.size;
+      if (total > DRIFT_DIGEST_MAX_BYTES) return undefined;
+      out.set(path, createHash("sha256").update(await fsReadFile(path)).digest("hex"));
+    } catch (err) {
+      if (err instanceof Error && "code" in err && err.code === "ENOENT") {
+        out.set(path, PENDING_ABSENT_DIGEST);
+        continue;
+      }
+      return undefined;
+    }
+  }
+  return out;
+}
+
+// -----------------------------------------------------------------------------------------------
+// 2.4.3a router_verify (plan section 1.5-18; pending.ts R2, R4, R6, R8, R9, R11)
+// -----------------------------------------------------------------------------------------------
+
+/** What one router_verify call asks for (index.ts builds it with parseRouterVerifyArgs). */
+export type VerifyTarget =
+  | { readonly kind: "handles"; readonly handles: readonly unknown[] }
+  | { readonly kind: "pending" };
+
+/** One line of a router_verify report, in the order the handles were named. */
+export type HandleReport =
+  | {
+      readonly kind: "verdict";
+      readonly handle: string;
+      readonly description: string;
+      readonly producerTier: string;
+      /** "run": judged by this call; "joined": another call's run; "cached": settled earlier, nothing ran. */
+      readonly via: "run" | "joined" | "cached";
+      readonly result: SettledVerification;
+    }
+  /** Malformed, never issued, or issued to another session (R6): nothing distinguishes them. */
+  | { readonly kind: "unknown"; readonly input: string }
+  | { readonly kind: "expired"; readonly handle: string }
+  /** Joined another call's run, which outlived this call's deadline (R8). */
+  | { readonly kind: "elsewhere"; readonly handle: string; readonly description: string };
+
+export interface VerifyReport {
+  readonly items: readonly HandleReport[];
+  /** Distinct handles beyond MAX_HANDLES_PER_CALL: reported, never run (R2). */
+  readonly excess: number;
+  readonly text: string;
+}
+
+export const ROUTER_VERIFY_ARGS_TEXT =
+  "[router] router_verify: pass exactly one of `handles` (a non-empty list of vrf_ handles) or `pending: true`; nothing was run.";
+export const ROUTER_VERIFY_NO_PENDING_TEXT = "[router] router_verify: no unverified delegations in this session; nothing was run.";
+export const ROUTER_VERIFY_NO_RETRY_TEXT = "[router] Nothing was retried or escalated; whether to re-dispatch is your call.";
+/** Section 1.5-18. The run always uses the current tree. */
+export const DRIFT_NOTICE = "tree drifted since delegation; verdict reflects current state";
+/** No per-file proof either way (no stored or current digests): a pass is never kept then. */
+export const DRIFT_UNCHECKED_NOTICE = "drift since delegation could not be checked; verdict reflects current state";
+export const ROUTER_VERIFY_CANCELLED_REASON = "router_verify was cancelled before a verdict";
+export const ROUTER_VERIFY_RELEASED_REASON = "the delegation's verification data was released";
+/** Drifted paths named per handle; the rest are counted. */
+export const DRIFT_MAX_PATHS = 10;
+
+/**
+ * index.ts `router_verify` args. The SDK's arg root is an object shape (phase-2.4.md gather item
+ * 1), so "exactly one of handles / pending" is checked here: both, neither, `pending` other than
+ * true, and `handles` that is not a non-empty array are errors. Pure; never throws.
+ */
+export function parseRouterVerifyArgs(args: unknown): VerifyTarget | { readonly error: string } {
+  const a = args !== null && typeof args === "object" ? (args as Record<string, unknown>) : {};
+  const hasHandles = a.handles !== undefined && a.handles !== null;
+  const hasPending = a.pending !== undefined && a.pending !== null;
+  if (hasHandles === hasPending) return { error: ROUTER_VERIFY_ARGS_TEXT };
+  if (hasPending) return a.pending === true ? { kind: "pending" } : { error: ROUTER_VERIFY_ARGS_TEXT };
+  if (!Array.isArray(a.handles) || a.handles.length === 0) return { error: ROUTER_VERIFY_ARGS_TEXT };
+  return { kind: "handles", handles: a.handles };
+}
+
+/** A literal phrase inside a RegExp source. */
+function escapeRegExp(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/**
+ * pending.ts R4: reasons that say nothing about the producer's work (slot busy, the deadline or an
+ * abort, a timeout, an executor or coordinator error). Matched on 2.1/2.2's stable phrases
+ * (deterministic.ts u6, u7, u13, u14, u16; batch.ts BATCH_REASONS; baseline.ts
+ * REFERENCE_NONE.gateBudget) and this module's own. REFERENCE_NONE.failed ("failed or timed out" at
+ * dispatch) is deliberately not matched: that reference cannot be recaptured, so it is terminal.
+ *
+ * QA-2.4-14: only where the ROUTER writes it: at the start of a reason, after at most one check-kind
+ * word ("testsPass: ", "testsPass "). Producer-controlled text (failing test ids, "file > title")
+ * only ever follows a router phrase ("introduced failures: ", "; observed failures: "), so a test
+ * titled "verification slot busy" can never make a terminal verdict retryable.
+ */
+const TRANSIENT_REASON = new RegExp(
+  "^(?:[A-Za-z]+:? )?(?:" +
+    [
+      "gate budget exhausted", // u7, u14 (deadline cut)
+      "verification slot busy", // u14
+      "timed out after \\d+ ?ms", // u13: "testsPass timed out after <n>ms: <command>"
+      "check errored", // u16: "testsPass check errored: <reason>"
+      "cannot attribute failures: the reference rerun timed out after \\d+ ?ms", // u6
+      `(?:no reference: pre-existing failures cannot be told apart \\()?${escapeRegExp(REFERENCE_NONE.gateBudget)}`,
+      "verification gate timed out after \\d+ ?ms",
+      "verification coordinator (?:disposed|failed)",
+      "verification batch (?:failed|ended without an outcome|produced no outcome)",
+      "verification unavailable:",
+      escapeRegExp(ABANDONED_REASON),
+      escapeRegExp(DISPOSED_REASON),
+      "router_verify was cancelled",
+    ].join("|") +
+    ")",
+  "i",
+);
+
+/**
+ * pending.ts R4 `retryable`: only an unverifiable (or skipped) verdict can be retryable, and only
+ * when the call was cut (deadline, abort) or a reason is transient. A pass or a fail is a verdict on
+ * the work and always terminal. Misclassification is never a false pass either way: a retryable
+ * entry is re-run later, a terminal unverifiable is replayed.
+ */
+export function isRetryableVerdict(verdict: Verdict, cut: boolean): boolean {
+  if (verdict.skipped === true) return true;
+  const outcome = verdict.outcome ?? (verdict.pass ? "pass" : "fail");
+  if (outcome !== "unverifiable") return false;
+  if (cut) return true;
+  return [...verdict.reasons, ...(verdict.caveats ?? [])].some(r => TRANSIENT_REASON.test(r));
+}
+
+function formatPaths(paths: readonly string[], base: string): string {
+  const shown = paths.slice(0, DRIFT_MAX_PATHS).map(p => {
+    const rel = relative(base, p);
+    return sanitizeDescription(rel !== "" && !rel.startsWith("..") && !isAbsolute(rel) ? rel : p);
+  });
+  const rest = paths.length - shown.length;
+  return rest > 0 ? `${shown.join(", ")} (+${rest} more)` : shown.join(", ");
+}
+
+function indent(text: string): string {
+  return text.split("\n").map(line => `  ${line}`).join("\n");
+}
+
+/**
+ * Section 1.5-18 / R9: one block per handle, in call order. A judged handle carries the required
+ * gate's own wording: buildAcceptedSuffix when accepted, buildForcingNote (with the next tier on a
+ * fail) plus ROUTER_VERIFY_NO_RETRY_TEXT when not. A retryable result is "not judged" and the
+ * delegation stays unverified. Pure.
+ */
+export function formatVerifyReport(
+  items: readonly HandleReport[],
+  excess: number,
+  strictUnverifiable: boolean,
+  cwdOf: (handle: string) => string | undefined = () => undefined,
+): string {
+  const blocks: string[] = [];
+  for (const item of items) {
+    if (item.kind === "unknown") {
+      blocks.push(`- ${sanitizeDescription(item.input)} \u00b7 ${UNKNOWN_HANDLE_TEXT}`);
+      continue;
+    }
+    if (item.kind === "expired") {
+      blocks.push(`- ${item.handle} \u00b7 ${EXPIRED_HANDLE_TEXT}`);
+      continue;
+    }
+    if (item.kind === "elsewhere") {
+      blocks.push(`- ${item.handle} \u00b7 ${item.description} \u00b7 ${VERIFYING_ELSEWHERE_TEXT}`);
+      continue;
+    }
+    const { result } = item;
+    const verdict = result.verdict;
+    const via = item.via === "joined" ? " (joined a run already in progress)" : item.via === "cached" ? " (cached verdict; nothing was run)" : "";
+    if (result.retryable) {
+      const why = scrubText([...new Set([...(verdict.caveats ?? []), ...verdict.reasons])].join("; ") || "no verdict");
+      blocks.push(
+        `- ${item.handle} \u00b7 ${item.description} \u00b7 not judged${via}: ${why}\n` +
+        "  [router] The delegation is still unverified; call `router_verify` again for a verdict.",
+      );
+      continue;
+    }
+    const judged = gateResult(verdict, "explicit", strictUnverifiable);
+    const outcome = judged.verdict.outcome ?? "fail";
+    const lines = [`- ${item.handle} \u00b7 ${item.description} \u00b7 ${outcome}${via}`];
+    const base = cwdOf(item.handle) ?? "";
+    if (result.driftedPaths !== undefined && result.driftedPaths.length > 0) {
+      lines.push(indent(`[router] ${DRIFT_NOTICE} (changed after the producer returned: ${formatPaths(result.driftedPaths, base)})`));
+    } else if ((verdict.caveats ?? []).includes(DRIFT_UNCHECKED_NOTICE)) {
+      lines.push(indent(`[router] ${DRIFT_UNCHECKED_NOTICE}`));
+    }
+    if (judged.accepted) {
+      lines.push(indent(buildAcceptedSuffix(verdict.method, judged.verdict.caveats, verdict.notes).trim()));
+    } else {
+      lines.push(indent(scrubText(buildForcingNote(verdict.reasons, { producerTier: item.producerTier, nextTier: result.nextTier ?? null }))));
+      lines.push(indent(ROUTER_VERIFY_NO_RETRY_TEXT));
+    }
+    blocks.push(lines.join("\n"));
+  }
+  if (excess > 0) {
+    blocks.push(`- ${excess} more handle(s) not run: at most ${MAX_HANDLES_PER_CALL} per call; call \`router_verify\` again with the rest.`);
+  }
+  // QA-2.4-6 (R9): reasons, caveats and notes quote producer-controlled text (failing test ids).
+  // An orchestrator that quotes this report before its own `VERIFY:` must not change its mode.
+  return neutralizeDirectives(
+    [`[router] router_verify: one verdict per handle (${items.length}${excess > 0 ? ` of ${items.length + excess}` : ""}).`, ...blocks].join("\n"),
+  );
+}
+
+/**
+ * 2.4.5 (pending.ts R14): a background run's report as queue outcomes. Only this run's own verdict
+ * ("run") is "judged"; a verdict another router_verify call produced or had cached, and a run that
+ * call still owns ("elsewhere"), are "reported" (that caller has or gets it); unknown and expired
+ * handles are "gone". Pure.
+ */
+export function backgroundOutcomes(items: readonly HandleReport[]): BackgroundOutcome[] {
+  return items.map((item): BackgroundOutcome => {
+    if (item.kind === "verdict") {
+      return item.via === "run"
+        ? { kind: "judged", handle: item.handle, description: item.description, result: item.result }
+        : { kind: "reported", handle: item.handle };
+    }
+    if (item.kind === "elsewhere") return { kind: "reported", handle: item.handle };
+    return { kind: "gone", handle: item.kind === "unknown" ? item.input : item.handle };
+  });
+}
+
+/** A never-rejecting wait for `promise` that ends with `fallback()` once `signal` aborts. */
+function untilAborted<T>(promise: Promise<T>, signal: AbortSignal, fallback: () => T): Promise<T> {
+  if (signal.aborted) return Promise.resolve(fallback());
+  return new Promise<T>(settle => {
+    const onAbort = (): void => settle(fallback());
+    signal.addEventListener("abort", onAbort, { once: true });
+    promise.then(
+      value => {
+        signal.removeEventListener("abort", onAbort);
+        settle(value);
+      },
+      () => {
+        signal.removeEventListener("abort", onAbort);
+        settle(fallback());
+      },
+    );
+  });
+}
+
+function unverifiableVerdict(reason: string): Verdict {
+  return { pass: false, outcome: "unverifiable", method: "none", reasons: [reason], caveats: [reason] };
+}
+
+/** Drift of one delegation's files since its producer returned (pending.ts R3 digests). */
+type DriftCheck = { readonly kind: "none" } | { readonly kind: "drifted"; readonly paths: readonly string[] } | { readonly kind: "unchecked" };
+
 /** A full object name (SHA-1 or SHA-256); anything else (e.g. an unborn HEAD) is an unknown head. */
 const OBJECT_NAME = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i;
 
@@ -159,11 +561,113 @@ export interface VerificationWiring {
    */
   beginVerification(store: ReturnType<typeof createChangedFileStore>, id: string, cwd: string | undefined, dod: DoD): Promise<void>;
   /**
-   * 2.1.5b: beginVerification, awaited for at most captureWaitMs. The capture keeps running (up to
-   * baselineTimeoutMs) in the store after a timeout; a timeout or error only means "no reference
-   * yet" and is logged. Never rejects.
+   * 2.1.5b: beginVerification, awaited for at most `waitMs` (2.4.2a: the dispatch's VERIFY_WAIT;
+   * default captureWaitMs). The capture keeps running (up to baselineTimeoutMs) in the store after
+   * a timeout; a timeout or error only means "no reference yet" and is logged. Never rejects.
    */
-  beginVerificationBounded(store: ReturnType<typeof createChangedFileStore>, id: string, cwd: string | undefined, dod: DoD): Promise<void>;
+  beginVerificationBounded(
+    store: ReturnType<typeof createChangedFileStore>,
+    id: string,
+    cwd: string | undefined,
+    dod: DoD,
+    waitMs?: number,
+  ): Promise<void>;
+  /**
+   * 2.4.2a: parseVerifyDirectives over `text` with the config defaults (defaultVerify,
+   * captureWaitMs, baselineTimeoutMs). `text` MUST be the orchestrator's own prompt
+   * (dispatchDirectiveText). Unknown values are logged. Never throws: when the config cannot be
+   * read, the mode is "required" (today's gate) and the wait FALLBACK_CAPTURE_WAIT_MS (QA-2.4-9).
+   */
+  resolveDirectives(text: string): VerifyDirectives;
+  /**
+   * 2.4.2a: resolveDirectives, then beginVerificationBounded for at most the directives' waitMs
+   * (section 1.5-14: VERIFY_WAIT, 0 allowed). `remember` keeps the start for takeDispatch (the
+   * native `task` after hook). Never rejects.
+   */
+  startDispatch(
+    store: ReturnType<typeof createChangedFileStore>,
+    id: string,
+    cwd: string | undefined,
+    dod: DoD,
+    text: string,
+    remember: boolean,
+  ): Promise<DispatchStart>;
+  /**
+   * 2.4.2b: the start remembered by startDispatch, forgotten on read. When none is remembered (the
+   * before hook did not run, or the entry was swept), `text` is parsed again (same orchestrator
+   * prompt) and dispatchedAt is now: a later dispatchedAt can only widen R11 lineage (fewer
+   * passes), never narrow it.
+   */
+  takeDispatch(id: string, text: string): DispatchStart;
+  /**
+   * 2.4.2a: whether this delegation defers (section 1.5-16): mode "deferred", a testsPass check
+   * in the DoD, and verification not disabled (`require: "never"`). Everything else is gated
+   * exactly as before 2.4.
+   * QA-2.4-10: only what the required gate would actually judge defers. `trivial` is the gate's own
+   * input (the native path's dispatch-time classification; delegate passes none): the gate skips a
+   * trivial dispatch whose DoD was inferred (gate.ts), so that one is not deferred and takes the
+   * required path, with the same outcome. (An attributed empty change set is the other case;
+   * finishDeferred answers "no-change" for it.)
+   */
+  isDeferred(dod: DoD, directives: VerifyDirectives, trivial?: boolean): boolean;
+  /**
+   * 2.4.2a: the deferred finish. No gate, no test command, no slot: a tree snapshot and the commit
+   * diff (git only, as prepareVerification) under DEFERRED_FINISH_MS, the static scoping plan
+   * (runner.ts: no spawn), the risk (pending.ts R10), the drift digests (fs reads, awaited inside
+   * the same bound so the baseline predates the result, QA-2.4-8),
+   * `pending.register`, and the section 1.5-16 footer. The dispatch's reference promise is
+   * registered un-awaited, and the dispatch record is cleared only after it settles (clearing it
+   * earlier would abort the capture). Never rejects. QA-2.4-4: when the registry refuses the entry
+   * or the finish fails, the result is `deferred: false` and the caller runs the required gate on
+   * the dispatch (whose record is then left in the store); there is no footer without a handle.
+   */
+  finishDeferred(store: ReturnType<typeof createChangedFileStore>, input: DeferredFinishInput): Promise<DeferredFinish>;
+  /**
+   * 2.4.2b/c, pending.ts R11 on a required gate's result:
+   * - outcome "fail" with proven-introduced ids -> pending.recordRejection (label
+   *   "dispatch <id>", landedAt = returnedAt); the result is returned unchanged;
+   * - otherwise, proven pre-existing ids that an earlier rejection of the same session and root
+   *   introduced (findLineage) -> the verdict becomes unverifiable with buildLineageCaveat; it
+   *   stays accepted unless strictUnverifiable. It never creates a pass or a fail.
+   * A verdict without `failures` (checker verdicts, a timed-out gate) and an unknown root are
+   * returned unchanged and record nothing.
+   */
+  applyLineage(res: GateResult, ctx: LineageContext): GateResult;
+  /**
+   * 2.4.3a, section 1.5-18: router_verify for `sessionID` (the calling orchestrator; "" = none, so
+   * every handle is unknown). Never rejects; never retries or escalates.
+   * - Handles are normalized, deduped and capped at MAX_HANDLES_PER_CALL; `pending` is listOpen, so
+   *   runs already in flight are joined (R8). Lookups are scoped by session (R6).
+   * - ONE Deadline of gateBudgetMs per call, created before any preparation (section 1.5-13) and
+   *   shared by every claimed handle, so their testsPass requests meet in one S5 window.
+   * - Each claimed handle runs the required gate's path: its stored changed files, its stored
+   *   reference (awaited under the deadline), a fresh tree snapshot, buildGateDeps + accept under
+   *   withTimeout(deadline.remaining()). All preparations finish before any gate starts.
+   * - R11 lineage can only turn a pass into unverifiable; drift (stored vs current digests) or
+   *   unprovable drift never lets a pass stand (DRIFT_NOTICE / DRIFT_UNCHECKED_NOTICE).
+   * - QA-2.4-1: judged in two phases. Every gate of the call returns, every terminal fail with
+   *   proven-introduced ids is recorded in the R11 ledger, and only then are lineage, drift and the
+   *   next tier applied to every result, so the handle order and the gates' finishing order never
+   *   decide a verdict. A background run is one such call.
+   * - claim.settle runs in a `finally`; a transient unverifiable (isRetryableVerdict) returns the
+   *   entry to unverified. A fail carries buildForcingNote with the next tier, and nothing else.
+   * `signal` (the tool call's abort) aborts the deadline. `background` (2.4.5, the background
+   * queue's own runs only) runs the gates at low priority whatever `lowPriority` says; any other
+   * call marks the handles it reported, so no late notice repeats a verdict the caller received.
+   */
+  verifyHandles(
+    sessionID: string,
+    target: VerifyTarget,
+    options?: { readonly signal?: AbortSignal; readonly background?: boolean },
+  ): Promise<VerifyReport>;
+  /** 2.4.1: the plugin instance's pending registry (sweep, forgetSession, dispose are wired in index.ts). */
+  pending: PendingRegistry;
+  /**
+   * 2.4.5 (pending.ts R14): the background queue, constructed only when `background` is true at
+   * plugin start; undefined otherwise, and nothing then refers to one. The deferred finish feeds
+   * it; index.ts reads its late notices in the system transform and forgets a deleted session.
+   */
+  background: BackgroundQueue | undefined;
   /**
    * 2.1.5b: the crash GC of stale reference dirs, fire-and-forget. QA-2.1-11: it runs `delayMs`
    * (default REFERENCE_GC_START_DELAY_MS) after the call, on an unref'd timer, so plugin start
@@ -259,6 +763,10 @@ export function createVerificationWiring(deps: {
   logger?: WiringLogger;
   /** Test seams of the S5 batch coordinator (clock, timers, platform, maximum window size). */
   batch?: Omit<BatchCoordinatorOptions, "logger">;
+  /** Test seams of the pending registry (clock, random source). */
+  pending?: Pick<PendingRegistryOptions, "now" | "random">;
+  /** Test seams of the 2.4.5 background queue; used only when `background` is true. */
+  background?: Pick<BackgroundQueueOptions, "now" | "timers" | "settleMs" | "retryBaseMs" | "maxAttempts" | "platform">;
 }): VerificationWiring {
   const { client, directory, getConfig } = deps;
   const logger: WiringLogger = deps.logger ?? { warn: (message, extra) => console.warn(message, extra ?? "") };
@@ -271,6 +779,40 @@ export function createVerificationWiring(deps: {
    * runtime, so a config reload reaches the next window without a new coordinator.
    */
   const coordinator = createBatchCoordinator({ ...deps.batch, logger });
+  /**
+   * 2.4.1/2.4.2a: one pending registry per plugin instance. Its TTL and abandonment bound are read
+   * from the config at plugin start (a reload applies after a restart; the registry holds no timer).
+   */
+  let pendingBudget: Pick<VerifyBudget, "pendingTtlMs" | "gateBudgetMs" | "background">;
+  try {
+    pendingBudget = resolveVerifyBudget(getConfig());
+  } catch (err) {
+    // Plugin start never fails on config: the section 1.4 defaults (background off).
+    logger.debug?.("[verify] pending registry uses default bounds: config unreadable", { error: errorText(err) });
+    pendingBudget = { pendingTtlMs: DEFAULT_PENDING_TTL_MS, gateBudgetMs: DEFAULT_GATE_BUDGET_MS, background: false };
+  }
+  const pending = createPendingRegistry({
+    ttlMs: pendingBudget.pendingTtlMs,
+    maxVerifyingMs: pendingBudget.gateBudgetMs + VERIFYING_GRACE_MS,
+    ...deps.pending,
+    onEvict: (entry, cause) => logger.debug?.("[verify] pending delegation evicted", { handle: entry.handle, cause }),
+  });
+  const pendingNow = deps.pending?.now ?? Date.now;
+  /**
+   * 2.4.5: assigned once verifyHandles exists, and only when `background` is true at plugin start
+   * (pending.ts R14). With background off this stays undefined: no queue, no timer, no run.
+   */
+  let background: BackgroundQueue | undefined;
+  /** QA-2.4-5: foreground testsPass requests in flight (the background queue's `busy`). */
+  const foreground = { tests: 0 };
+  /** 2.4.2b: native `task` dispatch starts, before hook -> after hook (bounded FIFO, swept). */
+  const dispatchStarts = new Map<string, DispatchStart>();
+  /**
+   * pending.ts R10: the settled value of each dispatch reference promise, recorded when it settles,
+   * so a deferred finish can tell "already captured at return" without awaiting (0 ms). Keyed by
+   * the promise object (the store returns the same one), so it holds nothing once the store drops it.
+   */
+  const settledReferences = new WeakMap<Promise<ReferenceState>, ReferenceState>();
 
   const abs = (p: string): string => (isAbsolute(p) ? p : join(directory, p));
 
@@ -502,9 +1044,13 @@ export function createVerificationWiring(deps: {
     inFlight?: Set<string>,
     prepared?: PreparedVerification,
     deadline?: Deadline,
+    forceLowPriority = false,
   ): GateDeps => {
     const cfg = getConfig();
-    const budget = resolveVerifyBudget(cfg);
+    const resolved = resolveVerifyBudget(cfg);
+    // 2.4.5 (section 1.5-19): background runs are low priority whatever `lowPriority` says.
+    // QA-2.4-5: and they never wait for the slot (waitMs 0): busy means back off and retry later.
+    const budget: VerifyBudget = forceLowPriority ? { ...resolved, lowPriority: true, slotWaitMs: 0 } : resolved;
     // QA-2.1-5: the recheck's git processes (GC, materialize, dispose) run at the configured
     // priority too, like the capture and the start-up GC (QA-1.2-13).
     const referenceArgv: ArgvSeam = (file, args, opts) => argvSeam(file, args, { ...opts, lowPriority: budget.lowPriority });
@@ -545,6 +1091,21 @@ export function createVerificationWiring(deps: {
         ...currentTree,
       });
     }
+    // QA-2.4-5: foreground testsPass (a required gate, router_verify) takes precedence over a
+    // background run: the run in flight is preempted before this request plans or asks for the
+    // slot, and no background run starts while one is active.
+    if (!forceLowPriority) {
+      const inner = testsPass;
+      testsPass = async request => {
+        foreground.tests += 1;
+        try {
+          void background?.preempt();
+          return await inner(request);
+        } finally {
+          foreground.tests -= 1;
+        }
+      };
+    }
     return {
       deterministic: {
         exec: execSeam,
@@ -583,28 +1144,657 @@ export function createVerificationWiring(deps: {
         uncaptured: { kind: "none", reason: `${REFERENCE_NONE.failed} (${errorText(err)})` },
       };
     }
-    await store.beginDispatch(id, resolve(directory, cwd || "."), deps);
+    const begun = store.beginDispatch(id, resolve(directory, cwd || "."), deps);
+    // pending.ts R10: remember the reference's settled value (the store hands out one promise).
+    const reference = store.reference(id);
+    if (!settledReferences.has(reference)) void reference.then(state => settledReferences.set(reference, state));
+    await begun;
   };
+
+  /**
+   * The producer's change since the dispatch: the gate-time snapshot (bounded by `deadline`), the
+   * commits since the dispatch head, and the store's delta. Shared by prepareVerification and the
+   * deferred finish, so both attribute exactly the same files.
+   */
+  const observeChange = async (
+    store: ReturnType<typeof createChangedFileStore>,
+    id: string,
+    childID: string,
+    cwd: string | undefined,
+    deadline: Deadline | undefined,
+  ): Promise<Omit<PreparedVerification, "reference">> => {
+    const base = resolve(directory, cwd || ".");
+    const controller = new AbortController();
+    const onAbort = (): void => controller.abort();
+    deadline?.signal.addEventListener("abort", onAbort, { once: true });
+    let snapshot: TreeSnapshot | undefined;
+    try {
+      const bound = deadline ? deadline.bound(GRADE_SNAPSHOT_TIMEOUT_MS) : GRADE_SNAPSHOT_TIMEOUT_MS;
+      // QA-2.1-2: digest exactly the paths the dispatch snapshot digested (<= MAX_DIGEST_FILES),
+      // so delta can tell which already-dirty file a shell edit changed.
+      const digests = store.baselineSnapshot(id)?.digests;
+      const options = digests === undefined ? {} : { digestPaths: digests === "unavailable" ? [] : [...digests.keys()] };
+      snapshot = bound > 0 && !controller.signal.aborted
+        ? await withTimeout(snapshotTree(base, controller.signal, options), bound, "grade fingerprint")
+        : undefined;
+    } catch {
+      snapshot = undefined; // Explicit unavailable disclaimer, never a raw tree.
+    } finally {
+      deadline?.signal.removeEventListener("abort", onAbort);
+      controller.abort();
+    }
+    const committed = await committedSinceDispatch(store.baselineSnapshot(id), snapshot, deadline);
+    return { ...store.delta(id, childID, snapshot, base, committed), snapshot };
+  };
+
+  const beginVerificationBounded: VerificationWiring["beginVerificationBounded"] = async (store, id, cwd, dod, waitOverrideMs) => {
+    let waitMs: number;
+    let begun: Promise<void>;
+    try {
+      waitMs = waitOverrideMs ?? resolveVerifyBudget(getConfig()).captureWaitMs;
+      begun = beginVerification(store, id, cwd, dod);
+    } catch (err) {
+      logger.warn("[verify] dispatch reference capture could not start", { id, error: errorText(err) });
+      return;
+    }
+    const outcome = await awaitBounded(begun, waitMs);
+    if (outcome.kind === "timeout") {
+      logger.debug?.("[verify] dispatch reference not ready; proceeding without waiting further", { id, waitMs });
+    } else if (outcome.kind === "error") {
+      logger.warn("[verify] dispatch reference capture failed; proceeding without a reference", { id, error: errorText(outcome.error) });
+    }
+  };
+
+  const resolveDirectives = (text: string): VerifyDirectives => {
+    try {
+      const budget = resolveVerifyBudget(getConfig());
+      return parseVerifyDirectives(
+        text,
+        { defaultVerify: budget.defaultVerify, captureWaitMs: budget.captureWaitMs, baselineTimeoutMs: budget.baselineTimeoutMs },
+        message => logger.warn(message),
+      );
+    } catch (err) {
+      // No config, no deferral: today's synchronous gate. QA-2.4-9: with the section 1.4 default
+      // capture wait (clamped to the default baselineTimeoutMs), as 2.1 waited: a producer started
+      // before its capture resolves contaminates it, and pre-existing failures could no longer be
+      // told apart.
+      logger.warn("[verify] dispatch directives could not be resolved; verifying synchronously", { error: errorText(err) });
+      return { mode: "required", waitMs: FALLBACK_CAPTURE_WAIT_MS, modeSource: "default", waitSource: "default" };
+    }
+  };
+
+  /**
+   * Section 1.5-17 "scoping impossible", decided with no process (runner.ts:11): planStaticScoping
+   * for each testsPass check, with the command and cwd the gate would use. The first S6 result wins;
+   * a command outside the allowlist is S6 too (the gate reports it unverifiable). Bounded by the
+   * deferred-finish deadline; an unfinished plan counts as impossible (raises the risk, never lowers it).
+   */
+  const staticScoping = async (
+    dod: DoD,
+    cwd: string | undefined,
+    changedFiles: readonly ChangedPath[],
+    deadline: Deadline,
+  ): Promise<StaticScoping> => {
+    const unfinished: StaticScoping = { unverifiable: true, code: "search-failed", reason: STATIC_SCOPING_UNFINISHED_REASON };
+    const budget = resolveVerifyBudget(getConfig());
+    const at = resolveBaseDir(cwd, directory);
+    const plans: StaticScoping[] = [];
+    for (const check of dod.checks) {
+      if (check.kind !== "testsPass") continue;
+      const command = resolveRepoCommand(check, "testsPass", undefined);
+      if (!isCommandAllowed(command, DEFAULT_ALLOWLIST)) {
+        plans.push({ unverifiable: true, code: "unsupported-command", reason: `command not allowlisted: ${scrubText(command)}` });
+        continue;
+      }
+      const ms = deadline.remaining();
+      if (ms <= 0) {
+        plans.push(unfinished);
+        continue;
+      }
+      try {
+        plans.push(await withTimeout(
+          planStaticScoping({ command, cwd: at, changedFiles, budget: { maxWorkers: budget.maxWorkers }, fs: fsSeam }),
+          ms,
+          "static scoping",
+        ));
+      } catch {
+        plans.push(unfinished);
+      }
+    }
+    return plans.find(p => "unverifiable" in p) ?? plans[0] ?? unfinished;
+  };
+
+  const finishDeferred: VerificationWiring["finishDeferred"] = async (store, input) => {
+    const producerTier = canonicalTier(input.producerTier);
+    // The live reference promise (no signal: never awaited here). Its settled value at this moment
+    // is the R10 `reference` input; a capture still in flight counts as absent.
+    const reference = store.reference(input.dispatchID);
+    const referenceCaptured = settledReferences.get(reference)?.kind === "captured";
+    const deadline = createDeadline(DEFERRED_FINISH_MS);
+    let risk: RiskAssessment = unattributedRisk();
+    let deferred = false;
+    try {
+      const change = await observeChange(store, input.dispatchID, input.producerSessionID, input.cwd, deadline);
+      // QA-2.4-10: an attributed empty change set is passed by the required gate with no process
+      // (section 1.5-6): nothing to defer. The caller runs that gate, with the same outcome.
+      if (change.changeBaseline === "available" && change.changedFiles.length === 0 && !deadline.signal.aborted) {
+        return { deferred: false, reason: "no-change", detail: "the producer changed no file" };
+      }
+      let changedFiles: ChangedPath[] | "unavailable" = "unavailable";
+      let digests: Promise<FileDigests | undefined> | undefined;
+      // Section 1.5-6 / QA-1.6-14: without a change baseline the set is unknown, never [].
+      if (change.changeBaseline === "available" && !deadline.signal.aborted) {
+        const paths: ChangedPath[] = change.changedFiles.map(f => ({
+          path: f.path,
+          status: f.status,
+          ...(f.previousPath !== undefined ? { previousPath: f.previousPath } : {}),
+        }));
+        changedFiles = paths;
+        const scopingPlan = await staticScoping(input.dod, input.cwd, paths, deadline);
+        risk = assessRisk({ changedFiles: paths, reference: referenceCaptured, producerTier, scopingPlan, root: change.snapshot?.root });
+        // QA-2.4-8: the drift baseline is taken BEFORE the result is released (fs reads only, under
+        // the same DEFERRED_FINISH_MS bound). An edit that lands right after the return is then
+        // drift, never part of the baseline. Not taken in time: no digests, so drift is
+        // "unchecked" and a later pass is downgraded.
+        const taken = await untilAborted(digestFiles(paths.map(p => p.path)), deadline.signal, () => undefined);
+        if (taken !== undefined) digests = Promise.resolve(taken);
+      }
+      const reg = pending.register({
+        orchestratorSessionID: input.orchestratorSessionID,
+        dispatchID: input.dispatchID,
+        producerSessionID: input.producerSessionID,
+        producerTier,
+        description: input.description,
+        cwd: resolveBaseDir(input.cwd, directory),
+        root: change.snapshot?.root,
+        dispatchedAt: input.dispatchedAt,
+        dod: input.dod,
+        reference,
+        changedFiles,
+        risk,
+        ...(digests !== undefined ? { digests } : {}),
+      });
+      if (!reg.ok) {
+        // QA-2.4-4: never a delegation without a verdict path: the caller runs the required gate.
+        logger.warn("[verify] deferred delegation not registered; verifying synchronously", { code: reg.code, detail: reg.detail });
+        return { deferred: false, reason: "unregistered", detail: `${reg.code}: ${reg.detail}` };
+      }
+      deferred = true;
+      // 2.4.5 (pending.ts R14): queued, never awaited: the queue's own timer starts the run later.
+      // An unattributed change set is not queued (nothing could run; it stays listed instead).
+      if (background !== undefined && changedFiles !== "unavailable") {
+        try {
+          background.enqueue({ sessionID: input.orchestratorSessionID, handle: reg.handle, files: changedFiles.map(p => p.path) });
+        } catch (err) {
+          // The handle is registered: the delegation stays unverified and listed, as without background.
+          logger.warn("[verify] deferred delegation not queued for background verification", { handle: reg.handle, error: errorText(err) });
+        }
+      }
+      return { deferred: true, footer: buildDeferredFooter({ handle: reg.handle, risk }), handle: reg.handle, risk };
+    } catch (err) {
+      // QA-2.4-4: as for a refused registration, the required gate runs instead.
+      logger.warn("[verify] deferred finish failed; verifying synchronously", { error: errorText(err) });
+      return { deferred: false, reason: "error", detail: errorText(err) };
+    } finally {
+      deadline.dispose();
+      // A deferred dispatch's record goes once the finish has read it (delta) AND its reference
+      // settled: clearing it earlier aborts an in-flight capture (dispatch.ts evict) and ends its
+      // contamination tracking (section 1.5-14). A dispatch that is not deferred keeps it for the
+      // required gate, which clears it as before.
+      if (deferred) void reference.then(() => store.clear(input.dispatchID));
+    }
+  };
+
+  /**
+   * R11, the downgrade half: proven pre-existing ids that an earlier rejection of the same session
+   * and root introduced turn a non-fail verdict into unverifiable with buildLineageCaveat. It never
+   * creates a pass or a fail. Shared by applyLineage and verifyHandles.
+   */
+  const lineageDowngrade = (
+    res: GateResult,
+    ctx: Pick<LineageContext, "orchestratorSessionID" | "root" | "dispatchedAt" | "strictUnverifiable">,
+  ): GateResult => {
+    const failures = res.verdict.failures;
+    if (failures === undefined || ctx.root === undefined || ctx.orchestratorSessionID === "") return res;
+    const outcome = res.verdict.outcome ?? (res.verdict.pass ? "pass" : "fail");
+    if (outcome === "fail" || failures.preexisting.length === 0) return res;
+    const match = pending.findLineage({
+      orchestratorSessionID: ctx.orchestratorSessionID,
+      root: ctx.root,
+      dispatchedAt: ctx.dispatchedAt,
+      preexisting: failures.preexisting,
+    });
+    if (match === undefined) return res;
+    const caveat = buildLineageCaveat(match);
+    return gateResult(
+      { ...res.verdict, pass: false, outcome: "unverifiable", caveats: [...(res.verdict.caveats ?? []), caveat] },
+      res.dodSource,
+      ctx.strictUnverifiable ?? false,
+    );
+  };
+
+  const applyLineage: VerificationWiring["applyLineage"] = (res, ctx) => {
+    const failures = res.verdict.failures;
+    if (failures === undefined || ctx.root === undefined || ctx.orchestratorSessionID === "") return res;
+    const outcome = res.verdict.outcome ?? (res.verdict.pass ? "pass" : "fail");
+    if (outcome === "fail") {
+      if (failures.introduced.length > 0) {
+        pending.recordRejection({
+          orchestratorSessionID: ctx.orchestratorSessionID,
+          root: ctx.root,
+          label: `dispatch ${ctx.dispatchID}`,
+          landedAt: ctx.returnedAt,
+          introduced: failures.introduced,
+        });
+      }
+      return res;
+    }
+    return lineageDowngrade(res, ctx);
+  };
+
+  /** 2.4.3a: the current tree for one call, once per cwd (the materialize same-repository guard, P0). */
+  const snapshotFor = async (cwd: string, deadline: Deadline): Promise<TreeSnapshot | undefined> => {
+    const controller = new AbortController();
+    const onAbort = (): void => controller.abort();
+    deadline.signal.addEventListener("abort", onAbort, { once: true });
+    try {
+      const bound = deadline.bound(GRADE_SNAPSHOT_TIMEOUT_MS);
+      if (bound <= 0 || controller.signal.aborted) return undefined;
+      // No digests: the drift check digests the producer's files itself (checkDrift).
+      return await withTimeout(snapshotTree(cwd, controller.signal, { digestPaths: [] }), bound, "router_verify fingerprint");
+    } catch {
+      return undefined; // No current tree: materialize skips its same-repository guard, as without a snapshot.
+    } finally {
+      deadline.signal.removeEventListener("abort", onAbort);
+      controller.abort();
+    }
+  };
+
+  /**
+   * 2.4.3a, section 1.5-18: the producer's files now against their digests right after it returned.
+   * "unchecked" whenever either side is missing (no change set, no stored digests, a digest that
+   * could not be taken, or the deadline): never a claim of "no drift" without proof.
+   */
+  const checkDrift = async (entry: PendingEntry, deadline: Deadline): Promise<DriftCheck> => {
+    if (entry.changedFiles === "unavailable" || entry.digests === undefined) return { kind: "unchecked" };
+    const before = await untilAborted(entry.digests, deadline.signal, () => undefined);
+    if (before === undefined) return { kind: "unchecked" };
+    const after = await untilAborted(digestFiles([...before.keys()]), deadline.signal, () => undefined);
+    if (after === undefined) return { kind: "unchecked" };
+    const paths = driftedPaths(before, after);
+    return paths.length > 0 ? { kind: "drifted", paths } : { kind: "none" };
+  };
+
+  interface ClaimPreparation {
+    readonly prepared: PreparedVerification;
+    readonly drift: DriftCheck;
+    /** R11 root: the registered one, else the current tree's. */
+    readonly root: string | undefined;
+  }
+
+  /** One claimed entry after its gate: a final result, or the raw gate result still to be judged. */
+  type ClaimGate =
+    | { readonly kind: "final"; readonly result: VerificationResult }
+    | { readonly kind: "gate"; readonly res: GateResult; readonly retryable: boolean; readonly strict: boolean };
+
+  /** 2.4.3a P0 from the pending entry: stored change set and reference, current tree, drift. */
+  const prepareClaim = async (
+    entry: PendingEntry,
+    deadline: Deadline,
+    snapshots: Map<string, Promise<TreeSnapshot | undefined>>,
+  ): Promise<ClaimPreparation> => {
+    let snapshot = snapshots.get(entry.cwd);
+    if (snapshot === undefined) {
+      snapshot = snapshotFor(entry.cwd, deadline);
+      snapshots.set(entry.cwd, snapshot);
+    }
+    const [reference, drift, tree] = await Promise.all([
+      // The same bound as the store's reference(id, signal): a capture still pending at the deadline
+      // is "no reference (gate budget)".
+      untilAborted<ReferenceState>(entry.reference, deadline.signal, () => ({ kind: "none", reason: REFERENCE_NONE.gateBudget })),
+      checkDrift(entry, deadline),
+      snapshot,
+    ]);
+    const changed = entry.changedFiles;
+    return {
+      prepared: {
+        changedFiles: changed === "unavailable"
+          ? []
+          : changed.map(c => ({ path: c.path, status: c.status ?? "", ...(c.previousPath !== undefined ? { previousPath: c.previousPath } : {}) })),
+        // Section 1.5-6: an unattributed change set stays unattributed (never []).
+        changeBaseline: changed === "unavailable" ? "unavailable" : "available",
+        reference,
+        snapshot: tree,
+      },
+      drift,
+      root: entry.root ?? tree?.root,
+    };
+  };
+
+  /**
+   * 2.4.3a: the required gate on one claimed entry (index.ts's sequence: buildGateDeps, accept
+   * under withTimeout(deadline.remaining()), unverifiableGateResult on a reject). A timeout aborts
+   * the shared deadline (every member is out of budget at that instant anyway) and this gate's
+   * graders; any other error leaves the other handles running. Returns either a final result
+   * (nothing was judged) or the raw gate result that judgeVerdict finishes once EVERY gate of the
+   * call has returned (QA-2.4-1).
+   */
+  const runClaimGate = async (
+    entry: PendingEntry,
+    prep: ClaimPreparation,
+    deadline: OwnedDeadline,
+    cfg: RouterConfig,
+    callSignal: AbortSignal | undefined,
+    lowPriority: boolean,
+  ): Promise<ClaimGate> => {
+    const dod = entry.dod;
+    // A claimed entry is never released (release happens on a terminal settle only).
+    if (dod === undefined) return { kind: "final", result: { verdict: unverifiableVerdict(ROUTER_VERIFY_RELEASED_REASON), retryable: false } };
+    const strict = cfg.enforcement?.verify?.strictUnverifiable ?? false;
+    const inFlight = new Set<string>();
+    const completedFailures: string[] = [];
+    const gateDeps = buildGateDeps(entry.orchestratorSessionID, inFlight, prep.prepared, deadline, lowPriority);
+    gateDeps.deterministic.onFailure = reason => completedFailures.push(reason);
+    const artefact = {
+      changedFiles: prep.prepared.changedFiles,
+      changeBaseline: prep.prepared.changeBaseline,
+      // Not stored (R3): a testsPass DoD is deterministic, and no deterministic check reads it.
+      finalReturnText: "",
+      declaredOutputs: dod.deliverable ? [dod.deliverable] : [],
+      producerSessionID: entry.producerSessionID,
+      producerTier: entry.producerTier,
+    };
+    let res: GateResult;
+    let timedOut = false;
+    try {
+      res = await withTimeout(
+        accept({ dod, trivial: false, mode: "modeA", cwd: entry.cwd }, artefact, gateDeps),
+        deadline.remaining(),
+        "verification gate",
+      );
+    } catch (error) {
+      timedOut = error instanceof RouterTimeoutError;
+      if (timedOut) {
+        deadline.abort("verification gate timed out");
+        for (const gsid of inFlight) {
+          try {
+            await client.session.abort({ path: { id: gsid } });
+          } catch (abortError) {
+            logger.debug?.("[verify] router_verify could not abort a grader", { error: errorText(abortError) });
+          }
+        }
+      }
+      res = unverifiableGateResult(
+        timedOut ? `verification gate timed out after ${deadline.budgetMs}ms` : `verification unavailable: ${errorText(error)}`,
+        dod.source,
+        strict,
+        completedFailures,
+      );
+    }
+    // verify.require "never" answers skipped: nothing was judged, so the entry stays unverified.
+    if (res.verdict.skipped === true) return { kind: "final", result: { verdict: res.verdict, retryable: true } };
+    // Decided on the gate's own verdict, before any router caveat (lineage, drift) is added.
+    const retryable = isRetryableVerdict(res.verdict, timedOut || deadline.signal.aborted || callSignal?.aborted === true);
+    return { kind: "gate", res, retryable, strict };
+  };
+
+  /** QA-2.4-1: the proven-introduced ids of a terminal gate fail (what a required gate records). */
+  const introducedOf = (gate: ClaimGate): readonly string[] => {
+    if (gate.kind !== "gate" || gate.retryable) return [];
+    const outcome = gate.res.verdict.outcome ?? (gate.res.verdict.pass ? "pass" : "fail");
+    return outcome === "fail" ? (gate.res.verdict.failures?.introduced ?? []) : [];
+  };
+
+  /**
+   * 2.4.3a: one claimed entry's verdict from its raw gate result: R11 lineage, then the drift rule,
+   * then the next tier. Runs only after every rejection of the call is in the ledger (QA-2.4-1).
+   */
+  const judgeVerdict = (entry: PendingEntry, prep: ClaimPreparation, gate: ClaimGate, cfg: RouterConfig): VerificationResult => {
+    if (gate.kind === "final") return gate.result;
+    const { strict, retryable } = gate;
+    const res = lineageDowngrade(gate.res, { orchestratorSessionID: entry.orchestratorSessionID, root: prep.root, dispatchedAt: entry.dispatchedAt, strictUnverifiable: strict });
+    let verdict = res.verdict;
+    if (prep.drift.kind !== "none") {
+      // Section 1.5-18 and the owner's rule: a verdict on a tree that is not (provably) the
+      // producer's never passes; it is unverifiable with the notice. A fail stays a fail.
+      const notice = prep.drift.kind === "drifted" ? DRIFT_NOTICE : DRIFT_UNCHECKED_NOTICE;
+      const outcome = verdict.outcome ?? (verdict.pass ? "pass" : "fail");
+      verdict = gateResult(
+        {
+          ...verdict,
+          ...(outcome === "pass" ? { pass: false, outcome: "unverifiable" as const } : {}),
+          caveats: [...(verdict.caveats ?? []), notice],
+        },
+        res.dodSource,
+        strict,
+      ).verdict;
+    }
+    const judged = gateResult(verdict, res.dodSource, strict);
+    const outcome = judged.verdict.outcome;
+    let nextTier: string | undefined;
+    if (!judged.accepted && outcome === "fail") {
+      // index.ts's rule for the native path: the ladder's next tier after the producer's.
+      const ladder = cfg.enforcement?.escalate?.ladder ?? ["fast", "medium", "heavy"];
+      const li = ladder.findIndex(t => canonicalTier(t) === entry.producerTier);
+      if (li >= 0 && li < ladder.length - 1) nextTier = ladder[li + 1];
+    }
+    const introduced = outcome === "fail" ? judged.verdict.failures?.introduced : undefined;
+    return {
+      verdict: judged.verdict,
+      retryable,
+      ...(introduced !== undefined && introduced.length > 0 ? { introduced } : {}),
+      ...(prep.drift.kind === "drifted" ? { driftedPaths: prep.drift.paths } : {}),
+      ...(nextTier !== undefined ? { nextTier } : {}),
+    };
+  };
+
+  const verifyHandles: VerificationWiring["verifyHandles"] = async (sessionID, target, options = {}) => {
+    let deadline: OwnedDeadline | undefined;
+    const callSignal = options.signal;
+    const onCallAbort = (): void => deadline?.abort(ROUTER_VERIFY_CANCELLED_REASON);
+    try {
+      // 1. Targets: normalized, deduped, capped (R2). `pending` = listOpen, so in-flight runs join.
+      let targets: Array<{ readonly input: string; readonly handle: string | undefined }> = [];
+      if (target.kind === "pending") {
+        // QA-2.4-3: listPending adds the background verdicts not yet replayed (a cached replay, no run).
+        if (sessionID !== "") targets = pending.listPending(sessionID, { verifying: true }).map(e => ({ input: e.handle, handle: e.handle }));
+        if (targets.length === 0) return { items: [], excess: 0, text: ROUTER_VERIFY_NO_PENDING_TEXT };
+      } else {
+        const seen = new Set<string>();
+        for (const raw of target.handles) {
+          const input = typeof raw === "string" ? raw : "(not a string)";
+          const handle = typeof raw === "string" ? normalizeHandle(raw) : undefined;
+          const key = handle ?? `raw:${input}`;
+          if (seen.has(key)) continue;
+          seen.add(key);
+          targets.push({ input, handle });
+        }
+      }
+      const excess = Math.max(0, targets.length - MAX_HANDLES_PER_CALL);
+      targets = targets.slice(0, MAX_HANDLES_PER_CALL);
+
+      // 2. The call's one deadline (section 1.5-13), before any preparation.
+      const cfg = getConfig();
+      const budget = resolveVerifyBudget(cfg);
+      const strict = cfg.enforcement?.verify?.strictUnverifiable ?? false;
+      deadline = createDeadline(budget.gateBudgetMs);
+      const owned = deadline;
+      if (callSignal?.aborted === true) owned.abort(ROUTER_VERIFY_CANCELLED_REASON);
+      else callSignal?.addEventListener("abort", onCallAbort, { once: true });
+
+      // QA-2.4-5: router_verify is foreground work. A background run in flight is preempted, and
+      // its claims settle (retryable) before this call claims, so no handle joins a run that is
+      // being aborted. The wait is bounded by this call's deadline.
+      if (options.background !== true && background !== undefined && targets.length > 0 && sessionID !== "") {
+        await untilAborted(background.preempt(), owned.signal, () => undefined);
+      }
+
+      // 3. Claims (R8: synchronous, so two calls for one handle make one "claimed").
+      type Claimed = Extract<ReturnType<PendingRegistry["markVerifying"]>, { kind: "claimed" }>;
+      const claims: Claimed[] = [];
+      const slots: Array<HandleReport | Promise<HandleReport> | { readonly claim: number }> = [];
+      const cwds = new Map<string, string>();
+      try {
+        for (const t of targets) {
+          if (t.handle === undefined || sessionID === "") {
+            slots.push({ kind: "unknown", input: t.handle ?? t.input });
+            continue;
+          }
+          const c = pending.markVerifying(sessionID, t.handle);
+          if (c.kind === "unknown") slots.push({ kind: "unknown", input: t.handle });
+          else if (c.kind === "expired") slots.push({ kind: "expired", handle: c.handle });
+          else if (c.kind === "settled") {
+            slots.push({ kind: "verdict", handle: c.entry.handle, description: c.entry.description, producerTier: c.entry.producerTier, via: "cached", result: c.result });
+          } else if (c.kind === "joined") {
+            const entry = c.entry;
+            cwds.set(entry.handle, entry.cwd);
+            slots.push(
+              untilAborted<SettledVerification | undefined>(c.run, owned.signal, () => undefined).then((settled): HandleReport =>
+                settled === undefined
+                  ? { kind: "elsewhere", handle: entry.handle, description: entry.description }
+                  : { kind: "verdict", handle: entry.handle, description: entry.description, producerTier: entry.producerTier, via: "joined", result: settled },
+              ),
+            );
+          } else {
+            cwds.set(c.entry.handle, c.entry.cwd);
+            slots.push({ claim: claims.length });
+            claims.push(c);
+          }
+        }
+      } catch (error) {
+        // Never leave a claim verifying until the reaper: settle what was claimed, retryable.
+        for (const c of claims) c.settle({ verdict: unverifiableVerdict(`verification unavailable: ${errorText(error)}`), retryable: true });
+        throw error;
+      }
+
+      // 4. Every preparation first, then every gate at once: the testsPass requests share the
+      //    deadline and reach the S5 coordinator together (one window, one batch).
+      const snapshots = new Map<string, Promise<TreeSnapshot | undefined>>();
+      const preparations = claims.map(c => prepareClaim(c.entry, owned, snapshots));
+      const allPrepared = Promise.allSettled(preparations);
+      const gates = claims.map(async (c, i): Promise<{ readonly prep: ClaimPreparation | undefined; readonly gate: ClaimGate }> => {
+        let prep: ClaimPreparation | undefined;
+        try {
+          prep = await preparations[i];
+          await allPrepared;
+          return { prep, gate: await runClaimGate(c.entry, prep, owned, cfg, callSignal, options.background === true) };
+        } catch (error) {
+          return { prep, gate: { kind: "final", result: { verdict: unverifiableVerdict(`verification unavailable: ${errorText(error)}`), retryable: true } } };
+        }
+      });
+      // 5. QA-2.4-1: judged in two phases. A verdict of this call must see every rejection of this
+      //    call, as it would across two calls or two required gates: (a) every gate returns;
+      //    (b) every terminal fail with proven-introduced ids goes into the R11 ledger; (c) lineage,
+      //    drift and the next tier are applied to every result; (d) every claim settles.
+      const judged = (async (): Promise<void> => {
+        const results: VerificationResult[] = claims.map(() => ({ verdict: unverifiableVerdict("verification unavailable: no verdict"), retryable: true }));
+        try {
+          const outcomes = await Promise.all(gates);
+          outcomes.forEach(({ prep, gate }, i) => {
+            const introduced = introducedOf(gate);
+            const root = prep?.root;
+            if (introduced.length === 0 || root === undefined) return;
+            const entry = claims[i].entry;
+            pending.recordRejection({ orchestratorSessionID: entry.orchestratorSessionID, root, label: entry.handle, landedAt: entry.createdAt, introduced });
+          });
+          outcomes.forEach(({ prep, gate }, i) => {
+            if (prep !== undefined) results[i] = judgeVerdict(claims[i].entry, prep, gate, cfg);
+            else if (gate.kind === "final") results[i] = gate.result;
+            // QA-2.4-3: a background verdict that did not pass stays listed until it is replayed.
+            if (options.background === true) results[i] = { ...results[i], background: true };
+          });
+        } catch (error) {
+          for (let i = 0; i < results.length; i += 1) {
+            results[i] = { verdict: unverifiableVerdict(`verification unavailable: ${errorText(error)}`), retryable: true };
+          }
+        } finally {
+          // R4: single use, in a finally; false only when the claim was reaped or disposed.
+          claims.forEach((c, i) => {
+            if (!c.settle(results[i])) logger.debug?.("[verify] router_verify settled a claim that was already reaped", { handle: c.entry.handle });
+          });
+        }
+      })();
+      const runs = claims.map(async (c): Promise<HandleReport> => {
+        await judged;
+        const settled = await c.run;
+        return { kind: "verdict", handle: c.entry.handle, description: c.entry.description, producerTier: c.entry.producerTier, via: "run", result: settled };
+      });
+
+      const items = await Promise.all(slots.map(s => ("claim" in s ? runs[s.claim] : s)));
+      // 2.4.5: this caller receives these verdicts, so no late notice repeats them (R14), and a
+      // background verdict among them leaves the pending list (QA-2.4-3). QA-2.4-17: only a
+      // terminal verdict counts; a retryable "not judged" leaves a later background verdict to notice.
+      if (options.background !== true) {
+        const reported = items.flatMap(i => (i.kind === "verdict" && !i.result.retryable ? [i.handle] : []));
+        background?.markReported(reported);
+        pending.markReplayed(sessionID, reported);
+      }
+      return { items, excess, text: formatVerifyReport(items, excess, strict, h => cwds.get(h)) };
+    } catch (error) {
+      logger.warn("[verify] router_verify failed", { error: errorText(error) });
+      return { items: [], excess: 0, text: `[router] router_verify failed; nothing was verified: ${errorText(error)}` };
+    } finally {
+      callSignal?.removeEventListener("abort", onCallAbort);
+      deadline?.dispose();
+    }
+  };
+
+  // 2.4.5 (section 1.5-19, pending.ts R14): only when `background` is true at plugin start. A run is
+  // this instance's own verifyHandles, so it claims, gates, batches and settles exactly as
+  // router_verify does, at low priority.
+  if (pendingBudget.background) {
+    background = createBackgroundQueue({
+      ...deps.background,
+      ttlMs: pendingBudget.pendingTtlMs,
+      verify: async (sessionID, handles, signal) =>
+        backgroundOutcomes((await verifyHandles(sessionID, { kind: "handles", handles }, { signal, background: true })).items),
+      onError: error => logger.warn("[verify] background verification run failed", { error: errorText(error) }),
+      // QA-2.4-5: no background run starts while foreground testsPass verification is active.
+      busy: () => foreground.tests > 0,
+    });
+  }
 
   return {
     beginVerification,
-    async beginVerificationBounded(store, id, cwd, dod) {
-      let waitMs: number;
-      let begun: Promise<void>;
-      try {
-        waitMs = resolveVerifyBudget(getConfig()).captureWaitMs;
-        begun = beginVerification(store, id, cwd, dod);
-      } catch (err) {
-        logger.warn("[verify] dispatch reference capture could not start", { id, error: errorText(err) });
-        return;
+    resolveDirectives,
+    async startDispatch(store, id, cwd, dod, text, remember) {
+      const start: DispatchStart = { directives: resolveDirectives(text), dispatchedAt: pendingNow() };
+      if (remember) {
+        dispatchStarts.delete(id);
+        dispatchStarts.set(id, start);
+        while (dispatchStarts.size > DISPATCH_STARTS_MAX) {
+          const oldest = dispatchStarts.keys().next();
+          if (oldest.done === true) break;
+          dispatchStarts.delete(oldest.value);
+        }
       }
-      const outcome = await awaitBounded(begun, waitMs);
-      if (outcome.kind === "timeout") {
-        logger.debug?.("[verify] dispatch reference not ready; proceeding without waiting further", { id, waitMs });
-      } else if (outcome.kind === "error") {
-        logger.warn("[verify] dispatch reference capture failed; proceeding without a reference", { id, error: errorText(outcome.error) });
+      await beginVerificationBounded(store, id, cwd, dod, start.directives.waitMs);
+      return start;
+    },
+    takeDispatch(id, text) {
+      const start = dispatchStarts.get(id);
+      if (start !== undefined) {
+        dispatchStarts.delete(id);
+        return start;
+      }
+      return { directives: resolveDirectives(text), dispatchedAt: pendingNow() };
+    },
+    isDeferred(dod, directives, trivial = false) {
+      if (directives.mode !== "deferred" || !hasTestsPass(dod)) return false;
+      // QA-2.4-10: gate.ts skips exactly this case ("trivial dispatch; verification skipped").
+      if (trivial && dod.source === "inferred") return false;
+      try {
+        return getConfig().enforcement?.verify?.require !== "never";
+      } catch {
+        return false;
       }
     },
+    finishDeferred,
+    applyLineage,
+    verifyHandles,
+    pending,
+    background,
+    beginVerificationBounded,
     startReferenceGc(delayMs = REFERENCE_GC_START_DELAY_MS) {
       if (!directory) {
         logger.debug?.("[verify] reference GC skipped: plugin root unknown");
@@ -639,35 +1829,32 @@ export function createVerificationWiring(deps: {
       };
     },
     async prepareVerification(store, id, childID, cwd, deadline) {
-      const base = resolve(directory, cwd || ".");
-      const controller = new AbortController();
-      const onAbort = (): void => controller.abort();
-      deadline?.signal.addEventListener("abort", onAbort, { once: true });
-      let snapshot: TreeSnapshot | undefined;
-      try {
-        const bound = deadline ? deadline.bound(GRADE_SNAPSHOT_TIMEOUT_MS) : GRADE_SNAPSHOT_TIMEOUT_MS;
-        // QA-2.1-2: digest exactly the paths the dispatch snapshot digested (<= MAX_DIGEST_FILES),
-        // so delta can tell which already-dirty file a shell edit changed.
-        const digests = store.baselineSnapshot(id)?.digests;
-        const options = digests === undefined ? {} : { digestPaths: digests === "unavailable" ? [] : [...digests.keys()] };
-        snapshot = bound > 0 && !controller.signal.aborted
-          ? await withTimeout(snapshotTree(base, controller.signal, options), bound, "grade fingerprint")
-          : undefined;
-      } catch {
-        snapshot = undefined; // Explicit unavailable disclaimer, never a raw tree.
-      } finally {
-        deadline?.signal.removeEventListener("abort", onAbort);
-        controller.abort();
-      }
-      const committed = await committedSinceDispatch(store.baselineSnapshot(id), snapshot, deadline);
+      const change = await observeChange(store, id, childID, cwd, deadline);
       const reference = await store.reference(id, deadline?.signal);
-      return { ...store.delta(id, childID, snapshot, base, committed), reference, snapshot };
+      return { ...change, reference };
     },
     graderSessions,
     disposeChildSession,
     dispatchGrader,
     buildGateDeps,
-    sweepVerification: () => coordinator.sweep(),
-    disposeVerification: () => coordinator.dispose(),
+    sweepVerification: () => {
+      // Native task starts whose after hook never came (the call was cancelled), past the idle TTL.
+      const at = pendingNow();
+      let evicted = 0;
+      for (const [id, start] of [...dispatchStarts]) {
+        if (at - start.dispatchedAt >= DEFAULT_IDLE_TTL_MS) {
+          dispatchStarts.delete(id);
+          evicted += 1;
+        }
+      }
+      // 2.4.5: undelivered late notices past pendingTtlMs; also the queue's idle trigger.
+      return evicted + coordinator.sweep() + (background?.sweep() ?? 0);
+    },
+    disposeVerification: () => {
+      dispatchStarts.clear();
+      // 2.4.5: abort the background run first, so nothing re-queues while the coordinator stops.
+      background?.dispose();
+      return coordinator.dispose();
+    },
   };
 }

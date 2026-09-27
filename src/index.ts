@@ -78,7 +78,8 @@ import { access, readFile as fsReadFile } from "node:fs/promises";
 import { tool } from "@opencode-ai/plugin";
 import { scrubText } from "./guard/scrub";
 import { accept, unverifiableGateResult } from "./verify/gate";
-import { createVerificationWiring, extractAssistantText } from "./verify/wiring";
+import { createVerificationWiring, dispatchDirectiveText, extractAssistantText, parseRouterVerifyArgs, type DispatchStart } from "./verify/wiring";
+import { appendRouterFooter, buildLateNoticeBlock, buildPendingListBlock } from "./verify/pending";
 import { createDeadline } from "./verify/deterministic";
 import {
   DEFAULT_DELEGATE_PROMPT_TIMEOUT_MS,
@@ -275,7 +276,15 @@ const ModelRouterPlugin: Plugin = async (ctx: PluginInput) => {
    * still cover the common cases, so the exposure is a rare, transient re-run of
    * the old behaviour rather than a permanent loss of function.
    */
-  const resolveIsRootSession = async (sessionID: string): Promise<boolean> => {
+  const resolveIsRootSession = async (sessionID: string): Promise<boolean> =>
+    (await lookupRootSession(sessionID)) ?? true;
+
+  /**
+   * The lookup behind resolveIsRootSession: true (no parentID), false (a parentID), or undefined
+   * when it is not known (the lookup failed, or failed recently and is throttled). QA-2.4-2 treats
+   * undefined as NOT root (isProvenRootCaller), where the protocol injection treats it as root.
+   */
+  const lookupRootSession = async (sessionID: string): Promise<boolean | undefined> => {
     const memo = sessionRootMemo.get(sessionID);
     if (memo !== undefined) {
       if (!memo) sessionStore.markChildSession(sessionID);
@@ -283,7 +292,7 @@ const ModelRouterPlugin: Plugin = async (ctx: PluginInput) => {
     }
     const failedAt = sessionLookupFailedAt.get(sessionID);
     if (failedAt !== undefined && Date.now() - failedAt < SESSION_LOOKUP_RETRY_MS) {
-      return true;
+      return undefined;
     }
     try {
       const res = await ctx.client.session.get({ path: { id: sessionID } });
@@ -309,7 +318,7 @@ const ModelRouterPlugin: Plugin = async (ctx: PluginInput) => {
         sessionLookupFailedAt.delete(oldest);
       }
       warnSessionLookupFailedOnce();
-      return true;
+      return undefined;
     }
   };
 
@@ -338,6 +347,8 @@ const ModelRouterPlugin: Plugin = async (ctx: PluginInput) => {
     // 2.2.3: the S5 batch coordinator's defensive eviction (batch.ts B11). Declared below; the
     // sweeper only runs from chat.message, long after this factory has returned.
     () => { sweepVerification(); },
+    // 2.4.2b: TTL eviction and reaping of the pending registry (pending.ts R7; no timer of its own).
+    () => { pending.sweep(); },
   ]);
 
   // Layer-2's impure corner: exec, fs, and the opencode client, built once and
@@ -350,8 +361,12 @@ const ModelRouterPlugin: Plugin = async (ctx: PluginInput) => {
 
   const {
     graderSessions, dispatchGrader, buildGateDeps, disposeChildSession,
-    beginVerificationBounded, prepareVerification, startReferenceGc,
+    prepareVerification, startReferenceGc,
     sweepVerification, disposeVerification,
+    startDispatch, takeDispatch, isDeferred: wiringIsDeferred, finishDeferred, applyLineage, pending,
+    verifyHandles,
+    // 2.4.5: undefined unless `background: true` at plugin start (pending.ts R14).
+    background,
   } = createVerificationWiring({
     client: ctx.client,
     directory: ctx.directory,
@@ -436,6 +451,37 @@ const ModelRouterPlugin: Plugin = async (ctx: PluginInput) => {
     cfg.experimental?.verifiedDelegateTool === true ||
     process.env.MODEL_ROUTER_VERIFIED_DELEGATE === "1";
 
+  // 2.4.3b (plan 2.4.3 "Registration"): `router_verify` is registered whenever verification is
+  // enabled at plugin start, independent of enableDelegateTool: verify.require is not "never" and
+  // a verifying path exists (the native `task` path needs an enforcement mode other than "off";
+  // the delegate tool verifies in every mode). The tool map is fixed at start.
+  let routerVerifyEnabled = false;
+  try {
+    const startMode = resolveEnforcementMode({ config: cfg, env: process.env }).mode;
+    routerVerifyEnabled = cfg.enforcement?.verify?.require !== "never" && (startMode !== "off" || enableDelegateTool);
+  } catch (error) {
+    logger.warn("[verify] router_verify not registered: the enforcement mode could not be resolved", { error: scrubText(String(error)) });
+  }
+  /**
+   * 2.4.2 + 2.4.3b: a delegation defers only when `router_verify` exists to verify it later. A
+   * footer never names a tool this instance did not register; without it the delegation keeps the
+   * synchronous gate (never weaker).
+   */
+  const isDeferred: typeof wiringIsDeferred = (dod, directives, trivial) => routerVerifyEnabled && wiringIsDeferred(dod, directives, trivial);
+  /**
+   * QA-2.4-2: a deferred entry is keyed to the dispatching session (pending.ts R6), and only a root
+   * orchestrator ever sees a pending list (the system transform returns early for every child). So
+   * only a PROVEN root orchestrator session may defer. A subagent dispatching `task` or `delegate`
+   * (a grader, a tracked subagent, a session with a parentID) gets today's synchronous gate and
+   * registers nothing, whatever its directives say; so does an unknown session (no id, or a failed
+   * lookup: fail safe).
+   */
+  const isProvenRootCaller = async (sessionID: unknown): Promise<boolean> => {
+    if (typeof sessionID !== "string" || sessionID === "") return false;
+    if (graderSessions.has(sessionID) || sessionStore.isSubagent(sessionID)) return false;
+    return (await lookupRootSession(sessionID)) === true;
+  };
+
   return {
     // Warnings post to /log fire-and-forget, which loses the message when the
     // process is about to exit — `opencode run` and `opencode debug` are short
@@ -443,6 +489,10 @@ const ModelRouterPlugin: Plugin = async (ctx: PluginInput) => {
     // that dispose is both called and awaited, so flushing here is enough.
     dispose: async () => {
       stopReferenceGc();
+      // 2.4.5: abort a background run and drop its queue and notices before the registry goes.
+      background?.dispose();
+      // 2.4.2b: evict every pending delegation; in-flight router_verify runs resolve (pending.ts R5).
+      pending.dispose();
       // 2.2.3: settle batched testsPass requests and kill running batches (never rejects).
       await disposeVerification();
       await logger.flush();
@@ -486,6 +536,13 @@ const ModelRouterPlugin: Plugin = async (ctx: PluginInput) => {
           // early return or a throw skipped — otherwise each retry leaks another.
           const producerSessions: string[] = [];
           let baselineID: string | undefined;
+          /** 2.4.2c: the directives and start time of this delegation, from its first attempt. */
+          let dispatchStart: DispatchStart | undefined;
+          /**
+           * 2.4.2c: finishDeferred clears the dispatch record (baselineID) once its reference
+           * settled; clearing it in the finally below would abort a capture still in flight.
+           */
+          let deferredOwnsBaseline = false;
           try {
             let activeCfg = cfg;
             try {
@@ -535,6 +592,11 @@ const ModelRouterPlugin: Plugin = async (ctx: PluginInput) => {
               sessionID: string;
               text: string;
               gateRes: Awaited<ReturnType<typeof accept>>;
+            } | {
+              sessionID: string;
+              text: string;
+              /** 2.4.2c: deferred; the section 1.5-16 footer to append to the result. */
+              deferredFooter: string;
             } | null> => {
               const taskText = forcingNote
                 ? `${scrubText(forcingNote)}\n\n${args.task}`
@@ -552,8 +614,9 @@ const ModelRouterPlugin: Plugin = async (ctx: PluginInput) => {
               // recapturing after a failed attempt would excuse its regression.
               if (!baselineID) {
                 baselineID = producerSid;
-                // 2.1.5b: wait at most captureWaitMs; the capture continues in the background.
-                await beginVerificationBounded(changedFileStore, baselineID, args.cwd, dod);
+                // 2.4.2c: the directives come from the orchestrator's `task` argument only; the
+                // capture is awaited for at most VERIFY_WAIT and continues in the background.
+                dispatchStart = await startDispatch(changedFileStore, baselineID, args.cwd, dod, args.task, false);
               }
               // Compose with Layer 1: guard the plugin-created producer session.
               try {
@@ -598,6 +661,48 @@ const ModelRouterPlugin: Plugin = async (ctx: PluginInput) => {
                 producerError =
                   error instanceof Error ? error.message : String(error);
                 producerText = "";
+              }
+              // pending.ts R11: the producer's changes landed by now.
+              const returnedAt = Date.now();
+
+              // 2.4.2c, section 1.5-16: a deferred delegation runs no gate and no ladder. A producer
+              // that failed outright produced nothing to verify later; it keeps today's
+              // failed-attempt path, which runs no verification process either.
+              const finish = dispatchStart !== undefined && producerError === null && isDeferred(dod, dispatchStart.directives) &&
+                await isProvenRootCaller(toolCtx?.sessionID)
+                ? await finishDeferred(changedFileStore, {
+                    dispatchID: baselineID,
+                    orchestratorSessionID: toolCtx?.sessionID ?? "",
+                    producerSessionID: producerSid,
+                    producerTier: tier,
+                    description: args.task,
+                    cwd: args.cwd,
+                    dod,
+                    dispatchedAt: dispatchStart.dispatchedAt,
+                  })
+                : undefined;
+              // QA-2.4-4 / QA-2.4-10: a finish that did not defer falls through to the required gate
+              // (and its ladder) below, with the dispatch record still in the store.
+              if (finish?.deferred === true) {
+                deferredOwnsBaseline = true;
+                if (producerSid !== baselineID) changedFileStore.clear(producerSid);
+                try {
+                  sessionStore.unregister(producerSid);
+                  sessionRootMemo.delete(producerSid);
+                } catch {
+                  // non-fatal
+                }
+                try {
+                  guardStore.clear(producerSid);
+                } catch {
+                  // non-fatal
+                }
+                await disposeChildSession(producerSid);
+                return { sessionID: producerSid, text: producerText, deferredFooter: finish.footer };
+              }
+              // Once a delegation is gated, every later attempt of its ladder is gated too.
+              if (finish !== undefined && dispatchStart !== undefined) {
+                dispatchStart = { ...dispatchStart, directives: { ...dispatchStart.directives, mode: "required" } };
               }
 
               const { gateBudgetMs } = resolveVerifyBudget(activeCfg);
@@ -690,6 +795,18 @@ const ModelRouterPlugin: Plugin = async (ctx: PluginInput) => {
               } finally {
                 gateDeadline.dispose();
               }
+              // pending.ts R11, as on the native path. Within this ladder every attempt is judged
+              // against the first attempt's reference and dispatchedAt precedes every landedAt, so
+              // it only affects later delegations of the same session (a native re-dispatch of
+              // rejected delegate work is the T11 case too).
+              gateRes = applyLineage(gateRes, {
+                orchestratorSessionID: toolCtx?.sessionID ?? "",
+                root: verification.snapshot?.root,
+                dispatchID: baselineID,
+                dispatchedAt: dispatchStart?.dispatchedAt ?? returnedAt,
+                returnedAt,
+                strictUnverifiable: activeCfg.enforcement?.verify?.strictUnverifiable,
+              });
 
               // Per-attempt cleanup (drop producer session tracking + state).
               if (producerSid !== baselineID) changedFileStore.clear(producerSid);
@@ -724,6 +841,11 @@ const ModelRouterPlugin: Plugin = async (ctx: PluginInput) => {
                 return "[router] delegate failed: could not create a producer session.";
               }
               producerText = attempt.text;
+              if ("deferredFooter" in attempt) {
+                // Section 1.5-16: the result unchanged plus the footer, appended last. Never
+                // labelled accepted or verified, and never retried or escalated.
+                return appendRouterFooter(producerText, attempt.deferredFooter);
+              }
               const producerSid = attempt.sessionID;
               const gateRes = attempt.gateRes;
 
@@ -775,9 +897,41 @@ const ModelRouterPlugin: Plugin = async (ctx: PluginInput) => {
             // disposeChildSession is fail-soft, so re-disposing an already
             // disposed session is harmless.
             for (const sid of producerSessions) {
-              changedFileStore.clear(sid);
+              if (!(deferredOwnsBaseline && sid === baselineID)) changedFileStore.clear(sid);
               await disposeChildSession(sid);
             }
+          }
+        },
+      }) } : {}),
+      // 2.4.3b, section 1.5-18: verify deferred delegations on the orchestrator's terms.
+      ...(routerVerifyEnabled ? { router_verify: tool({
+        description:
+          "Verify delegations that returned 'unverified' with a vrf_ handle. Runs the same checks as a required verification (affected tests, batched, under the verification slot and one gate deadline) and returns one verdict per handle: pass, fail (with the introduced failures and a suggested next tier) or unverifiable. Nothing is retried or escalated for you. Pass exactly one of `handles` or `pending: true` (every unverified delegation of this session).",
+        args: {
+          handles: tool.schema
+            .array(tool.schema.string())
+            .optional()
+            .describe("The vrf_ handles from the delegations' [router] footers."),
+          pending: tool.schema
+            .boolean()
+            .optional()
+            .describe("true: verify every still-unverified delegation of this session."),
+        },
+        async execute(
+          args: { handles?: string[]; pending?: boolean },
+          toolCtx?: { sessionID?: string; abort?: AbortSignal },
+        ): Promise<string> {
+          // Never throws: every failure is a text answer (the tool result reaches the orchestrator).
+          try {
+            const target = parseRouterVerifyArgs(args);
+            if ("error" in target) return target.error;
+            // R6: handles are scoped by the calling session; without one, every handle is unknown.
+            const sessionID = typeof toolCtx?.sessionID === "string" ? toolCtx.sessionID : "";
+            const report = await verifyHandles(sessionID, target, toolCtx?.abort !== undefined ? { signal: toolCtx.abort } : {});
+            return report.text;
+          } catch (error) {
+            logger.warn("[verify] router_verify failed", { error: scrubText(String(error)) });
+            return `[router] router_verify failed; nothing was verified: ${scrubText(String(error))}`;
           }
         },
       }) } : {}),
@@ -927,13 +1081,16 @@ const ModelRouterPlugin: Plugin = async (ctx: PluginInput) => {
       if (input?.tool === "task" && typeof input.callID === "string" && typeof input.sessionID === "string") {
         const mode = resolveEnforcementMode({ config: cfg, env: process.env }).mode;
         if (shouldVerifyTask("task", mode, cfg.enforcement?.verify?.require)) {
-          // 2.1.5b: wait at most captureWaitMs; the capture continues in the background.
-          await beginVerificationBounded(changedFileStore, `task:${input.sessionID}:${input.callID}`,
+          const prompt = typeof output?.args?.prompt === "string" ? output.args.prompt : undefined;
+          const description = typeof output?.args?.description === "string" ? output.args.description : undefined;
+          // 2.4.2b: the directives come from the orchestrator's own prompt, read here before the
+          // dispatch header or any repair touches it, and are kept for the after hook. The capture
+          // is awaited for at most VERIFY_WAIT (section 1.5-14) and continues in the background.
+          await startDispatch(changedFileStore, `task:${input.sessionID}:${input.callID}`,
             typeof output?.args?.cwd === "string" ? output.args.cwd : undefined,
-            buildDelegationDoD({
-              prompt: typeof output?.args?.prompt === "string" ? output.args.prompt : undefined,
-              description: typeof output?.args?.description === "string" ? output.args.description : undefined,
-            }));
+            buildDelegationDoD({ prompt, description }),
+            dispatchDirectiveText(prompt, description),
+            true);
         }
       }
       // A task call with no prompt (typically a forced delegation of a bare
@@ -1108,6 +1265,8 @@ const ModelRouterPlugin: Plugin = async (ctx: PluginInput) => {
         const requireMode = cfg.enforcement?.verify?.require;
         if (shouldVerifyTask(input.tool, mode, requireMode)) {
           try {
+            // pending.ts R11: the producer's changes landed by now.
+            const returnedAt = Date.now();
             const { finalReturnText, childSessionID } = parseTaskResult(output);
             const producerTier =
               typeof input?.args?.subagent_type === "string"
@@ -1118,6 +1277,37 @@ const ModelRouterPlugin: Plugin = async (ctx: PluginInput) => {
               description: input?.args?.description,
             });
             const dispatchID = `task:${input.sessionID}:${input.callID}`;
+            const orchestratorSessionID = typeof input.sessionID === "string" ? input.sessionID : "";
+            const taskPrompt = typeof input?.args?.prompt === "string" ? input.args.prompt : undefined;
+            const taskDescription = typeof input?.args?.description === "string" ? input.args.description : undefined;
+            // 2.4.2b: the mode the orchestrator chose at dispatch (never the subagent's text).
+            const start = takeDispatch(dispatchID, dispatchDirectiveText(taskPrompt, taskDescription));
+            const trivial = childSessionID
+              ? sessionStore.isTrivial(childSessionID)
+              : false;
+            // QA-2.4-10: `trivial` as the gate sees it below; a dispatch the gate would skip is not
+            // deferred (isDeferred). QA-2.4-2: only a proven root orchestrator defers.
+            if (isDeferred(dod, start.directives, trivial) && await isProvenRootCaller(orchestratorSessionID)) {
+              // Section 1.5-16: no gate, no test process; the result goes back now with the
+              // footer, which is appended last and never says accepted or verified.
+              const finish = await finishDeferred(changedFileStore, {
+                dispatchID,
+                orchestratorSessionID,
+                producerSessionID: childSessionID ?? "",
+                producerTier,
+                description: taskDescription?.trim() ? taskDescription : (taskPrompt ?? ""),
+                cwd: typeof input?.args?.cwd === "string" ? input.args.cwd : undefined,
+                dod,
+                dispatchedAt: start.dispatchedAt,
+              });
+              if (finish.deferred) {
+                output.output = appendRouterFooter(typeof output.output === "string" ? output.output : "", finish.footer);
+                // The dispatch record is cleared by finishDeferred once its capture settled.
+                if (childSessionID) changedFileStore.clear(childSessionID);
+                return;
+              }
+              // QA-2.4-4 / QA-2.4-10: not deferred after all; today's required gate runs below.
+            }
             // Same bound as the delegate gate: one deadline per invocation,
             // a withTimeout ceiling, and abort-on-reject so a hung check or
             // grader cannot hold the after-hook (and its process tree) open.
@@ -1140,9 +1330,6 @@ const ModelRouterPlugin: Plugin = async (ctx: PluginInput) => {
               producerSessionID: childSessionID ?? "",
               producerTier,
             };
-            const trivial = childSessionID
-              ? sessionStore.isTrivial(childSessionID)
-              : false;
 
             // Read-only / research delegation: an auto-inferred, criteria-only DoD on a
             // native Task() that changed no files is exploration, not implementation.
@@ -1212,6 +1399,16 @@ const ModelRouterPlugin: Plugin = async (ctx: PluginInput) => {
             } finally {
               gateDeadline.dispose();
             }
+            // pending.ts R11: a proven-introduced rejection is recorded for this session; a pass
+            // on ids an earlier rejection introduced becomes unverifiable (never a new pass/fail).
+            res = applyLineage(res, {
+              orchestratorSessionID,
+              root: verification.snapshot?.root,
+              dispatchID,
+              dispatchedAt: start.dispatchedAt,
+              returnedAt,
+              strictUnverifiable: cfg.enforcement?.verify?.strictUnverifiable,
+            });
             if (!res.accepted && !res.verdict.skipped) {
               const ladder = cfg.enforcement?.escalate?.ladder ?? ["fast", "medium", "heavy"];
               const li = ladder.indexOf(producerTier);
@@ -1272,6 +1469,10 @@ const ModelRouterPlugin: Plugin = async (ctx: PluginInput) => {
             sessionRootMemo.delete(id);
             sessionLookupFailedAt.delete(id);
             sessionStore.unregister(id);
+            // 2.4.2b: a deleted orchestrator's handles, tombstones and lineage records go with it.
+            // 2.4.5: so do its background requests and late notices; its run in flight is aborted.
+            background?.forgetSession(id);
+            pending.forgetSession(id);
           }
         } catch {
           // best-effort: cleanup must never crash a real session
@@ -1548,6 +1749,30 @@ const ModelRouterPlugin: Plugin = async (ctx: PluginInput) => {
       let enfOn = false;
       try { enfOn = resolveEnforcementMode({ config: cfg, env: process.env }).mode !== "off"; } catch {}
       output.system.push(assembleSystemPrompt(cfg, orchestratorModel, enfOn));
+
+      // 2.4.4, section 1.5-20: this orchestrator's still-unverified delegations (at most 5 shown,
+      // newest first), as one short block. Nothing is pushed when the list is empty, so the prompt
+      // does not grow for sessions that never defer. Orchestrator path only: every child returned
+      // above. With background mode on, an entry the queue is verifying right now is still
+      // unverified to the orchestrator, so it stays listed until its run settles.
+      try {
+        // QA-2.4-3: plus background verdicts that did not pass, until router_verify replays them.
+        const open = pending.listPending(sessionID, { verifying: background !== undefined });
+        const block = buildPendingListBlock(open);
+        if (block !== undefined) output.system.push(block);
+      } catch (error) {
+        logger.warn("[verify] pending list not injected", { error: scrubText(String(error)) });
+      }
+      // 2.4.5, section 1.5-19 (`background: true` only): late notices of background runs that did
+      // not pass, each delivered once (takeNotices marks them delivered).
+      if (background !== undefined) {
+        try {
+          const late = buildLateNoticeBlock(background.takeNotices(sessionID));
+          if (late !== undefined) output.system.push(late);
+        } catch (error) {
+          logger.warn("[verify] late notices not injected", { error: scrubText(String(error)) });
+        }
+      }
     },
 
     // -----------------------------------------------------------------------
