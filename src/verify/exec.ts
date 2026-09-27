@@ -90,12 +90,29 @@ export function runShell(command: string, opts: RunOptions = {}): Promise<ShellR
 }
 
 /**
+ * Windows: a batch file name, in any case and with the trailing dots and
+ * spaces that Windows strips from a file name.
+ */
+const BATCH_FILE = /\.(cmd|bat)[. ]*$/i;
+/** What Node itself returns for a batch file spawned without a shell. */
+const BATCH_REFUSED = "exec failed: Error: spawn EINVAL (batch files must run through runShell)";
+
+/**
  * Spawn `file` with `args` and no shell: arguments reach the child
- * byte-for-byte. On Windows, Node refuses to spawn `.cmd`/`.bat` files without
- * a shell (EINVAL since the CVE-2024-27980 fix); that resolves as a spawn
- * error (`code: 1`) — run batch files through `runShell` instead.
+ * byte-for-byte. On Windows a `.cmd`/`.bat` target is refused before anything
+ * is spawned, as a spawn error (`code: 1`, `spawn EINVAL` on stderr) — run
+ * batch files through `runShell` instead.
+ *
+ * CreateProcess runs a batch file through cmd.exe, which re-parses the
+ * arguments, so `"&calc&"` would run `calc` (BatBadBut, CVE-2024-27980). Node
+ * refuses such a spawn with EINVAL; Bun, which opencode loads the plugin in,
+ * does not, so the check is made here for both runtimes (QA-1.2-17). A bare
+ * name cannot reach a batch file: the runtime resolves it with `.com` and
+ * `.exe` only (a bare `probe` beside `probe.cmd` is ENOENT under both), and
+ * the argv adapters pass absolute `.js`/`.exe` targets.
  */
 export function runArgv(file: string, args: readonly string[], opts: RunOptions = {}): Promise<ShellResult> {
+  if (isWin && BATCH_FILE.test(file)) return Promise.resolve({ code: 1, stdout: "", stderr: BATCH_REFUSED, timedOut: false });
   // `--` keeps a target whose name starts with "-" from being read as a nice option.
   if (opts.lowPriority && !isWin) return run("nice", ["-n", "10", "--", file, ...args], false, opts, file);
   return run(file, [...args], false, opts);

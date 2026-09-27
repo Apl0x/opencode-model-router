@@ -233,13 +233,25 @@ describe("runArgv", () => {
     expect((await runShell("omr-no-such-executable-xyz", { cwd: dir, timeoutMs: 20000 })).code).toBe(127);
   }, 30000);
 
-  it.runIf(isWin)("refuses a .cmd target without a shell (Node EINVAL) as a spawn error; use runShell for batch files", async () => {
+  it.runIf(isWin)("refuses a batch file before spawning anything, so cmd.exe never re-parses an argument (QA-1.2-17, Windows-only: batch files)", async () => {
     const dir = scratch();
-    const cmd = join(dir, "t.cmd");
-    writeFileSync(cmd, "@exit /b 3\r\n");
-    const r = await runArgv(cmd, [], { cwd: dir, timeoutMs: 20000 });
-    expect(r).toMatchObject({ code: 1, timedOut: false });
-    expect(r.stderr).toMatch(/EINVAL/);
+    const marker = join(dir, "ran");
+    const batch = `@echo off\r\necho ran> "${marker}"\r\necho probe-ran\r\n`;
+    writeFileSync(join(dir, "probe.cmd"), batch);
+    writeFileSync(join(dir, "probe.bat"), batch);
+    // Every spelling CreateProcess hands to cmd.exe: any case, the trailing dots
+    // and spaces Windows strips (Bun ran `probe.cmd  ` and `probe.cmd.`), and a
+    // name relative to cwd.
+    const files = ["probe.cmd", "PROBE.CMD", "probe.bat", "probe.Bat", "probe.cmd.", "probe.cmd  ", "probe.bat. ."].map(n => join(dir, n));
+    for (const file of [...files, "probe.cmd"]) {
+      for (const lowPriority of [false, true]) {
+        const r = await runArgv(file, ['"&echo INJECTED&"'], { cwd: dir, timeoutMs: 20000, lowPriority });
+        // The refusal's own text: a Node spawn would have failed with a bare
+        // `spawn EINVAL`, and Bun would have run cmd.exe (and `echo INJECTED`).
+        expect(r).toEqual({ code: 1, stdout: "", stderr: "exec failed: Error: spawn EINVAL (batch files must run through runShell)", timedOut: false });
+      }
+    }
+    expect(existsSync(marker)).toBe(false);
   });
 
   it("never starts when the signal is already aborted", async () => {
