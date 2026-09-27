@@ -1064,3 +1064,91 @@ are open.
 - QA-1.2-22 — Resolution: 2d6ff09, 33f1d14 — 2d6ff09: `waitForFile` takes a limit; the two `lowPriority` grandchild tests wait 30 s for the fixture with `timeoutMs: 30000` (test timeout 90 s), and the `lowPriority` exit-code tests use `timeoutMs: 60_000`, but their vitest timeout stayed at 20 s. 33f1d14: the vitest timeout of the exit-code tests (two sequential 60 s runs) and of the Windows `.cmd` exit-code test (a 20 s and a 60 s run) is raised to 130 s. Test-only change.
 - QA-1.2-23 — Resolution: 2d6ff09 — `tracked` is a `Map<pid, token>`; each run tracks with its own token and `untrack` deletes only when the token matches, so a recycled id tracked by a new run survives the old run's second untrack. Unit test `tracked-process bookkeeping (QA-1.2-23)` via `trackingForTests`. Documented residual (needs pidfd): a group that empties after `exit` and whose id is recycled by an unrelated group can be signalled by the late kill or the exit hook.
 - Verification: `npx vitest run --maxWorkers=2 test/unit/exec.test.ts` twice, 39 passed / 1 skipped each (36.3 s, 35.1 s); `npm run typecheck` clean; no fixture processes left.
+
+## QA re-review (round 5)
+
+Reviewer: heavy QA, adversarial re-review of the round-4 fixes, `git diff a3fb8af..a14ba68` on
+`vrb/p12` (`2d6ff09`, `9d49eea`, `33f1d14`, `a14ba68`: `src/verify/exec.ts`,
+`test/unit/exec.test.ts` and this file), under node and **Bun 1.3.14**. The POSIX paths were run
+on Linux under WSL.
+
+**Setup.**
+- Hosts:
+  - Windows 11, 16 logical cores, node v24.21.0, bun 1.3.14. Other agents were using the machine.
+  - WSL 2 Ubuntu (kernel 6.18.33.1-microsoft-standard-WSL2, `pid_max` 4194304), node v25.9.0.
+- `npx vitest run --maxWorkers=2 test/unit/exec.test.ts` was run once (node): **38 passed,
+  1 failed, 1 skipped** (40 in total), 58.87 s.
+  - The failure is "process lifecycle around the direct child's exit > an abort between the
+    child's exit and the pipes closing kills the leftovers, not the exited PID":
+    `AssertionError: expected true to be false`. In that test only
+    `expect(alive(holder)).toBe(false)` (`exec.test.ts:443`) produces this message, so the run
+    resolved while the holder was still alive. See QA-1.2-26.
+  - No test the diff added or changed failed. The new bookkeeping test passed.
+- `npm run typecheck` is clean.
+- The repro scripts lived in `%TEMP%\omr-qa12r5` (and `/tmp/omr-qa12r5` in WSL) and have been
+  removed. Afterwards, a `Win32_Process` query on the scratch, fixture and stand-in names matched
+  nothing, and so did `ps` in WSL.
+  - `exithost.mjs` imported `exec.ts` with `%SystemRoot%` pointed at a scratch root. Its
+    `System32\taskkill.exe` was a `bun build --compile` stand-in that logs its arguments and then
+    either hangs for 60 s or runs the real taskkill. The host put 2 `runShell` trees
+    (cmd.exe → node → node) in flight and called `process.exit(0)`. It was launched from pwsh.
+  - `hyg.mjs` used the same root with the forwarding stand-in, so every taskkill the exit hook
+    starts could be seen.
+  - `posix.mjs` ran as root in its own PID namespace (`unshare -p -f --mount-proc`), so it could
+    give a chosen PID to a new run through `/proc/sys/kernel/ns_last_pid`. It wrapped
+    `child_process.spawn` through `syncBuiltinESMExports` to learn each run's direct child. It ran
+    against the new `exec.ts` and against `a3fb8af`'s.
+  - `sweeptime.mjs` repeated the failing test's sequence 8 times, with timings.
+  - `graceverdict.mjs` repeated that sequence with a sweeper stand-in: a `bun build --compile`
+    binary set through `setSweeperExecutableForTests`. It kills the holder with the real taskkill
+    at once and prints the holder's PID either 0 ms or 2500 ms later.
+  - `vacuous.mjs` repeated the `lowPriority` grandchild test with a fixture that starts its
+    grandchild late.
+
+**Result.**
+- QA-1.2-21, -22 and -23 are verified. -22 has one gap (QA-1.2-25).
+- `trackingForTests` is not reachable from the plugin's exports.
+- There are 4 new findings: 1 minor and 3 nits.
+  - QA-1.2-25 is a gap in this round's diff.
+  - The other three are in older code. They were found through the failing gating run and the
+    POSIX repro.
+- The DoD (zero open findings) is **not met**.
+
+### Round-4 findings
+
+| Finding | Status | Evidence |
+|---|---|---|
+| QA-1.2-21 | verified | **Code.** `EXIT_TASKKILL_TIMEOUT_MS = 10_000` (`exec.ts:89`) is used only by the hook's single `spawnSync` (`:466-470`). The comment (`:81-88`) matches the round-4 measurements.<br>**The limit holds under both runtimes.**<br>• With the hanging stand-in, the host exited 10174 ms (node) and 10167 ms (bun) after `ready`. There was one call, `/pid <a> /pid <b> /T /F`. The stand-in was dead after the host exited: `spawnSync`'s timeout ended it. The 4 descendants were still alive, as expected with a stand-in that kills nothing; the reviewer ended them.<br>• With the forwarding stand-in, 4 of 4 descendants were dead when the host exited, under node and bun, 2422 and 2413 ms after `ready`. That time includes starting the ~98 MB stand-in.<br>**No cost when idle.** Called with nothing in flight, the hook started no taskkill and took 0–1 ms. |
+| QA-1.2-22 | verified, with a gap: QA-1.2-25 | **Code.**<br>• `waitForFile(path, limitMs = 5000)` (`exec.test.ts:134`).<br>• The grandchild tests wait 30 s for the fixture, with a 90 s vitest timeout (`:613`, `:620`, `:628`, `:635`).<br>• The exit-code tests use `timeoutMs: 60_000` with a 130 s vitest timeout (`:639-641`).<br>**The budgets fit.** 30 s of waiting, at most 30 s of `priorityOf`, the 2 s grace and 5 s of `waitForExit` stay under 90 s. Two runs of 60 s plus 2 s stay under 130 s.<br>**Gap.** The `.cmd` test got the 130 s vitest timeout, but its `lowPriority` `t.cmd` run still has `timeoutMs: 20000` (`:646`): QA-1.2-25.<br>**A window checked and refuted.**<br>• The 30 s wait now equals the run's own 30 s deadline.<br>• On Windows, `priorityOf` returns 0 for a PID with no process: the query prints nothing and `Number("")` is 0. `lowered(0)` is true.<br>• With a fixture that wrote its grandchild's PID at 29821 ms (`lowPriority: false`), the query still saw the live grandchild at priority 8, and the assertion failed as it should. `priorityOf` is a synchronous `execFileSync`, so the deadline timer fired only after it returned; the run settled at 31134 ms.<br>• A dead process can pass only if the file appears within one 50 ms poll before the deadline.<br>• Optional hardening, not a finding: make `priorityOf` throw on empty output. |
+| QA-1.2-23 | verified; the late-kill side is QA-1.2-27 | **Code.**<br>• `tracked` is a `Map<number, symbol>` (`exec.ts:433`), and each run has its own `Symbol("run")` (`:209`).<br>• `untrack` deletes only when the token matches (`:443-445`). It is called at `:230`, `:316` and `:319`.<br>• The hook iterates `tracked.keys()` (`:456`).<br>**POSIX, real processes** (WSL, own PID namespace).<br>• Run A's child exited with its group empty; a `setsid` holder kept the pipes. So A untracked PID 77 at `exit`.<br>• `ns_last_pid` then gave PID 77 to run B's child, at the first attempt.<br>• New code: B was tracked, A settled (its second untrack), and B was **still tracked**. The exit hook then killed B's group, and B resolved with `code 1`.<br>• `a3fb8af`'s code, same sequence: the hook did **not** reach B, which was still pending 5 s after the hook. The round-4 defect is reproduced, and the new code fixes it.<br>**POSIX hygiene.** Each run's PID was untracked after:<br>• a natural `runArgv`;<br>• `runShell` `exit 3`;<br>• both of those with `lowPriority`;<br>• a `nice` exec failure;<br>• a deadline on a live group;<br>• a deadline after the child's exit with a group member left (`[killed the process group…]`);<br>• a grace settle with a `setsid` escapee.<br>A spawn error has no PID and is never tracked.<br>**Windows, node and bun.** The hook started no taskkill after:<br>• 5 natural runs;<br>• 2 deadline kills of live trees;<br>• an `early-exit` sweep;<br>• a `broken-tree` grace settle;<br>• a spawn error.<br>With one run in flight, the hook made one call (`/pid <cmd.exe> /T /F`) and the tree was dead. A second call started nothing.<br>**Why Windows is safe.** An entry cannot be overwritten before its owner's `exit`: libuv holds the handle until then, and the untrack runs in that same callback.<br>**The unit test passes.** With the old `Set` semantics, its first `isTracked` check would fail. |
+| `trackingForTests` reachability | verified | • `rg trackingForTests src` matches only its definition (`exec.ts:448`).<br>• The only runtime export of `src/index.ts` is `default` (`:1548`); `:106-110` are `export type` lines.<br>• The only production importer of `exec.ts` is `wiring.ts:20`, and it imports only `runShell`.<br>• `package.json` has no `exports` map (`main: ./src/index.ts`, `files: src/`). A deep import of `src/verify/exec.ts` is therefore possible, the same as for `setSweeperExecutableForTests` (round 3).<br>• The test's PID, 2_000_000_123, is above Linux's `pid_max` limit and never a live Windows PID. If the test fails midway, the leftover entry only makes the hook report "not found" or `ESRCH`. |
+
+### New findings
+
+| ID | Severity | Where | Evidence | Fix |
+|---|---|---|---|---|
+| QA-1.2-24 | minor (pre-existing since `6966a5c`; Windows) | `exec.ts:269-282` (`onGrace`), with `:334-341` (`close`) and `:249-259` (`onSwept`) | **The grace can settle a swept run as a natural exit, and the result then loses the kill.**<br>**How.**<br>1. The sweep's taskkill ends the holder, so the pipes close. `close` waits for the sweep's report (`sweepPending`).<br>2. If the report has not arrived when the grace fires, `onGrace` sees `closed` and calls `finish(closeCode)` with `killed` still false.<br>3. The result is `{ code: 0, timedOut: false }` with no note. The report that comes later is dropped, because the run has settled.<br>**What this contradicts.**<br>• The header: "`timedOut` is true exactly when the deadline or abort had to end something".<br>• QA-1.2-2's resolution: the run waits for the sweep, "bounded by the same timer, so `timedOut` reflects what was actually killed".<br>The same abort therefore gives `code 1, timedOut: true` or `code 0, timedOut: false`, depending on how fast PowerShell prints.<br>**Measured** (`sweeptime.mjs`, the failing test's sequence, the real PowerShell sweeper):<br>• runs 0–4: the holder died at +1157 to +1346 ms; `code 1, timedOut: true`, with `[killed 1 process tree(s)…]`;<br>• **run 5: the holder died at +1829 ms; the result came at +2016 ms as `code 0, timedOut: false`, with empty stderr**.<br>**Deterministic** (`graceverdict.mjs`, a stand-in that kills at once and reports 2500 ms later): the holder died at +1664 ms, and the result came at +2004 ms as `{"code":0,"stdout":"","stderr":"","timedOut":false}`. With a 0 ms report, the same fixture gave `code 1, timedOut: true` and the kill note at +1761 ms.<br>In a second 2500 ms run, the stand-in's kill itself landed after the grace (+2382 ms). The force-closed path then gave `timedOut: true`, which is correct.<br>**Impact.** A deadline that had to kill a leftover can be reported as a clean `code 0` when the direct child exited 0. This is more likely under load, when PowerShell is slow. | 1. In `onGrace`, when `closed && sweepPending`, check whether the sweeper has printed `pinned <n>` with n > 0.<br>&nbsp;&nbsp;– If it has, it may have killed: set `killed = true` and add a note, for example `[orphan sweep still reporting at settle: it may have ended what held the pipes]`.<br>&nbsp;&nbsp;– If it has not pinned yet, it cannot have killed anything, so the natural result stands. This keeps the QA-1.2-10 no-op.<br>&nbsp;&nbsp;– `Sweeper` needs an accessor for the pinned count.<br>2. Add a Windows test: the `early-exit` fixture, with a stand-in sweeper (through `setSweeperExecutableForTests`) that pins, kills the holder at once and reports after `KILL_GRACE_MS`. Assert `timedOut: true`. |
+| QA-1.2-25 | nit (test-only; a gap in the QA-1.2-22 fix) | `test/unit/exec.test.ts:646` | The `.cmd` exit-code test's first run, `runShell("<t.cmd>", { timeoutMs: 20000, lowPriority: true })`, keeps its 20 s deadline. That is the budget that failed under load in round 3 ("two other `lowPriority` runs hit their 20 s deadline (`expected 1 to be 3`)"). The `.cmd` test is one of the two tests that can fail with that message. | Raise it to `timeoutMs: 60_000`, as in the other exit-code tests. Two runs of 60 s plus 2 s fit in the 130 s vitest timeout. |
+| QA-1.2-26 | nit (test-only; pre-existing) | `test/unit/exec.test.ts:421` and `:443` | **The gating run failed here.** Both lifecycle tests assert that the holder is dead the moment the run resolves.<br>• The run resolves at most `KILL_GRACE_MS` (2 s) after the kill. So the tests require the Windows sweep to finish within 2 s, which is stricter than G4's 3 s. When the sweep is slower, the grace settles the run first.<br>• Measured (`sweeptime.mjs` run 6, with other agents' work taking the CPU to 100 %): the result came at +2021 ms with the force-closed note, and the holder died at +4088 ms.<br>• Idle, the sweep kills at +1.2 to +1.35 s, which leaves 0.65–0.8 s of margin. | 1. Check the holder with `waitForExit` up to G4's bound (3 s after the deadline or the abort), not at the result.<br>2. When the sweep is late, the result carries the force-closed note, not the sweep note. Either accept both notes, or state in the test file that these tests need a machine that is not saturated by normal-priority load, as QA-1.2-22 option 3 did. That load is G4 limit (c), which 3.1's loaded run covers. |
+| QA-1.2-27 | nit (pre-existing since `6966a5c`; POSIX) | `exec.ts:300-305` (the late kill) and `:430-432` (the residual comment) | **The late kill can SIGKILL another run's group, although the map now shows when.**<br>**How.**<br>1. A run whose group empties after `exit` stays tracked (`groupGone` is false).<br>2. If its id is recycled by a new run's group, the new run overwrites the entry.<br>3. A deadline or abort of the old run still calls `signalGroup(pid, "SIGKILL")`.<br>**Measured** (WSL, own PID namespace; the new code and `a3fb8af` behave the same):<br>• Run A's child exited with a group member left and a `setsid` holder on the pipes, so A was still tracked at exit.<br>• The member then exited, and `ns_last_pid` gave PID 84 to run B.<br>• Aborting A killed B's group. B resolved `{ code: 1, timedOut: false }`, a false failure.<br>• A resolved `timedOut: true` with `[killed the process group left running by the exited command]`, but the group it killed was B's.<br>**Why it is fixable.** The comment calls this residual "not fixable without pidfd". That holds for an unrelated group. For a run of this process, the token shows the recycle: A's own entry is deleted only once its group was seen empty (`groupGone`) or at settle.<br>**Rarity.** The conditions are QA-1.2-23's: a `setsid` escapee on the pipes, plus PID wrap-around. | 1. Signal only while the entry is still the run's own: `pid && !groupGone && tracked.get(pid) === trackToken && signalGroup(pid, "SIGKILL")`. After the exit hook has cleared the map, opencode is exiting anyway.<br>2. Narrow the comment to unrelated groups.<br>3. Add a POSIX test. Overwrite a running run's entry with `trackingForTests.track(pid, Symbol())` to stand in for the recycle. Then abort the run, and assert that there is no `[killed the process group…]` note and that the group member is still alive. |
+
+### Checked, no finding
+
+- **The hook's longer limit costs time only while a run is in flight.** With an empty map, the
+  Windows hook returns before spawning anything (`exec.ts:462`). POSIX signals synchronously and
+  is unchanged.
+- **`waitForFile`.** The loop makes `limitMs / 50` iterations of at least 50 ms each, so the
+  wall-clock wait is never shorter than the limit.
+- **The bookkeeping test and the exit hook.** Its `track` installs the exit hook when it runs
+  first, and `exitHookInstalled` keeps it to one listener. The hook test (`:521-543`) asserts one
+  listener. The bookkeeping test untracks its own entry before it ends.
+
+### Deferred by plan (not open)
+
+- **deferred by plan (3.1):** unchanged from round 4.
+- **deferred by plan (3.2):** unchanged from round 4. This includes QA-1.2-21 item 2 (the
+  known-limit wording); its code change is verified above.
+- **deferred by plan (2.1):** QA-1.2-13, unchanged.
+
+**Status: phase 1.2 QA is not CLEAN.** QA-1.2-24 (minor) and QA-1.2-25, QA-1.2-26 and QA-1.2-27
+(nits) are open.
