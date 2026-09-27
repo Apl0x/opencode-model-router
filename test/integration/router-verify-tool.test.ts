@@ -1043,6 +1043,29 @@ describe("background mode (2.4.5)", () => {
     expect(wiring.pending.get("orch", h)).toMatchObject({ entry: { state: "verified" } });
   });
 
+  it("QA-2.4-17: a retryable router_verify result (cancelled call) does not hide a later background fail: the notice is shown and the entry stays listed", async () => {
+    exactReference();
+    state.failing = { a: ["t2"] };
+    const { wiring } = makeWiring({ background: true }, undefined, { settleMs: 5, retryBaseMs: 20 });
+    const h = await register(wiring.pending, "a");
+    // S10: the tool's abort cancels the call; its result is retryable ("not judged").
+    const controller = new AbortController();
+    controller.abort();
+    const cancelled = await wiring.verifyHandles("orch", { kind: "handles", handles: [h] }, { signal: controller.signal });
+    expect(verdictOf(cancelled.items[0]).result.retryable).toBe(true);
+    expect(wiring.pending.get("orch", h)).toMatchObject({ kind: "found", entry: { state: "unverified" } });
+    // Then the background run judges the handle a fail (after a short backoff: retryBaseMs 20).
+    enqueue(wiring, h, "a");
+    const queue = queueOf(wiring);
+    await vi.waitFor(() => expect(wiring.pending.get("orch", h)).toMatchObject({ kind: "found", entry: { state: "verified" } }), { timeout: 3_000 });
+    await queue.whenIdle();
+    expect(wiring.pending.get("orch", h)).toMatchObject({ kind: "found", entry: { state: "verified", result: { verdict: { outcome: "fail" } } } });
+    const notices = queue.takeNotices("orch");
+    expect(notices).toHaveLength(1);
+    expect(notices[0]).toMatchObject({ handle: h, outcome: "fail" });
+    expect(wiring.pending.listPending("orch").map(e => e.handle)).toContain(h);
+  });
+
   it("QA-2.4-5: a required gate arriving during a background run is judged, not 'slot busy'; the background entry is retried later, uncounted", async () => {
     state.slotMax = 1;
     state.hangLow = true;

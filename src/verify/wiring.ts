@@ -1722,9 +1722,10 @@ export function createVerificationWiring(deps: {
 
       const items = await Promise.all(slots.map(s => ("claim" in s ? runs[s.claim] : s)));
       // 2.4.5: this caller receives these verdicts, so no late notice repeats them (R14), and a
-      // background verdict among them leaves the pending list (QA-2.4-3).
+      // background verdict among them leaves the pending list (QA-2.4-3). QA-2.4-17: only a
+      // terminal verdict counts; a retryable "not judged" leaves a later background verdict to notice.
       if (options.background !== true) {
-        const reported = items.flatMap(i => (i.kind === "verdict" ? [i.handle] : []));
+        const reported = items.flatMap(i => (i.kind === "verdict" && !i.result.retryable ? [i.handle] : []));
         background?.markReported(reported);
         pending.markReplayed(sessionID, reported);
       }
