@@ -12,6 +12,15 @@
     default is 15000).
   - `src/index.ts:593-596` — `timeoutMs(activeCfg.enforcement?.verify?.gateBudgetMs, DEFAULT_GATE_BUDGET_MS)`.
   - `src/verify/timeout.ts:37` — `DEFAULT_GATE_BUDGET_MS = 90_000` (the constant `src/index.ts:82` imports).
+  - `src/verify/wiring.ts:258` — `verify?.testBaseline === false || verify?.require === "never" ? [] : commands`
+    (decides whether a capture runs); switch to `resolveVerifyBudget(cfg).failureRecheck`.
+  - `src/verify/wiring.ts:276` — `getConfig().enforcement?.verify?.testBaseline === false` (decides
+    whether the baseline is used); switch to `resolveVerifyBudget(cfg).failureRecheck`.
+  - `src/index.ts:82` — the `DEFAULT_GATE_BUDGET_MS` import goes once the read at `:593-596` moves.
+  - `tiers.json:21` — `"gateBudgetMs": 90000` makes the `?? 90_000` default in `resolveVerifyBudget`
+    dead for every real `loadConfig()`. **Removing this key is Phase 2.1's job** (not edited in 1.1).
+  - `src/index.ts` must call `warnDeprecatedVerifyKeys(cfg, logger)` with the plugin logger after
+    every `loadConfig()` — **deferred by plan (2.1)**. `resolveVerifyBudget` no longer logs.
 
 ## Implementation notes
 
