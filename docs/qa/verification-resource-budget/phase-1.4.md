@@ -1513,3 +1513,223 @@ Other agents may have been running tests on this machine at the same time.
     ±Infinity) as 0, and a negative one as 0, as before. Both paths, the file slots and the
     in-process fallback, get the clamped value. Test: NaN and Infinity each make one attempt and
     return busy, with no ticket; both fail by mutation. Phase 1.1 still validates the setting.
+
+## QA re-review (round 4)
+
+Reviewer: adversarial QA, `[tier:heavy]` (CAP:none).
+
+- **Scope:** `git diff a4ce821..e35200c` (`a4034ec`, `e35200c`), checked against the round-3
+  findings. Line numbers refer to `src/verify/slot.ts` at `e35200c`.
+- **Environment:** Windows 11, NTFS, 16 cores, Node v24.21.0, Bun 1.3.14. No POSIX host and no
+  Node 20 binary were available.
+- **Repros:** `%TEMP%\omr-qa14r4\` held `clock.mjs`, `stress.mjs` and `exitfence.mjs`. The dir was
+  deleted after the review.
+  - They load the real `src/verify/slot.ts`: Node 24 through type stripping, Bun natively.
+  - `clock.mjs` and `stress.mjs` run real Bun and Node processes with the production clocks and
+    constants.
+  - `exitfence.mjs` uses module instances (`?a`, `?r`, `?p`) as processes. The `read` and `unlink`
+    seams fix the interleaving.
+- **Cleanup:** afterwards no `omr-qa14r4*` or `omr-slot-*` dir was left, and no `node.exe` or
+  `bun.exe` running a repro, `holder.mjs` or a busy loop. One `omr-repro-*` dir that predates this
+  review (01:19) belongs to another run and was left alone.
+
+**Test runs** (`npx vitest run --maxWorkers=2 test/unit/slot.test.ts`):
+
+| run | result | duration |
+|---|---|---|
+| Node v24.21.0 | 60/60 | 56.6 s |
+| under load: 14 `node -e "for(;;){}"` processes, killed afterwards | **57/60** (QA-1.4-33) | 93.5 s |
+| under load again, to capture the failures | 60/60 | 75.0 s |
+| under load, only the 3 failed tests (`-t`, 5 tests matched) | 5/5 | 13.0 s |
+
+Other agents may have been running tests on this machine at the same time.
+
+**Committed repro** (`test/fixtures/slot/runtime-repro.mjs src/verify/slot.ts`, at `e35200c`):
+
+| runtime | b1 (O at 4.4 s after a beat) | b2 (fresh `waitMs: 0` processes, 3 s apart) | b3 (two watchers started 30 s apart) |
+|---|---|---|---|
+| `bun` 1.3.14 | origins 8 090 ms apart; Y busy twice, O busy at 4 429 ms; H not lost | 0.1–12.1 s busy, 15.1 s held | reclaimed after 15.2 s |
+| `node` v24.21.0 | origins 1 ms apart; O busy at 4 417 ms; H not lost | 0.2–9.2 s busy, 12.2 s held | reclaimed after 20.1 s |
+
+- **Bun b2:** at 12.1 s the witness is 12.0 s, which is the threshold (2 heartbeats plus the 2 s
+  pad), so a hold at 12.1 s (round 3) or at 15.1 s (here) are both expected.
+- **Node b3:** one watch step later than round 3 (15.1 s). The same case was re-run 3 times with a
+  sidecar monitor (`stress.mjs b3x node 3`, two processes calling at the same instant): reclaimed
+  after 15.1 s, 15.1 s and 15.0 s, and no view restarted. A torn sidecar read (see the focus
+  answers) accounts for one lost step. It only delays.
+
+**Summary (round 4):**
+- QA-1.4-27, -28, -29 and -31 are verified.
+- QA-1.4-30 is verified for its tests, but 3 other tests failed in one of two loaded runs
+  (QA-1.4-33).
+- New findings: 0 critical, 0 major, 1 minor and 2 nits (QA-1.4-32…34).
+- QA-1.4-32 is a two-holder path (theoretical, proven with seams). The exit-hook addition of the
+  QA-1.4-29 fix introduced it.
+
+### Verification of QA-1.4-27…31
+
+| finding | status | evidence |
+|---|---|---|
+| QA-1.4-27 | verified (Windows: Bun and Node) | **Repro:** the committed repro above shows no two holders in b1 on either runtime, and b2 and b3 reclaim on both. **Clock** (`clock.mjs`, 3 Bun and 3 Node processes started 1.2 s apart):<br>• Bun is anchored: `hrtime` reads 367–449 ms at start. Node takes it as is: `uptime − hrtime` is −28…−35 ms.<br>• The final `bootAt` values are 20.9 ms apart, within the 1 s slack.<br>• 52.5 M reads over 2 s each: 0 decreases.<br>• `os.uptime()` steps 15 or 16 ms on both runtimes.<br>• The largest step of an anchored clock is 14.4 ms (the offset catching up one uptime tick).<br>**Stress** (`stress.mjs`): 4 Bun and 4 Node observers write into one view (at most 1 view per record). |
+| QA-1.4-28 | verified | **Code:** `createOwned` runs `stray` before it rethrows (`:654-657`). `dropStray` (`:838-846`) removes the file under the claim of its own token, and only while the file still holds that token. The token is unique and is re-read before every unlink, so another process's lock can never be deleted. `isStray` (`:829-835`) makes only this process's own token stale at once. The entry is forgotten on another token (`:833`) or when the file is missing (`:1292`). At exit, `releaseOneSync` takes and drops the claim in one synchronous call.<br>**Test:** passes in every run.<br>**Side note:** if the stray's claim is this process's own unconfirmed claim, the exit hook's `wx` gets EEXIST and leaves the stray (`:875`). That lock then carries a dead PID, so same-host callers reap it at once. |
+| QA-1.4-29 | verified; the exit addition is QA-1.4-32 | `dropUnconfirmed` (`:690-702`) drops only its own token (`unlinkWhile` with the token check) and only until `dropBy`. The map holds at most 64 entries and forgets an entry on another token or past the fence. The test passes. The exit hook (`:908-916`) drops the remembered claims **without** the fence. |
+| QA-1.4-30 | verified for its tests; see QA-1.4-33 | The 4 tests, plus the 5 others on `WATCHER_HEARTBEAT_MS`, passed in both loaded runs. |
+| QA-1.4-31 | verified | `:1554` clamps NaN and ±Infinity to 0 before both paths. The NaN and Infinity tests pass. Phase 1.1 still validates the setting (deferred). |
+
+### Answers to the round-4 focus questions
+
+- **Sidecar growth.**
+  - A record keeps at most 4 views (`:568`), about 100 bytes each.
+  - There is one sidecar per target, identity and host. The owner's release and every reap delete
+    it (`:786-787`). An observer that writes after that delete leaves an orphan, and housekeeping
+    collects it after 1 h.
+  - In the stress run (13 090 calls) there was at most 1 sidecar with at most 1 view. No file was
+    left after the processes exited.
+  - A stale origin goes as the oldest view once 4 exist, or with the key. Either way only evidence
+    is lost.
+  - More than 4 live origins at once would thrash the views and stop the sharing. No such case was
+    seen: Bun and Node share one origin within 21 ms.
+- **Concurrent read-modify-write on the sidecar.** `observe` reads, computes, then writes with
+  `writeFile` (truncate, then write), without a lock.
+  - Lost updates and torn reads do happen: the parent sampled 5 torn reads in 370 during the stress.
+    A torn read parses as nothing and restarts the view. A lost update drops looks.
+  - Neither can move `first` or `from` back, so neither can cause an early reap:
+    - a writer extends a view only with its own `at`;
+    - a new key drops every view;
+    - a stale write carries a `last` no later than its writer's `at`, so any later look more than 2
+      heartbeats after that restarts the witness.
+  - **Premature-reap stress** (`stress.mjs`):
+    - Setup: a live Bun holder with the production heartbeat. 8 observers (4 Bun, 4 Node) see a
+      +31 s wall step, so the lock always looks old, and call with `waitMs: 0` in a loop for 40 s.
+    - Output: `{"hLost":false,"lockStillH":true,"heartbeats":9,"observerCalls":13090,"observerHeld":0,"sidecarFilesMax":1,"viewsPerRecordMax":1,"parentTornReads":"5/370","filesAfterExit":[]}`.
+  - The cost is liveness: a restart delays a reclaim by one watch step (Node b3 above).
+- **`machineClockFrom`.**
+  - Within a process it never goes back, by construction (`hrtime` never decreases, and the offset
+    only rises) and over 52.5 M reads.
+  - Across processes the clocks are not meant to agree exactly: origins are compared within 1 s.
+  - A Bun process whose first use comes within 2 s of boot would take its per-process `hrtime` as
+    is. It then gets a view of its own, which only costs sharing.
+  - Linux and macOS, and a runtime whose uptime counts whole seconds: not verified (no host).
+- **The 2 s pad.** It is correct for the span and the witness: every writer of a view is within its
+  own slack of the view's `bootAt`, so any two are within `errMs` of each other. The gap rule is not
+  padded (QA-1.4-34).
+- **Stray cleanup.** It cannot delete another process's lock (QA-1.4-28 above).
+- **Unconfirmed-claim memory.** It is bounded (64 entries) and drops by token only. While the
+  process runs, it never deletes another claim. The exit hook is the exception (QA-1.4-32).
+- **Exit-hook additions.** Strays are safe: the claim protocol runs within one synchronous call.
+  Unconfirmed claims are not: see QA-1.4-32.
+- **Non-finite `waitMs`.** See QA-1.4-31 above. `max` is still not clamped against NaN:
+  `Math.max(1, Math.floor(NaN))` is NaN, so every call is busy (QA-1.4-19, deferred).
+- **Invariants:**
+  - At most `max` holders: this held in every run, except under the QA-1.4-32 interleaving.
+  - No unbounded lockout for long-lived callers: b3 reclaims after 15–20 s on both runtimes, and a
+    watch lasts up to 50 s.
+  - `acquireSlot` never rejects: no new path throws out of it (`dropStray` catches), and no repro
+    printed an unhandled rejection.
+  - Timers: the round-3 fixes add none.
+
+### New findings
+
+| ID | severity | finding | evidence | fix |
+|---|---|---|---|---|
+| QA-1.4-32 | nit (theoretical) | The exit hook drops this process's unconfirmed claims past their drop fence. A reaper that has judged such a claim inert can then delete a third reaper's new claim: two claimers, then two holders. | `exitfence.mjs` exit: `"bothInsideClaimT":true,"twoHolders":true,"rLost":true`. Control, same interleaving without the exit: one holder. | At exit, drop an unconfirmed claim only within its `dropBy`. |
+| QA-1.4-33 | minor | 3 more tests fail under CPU load (the QA-1.4-30 class). | Loaded run 1: 57/60. The ticket test fails at `:917`; the other two messages were not captured. Loaded run 2: 60/60. | Ticket test: heartbeat 500 ms. Explicit timeouts on the 5 s waits. |
+| QA-1.4-34 | nit | The gap rule compares stamps of different writers without the 2 s pad, contrary to "every `mono` threshold adds that". | Analysis. No early reap is reachable, because a stale verdict also needs an old lock. | Restart at `at − last > maxGap − errMs`, or correct the header. |
+
+### QA-1.4-32 — nit (theoretical) — The exit hook drops unconfirmed claims past their drop fence: two claimers, then two holders
+
+- **Where:**
+  - `releaseAllSync` (`:908-916`) unlinks every remembered unconfirmed claim that still holds its
+    token, without checking `dropBy`.
+  - The header (`:103-106`) and the notes say the process drops such a claim "at its next readable
+    look within those 7.5 s, and at exit".
+  - An entry lives until the next readable look at that claim path, 64 newer entries or the exit
+    (`:673-702`), so it can be minutes old at exit.
+- **Why it matters:**
+  - Deletion safety rests on one rule: only a claim's owner removes it, and only within 7.5 s.
+    After at least 30 s others may remove it as inert, under a claim of its own.
+  - An exit-time delete after that races with an inert-reclaimer R, between R's re-read and R's
+    unlink.
+  - If a third reaper P creates a new claim in that window, R deletes it. R and P are then both
+    inside the claim for the same victim, and "only a K-claim holder deletes K's file" no longer
+    holds.
+- **Evidence (proven with seams, `exitfence.mjs`):**
+  - Setup: A reaps a dead-PID lock T. A scanner (A's `read` seam: EBUSY on `.reap-*`) keeps A from
+    confirming its claim, so A remembers it.
+  - After A's drop fence (300 ms here), R judges the claim inert and issues its unlink.
+  - At that moment A's exit hook runs. P, another reaper of T, takes the claim that is now free,
+    re-reads T and issues its unlink. P's unlink is let through last.
+  - Output: `{"claimAfterAExit":null,"pFirst":"inside","rResult":"held","lockAfterR":"d291d911-…","pResult":"held","lockAfterP":"9ea4f511-…","rLost":true,"twoHolders":true,"bothInsideClaimT":true}`.
+    R also warned "verification slot lost: another process reclaimed it while it was held".
+  - Control, the same interleaving without A's exit:
+    `{"pFirst":"busy","rResult":"held","pResult":"busy","rLost":false,"twoHolders":false}`.
+- **Likelihood:** every one of these is needed:
+  - an unconfirmed claim: a scanner holds a new claim for more than 3.15 s, or its re-read hits an
+    EMFILE;
+  - no readable look at it by its owner for at least 30 s;
+  - the owner exits inside another process's re-read → unlink window;
+  - a third reaper acts inside the same window.
+
+  So it is a nit (theoretical), like QA-1.4-26, even though the consequence is the critical one.
+- **Fix:**
+  - At exit, remove an unconfirmed claim only while `mono() <= dropBy`: keep the `mono` function
+    with the entry. Otherwise leave the claim to the inert rule.
+  - Optionally, drop the unconfirmed claims that are within their fence before the strays are
+    released. Then a stray whose claim is this process's own is not skipped (`:875`).
+  - Test: remember a claim, pass its fence, run `releaseAllSlotsSync()`, and assert that the claim
+    is still there.
+
+### QA-1.4-33 — minor — Three more tests fail under CPU load
+
+- **Where:**
+  - `slot.test.ts:909-927`: a live older ticket defers a non-waiting caller. `fast()` has a 100 ms
+    heartbeat, so the ticket TTL is 200 ms.
+  - `:645-661`: a live claimer's claim is inert only after `staleMs`.
+  - `:686-706`: an unconfirmed claim (QA-1.4-26).
+- **Evidence:**
+  - Loaded run 1: 57/60 in 93.5 s, with exactly these 3 failing. The ticket test failed at `:917`:
+    `AssertionError: expected { release: [Function release], …(1) } to deeply equal { busy: true }`.
+    The caller held although a live ticket was ahead of it.
+  - Loaded run 2: 60/60 in 75.0 s. The 3 tests alone under load: pass. Unloaded: 60/60.
+- **Mechanism:**
+  - Ticket test (analysis): the live ticket is written with a fresh mtime just before the call. If
+    more than 200 ms pass between that write and the ticket scan (the call's first dir probe comes
+    first), the ticket counts as dead and the caller does not defer.
+  - Claim tests (not verified): the filter of run 1 did not capture their messages. Each ends with
+    a `waitMs: 5_000` acquire inside vitest's default 5 s test timeout, since no `testTimeout` is
+    configured.
+  - In `:645` the first look uses production deps (1 s slack). The fast observer joins that view,
+    so its pad is 1.1 s and it needs a span of at least 2.1 s.
+- **Fix:**
+  - Ticket test: a 500 ms heartbeat (TTL 1 s), with `setAge(live, 1_500)`.
+  - Tests that wait 5 s: explicit timeouts (for example 20 s).
+  - In `:645`: give the first two looks fast deps, or allow for the 1.1 s pad in the timings.
+
+### QA-1.4-34 — nit — The gap rule is not padded by the view's slack
+
+- **Where:**
+  - `observe` (`:564`) restarts `from` when `at − old.last > maxGap`. `old.last` can be another
+    writer's stamp, up to `errMs` (2 s) off.
+  - The header (`:44-46`) says "every `mono` threshold below adds that, so it never shortens a
+    margin", and the notes say "Every `mono` threshold adds that, so no margin shrinks".
+- **Effect:** a gap in the looks of up to 2 heartbeats plus 2 s (12 s) can go unseen, so the
+  witness does not restart after such a freeze.
+- **Reachability (analysis):** no early reap of a running holder was found.
+  - A stale verdict also needs the lock to be old: a wall age over 30 s, or a span of at least
+    32 s.
+  - A holder that heartbeated before a freeze of 12 s or less is not old.
+  - A freeze long enough to make it old (over 25 s) shows as a gap even with the 2 s skew.
+
+  So the sentence is inaccurate, but the margins hold.
+- **Fix:** restart when `at − old.last > maxGap − errMs`, which is conservative. Otherwise, correct
+  the sentence so that it leaves out the gap rule, and give the argument above.
+
+### Deferred by plan (round 4)
+
+- **QA-1.4-18** (Phase 2.1 / 2.2), nested acquisition: unchanged.
+- **QA-1.4-19** (Phase 1.1 schema, Phase 2.1 wiring), non-finite `max`: unchanged. NaN makes every
+  call busy.
+- **QA-1.4-31** (Phase 1.1): the clamp is in the code; validating `slotWaitMs` stays with Phase 1.1.
+- **QA-1.4-21 residual** (Phase 1.1 / 2.1): state it next to `slotWaitMs`.
+
+**Open, not deferred:** QA-1.4-32, -33 and -34. Phase 1.4 QA is **not** clean.
