@@ -13,6 +13,7 @@ import {
   planStaticScoping,
   resolveEntry,
   REPORT_NAME_RE,
+  SEARCH_LIMIT,
   STEM_MATCH_LIMIT,
   JS_TEST_GLOBS,
   PY_TEST_GLOBS,
@@ -2462,5 +2463,59 @@ describe("QA-1.3-28: the setup-file trigger follows 1.6's rule", () => {
   it("win32 matches case-insensitively", async () => {
     const W = { "C:\\repo\\.git": "" };
     expectS6(await planScopedRun(input({ win: true, files: W, cwd: "C:\\repo", changedFiles: changed("SetupTests.TS") })), "config-changed", "config file changed: SetupTests.TS");
+  });
+});
+
+describe("QA-1.3-26: process-backed searches are bounded", () => {
+  const st = (over: Parameters<typeof input>[0]) => {
+    const { search: _s, ...rest } = input(over);
+    return planStaticScoping(rest);
+  };
+  const why = (n: number) => `too many changed modules to map: ${n} test searches (limit ${SEARCH_LIMIT})`;
+
+  it("more than SEARCH_LIMIT deleted sources -> S6 before any search, in both planners", async () => {
+    const gone = Array.from({ length: SEARCH_LIMIT + 1 }, (_, i) => `src/gone${i}.ts`);
+    const search = stubSearch();
+    expectS6(await planScopedRun(input({ changedFiles: changed(...gone), search })), "too-many-searches", why(SEARCH_LIMIT + 1));
+    expect(search.findByContent).not.toHaveBeenCalled();
+    expectS6(await st({ changedFiles: changed(...gone) }), "too-many-searches", why(SEARCH_LIMIT + 1));
+  });
+
+  it("pytest modules count too; exactly SEARCH_LIMIT still plans", async () => {
+    const mods = Array.from({ length: SEARCH_LIMIT + 1 }, (_, i) => `src/m${i}.py`);
+    const files = pyRepo(Object.fromEntries(mods.map((m) => [`/r/${m}`, ""])));
+    const search = stubSearch();
+    expectS6(await planScopedRun(input({ command: "pytest", files, changedFiles: changed(...mods), search })), "too-many-searches", why(SEARCH_LIMIT + 1));
+    expect(search.findByName).not.toHaveBeenCalled();
+    const ok = await planScopedRun(input({ command: "pytest", files, changedFiles: changed(...mods.slice(1)), search }));
+    expect(ok).toEqual({ noAffected: true, note: "no affected tests: no test files map to the changed modules" });
+    expect(search.findByName).toHaveBeenCalledTimes(SEARCH_LIMIT);
+    expect(await st({ command: "pytest", files, changedFiles: changed(...mods.slice(1)) })).toMatchObject({ scopable: true, pendingSearches: SEARCH_LIMIT });
+  });
+});
+
+describe("QA-1.3-27: planStaticScoping runs the spec-time pytest config lookup", () => {
+  const st = (over: Parameters<typeof input>[0]) => {
+    const { search: _s, ...rest } = input(over);
+    return planStaticScoping(rest);
+  };
+
+  it("tests/unit/pytest.ini with a positional addopts: S6 from both planners", async () => {
+    const files = pyRepo({ "/r/tests/unit/pytest.ini": "[pytest]\naddopts = tests\n", "/r/tests/unit/test_x.py": "" });
+    const reason = 'unsupported pytest argument "tests" in addopts of /r/tests/unit/pytest.ini';
+    expectS6(await planScopedRun(input({ command: "pytest", files, changedFiles: changed("tests/unit/test_x.py") })), "unsupported-argument", reason);
+    expectS6(await st({ command: "pytest", files, changedFiles: changed("tests/unit/test_x.py") }), "unsupported-argument", reason);
+  });
+
+  it("static notes carry the lookup's notes; with only pending searches there is nothing to look up", async () => {
+    const files = pyRepo({ "/r/tests/test_x.py": "", "/r/src/m.py": "", "/r/tests/tox.ini": "x" });
+    const fs = memFs(files, false, {}, ["/r/tests/tox.ini"]);
+    expect(await st({ command: "pytest", fs, changedFiles: changed("tests/test_x.py") })).toMatchObject({
+      scopable: true,
+      pendingSearches: 0,
+      notes: ["unreadable pytest config ignored: /r/tests/tox.ini"],
+    });
+    expect(await st({ command: "pytest", fs, changedFiles: changed("src/m.py") })).toEqual({ scopable: true, runner: "pytest", pendingSearches: 1, notes: [] });
+    expect(await st({ files: jsRepo({}, { "/r/src/a.ts": "" }), changedFiles: changed("src/a.ts") })).toEqual({ scopable: true, runner: "vitest", pendingSearches: 0, notes: [] });
   });
 });

@@ -457,10 +457,17 @@
 //        []                      -> S6 deleted-no-tests.
 //        more than STEM_MATCH_LIMIT files -> S6 stem-too-common.
 //        otherwise               -> the existing, inside-root results join the inputs.
+//   9a. (QA-1.3-26) The searches run one process each, in sequence. More than SEARCH_LIMIT (50)
+//      pending searches (the count below) -> S6 too-many-searches, decided before the first
+//      search. 5000 changed pytest modules made 5000 git calls (about 26 minutes at 0.3 s each).
+//      Batching (one git grep with several -e, one ls-files) would need a TestSearchSeam change;
+//      the cap is the simpler bound, and planStaticScoping applies it identically.
 //   10. Inputs empty after steps 8 and 9 -> NoAffected, with the note from M.2.
 //   planStaticScoping stops before every search. Each gone non-test source, and each existing
-//   pytest module, counts as a pending search. When nothing is decidable, the result is
-//   {scopable: true, runner, pendingSearches}.
+//   pytest module, counts as a pending search. It applies 9a, and (QA-1.3-27) runs the spec-time
+//   pytest config lookup (D.4) over the test inputs it already knows, so an addopts S6 there is
+//   seen by 1.6 too. When nothing is decidable, the result is {scopable: true, runner,
+//   pendingSearches}.
 //
 // ------------------------------------------------------------------------------------------------
 // H. ARGV CONSTRUCTION
@@ -687,6 +694,8 @@
 //     node-not-found           node not found: no absolute PATH entry has a node executable
 //                              node path is not absolute: <path>
 //                              node on PATH is not an executable file: <f>   (F.1)
+//     too-many-searches        too many changed modules to map: <n> test searches (limit 50)
+//                              (G.9a)
 //   M.2 NoAffected notes:
 //     "no changed files, no affected tests"                          (section 1.5-6, exactly)
 //     "no affected tests: no changed file is a test input"           (docs only, dropped paths,
@@ -795,7 +804,8 @@
 //
 //   1.6 risk.ts takes `ScopingPlan | StaticScoping`. "Scoping impossible" holds when
 //       isUnverifiable(plan). Show plan.reason and branch on plan.code. Callers obtain the plan
-//       from planStaticScoping, which starts no process.
+//       from planStaticScoping, which starts no process. S6Code only grows (round 2 added
+//       node-not-found and too-many-searches), so a switch over it needs a default branch.
 //   2.1 testsPass: plan = planScopedRun(...).
 //       - NoAffected -> pass, with the note.
 //       - Unverifiable -> S6.
@@ -856,6 +866,8 @@ export const JS_TEST_GLOBS: readonly string[] = [":(glob)**/*.test.*", ":(glob)*
 export const PY_TEST_GLOBS: readonly string[] = [":(glob)**/test_*.py", ":(glob)**/*_test.py"];
 /** A deleted source whose stem appears in more test files than this is S6 stem-too-common. */
 export const STEM_MATCH_LIMIT = 20;
+/** More changed files needing a process-backed test search than this is S6 too-many-searches (G.9a). */
+export const SEARCH_LIMIT = 50;
 /** Upper bound on the summed (arg.length + 1) of a spec's args (Windows CreateProcess: 32767). */
 export const MAX_ARGV_CHARS = 30000;
 /** Report files: `${tmpdir}/omr-verify-<uuid>.json|.xml`. readResult touches nothing else. */
@@ -897,7 +909,8 @@ export type S6Code =
   | "search-failed"
   | "tmpdir-in-repo"
   | "argv-too-long"
-  | "node-not-found";
+  | "node-not-found"
+  | "too-many-searches";
 
 /** S6: scoping is impossible. The reason names the construct (section M.1) and never triggers a full suite. */
 export interface Unverifiable {
@@ -2704,12 +2717,25 @@ async function classify(
 
   const pending = det.kind === "pytest" ? modules.length + goneModules.length : goneSources.length;
   const emptyNote = det.kind === "pytest" && modules.length + goneModules.length > 0 ? NOTE_NO_PY_MAP : NOTE_NO_INPUT;
+  // G.9a (QA-1.3-26): the searches are sequential processes (a git grep costs ~0.3 s in a large
+  // repo), so their number is bounded. Decided before any search, so static scoping agrees.
+  if (pending > SEARCH_LIMIT) {
+    return s6("too-many-searches", `too many changed modules to map: ${pending} test searches (limit ${SEARCH_LIMIT})`);
+  }
 
   if (!search) {
     if (inputs.size === 0 && pending === 0) return noAffected(emptyNote);
     const pre = await preflight(ctx, det, fs);
     if (isS6(pre)) return pre;
-    return { scopable: true, runner: det.kind, pendingSearches: pending, notes: [...notes, ...pre.notes] };
+    const staticNotes = [...notes, ...pre.notes];
+    // QA-1.3-27: the spec-time pytest config lookup needs only the fs. Run it over the test inputs
+    // known without a search, so 1.6 sees the S6 planScopedRun would return for them.
+    if (inputs.size > 0) {
+      const known = [...inputs.entries()].sort(byKey).map(([, v]) => v);
+      const py = await pytestAtInputs(ctx, fs, det, known, det.runnerCwd, staticNotes);
+      if (py !== undefined && isS6(py)) return py;
+    }
+    return { scopable: true, runner: det.kind, pendingSearches: pending, notes: staticNotes };
   }
 
   // G.9 and the pytest name mapping.
