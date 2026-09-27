@@ -500,6 +500,205 @@ case runs on both paths through `describe.each(["task", "delegate"])`.
   no reference (risk.ts table). This is by design in 1.6; noted because the footer then shows no
   "no reference" reason.
 
+## Implementation notes (2.4.3a, 2.4.3b, 2.4.4)
+
+Commits on `vrb/p24`: 2.4.3a `e1f8cee`, 2.4.3b `da6eb9b`, 2.4.4 `be8dcf5`. Tests:
+`test/integration/router-verify-tool.test.ts` (2.4.3) and
+`test/integration/pending-list-transform.test.ts` (2.4.4). The plan names
+`test/unit/router-verify-tool.test.ts`. The file is under `test/integration` because it drives the
+plugin and the real 2.1/2.2 pipeline (planner, scope opener, batch coordinator, judge) over a
+vitest-shaped project on disk, like `batch-wiring.test.ts`.
+
+### Wiring API (`src/verify/wiring.ts`, 2.4.3a)
+
+- `parseRouterVerifyArgs(args)`: exactly one of `handles` (a non-empty array) or `pending: true`.
+  Both, neither, `pending: false` (also next to `handles`), and a non-array or empty `handles`
+  return `ROUTER_VERIFY_ARGS_TEXT`. It is pure and never throws.
+- `verifyHandles(sessionID, target, { signal })` never rejects. In order:
+  1. **Targets.** `pending` is `listOpen(sessionID)` (unverified plus verifying, newest first). An
+     empty list returns `ROUTER_VERIFY_NO_PENDING_TEXT` and runs nothing. For `handles`, each
+     entry goes through `normalizeHandle`, and the normalized handles are deduped. A malformed or
+     non-string entry is "unknown handle". The first `MAX_HANDLES_PER_CALL` (32) run, and the rest
+     are counted in one "not run" line.
+  2. **One deadline.** `createDeadline(gateBudgetMs)` is created once per call, before any
+     preparation (§1.5-13). The tool's abort signal aborts it.
+  3. **Claims.** `markVerifying` is called synchronously for every handle (R8).
+     - `unknown` and `expired` get their R9 texts. An empty `sessionID` makes every handle
+       unknown.
+     - `settled` replays the cached verdict ("cached verdict; nothing was run"). Nothing is
+       spawned and no snapshot is taken.
+     - `joined` awaits the other call's run, bounded by this call's deadline, and answers
+       `VERIFYING_ELSEWHERE_TEXT` if the deadline passes first.
+     - If `markVerifying` throws mid-loop, the claims made so far are settled as retryable
+       before the error propagates.
+  4. **Preparation (P0 from the entry).** For every claimed handle:
+     - the stored changed files (`"unavailable"` stays unavailable, never `[]`);
+     - the stored reference, awaited under the deadline (`none(gateBudget)` on expiry, like
+       `store.reference(id, signal)`);
+     - a fresh tree snapshot once per cwd (git only, `digestPaths: []`, bounded by
+       `GRADE_SNAPSHOT_TIMEOUT_MS`). It feeds `currentTree`, which materialize uses for its
+       same-repository guard;
+     - the drift check (see decision 1).
+  5. **Gates.** Once every preparation has settled, all gates start at once. Each uses the
+     required gate's sequence: `buildGateDeps(orchestrator, inFlight, prepared, deadline)`, then
+     `accept({ dod, trivial: false, mode: "modeA", cwd })` under
+     `withTimeout(deadline.remaining())`, then `unverifiableGateResult(…, completedFailures)` on a
+     reject. Every testsPass request carries the **same** `Deadline`, so the requests meet in one
+     S5 window (batch.ts B9, W7).
+  6. **Verdict.** R11 `lineageDowngrade` runs first, then the drift rule, then `nextTier` for a
+     fail, using the ladder rule from `index.ts` with the canonical producer tier.
+  7. **Settle.** `claim.settle` runs in a `finally`, with a retryable fallback result when judging
+     threw.
+- `lineageDowngrade` is the R11 downgrade half, taken out of `applyLineage` without changing
+  `applyLineage`'s behaviour. `verifyHandles` uses only this half. The record half is
+  `claim.settle`'s automatic `recordRejection` (label = handle, `landedAt` = `createdAt`), so a
+  rejection is never recorded twice.
+- `isRetryableVerdict(verdict, cut)` supplies R4's `retryable` (see decision 2).
+- `formatVerifyReport(items, excess, strictUnverifiable)` writes one block per handle, in call
+  order: `- <handle> · <description> · pass|fail|unverifiable`.
+  - An accepted verdict gets the required gate's `buildAcceptedSuffix`.
+  - A rejected one gets `buildForcingNote(reasons, { producerTier, nextTier })` followed by
+    `ROUTER_VERIFY_NO_RETRY_TEXT`.
+  - The drift notice has its own line.
+  - A retryable result reads "not judged: <reasons>", followed by "still unverified; call
+    `router_verify` again".
+  - The output is scrubbed like the gate's forcing notes.
+
+### Plugin (`src/index.ts`, 2.4.3b and 2.4.4)
+
+- **`router_verify`** is registered next to `delegate` with args
+  `{ handles?: string[]; pending?: boolean }`. `execute` never throws: argument errors and
+  failures come back as text. The session is `toolCtx.sessionID`, or none (then every handle is
+  unknown). `toolCtx.abort` is passed on as the call signal.
+- **Registration.** `routerVerifyEnabled` is fixed at plugin start and holds when both hold:
+  - `verify.require` is not `"never"`;
+  - the enforcement mode is not `"off"`, or the delegate tool is enabled (the delegate tool
+    verifies in every mode).
+
+  It does not depend on `enableDelegateTool` otherwise.
+- **Deferral requires the tool.** The wiring's `isDeferred` is wrapped as `routerVerifyEnabled &&
+  isDeferred(…)` on both paths. So a footer never names a tool this instance did not register.
+- **2.4.4 system transform.** After the protocol push, on the orchestrator path only, it calls
+  `buildPendingListBlock(pending.listUnverified(sessionID))` and pushes the block as its own
+  system entry when it is defined.
+  - A missing `sessionID`, graders and subagents return earlier, through the existing
+    suppression. So do bypass mode and child sessions.
+  - Entries in `verifying` are not listed (R5 `listUnverified`).
+  - A registry error is logged, and the transform goes on.
+
+### Decisions (QA may challenge)
+
+1. **Drift never lets a pass stand.** §1.5-18 asks only for a notice. The owner's rule (deferred
+   verification is never weaker than a required gate on the same work) goes further:
+   - a required gate judges the tree right after the producer returns;
+   - `router_verify` judges the current tree.
+
+   So:
+   - **Drifted** (stored digests ≠ current digests, `driftedPaths`): a pass becomes
+     `unverifiable` with `DRIFT_NOTICE` and the drifted paths. A fail stays a fail, with the
+     notice. The drifted files are the producer's own stored changed files, because the digests
+     are keyed by that set. So they are always inside the verification scope, and the run sees
+     their current content.
+   - **Unprovable**: no stored digests, a digest that cannot be taken, the deadline, or an
+     unattributed change set. The same downgrade applies, with `DRIFT_UNCHECKED_NOTICE`. It is
+     never a claim of "no drift" without proof. Under `testScope: "full"`, an unattributed
+     change set can therefore never pass through `router_verify`.
+2. **Retryable (R4).** `isRetryableVerdict` never makes a pass or a fail retryable, and neither
+   is a false pass:
+   - only `unverifiable` and skipped (`require: "never"` at call time) verdicts can be
+     retryable;
+   - they are retryable when the call was cut (a gate timeout, the deadline, the tool's abort),
+     or when a reason matches 2.1/2.2's stable transient phrases: budget exhausted, slot busy,
+     `timed out after <n>ms`, `check errored`, coordinator or batch failures, and this module's
+     `verification unavailable:`;
+   - `REFERENCE_NONE.failed` ("failed or timed out" at dispatch) is deliberately **terminal**:
+     that reference cannot be recaptured, and a retryable entry would stay in the pending list
+     and invite futile reruns;
+   - a misclassification only reruns the entry, or replays an `unverifiable`.
+3. **Preparation before gates.** W7 closes a window when no request is planning. So one gate
+   starting early could batch alone. Every preparation finishes first, then every gate starts
+   together. Cost: a reference still being captured for one handle delays the others' gates.
+   That wait is bounded by the shared deadline, and references are git-only and usually settled
+   long before a `router_verify` call.
+4. **A shared deadline and errors.** A gate timeout aborts the shared deadline and that gate's
+   graders, as the required gate does; every member expires at the same instant anyway. Any
+   other exception in one gate becomes that handle's retryable `verification unavailable: …` and
+   does **not** abort the other handles' batch.
+5. **Stricter inputs than the required path.** `trivial: false` always: a deferred testsPass
+   delegation is judged in full, even where the native path would have skipped a trivial
+   inferred DoD. `finalReturnText` is `""`: it is not stored (R3), and a testsPass DoD is
+   deterministic, so no check reads it.
+6. **Lineage root.** It is the registered `root`, or the fresh snapshot's root when the deferred
+   finish had none. This can only remove passes.
+7. **Nothing is retried.** A fail gets the forcing note with the next tier, plus the no-retry
+   line. The tests assert that no session is created.
+8. **Arguments are strict.** `{ handles, pending: false }` is an error, not "handles". The error
+   text says exactly what to pass.
+
+### Residuals
+
+- `maxVerifyingMs` is `gateBudgetMs` at plugin start plus 30 s. A runtime config change that
+  raises `gateBudgetMs` beyond that lets the reaper take back a live claim. Its later `settle`
+  then returns `false`, and the run has already resolved `ABANDONED` (retryable), so the entry
+  is re-verified later. Nothing is lost except that run.
+- The tool map is fixed at plugin start (the SDK's `tool` object). Turning verification on at
+  runtime in an instance that started without it keeps delegations synchronous (decision in
+  2.4.3b), until a restart registers the tool.
+- Spike F (a), (b), (d) stay live checks for 3.1: whether the tool is visible to the
+  orchestrator, how long the host lets `execute` run, and per-agent visibility. The optional
+  hardening of adding `router_verify` to `experimental.primary_tools` is not done. R6 already
+  answers a subagent's call with "unknown handle".
+
+### Test coverage (2.4.3, 2.4.4)
+
+- `router-verify-tool.test.ts`, `verifyHandles (2.4.3a)`:
+  - the argument matrix and the retryable matrix;
+  - pass: verified, then a cached replay with no new run, git call, slot hold or snapshot;
+  - fail: the forcing note with `medium` after `fast`, the no-retry line, no session, the
+    lineage record;
+  - unverifiable without a reference (terminal);
+  - an unattributed change set: no run;
+  - drift → notice, and the pass is gone;
+  - unchecked drift → the same;
+  - three handles → one `createDeadline`, one union run, one slot hold;
+  - two concurrent calls → one run, and the second joins it;
+  - slot busy → back to unverified, then judged on the next call;
+  - R11 lineage turns a later pre-existing pass into `unverifiable` naming the earlier handle;
+  - R6: other session, producer session, `""` and malformed input are all unknown;
+  - expired (injected clock);
+  - dedupe and the 32 cap;
+  - `pending: true` verifies `listOpen` and joins a run in flight;
+  - a cancelled call judges nothing.
+- `router-verify-tool.test.ts`, `the router_verify tool (2.4.3b)`:
+  - registration with and without `delegate`, and absent under `require: "never"`;
+  - without the tool, a later testsPass task is not deferred;
+  - the exactly-one texts; `execute` never throws;
+  - session scoping through `toolCtx.sessionID`;
+  - end to end: a deferred native task's footer handle, then `pending: true`; a cancelled call.
+- `pending-list-transform.test.ts`:
+  - absent when empty;
+  - one block after the protocol: 5 of 7 entries, newest first, and "… and 2 more";
+  - verified and verifying entries leave the list;
+  - sessions never see each other's entries;
+  - never for a subagent or without a session id.
+
+### Left in 2.4
+
+- **2.4.5 background mode** (`background: true` only):
+  - the queue factory, coalescing, the same coordinator, slot and caps;
+  - late notices once per handle, injected at the marked place in the system transform
+    (`buildLateNoticeBlock`);
+  - a test that asserts the queue is never constructed when `background` is false.
+- **2.4.6 remaining tests:**
+  - `router_verify` with a deadline that expires mid-run: `unverifiable` for the handles not yet
+    judged, and the tree killed;
+  - a capture that resolves after the wait but was invalidated by an edit, followed by
+    `router_verify` → "no reference";
+  - 50 deferred delegations with `background: false` spawn nothing.
+
+  Latency and "subagent cannot self-select" are already covered by 2.4.2.
+- **2.3** must describe `router_verify` in the protocol text and in `COMMAND_REFERENCE_INDEX.md`.
+
 ## Task breakdown
 
 Each task is ≤ ~20 tool calls. Commit and push each one when green. Run only scoped
@@ -511,8 +710,8 @@ Each task is ≤ ~20 tool calls. Commit and push each one when green. Run only s
 | 2.4.2a | **done** `7eeb91a` | wiring.ts: parse directives from the orchestrator prompt only; `VERIFY_WAIT` bounds the capture wait; deferred-finish helper (snapshot → changed files or `"unavailable"`, static scoping, risk, digests, register, footer). |
 | 2.4.2b | **done** `80598f5` | index.ts native `task`: mode routing; required path unchanged; deferred footer; `recordRejection` on required rejections; `pending.sweep` in `createIdleTtlSweeper`. |
 | 2.4.2c | **done** `d414687` | index.ts `delegate`: same routing; footer on the tool return; no ladder for deferred. |
-| 2.4.3a | after Spike F | wiring.ts `verifyHandles`: normalize, claim/join, one `Deadline`, one batch via the 2.2 coordinator, drift, per-handle verdict with forcing note and next tier, lineage caveat, settle in `finally`, no retry ever. |
-| 2.4.3b | after 2.4.3a | index.ts: register `router_verify` whenever verification is enabled (independent of `enableDelegateTool`); `test/unit/router-verify-tool.test.ts`. |
-| 2.4.4 | after 2.4.2 | System transform: `buildPendingListBlock(listUnverified(sid))`, appended only when defined. |
+| 2.4.3a | **done** `e1f8cee` | wiring.ts `verifyHandles`: normalize, claim/join, one `Deadline`, one batch via the 2.2 coordinator, drift, per-handle verdict with forcing note and next tier, lineage caveat, settle in `finally`, no retry ever. Spike F's live items remain for 3.1. |
+| 2.4.3b | **done** `da6eb9b` | index.ts: register `router_verify` whenever verification is enabled (independent of `enableDelegateTool`); `test/integration/router-verify-tool.test.ts`. |
+| 2.4.4 | **done** `be8dcf5` | System transform: `buildPendingListBlock(listUnverified(sid))`, appended only when defined; `test/integration/pending-list-transform.test.ts`. |
 | 2.4.5 | after 2.4.3 | Background mode (only `background: true`): queue factory in pending.ts, coalescing, same coordinator, slot and caps, late notices once per handle; never constructed when false. |
 | 2.4.6 | last | Remaining plan tests in `test/unit/deferred-verification.test.ts`: latency under fake timers, capture after the wait, subagent cannot self-select, 50 deferred delegations spawn nothing. |
