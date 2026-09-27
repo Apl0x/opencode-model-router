@@ -583,9 +583,15 @@ describe("verifyHandles (2.4.3a)", () => {
   it("an unattributed change set is unverifiable, never scoped over []", async () => {
     const { wiring } = makeWiring();
     const h = await register(wiring.pending, "a", { changedFiles: "unavailable", digests: undefined });
-    const item = verdictOf((await wiring.verifyHandles("orch", { kind: "handles", handles: [h] })).items[0]);
+    const report = await wiring.verifyHandles("orch", { kind: "handles", handles: [h] });
+    const item = verdictOf(report.items[0]);
     expect(item.result.verdict.outcome).toBe("unverifiable");
     expect(state.runs).toEqual([]);
+    // QA-2.4-12 (M26): the verdict names the attribution, never "no changed files" (an empty set).
+    const said = [...item.result.verdict.reasons, ...(item.result.verdict.caveats ?? [])].join(" ");
+    expect(said).toContain("change attribution unavailable");
+    expect(said).not.toContain("no changed files");
+    expect(report.text).toContain("change attribution unavailable");
   });
 
   it("drift: a producer file edited after it returned -> the notice, and the pass does not stand", async () => {

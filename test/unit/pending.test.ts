@@ -1621,6 +1621,19 @@ describe("QA-2.4-5: foreground precedence in the background queue", () => {
     expect(queue.stats()).toMatchObject({ queued: 0, running: false });
   });
 
+  it("QA-2.4-12 (M17): enqueue never coalesces across sessions: another session's overlapping queued request survives", async () => {
+    const { queue, calls, advance } = harness();
+    queue.enqueue({ sessionID: "s1", handle: H(1), files: ["/shared.ts"] });
+    queue.enqueue({ sessionID: "s2", handle: H(2), files: ["/shared.ts"] });
+    expect(queue.stats()).toMatchObject({ queued: 2, superseded: 0 });
+    await advance(BACKGROUND_SETTLE_MS);
+    expect(calls.map(c => c.handles)).toEqual([[H(1)]]);
+    calls[0].resolve([]);
+    await flush();
+    await advance(BACKGROUND_RETRY_BASE_MS * 4);
+    expect(calls.map(c => c.handles)).toContainEqual([H(2)]);
+  });
+
   it("no run starts while foreground verification is busy: the due requests back off, uncounted, and run once it is not", async () => {
     let busy = true;
     const { queue, calls, advance } = harness(() => busy);
