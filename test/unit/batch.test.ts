@@ -1173,6 +1173,64 @@ describe("createBatchCoordinator: windows and the union run", () => {
     await Promise.all([c.dispose(), c2.dispose()]);
   });
 
+  it("QA-2.2-24, W3: the member at arrival index k keeps its floor plus e x (2k + 1), the split schedule ahead of its recheck", async () => {
+    const RUN_MS = 1_000;
+    const tick = () => new Promise<void>((resolve) => setTimeout(resolve, RUN_MS));
+    const { calls, runtime } = harness(MODEL, {
+      execute: async (spec) => {
+        await tick();
+        return ranModel(MODEL, spec);
+      },
+      runtime: { batchWindowMs: 10_000 },
+    });
+    const c = createBatchCoordinator({ platform: "linux" });
+    const hook = c.hook(runtime);
+    // A first batch measures the key's estimate: 1 s.
+    const warm = hook(req(["src/h.ts"]));
+    await vi.advanceTimersByTimeAsync(10_000 + RUN_MS);
+    expect(ran(await warm).exitCode).toBe(0);
+    // Floor 2 s. b joins second (k = 1): it keeps 2 s + 3 runs, so with 7 s it may wait 2 s. With
+    // e ignored (QA-2.2-26 M4) it would wait 5 s; with one run for every member, 4 s.
+    const a = hook(req(["src/a.ts"]));
+    const b = hook(req(["src/b.ts"], { deadline: liveDeadline(2_000 + 3 * RUN_MS + 2_000) }));
+    await vi.advanceTimersByTimeAsync(1_999);
+    expect(calls.executes).toHaveLength(1);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(calls.executes.length).toBeGreaterThan(1);
+    await vi.advanceTimersByTimeAsync(10 * RUN_MS);
+    await Promise.all([a, b]);
+    await c.dispose();
+  });
+
+  it("QA-2.2-26 (M14), W3: a run measured while a window is open moves that window's close earlier", async () => {
+    const RUN_MS = 3_000;
+    const tick = () => new Promise<void>((resolve) => setTimeout(resolve, RUN_MS));
+    const { calls, runtime } = harness(MODEL, {
+      execute: async (spec, _deadline, n) => {
+        if (n === 0) await tick();
+        return ranModel(MODEL, spec);
+      },
+      runtime: { batchWindowMs: 10_000 },
+    });
+    const c = createBatchCoordinator({ platform: "linux", maxBatchSize: 2 });
+    const hook = c.hook(runtime);
+    // Two requests fill a window (W2); their union runs 3 s, the key's first measurement.
+    const first = [hook(req(["src/a.ts"])), hook(req(["src/b.ts"]))];
+    await flush();
+    expect(calls.executes).toHaveLength(1);
+    // m joins the next window with 8 s: floor 2 s and e = 0, so it could wait 6 s.
+    const m = hook(req(["src/c.ts"], { deadline: liveDeadline(8_000) }));
+    await flush();
+    expect(c.stats().openWindows).toBe(1);
+    // At 3 s the union is measured: m now keeps 2 s + 3 s, which it has only just left, so the
+    // window closes then, not at 6 s.
+    await vi.advanceTimersByTimeAsync(RUN_MS);
+    expect(calls.executes.map((e) => e.spec.inputs)).toEqual([[at("src/a.ts"), at("src/b.ts")], [at("src/c.ts")]]);
+    expect(c.stats().openWindows).toBe(0);
+    await Promise.all([...first, m]);
+    await c.dispose();
+  });
+
   it("QA-2.2-17 (a), QA-2.2-18, W7: a lone request never waits; arrivals during a running batch gather until it ends", async () => {
     const gate = deferred<void>();
     const { calls, runtime } = harness(MODEL, {

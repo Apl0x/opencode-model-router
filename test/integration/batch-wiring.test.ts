@@ -794,4 +794,55 @@ describe("QA-2.2-23 to QA-2.2-25: batched gates keep the verdict of batchWindowM
     ]);
     expect(batched.out.map(verdictOf)).toEqual(alone.out.map(verdictOf));
   }, 40_000);
+
+  it("N2 (QA-2.2-24): a window held open by another gate's planning keeps the reserve of the schedule its members then run", async () => {
+    exactReference();
+    state.failing = { c: ["t2"], d: ["t1"] };
+    state.fifo = true;
+    state.runMs = 1_000;
+    // One slot. a is still planning, so W7 keeps the window of c (14.0 s) and d (14.1 s) open.
+    // Alone, the second of them runs after the first's run and recheck, and still rechecks.
+    const { batched, alone } = await twice(async wiring => {
+      const releaseA = holdPlanning("a");
+      const other = gate(wiring, "a");
+      const verdicts = await Promise.all([
+        gate(wiring, "c", { reference: captured(), budgetMs: 14_000 }),
+        gate(wiring, "d", { reference: captured(), budgetMs: 14_100 }),
+      ]);
+      releaseA();
+      expect((await other).verdict.outcome).toBe("pass");
+      return verdicts;
+    });
+    expect(alone.out.map(outcomeOf)).toEqual([
+      ["fail", false],
+      ["fail", false],
+    ]);
+    expect(batched.out.map(verdictOf)).toEqual(alone.out.map(verdictOf));
+  }, 40_000);
+
+  it("N2b (QA-2.2-24): two gates that arrive just after a lone gate went direct, with two slots", async () => {
+    exactReference();
+    state.failing = { c: ["t2"], d: ["t1"], e: ["t1"] };
+    state.fifo = true;
+    state.capacity = 2;
+    state.runMs = 1_000;
+    // g (test file e) is alone, so it runs at once (W7) on one slot, with a run and a recheck.
+    // c and d arrive 100 ms later. Alone, c runs beside g, and d takes g's slot when g is done.
+    const { batched, alone } = await twice(async wiring => {
+      const g = gate(wiring, "e", { reference: captured(), budgetMs: 60_000 });
+      await sleep(100);
+      const verdicts = await Promise.all([
+        gate(wiring, "c", { reference: captured(), budgetMs: 14_000 }),
+        gate(wiring, "d", { reference: captured(), budgetMs: 14_100 }),
+      ]);
+      return [await g, ...verdicts];
+    });
+    expect(alone.out.map(outcomeOf)).toEqual([
+      ["fail", false],
+      ["fail", false],
+      ["fail", false],
+    ]);
+    expect(batched.out.map(verdictOf)).toEqual(alone.out.map(verdictOf));
+    expect(batched.maxHolds).toBeLessThanOrEqual(2);
+  }, 40_000);
 });

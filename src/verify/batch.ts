@@ -98,12 +98,18 @@
 //      later: arrivals do not push it back (no debounce). So a steady stream cannot keep a window
 //      open, and no request waits in a window for longer than batchWindowMs (2.1-T3's bound for
 //      the batch wait). This is the starvation bound. W3 and W7 only close it earlier.
-//   W3 The reserve (QA-2.2-17 b). A member's floor is its runtime.recheckMinRemainingMs when it
-//      can recheck at all (failureRecheck on and a captured reference), else 0, plus
-//      BATCH_RESERVE_MARGIN_MS (1 s: union planning and scheduling). With e = the key's last
-//      measured run duration (0 before the first run of the key), the window closes no later than
-//      the moment any member would be left with less than floor + e: what the direct path needs
-//      for its run and its recheck. When a member joins, and when a run of the key is measured,
+//   W3 The reserve (QA-2.2-17 b, QA-2.2-24). A member's floor is its
+//      runtime.recheckMinRemainingMs when it can recheck at all (failureRecheck on and a captured
+//      reference), else 0, plus BATCH_RESERVE_MARGIN_MS (1 s: union planning and scheduling).
+//      With e = the key's last measured run duration (0 before the first run of the key), the
+//      window closes no later than the moment the member at arrival index k (0 for the first)
+//      would be left with less than
+//        floor + e x (2k + 1).
+//      That is what the schedule after the close needs when the batch splits (B5.6) and the slot
+//      is one: the k members that joined before it run and recheck first, then its own run, then
+//      its recheck. Their direct hooks would have queued in that order too. QA-2.2-24: the former
+//      reserve, floor + e for each member alone, let a window held open by W7's signal spend the
+//      recheck of the second tight member. When a member joins, and when a run of the key is measured,
 //      the close time moves earlier if needed (the timer is re-armed, still one per window), or
 //      the window closes at once when that moment has passed. A joiner whose remaining() is
 //      within its floor therefore closes the window at once, as the former W3 did for a joiner
@@ -423,8 +429,8 @@
 //     verdict at its deadline (2.1-T6 R5 u13, or u6 during the recheck). It never makes the
 //     requester wait past its deadline.
 //   - QA-2.2-17: under the default policy (strictUnverifiable off) such a verdict is accepted, so
-//     the batch must not be what runs a member out of budget. W3 keeps each member's floor plus
-//     one run out of the window wait. B5.2a pools the members only when every member's budget
+//     the batch must not be what runs a member out of budget. W3 keeps each member's floor and
+//     the split schedule ahead of it out of the window wait. B5.2a pools the members only when every member's budget
 //     covers the worst-case batched schedule ahead of its recheck; otherwise each runs alone
 //     (B5.6). W7 removes the window from a lone request altogether. What remains is an
 //     estimate's error (B15).
@@ -1098,16 +1104,22 @@ export function createBatchCoordinator(options: BatchCoordinatorOptions = {}): B
   }
 
   /**
-   * W3 (QA-2.2-17 b): the window closes no later than the moment any member would be left with
-   * less than its floor plus one run of the key's estimate, which is what the direct path needs
-   * for its run and its recheck. The close time only ever moves earlier (W2).
+   * W3 (QA-2.2-17 b, QA-2.2-24): the window closes no later than the moment some member would be
+   * left with less than the schedule it may then run: a split (B5.6) where, on one slot, every
+   * member that joined before it runs and rechecks first. For the member at arrival index k that
+   * is its floor plus e x (2k + 1). The close time only ever moves earlier (W2).
    */
   function fitWindow(w: BatchWindow): void {
     if (w.closed) return;
     const t = now();
     const e = estimate(w.key);
     let closeAt = w.closeAt;
-    for (const m of w.members) if (!m.settled) closeAt = Math.min(closeAt, t + m.request.deadline.remaining() - floorOf(m) - e);
+    let k = 0;
+    for (const m of w.members) {
+      if (m.settled) continue;
+      closeAt = Math.min(closeAt, t + m.request.deadline.remaining() - floorOf(m) - e * (2 * k + 1));
+      k++;
+    }
     if (closeAt <= t) {
       closeWindow(w);
       return;
