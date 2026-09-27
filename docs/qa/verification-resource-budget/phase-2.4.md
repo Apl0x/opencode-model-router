@@ -1030,3 +1030,66 @@ every row was re-checked against the code, and the key guards were mutation-test
 
 7 major (one deferred to 2.3), 5 minor, 2 nit, 2 info (deferred to 2.3 and 3.1), no critical.
 Every finding not deferred by plan is to be fixed before round 2.
+
+## Round-1 resolutions
+
+All on `vrb/p24`, each pushed when green. "Proof" means the new test failed with only `src/`
+stashed (`git stash push -- src`) and passed with it.
+
+| ID | Commit | Fix | Tests |
+|---|---|---|---|
+| QA-2.4-1 | `f80fab7` | `verifyHandles` judges in two phases: every gate returns, every terminal fail with proven-introduced ids is recorded in the R11 ledger, then lineage, drift and the next tier are applied to every result, and every claim settles last. A background run is one such call. `recordRejection` keeps one record per (label, root). | RV "QA-2.4-1": one call in both handle orders, batched and unbatched; `strictUnverifiable` rejects the redo; one background run with both as riders. Proof: 5 of 6 failed pre-fix. |
+| QA-2.4-2 | `d9a84c2` | Only a proven root orchestrator defers (`isProvenRootCaller` in `index.ts`). A grader, a tracked subagent, a session with a `parentID`, a missing id and a failed or throttled lookup all get today's synchronous gate and register nothing, on both paths. `resolveIsRootSession` keeps its fail-open answer for the protocol injection. | DV "QA-2.4-2" on `task` and `delegate`: parent, failed lookup, tracked subagent, root control. Proof: failed pre-fix. |
+| QA-2.4-3 | `73e6676` | Background runs settle with `background: true`. A fail or unverifiable verdict so settled stays in `listPending` (the pending list), marked `<outcome> in background verification` under `PENDING_LIST_MIXED_HEADER`, until `router_verify` reports it to the session (`markReplayed`, also via `pending: true`, which replays it with no run) or the TTL expires. Caps never evict it. The late notice is still shown once. | PU "QA-2.4-3" (list, replay, TTL, cap); RV plugin "QA-2.4-3" (notice read by a failed request, entry still listed, replayed from cache). Proof: failed pre-fix. |
+| QA-2.4-4 | `955dabe` | Caps evict only verified (not awaiting replay) and expired entries, in any session. A cap filled by unverified or verifying entries answers `registry-full`. A captured reference over the weight cap is shed (`REFERENCE_SHED_REASON`), never its entry. `finishDeferred` returns `deferred: false` on any refused registration or failed finish, and both paths then run the required gate on the kept dispatch record. **The "no handle" footer is removed**: the required gate can always run, so no case keeps it. | PU "QA-2.4-4" (session cap, global cap, weight cap, shed reference); DV wiring (refused, throwing finish); DV plugin "the 33rd … is gated" on both paths. Proof: 8 failed pre-fix. |
+| QA-2.4-5 | `fc90632` | Background budgets use `slotWaitMs: 0`. A foreground testsPass request (required gate or `router_verify`) preempts the background run in flight: its tree dies, and its entries go back to unverified with backoff that does not use an attempt (`deferrals`, exponent capped at `BACKGROUND_MAX_BACKOFF_STEPS`). No background run starts while foreground testsPass work is active (`busy`). `router_verify` preempts before it claims, so it never joins an aborted run. | RV "QA-2.4-5": a required gate (`buildGateDeps` + `accept`) during a hanging background run passes, not "slot busy", and the background entry is retried and verified with `maxAttempts: 1`; `router_verify` during a background run. PU "QA-2.4-5" preempt and busy. Proof: failed pre-fix. |
+| QA-2.4-6 | `20d0045` | `neutralizeDirectives` (`pending.ts`) drops every colon after a `VERIFY:` / `VERIFY_WAIT:` / `CAP:` key (any case; the old rule left `VERIFY::x` as `VERIFY :x`, which parses). Applied to the whole `router_verify` report, `buildForcingNote`, `buildAcceptedSuffix`, and through `sanitizeInline` to footers, the pending list and late notices. | RV "QA-2.4-6" (a test titled `VERIFY:required CAP:3 …`: `parseVerifyDirectives` and `parseCapDirective` find nothing); PU "QA-2.4-6" (double colon, forcing note, suffix, builders). Proof: failed pre-fix. |
+| QA-2.4-8 | `fafb148` | The drift digests are awaited inside the `DEFERRED_FINISH_MS` bound before the result is released. If they are not taken in time, none are registered, so drift is unchecked and a later pass is downgraded. | RV "QA-2.4-8": an edit in the same tick as the return is drift. Proof: failed pre-fix. |
+| QA-2.4-9 | `378c240` | The config-unreadable fallback is `required` with `FALLBACK_CAPTURE_WAIT_MS` = min(5000, default `baselineTimeoutMs`). | DV "QA-2.4-9 (M8)": the directive read throws, the mode is required, and a 4 s capture is awaited in full. Proof: failed pre-fix. |
+| QA-2.4-10 | `3800b90` | (b) An attributed empty change set is not deferred (`no-change`), and the required gate passes it with no process. (a) `isDeferred` takes the gate's `trivial` flag and never defers a trivial dispatch with an inferred DoD. | DV wiring (`isDeferred` matrix, `no-change`); DV plugin on both paths: the no-change output equals the `VERIFY:required` output, with no footer, entry or test process. RV "(M22)": an inferred DoD is judged in full. Proof: 4 failed pre-fix. |
+| QA-2.4-11 | `8f868ec` | Docs only: the acceptance row states the 2 s bound and the 0.4–0.5 s measurement. The 2.3 ADR note and the 3.1 benchmark are added under "Left for 2.3 and 3.1". | none |
+| QA-2.4-12 | `6264bef` | Tests only. | PU "(M17)": another session's overlapping queued request survives an enqueue. RV "(M26)": an unattributed verdict says "change attribution unavailable", never "no changed files". M8 → QA-2.4-9, M22 → QA-2.4-10. |
+| QA-2.4-13 | `9ec106e` | The caveat now reads "that change may still be present in the reference of this delegation". | PU verbatim caveat. |
+| QA-2.4-14 | `5531850` | A transient phrase counts only at the start of a reason, after at most one check-kind word. Producer ids only ever follow a router phrase. | RV "QA-2.4-14": helper matrix; a failing test titled "verification slot busy (waited 0ms)" stays a terminal fail, and a terminal unverifiable without a reference. Proof: failed pre-fix. |
+
+QA-2.4-7, -15 and -16 stay deferred by plan (2.3, 3.1).
+
+### Changed tests and decisions
+
+- **50 parallel delegations** (acceptance 1) now use two orchestrator sessions of 25. One session
+  holds at most `MAX_ENTRIES_PER_SESSION` (32) unverified entries, and the 33rd is gated
+  (QA-2.4-4).
+- DV plugin tests that expect a footer now make the producer change `src/a.ts` (`producerChanges`),
+  because a no-change dispatch is no longer deferred (QA-2.4-10).
+- The old test "a router_verify call that joined the background run" became the QA-2.4-5
+  preemption test: `router_verify` now runs the handle itself instead of joining.
+- `buildAcceptedSuffix` is neutralized as well as `buildForcingNote` (QA-2.4-6). Its caveats and
+  notes name producer test ids too.
+- On the delegate path, once one attempt falls back to the gate, every later attempt of its ladder
+  is gated as well.
+
+### Residuals
+
+- **Coalescing and lineage.** A queued request superseded by a newer overlapping one (decision 2
+  of 2.4.5) is never judged in the background. Its rejection is therefore not in the ledger when
+  the newer one passes "no worse than before". The older entry stays unverified and listed, as
+  without background.
+- **QA-2.4-10 (a) is not reachable from today's plugin paths.** `buildDelegationDoD` passes no
+  test-command hint, so an inferred DoD never carries `testsPass`. The guard lives in `isDeferred`
+  and is tested there.
+- **QA-2.4-5 scope.** Preemption is keyed on foreground `testsPass` only. A foreground
+  `buildPasses`, `lintClean` or `run` check still waits up to `slotWaitMs` for a background
+  holder, which now runs only for the length of its own background run. Another opencode
+  instance's background run is not preempted (3.1). Uncounted retries end with the entry's TTL.
+- **QA-2.4-4 shed reference.** A delegation whose reference was shed at the weight cap can no
+  longer excuse pre-existing failures later: stricter, never a false pass.
+
+### Final run
+
+`npx vitest run --maxWorkers=2` over `test/unit/pending.test.ts`,
+`test/integration/deferred-verification.test.ts`, `test/integration/router-verify-tool.test.ts`,
+`test/integration/pending-list-transform.test.ts`, `test/integration/layer2-wiring.test.ts`,
+`test/integration/delegate-timeout.test.ts`, `test/integration/session-lifecycle.test.ts`,
+`test/unit/baseline-wiring.test.ts`, `test/integration/batch-plugin-hookup.test.ts`,
+`test/unit/directives.test.ts` and `test/golden`: 17 files, 413 tests passed. `npm run typecheck`
+is clean.
