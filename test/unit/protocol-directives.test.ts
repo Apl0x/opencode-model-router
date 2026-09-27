@@ -6,6 +6,7 @@ import {
   assembleSystemPrompt,
   buildDelegationProtocol,
   buildDoDProtocolSection,
+  DELEGATE_TOOL_DESCRIPTION,
 } from "../../src/router/protocol";
 import { parseVerifyDirectives } from "../../src/verify/directives";
 import { parseCapDirective } from "../../src/router/sessions";
@@ -36,8 +37,10 @@ describe("protocol text is not read as a directive", () => {
         assembleSystemPrompt(cfg, "openai/gpt-5", true),
         assembleSystemPrompt(cfg, "anthropic/claude-sonnet-4", true),
       ];
-      expect(texts[0]).toContain("VERIFY:required|deferred");
+      expect(texts[0]).toContain("`VERIFY:` followed by `required` or `deferred`");
       expect(texts[0]).toContain("VERIFY_WAIT:<n>s");
+      // QA-2.3-3: no pipe placeholder is presented as the thing to paste.
+      expect(texts[0]).not.toMatch(/VERIFY:[a-z]+\|/i);
       for (const text of texts) {
         const d = parseVerifyDirectives(text, defaults);
         expect(d).toEqual({ mode: "deferred", waitMs: 1234, modeSource: "default", waitSource: "default" });
@@ -49,4 +52,11 @@ describe("protocol text is not read as a directive", () => {
       expect(parseCapDirective(texts[2]!)).toBe(baseline);
     });
   }
+
+  // QA-2.3-3: the delegate tool description (not dispatch text) shows the literal, working form.
+  it("delegate tool description demonstrates a working VERIFY:required", () => {
+    const d = parseVerifyDirectives(DELEGATE_TOOL_DESCRIPTION, defaults);
+    expect(d.mode).toBe("required");
+    expect(d.modeSource).not.toBe("default");
+  });
 });

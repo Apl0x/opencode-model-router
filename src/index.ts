@@ -49,6 +49,7 @@ import {
   CLAUDE_ORCHESTRATOR_PREFIX,
   CLAUDE_ANTI_NARRATION,
   assembleSystemPrompt,
+  DELEGATE_TOOL_DESCRIPTION,
 } from "./router/protocol";
 import { resolveEnforcementMode } from "./router/enforcement";
 import { createPluginLogger } from "./router/logger";
@@ -499,8 +500,7 @@ const ModelRouterPlugin: Plugin = async (ctx: PluginInput) => {
     },
     tool: {
       ...(enableDelegateTool ? { delegate: tool({
-        description:
-          "Delegate a task to a tier subagent (fast | medium | heavy). Required-mode delegations and non-testsPass DoDs are verified independently (deterministic checks, or a grader at >= the producer tier in a fresh session) before return: an accepted result on PASS, an honest 'unmet' status on FAIL. testsPass delegations are deferred by default and return UNVERIFIED with a `[router] unverified · vrf_…` footer, a risk level and a handle; verify them with router_verify, or dispatch in required mode (`VERIFY:required|deferred`). Optionally pass an [acceptance]...[/acceptance] block to define the Definition of Done.",
+        description: DELEGATE_TOOL_DESCRIPTION,
         args: {
           task: tool.schema
             .string()
