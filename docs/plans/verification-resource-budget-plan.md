@@ -148,6 +148,44 @@ with that record. If heavy's approach also fails, this is a blocking problem und
 - [ ] No stale `omr-ref-*` worktrees are left over (`git -C D:\git\opencode-model-router worktree list`).
 - [ ] The phase-specific pre-flight items below pass (spikes included).
 
+
+### 0.10 Execution conduct (binding for the executing orchestrator)
+
+1. **Iterate continuously.** Go from phase to phase and wave to wave without pausing. Stop **only**
+   for a blocking or critical problem as defined in §0.1. A QA finding, a red test, a failed spike
+   with a documented alternative, or a merge conflict is work, not a stop.
+2. **Take over when delegation itself is the blocker.** If the model-router repeatedly blocks
+   progress, you take over **momentarily** and do the blocked reading or implementation yourself.
+   Typical cases: a less capable subagent returning verbose, circular or off-target output; cap
+   banners exhausting a delegate before it reaches the answer; the same dispatch failing twice with
+   `NEED MORE:`/`ESCALATE:` loops. You are a top-tier model, extremely intelligent and capable.
+   Record in the run log what you took over and why, then return to delegating for the next task.
+   Taking over is a recovery tool, not the default.
+3. **Pre-flight before every phase** (§0.9 + the phase items). **Fix everything it finds.** If a
+   finding is explicitly scheduled for a later phase of this plan, do not fix it early: document it
+   in the phase's QA report under "deferred by plan", with the phase that owns it.
+4. **Heavy senior QA after every phase.** QA is always a `[tier:heavy]` task. Always apply this rule.
+   Delegate to heavy QA an **adversarial** review of the work done, then fix **every** finding and
+   re-review until clean (§0.7).
+5. **Always delegate through the model-router, preferring atomic tasks.** One dispatch = one small,
+   verifiable unit: a function, a test file, one doc section. Coding tasks go to `@medium`; a coding
+   task that is genuinely complex (concurrency, cleanup safety, verdict algebra, command
+   construction) may go to `@heavy`. Split heavy work: `@heavy` does the reasoning-dense lift (design
+   or the hard code). Running tests, collecting results and applying mechanical fixes go to lighter
+   delegations (`@fast` to run and report, `@medium` to fix).
+6. **Test only what the change touches.** Never run the full suite unless it is actually needed:
+   the per-phase §0.9 run, post-merge integration and the release. A task's verification runs the
+   test files for the modules it changed (`npx vitest run <files>`, or `npx vitest related <src files> --run`).
+   **Accelerate scoped runs:** they may use vitest's default parallelism or higher
+   (`--maxWorkers=50%` or more, `--pool=threads` when the suite is compatible,
+   `--no-isolate` for pure unit files), and independent scoped runs from different agents may run
+   concurrently. The only runs that stay capped and serialized are **full-suite** runs of this repo
+   (§0.6.7), because many of them at once saturate the machine this plan is meant to protect.
+7. **Commit often** (§0.3): after every green subtask, and push immediately.
+8. **Issue tracking.** This repo does not use Linear. At planning time, a search of the repo for
+   Linear URLs or issue keys found none. GitHub PRs are the tracking record. If Linear references
+   appear later, update the matching issue at each phase boundary.
+
 ---
 
 ## 1. Problem and design
@@ -451,7 +489,8 @@ Not a delivery phase. It prepares a safe workspace.
       `git -C D:\git\opencode-model-router branch vrb/wave-1 origin/docs/verification-budget-plan`.
       Confirm that `origin/docs/verification-budget-plan` is `origin/master` plus plan commits only
       (`git log origin/master..origin/docs/verification-budget-plan --stat` touches only
-      `D:\git\opencode-model-router\docs\plans\verification-resource-budget-plan.md`). Push it.
+      `D:\git\opencode-model-router\docs\plans\verification-resource-budget-plan.md` and
+      `D:\git\opencode-model-router\docs\plans\verification-resource-budget-handover.md`). Push it.
 - [ ] **0.P.4** Record machine facts in the run log: OS, core count, Node version, and whether
       `uv`/`pytest` are on PATH (for the pytest spikes).
 
