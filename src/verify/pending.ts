@@ -271,7 +271,8 @@
 //     (label = handle, landedAt = entry.createdAt), and by 2.4.2 for a rejected REQUIRED gate in
 //     the native path (label "dispatch <dispatchID>", landedAt = the producer's return).
 //     introduced is capped at MAX_LEDGER_IDS; MAX_LEDGER_PER_SESSION records per session, oldest
-//     dropped; records expire with ttlMs.
+//     dropped; records expire with ttlMs. One record per (label, root): a second one replaces the
+//     first (router_verify records a call's rejections before it settles them, QA-2.4-1).
 //   - findLineage({ orchestratorSessionID, root, dispatchedAt, preexisting }) -> the newest record
 //     of the same session and root with landedAt <= dispatchedAt whose introduced ids intersect
 //     `preexisting`: { label, ids } (ids in `preexisting` order). A record never matches its own
@@ -834,7 +835,11 @@ export function createPendingRegistry(options: PendingRegistryOptions): PendingR
       landedAt: record.landedAt,
       introduced: Object.freeze(record.introduced.slice(0, MAX_LEDGER_IDS)),
     });
-    const list = ledger.get(record.orchestratorSessionID) ?? [];
+    // QA-2.4-1: router_verify records a call's rejections before it settles them, and settle records
+    // again: one record per label and root, the newest kept.
+    const list = (ledger.get(record.orchestratorSessionID) ?? []).filter(
+      (l) => l.record.label !== record.label || l.record.root !== record.root,
+    );
     list.push({ record: stored, recordedAt: now() });
     while (list.length > MAX_LEDGER_PER_SESSION) list.shift();
     ledger.set(record.orchestratorSessionID, list);

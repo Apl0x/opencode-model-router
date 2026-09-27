@@ -616,6 +616,10 @@ export interface VerificationWiring {
    *   withTimeout(deadline.remaining()). All preparations finish before any gate starts.
    * - R11 lineage can only turn a pass into unverifiable; drift (stored vs current digests) or
    *   unprovable drift never lets a pass stand (DRIFT_NOTICE / DRIFT_UNCHECKED_NOTICE).
+   * - QA-2.4-1: judged in two phases. Every gate of the call returns, every terminal fail with
+   *   proven-introduced ids is recorded in the R11 ledger, and only then are lineage, drift and the
+   *   next tier applied to every result, so the handle order and the gates' finishing order never
+   *   decide a verdict. A background run is one such call.
    * - claim.settle runs in a `finally`; a transient unverifiable (isRetryableVerdict) returns the
    *   entry to unverified. A fail carries buildForcingNote with the next tier, and nothing else.
    * `signal` (the tool call's abort) aborts the deadline. `background` (2.4.5, the background
@@ -1364,6 +1368,11 @@ export function createVerificationWiring(deps: {
     readonly root: string | undefined;
   }
 
+  /** One claimed entry after its gate: a final result, or the raw gate result still to be judged. */
+  type ClaimGate =
+    | { readonly kind: "final"; readonly result: VerificationResult }
+    | { readonly kind: "gate"; readonly res: GateResult; readonly retryable: boolean; readonly strict: boolean };
+
   /** 2.4.3a P0 from the pending entry: stored change set and reference, current tree, drift. */
   const prepareClaim = async (
     entry: PendingEntry,
@@ -1400,21 +1409,23 @@ export function createVerificationWiring(deps: {
 
   /**
    * 2.4.3a: the required gate on one claimed entry (index.ts's sequence: buildGateDeps, accept
-   * under withTimeout(deadline.remaining()), unverifiableGateResult on a reject), then R11 and the
-   * drift rule. A timeout aborts the shared deadline (every member is out of budget at that
-   * instant anyway) and this gate's graders; any other error leaves the other handles running.
+   * under withTimeout(deadline.remaining()), unverifiableGateResult on a reject). A timeout aborts
+   * the shared deadline (every member is out of budget at that instant anyway) and this gate's
+   * graders; any other error leaves the other handles running. Returns either a final result
+   * (nothing was judged) or the raw gate result that judgeVerdict finishes once EVERY gate of the
+   * call has returned (QA-2.4-1).
    */
-  const judgeClaim = async (
+  const runClaimGate = async (
     entry: PendingEntry,
     prep: ClaimPreparation,
     deadline: OwnedDeadline,
     cfg: RouterConfig,
     callSignal: AbortSignal | undefined,
     lowPriority: boolean,
-  ): Promise<VerificationResult> => {
+  ): Promise<ClaimGate> => {
     const dod = entry.dod;
     // A claimed entry is never released (release happens on a terminal settle only).
-    if (dod === undefined) return { verdict: unverifiableVerdict(ROUTER_VERIFY_RELEASED_REASON), retryable: false };
+    if (dod === undefined) return { kind: "final", result: { verdict: unverifiableVerdict(ROUTER_VERIFY_RELEASED_REASON), retryable: false } };
     const strict = cfg.enforcement?.verify?.strictUnverifiable ?? false;
     const inFlight = new Set<string>();
     const completedFailures: string[] = [];
@@ -1457,9 +1468,27 @@ export function createVerificationWiring(deps: {
       );
     }
     // verify.require "never" answers skipped: nothing was judged, so the entry stays unverified.
-    if (res.verdict.skipped === true) return { verdict: res.verdict, retryable: true };
+    if (res.verdict.skipped === true) return { kind: "final", result: { verdict: res.verdict, retryable: true } };
+    // Decided on the gate's own verdict, before any router caveat (lineage, drift) is added.
     const retryable = isRetryableVerdict(res.verdict, timedOut || deadline.signal.aborted || callSignal?.aborted === true);
-    res = lineageDowngrade(res, { orchestratorSessionID: entry.orchestratorSessionID, root: prep.root, dispatchedAt: entry.dispatchedAt, strictUnverifiable: strict });
+    return { kind: "gate", res, retryable, strict };
+  };
+
+  /** QA-2.4-1: the proven-introduced ids of a terminal gate fail (what a required gate records). */
+  const introducedOf = (gate: ClaimGate): readonly string[] => {
+    if (gate.kind !== "gate" || gate.retryable) return [];
+    const outcome = gate.res.verdict.outcome ?? (gate.res.verdict.pass ? "pass" : "fail");
+    return outcome === "fail" ? (gate.res.verdict.failures?.introduced ?? []) : [];
+  };
+
+  /**
+   * 2.4.3a: one claimed entry's verdict from its raw gate result: R11 lineage, then the drift rule,
+   * then the next tier. Runs only after every rejection of the call is in the ledger (QA-2.4-1).
+   */
+  const judgeVerdict = (entry: PendingEntry, prep: ClaimPreparation, gate: ClaimGate, cfg: RouterConfig): VerificationResult => {
+    if (gate.kind === "final") return gate.result;
+    const { strict, retryable } = gate;
+    const res = lineageDowngrade(gate.res, { orchestratorSessionID: entry.orchestratorSessionID, root: prep.root, dispatchedAt: entry.dispatchedAt, strictUnverifiable: strict });
     let verdict = res.verdict;
     if (prep.drift.kind !== "none") {
       // Section 1.5-18 and the owner's rule: a verdict on a tree that is not (provably) the
@@ -1571,18 +1600,48 @@ export function createVerificationWiring(deps: {
       const snapshots = new Map<string, Promise<TreeSnapshot | undefined>>();
       const preparations = claims.map(c => prepareClaim(c.entry, owned, snapshots));
       const allPrepared = Promise.allSettled(preparations);
-      const runs = claims.map(async (c, i): Promise<HandleReport> => {
-        let result: VerificationResult = { verdict: unverifiableVerdict("verification unavailable: no verdict"), retryable: true };
+      const gates = claims.map(async (c, i): Promise<{ readonly prep: ClaimPreparation | undefined; readonly gate: ClaimGate }> => {
+        let prep: ClaimPreparation | undefined;
         try {
-          const prep = await preparations[i];
+          prep = await preparations[i];
           await allPrepared;
-          result = await judgeClaim(c.entry, prep, owned, cfg, callSignal, options.background === true);
+          return { prep, gate: await runClaimGate(c.entry, prep, owned, cfg, callSignal, options.background === true) };
         } catch (error) {
-          result = { verdict: unverifiableVerdict(`verification unavailable: ${errorText(error)}`), retryable: true };
+          return { prep, gate: { kind: "final", result: { verdict: unverifiableVerdict(`verification unavailable: ${errorText(error)}`), retryable: true } } };
+        }
+      });
+      // 5. QA-2.4-1: judged in two phases. A verdict of this call must see every rejection of this
+      //    call, as it would across two calls or two required gates: (a) every gate returns;
+      //    (b) every terminal fail with proven-introduced ids goes into the R11 ledger; (c) lineage,
+      //    drift and the next tier are applied to every result; (d) every claim settles.
+      const judged = (async (): Promise<void> => {
+        const results: VerificationResult[] = claims.map(() => ({ verdict: unverifiableVerdict("verification unavailable: no verdict"), retryable: true }));
+        try {
+          const outcomes = await Promise.all(gates);
+          outcomes.forEach(({ prep, gate }, i) => {
+            const introduced = introducedOf(gate);
+            const root = prep?.root;
+            if (introduced.length === 0 || root === undefined) return;
+            const entry = claims[i].entry;
+            pending.recordRejection({ orchestratorSessionID: entry.orchestratorSessionID, root, label: entry.handle, landedAt: entry.createdAt, introduced });
+          });
+          outcomes.forEach(({ prep, gate }, i) => {
+            if (prep !== undefined) results[i] = judgeVerdict(claims[i].entry, prep, gate, cfg);
+            else if (gate.kind === "final") results[i] = gate.result;
+          });
+        } catch (error) {
+          for (let i = 0; i < results.length; i += 1) {
+            results[i] = { verdict: unverifiableVerdict(`verification unavailable: ${errorText(error)}`), retryable: true };
+          }
         } finally {
           // R4: single use, in a finally; false only when the claim was reaped or disposed.
-          if (!c.settle(result)) logger.debug?.("[verify] router_verify settled a claim that was already reaped", { handle: c.entry.handle });
+          claims.forEach((c, i) => {
+            if (!c.settle(results[i])) logger.debug?.("[verify] router_verify settled a claim that was already reaped", { handle: c.entry.handle });
+          });
         }
+      })();
+      const runs = claims.map(async (c): Promise<HandleReport> => {
+        await judged;
         const settled = await c.run;
         return { kind: "verdict", handle: c.entry.handle, description: c.entry.description, producerTier: c.entry.producerTier, via: "run", result: settled };
       });

@@ -82,6 +82,10 @@ const state = vi.hoisted(() => ({
   slotBusy: false,
   /** When set, materialize returns an exact reference over this copy of the project. */
   refRoot: "",
+  /** Further exact references, by DispatchReference.commit: their copy and what fails there. */
+  otherRefs: {} as Record<string, { dir: string; failing: Record<string, string[]> }>,
+  /** A run at state.refRoot (the first reference) is held this long: it then finishes last. */
+  refDelayMs: 0,
   /** Called after each planScopedRun with the planned changed paths: a barrier or a hold. */
   planGate: undefined as undefined | ((changed: readonly string[]) => Promise<void> | undefined),
 }));
@@ -186,8 +190,8 @@ vi.mock("../../src/verify/reference", async importOriginal => ({
     if (ref.kind !== "captured") throw new Error("unreachable");
     return ref.reference;
   },
-  materialize: async () => {
-    const dir = state.refRoot;
+  materialize: async (ref: DispatchReference) => {
+    const dir = state.otherRefs[ref.commit]?.dir ?? state.refRoot;
     if (dir === "") return { ok: false as const, reason: "worktree-add-failed" as const, detail: "test seam: no worktree" };
     return {
       ok: true as const,
@@ -209,12 +213,14 @@ vi.mock("../../src/verify/reference", async importOriginal => ({
 
 /** A vitest run over the fake project (or its reference copy): each source relates to its own test file. */
 async function fakeVitest(args: readonly string[], opts?: { signal?: AbortSignal; lowPriority?: boolean }): Promise<ExecOut> {
-  const atRef = state.refRoot !== "" && args.some(a => a.startsWith(state.refRoot));
-  const root = atRef ? state.refRoot : state.root;
-  const failingNow = atRef ? state.failingAtRef : state.failing;
+  const other = Object.values(state.otherRefs).find(r => args.some(a => a.startsWith(r.dir)));
+  const atRef = other === undefined && state.refRoot !== "" && args.some(a => a.startsWith(state.refRoot));
+  const root = other?.dir ?? (atRef ? state.refRoot : state.root);
+  const failingNow = other?.failing ?? (atRef ? state.failingAtRef : state.failing);
   const report = args.find(a => a.startsWith("--outputFile="))?.slice("--outputFile=".length);
   const inputs = args.filter(a => isAbsolute(a) && a.startsWith(root) && !a.includes("node_modules"));
   state.runs.push({ inputs: [...inputs].sort(), holds: state.holds, lowPriority: opts?.lowPriority });
+  if (atRef && state.refDelayMs > 0) await new Promise(resolve => setTimeout(resolve, state.refDelayMs));
   if (state.hang) {
     // Like a real tree: it runs until the run's signal kills it, and writes no report.
     await new Promise<void>(resolve => {
@@ -253,10 +259,10 @@ function config(verify: NonNullable<NonNullable<RouterConfig["enforcement"]>["ve
   return { activePreset: "a", presets: { a: { medium: { model: "p/m" } } }, defaultTier: "medium", rules: [], enforcement: { verify } };
 }
 
-function captured(): ReferenceState {
+function captured(commit = "b".repeat(40)): ReferenceState {
   return {
     kind: "captured",
-    reference: { root: state.root, head: "a".repeat(40), commit: "b".repeat(40), untracked: new Map(), tracked: new Map(), captureReasons: [], capturedAt: 0 } satisfies DispatchReference,
+    reference: { root: state.root, head: "a".repeat(40), commit, untracked: new Map(), tracked: new Map(), captureReasons: [], capturedAt: 0 } satisfies DispatchReference,
   };
 }
 
@@ -265,6 +271,14 @@ function exactReference(): void {
   const refRoot = realpathSync.native(mkdtempSync(join(tmpdir(), "omr-rv-ref-")));
   cpSync(state.root, refRoot, { recursive: true });
   state.refRoot = refRoot;
+}
+
+/** A second exact reference (another dispatch's), where `failing` fails: captured(commit) selects it. */
+function otherReference(commit: string, failing: Record<string, string[]>): ReferenceState {
+  const dir = realpathSync.native(mkdtempSync(join(tmpdir(), "omr-rv-ref2-")));
+  cpSync(state.root, dir, { recursive: true });
+  state.otherRefs[commit] = { dir, failing };
+  return captured(commit);
 }
 
 const src = (x: string): string => join(state.root, "src", `${x}.ts`);
@@ -364,6 +378,8 @@ beforeEach(() => {
   state.failingAtRef = {};
   state.slotBusy = false;
   state.refRoot = "";
+  state.otherRefs = {};
+  state.refDelayMs = 0;
   state.hang = false;
   state.capture = undefined;
   state.treeFiles = [];
@@ -374,6 +390,7 @@ beforeEach(() => {
 afterEach(() => {
   rmSync(state.root, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   if (state.refRoot !== "") rmSync(state.refRoot, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+  for (const ref of Object.values(state.otherRefs)) rmSync(ref.dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
 });
 
 describe("verifyHandles (2.4.3a)", () => {
@@ -613,6 +630,85 @@ describe("verifyHandles (2.4.3a)", () => {
     expect(item.result.verdict.outcome).toBe("unverifiable");
     expect(item.result.verdict.caveats?.join(" ")).toContain(`failed after ${rejected} in this session and still fail`);
     expect(item.result.retryable).toBe(false);
+  });
+
+  describe("QA-2.4-1: R11 lineage inside one call and one background run", () => {
+    /**
+     * D1 breaks a > t2 (it passes at D1's reference). D2 is dispatched after D1 landed and leaves it
+     * broken: t2 already fails at D2's own reference, so D2's gate alone says "no worse than before".
+     */
+    async function pair(wiring: VerificationWiring): Promise<{ d1: string; d2: string }> {
+      exactReference();
+      // D1's recheck finishes last: its gate returns after D2's, whatever the handle order.
+      state.refDelayMs = 50;
+      state.failing = { a: ["t2"] };
+      const d1 = await register(wiring.pending, "a");
+      const d2 = await register(wiring.pending, "a", {
+        dispatchID: "task:orch:redo",
+        producerSessionID: "child-redo",
+        description: "redo a",
+        reference: Promise.resolve(otherReference("c".repeat(40), { a: ["t2"] })),
+      });
+      return { d1, d2 };
+    }
+
+    const itemFor = (items: readonly HandleReport[], handle: string) => verdictOf(items.find(i => i.kind === "verdict" && i.handle === handle));
+
+    it.each([
+      ["the redo first", "batched", true],
+      ["the original first", "batched", false],
+      ["the redo first", "unbatched", true],
+      ["the original first", "unbatched", false],
+    ] as const)(
+      "one call, %s, %s: the redo is unverifiable with the caveat naming the original",
+      async (_order, batching, redoFirst) => {
+        // Unbatched, each gate runs on its own and D1's (delayed) gate returns last.
+        const { wiring } = makeWiring(batching === "batched" ? {} : { batchWindowMs: 0 });
+        const { d1, d2 } = await pair(wiring);
+        barrier(2);
+        const report = await wiring.verifyHandles("orch", { kind: "handles", handles: redoFirst ? [d2, d1] : [d1, d2] });
+        expect(itemFor(report.items, d1).result.verdict.outcome).toBe("fail");
+        const redo = itemFor(report.items, d2);
+        expect(redo.result.verdict.outcome).toBe("unverifiable");
+        expect(redo.result.verdict.caveats?.join(" ")).toContain(`failed after ${d1} in this session and still fail`);
+        expect(redo.result.retryable).toBe(false);
+        expect(report.text).toContain(`- ${d2} \u00b7 redo a \u00b7 unverifiable`);
+        // One record for the rejection, although the call and its settle both record it.
+        expect(wiring.pending.stats().rejections).toBe(1);
+      },
+    );
+
+    it("one call under strictUnverifiable: the redo is not accepted, as the required path rejects it", async () => {
+      const { wiring } = makeWiring({ strictUnverifiable: true });
+      const { d1, d2 } = await pair(wiring);
+      barrier(2);
+      const report = await wiring.verifyHandles("orch", { kind: "handles", handles: [d1, d2] });
+      expect(itemFor(report.items, d2).result.verdict.outcome).toBe("unverifiable");
+      const redoBlock = report.text.slice(report.text.indexOf(`- ${d2} `));
+      expect(redoBlock).toContain("[router \u26a0 NOT ACCEPTED]");
+      expect(redoBlock).not.toContain("accepted: deterministic");
+    });
+
+    it("one background run with both as riders: the redo is unverifiable and noticed, never a silent pass", async () => {
+      // Unbatched: D1's (delayed) gate returns after D2's inside the one background run.
+      const { wiring } = makeWiring({ background: true, batchWindowMs: 0 }, undefined, { settleMs: 5 });
+      const { d1, d2 } = await pair(wiring);
+      const queue = wiring.background;
+      if (queue === undefined) throw new Error("no background queue");
+      barrier(2);
+      // Request files only drive coalescing (its own test covers overlapping requests); distinct
+      // ones keep both requests as riders of one run, redo first.
+      queue.enqueue({ sessionID: "orch", handle: d2, files: [src("b")] });
+      queue.enqueue({ sessionID: "orch", handle: d1, files: [src("a")] });
+      await queue.whenIdle();
+      expect(queue.stats().runs).toBe(1);
+      const redo = wiring.pending.get("orch", d2);
+      if (redo.kind !== "found") throw new Error(redo.kind);
+      expect(redo.entry.result?.verdict.outcome).toBe("unverifiable");
+      expect(redo.entry.result?.verdict.caveats?.join(" ")).toContain(`failed after ${d1} in this session and still fail`);
+      expect(wiring.pending.get("orch", d1)).toMatchObject({ entry: { result: { verdict: { outcome: "fail" } } } });
+      expect(queue.takeNotices("orch").map(n => [n.handle, n.outcome])).toEqual([[d2, "unverifiable"], [d1, "fail"]]);
+    });
   });
 
   it("scoping (R6): another session, the producer's session and malformed input are all unknown; nothing runs", async () => {
