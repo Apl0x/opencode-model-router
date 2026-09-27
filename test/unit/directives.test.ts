@@ -153,6 +153,57 @@ describe("parseVerifyDirectives", () => {
   it("QA-1.6-16: directives.ts imports nothing (no process, fs or network)", () => {
     const src = readFileSync(new URL("../../src/verify/directives.ts", import.meta.url), "utf8");
     expect(src.match(/^import .*$/gm)).toBeNull();
-    expect(src).not.toMatch(/child_process|\brequire\(|\bimport\(|node:|\bprocess\./);
+    expect(src).not.toMatch(/child_process|\brequire\(|\bimport\(|node:|\bprocess\.|\bfetch\(|\bWebSocket\b|\bXMLHttpRequest\b|^export .* from/m);
+  });
+
+  it("QA-1.6-18: lower/mixed-case key in prose is not a directive; upper case unchanged", () => {
+    const R = { ...D, defaultVerify: "required" as const };
+    for (const t of [
+      "Verify: required fields are validated",
+      "Also verify: *required* fields show an error.",
+      "verify: \u0027required\u0027 props are passed",
+    ]) {
+      expect(parseVerifyDirectives(t, D)).toEqual(DEFAULT);
+    }
+    for (const t of [
+      "Things to verify: deferred loading works",
+      "Please verify: \"deferred\" state is rendered correctly.",
+      "Things to verify: `deferred` imports still resolve",
+    ]) {
+      expect(parseVerifyDirectives(t, R)).toEqual({ ...DEFAULT, mode: "required" });
+    }
+    expect(parseVerifyDirectives("verify: required", D)).toEqual(REQUIRED);
+    expect(parseVerifyDirectives("intro\nverify: *required*.\nmore", D)).toEqual(REQUIRED);
+    expect(parseVerifyDirectives("VERIFY: required fields are validated", D)).toEqual(REQUIRED);
+    expect(parseVerifyDirectives("verify_wait: 2s please", D).waitMs).toBe(5000);
+    expect(parseVerifyDirectives("verify_wait: 2s", D).waitMs).toBe(2000);
+  });
+
+  it("QA-1.6-19: a second occurrence in the same token is found (CAP parity)", () => {
+    expect(parseCapDirective("CAP:abc,CAP:3")).toBe(3);
+    const log = vi.fn();
+    expect(parseVerifyDirectives("VERIFY:maybe,VERIFY:required", D, log)).toEqual(REQUIRED);
+    expect(log).not.toHaveBeenCalled();
+    expect(parseVerifyDirectives("(VERIFY:tbd)/VERIFY:required", D).mode).toBe("required");
+    expect(parseVerifyDirectives("VERIFY_WAIT:soon,VERIFY_WAIT:2s", D).waitMs).toBe(2000);
+  });
+
+  it("QA-1.6-20: NBSP and ideographic space around the colon parse; newline does not", () => {
+    expect(parseCapDirective("CAP:\u00a03")).toBe(3);
+    for (const t of ["VERIFY:\u00a0required", "VERIFY:\u3000required", "VERIFY\u00a0:required"]) {
+      expect(parseVerifyDirectives(t, D)).toEqual(REQUIRED);
+    }
+    expect(parseVerifyDirectives("VERIFY:\u2028required", D)).toEqual(DEFAULT);
+    expect(parseVerifyDirectives("VERIFY:\nrequired", D)).toEqual(DEFAULT);
+  });
+
+  it("QA-1.6-24: bidi and format characters are escaped in log lines", () => {
+    const log = vi.fn();
+    parseVerifyDirectives("VERIFY:x\u202eevil\u200b\u2066", D, log);
+    const line = String(log.mock.calls[0]?.[0]);
+    expect(line).toContain("\\u202e");
+    expect(line).toContain("\\u200b");
+    expect(line).toContain("\\u2066");
+    expect(line).not.toMatch(/[\u200e\u200f\u202a-\u202e\u2066-\u2069\u200b]/);
   });
 });

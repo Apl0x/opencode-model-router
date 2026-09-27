@@ -7,7 +7,15 @@
  *                                       malformed → captureWaitMs (with a log line)
  *
  * Grammar (same rules as `parseCapDirective`, src/router/sessions.ts):
- * - key, then `[ \t]*:[ \t]*` — a directive never straddles a line break;
+ * - key, then horizontal whitespace (`[^\S\r\n\u2028\u2029]*`, so NBSP/U+3000 are fine) around
+ *   the colon — a directive never straddles a line break (QA-1.6-20);
+ * - only key + colon is matched; the value token is read with a sticky regex, so scanning resumes
+ *   after the colon and `VERIFY:maybe,VERIFY:required` → required, like `CAP:abc,CAP:3` → 3 (QA-1.6-19);
+ * - prose guard (QA-1.6-18): when the key is NOT written as upper-case `VERIFY`/`VERIFY_WAIT`,
+ *   the value counts only if it ends the line (optionally followed by closing quotes, `*`, `_`,
+ *   `)`/`]` or punctuation). So `verify: required` alone on a line → required (decision), but
+ *   `Things to verify: deferred loading works` and `Please verify: "deferred" state…` are prose
+ *   and ignored silently. Upper-case keys keep the word-boundary rule below;
  * - the value ends at a word boundary, like `CAP:`'s `(none|\d+)\b`:
  *   `VERIFY:([a-z]+)\b`, `VERIFY_WAIT:(\d+)(ms|s)\b`. So `**VERIFY:required**`,
  *   `` `VERIFY:required` `` and `VERIFY:required.` all parse;
@@ -38,7 +46,8 @@
  * the mode came from a `VERIFY:` directive, `waitSource` whether the wait came from `VERIFY_WAIT:`.
  *
  * Pure: no imports, no process, filesystem or network access. Logging goes through the injected
- * `log` seam; logged values are truncated to 32 characters and control characters are escaped.
+ * `log` seam; logged values are truncated to 32 characters; control, bidi and other format characters are
+ * escaped (QA-1.6-24).
  */
 
 export type VerifyMode = "required" | "deferred";
@@ -67,17 +76,26 @@ export type DirectiveLogger = (message: string) => void;
 
 const noopLog: DirectiveLogger = () => {};
 
-const VERIFY_RE = /\bVERIFY[ \t]*:[ \t]*(\S*)/gi;
-const WAIT_RE = /\bVERIFY_WAIT[ \t]*:[ \t]*(\S*)/gi;
+/** Horizontal whitespace (incl. NBSP, U+3000); never a line break (QA-1.6-20). */
+const HWS = "[^\\S\\r\\n\\u2028\\u2029]*";
+// Key + colon only; the value is read with a sticky regex so scanning resumes right after the
+// colon and a second occurrence in the same token is still found (QA-1.6-19).
+const VERIFY_RE = new RegExp(`\\bVERIFY${HWS}:${HWS}`, "gi");
+const WAIT_RE = new RegExp(`\\bVERIFY_WAIT${HWS}:${HWS}`, "gi");
+const TOKEN = /\S*/y;
 const LEAD = /^["'`*_]?/;
 const MODE_VALUE = /^([a-z]+)\b/i;
 const WAIT_VALUE = /^(\d+)(ms|s)\b/i;
+/** After a non-upper-case key the value must end the line, bar closing marks (QA-1.6-18). */
+const LINE_TAIL = /^["'`*_.,;:!?)\]]*[^\S\r\n\u2028\u2029]*(?:[\r\n\u2028\u2029]|$)/;
 const MAX_LOGGED = 32;
+/** C1/DEL, soft hyphen, bidi controls, zero-width and other format characters (QA-1.6-24). */
+const UNSAFE = /[\u007f-\u009f\u00ad\u061c\u180e\u200b-\u200f\u2028-\u202e\u2060-\u206f\ufeff\ufff9-\ufffb]/g;
 
 /** Bounded, escaped rendering of an untrusted value for a log line. */
 function safe(value: string): string {
   return JSON.stringify(value.slice(0, MAX_LOGGED)).replace(
-    /[\u007f-\u009f]/g,
+    UNSAFE,
     (c) => `\\u${c.charCodeAt(0).toString(16).padStart(4, "0")}`,
   );
 }
@@ -87,28 +105,42 @@ interface Scan<T> {
   firstInvalid: string | null;
 }
 
-function scan<T>(text: string, re: RegExp, valueRe: RegExp, accept: (m: RegExpExecArray) => T | null): Scan<T> {
+function scan<T>(
+  text: string,
+  keyRe: RegExp,
+  upperKey: string,
+  valueRe: RegExp,
+  accept: (m: RegExpExecArray) => T | null,
+): Scan<T> {
   let firstInvalid: string | null = null;
-  for (const m of text.matchAll(re)) {
-    const raw = m[1] ?? "";
+  const re = new RegExp(keyRe.source, keyRe.flags);
+  const token = new RegExp(TOKEN.source, TOKEN.flags);
+  for (let m = re.exec(text); m !== null; m = re.exec(text)) {
+    const start = m.index + m[0].length;
+    token.lastIndex = start;
+    const raw = token.exec(text)?.[0] ?? "";
     if (raw === "") continue;
     const body = raw.replace(LEAD, "");
     if (body.startsWith("<")) continue; // placeholder
     const v = valueRe.exec(body);
     if (v && body.charAt(v[0].length) === "|") continue; // placeholder
+    if (!m[0].startsWith(upperKey)) {
+      // Prose guard: `Things to verify: deferred loading works` is not a directive.
+      const end = v ? start + (raw.length - body.length) + v[0].length : start + raw.length;
+      if (!LINE_TAIL.test(text.slice(end, end + 256).split(/[\r\n\u2028\u2029]/)[0] ?? "")) continue;
+    }
     const accepted = v ? accept(v) : null;
     if (accepted !== null) return { value: accepted, firstInvalid };
     firstInvalid ??= raw;
   }
   return { value: null, firstInvalid };
 }
-
 export function parseVerifyDirectives(
   text: string,
   defaults: VerifyDirectiveDefaults,
   log: DirectiveLogger = noopLog,
 ): VerifyDirectives {
-  const modeScan = scan<VerifyMode>(text, VERIFY_RE, MODE_VALUE, (m) => {
+  const modeScan = scan<VerifyMode>(text, VERIFY_RE, "VERIFY", MODE_VALUE, (m) => {
     const v = (m[1] ?? "").toLowerCase();
     return v === "required" || v === "deferred" ? v : null;
   });
@@ -116,7 +148,7 @@ export function parseVerifyDirectives(
     log(`[verify] ignoring unknown VERIFY value ${safe(modeScan.firstInvalid)}; using default "${defaults.defaultVerify}"`);
   }
 
-  const waitScan = scan<number>(text, WAIT_RE, WAIT_VALUE, (m) => {
+  const waitScan = scan<number>(text, WAIT_RE, "VERIFY_WAIT", WAIT_VALUE, (m) => {
     const n = Number(m[1]);
     const ms = (m[2] ?? "").toLowerCase() === "s" ? n * 1000 : n;
     return Number.isNaN(ms) ? null : Math.min(ms, defaults.baselineTimeoutMs);
