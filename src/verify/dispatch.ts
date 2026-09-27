@@ -17,6 +17,8 @@ import { withTimeout } from "./timeout";
 
 export interface TreeSnapshot {
   cwd: string;
+  /** Real path of `git rev-parse --show-toplevel` at capture time. */
+  root?: string;
   head: string;
   fingerprint: string;
   dirty: boolean;
@@ -48,6 +50,8 @@ const MAY_WRITE_TOOLS = new Set([...WRITE_TOOLS, "bash", "shell", "powershell", 
 export interface ChangedFile {
   path: string;
   status: string;
+  /** Rename/copy source (absolute) when git status reports R or C. */
+  previousPath?: string;
 }
 
 /** Derive a {path,status} record from a write/edit tool call, or null. */

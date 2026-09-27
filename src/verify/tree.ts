@@ -24,8 +24,13 @@ export async function snapshotTree(cwd: string, signal: AbortSignal): Promise<Tr
     for (let i = 0; i < records.length; i++) {
       const record = records[i];
       if (!record) continue;
-      files.push({ path: resolve(root, record.slice(3)), status: record.slice(0, 2) });
-      if (/[RC]/.test(record.slice(0, 2))) i++; // -z rename destination precedes source.
+      const file: ChangedFile = { path: resolve(root, record.slice(3)), status: record.slice(0, 2) };
+      // -z emits a rename/copy as `XY dest\0source\0`; keep the source.
+      if (/[RC]/.test(file.status)) {
+        const source = records[++i];
+        if (source) file.previousPath = resolve(root, source);
+      }
+      files.push(file);
     }
     const hash = createHash("sha256").update(status);
     hash.update(await git(["diff", "HEAD", "--binary", "--no-ext-diff", "--no-textconv"]));
@@ -44,7 +49,7 @@ export async function snapshotTree(cwd: string, signal: AbortSignal): Promise<Tr
       else return undefined;
     }
     if (signal.aborted) return undefined;
-    return { cwd: await realpath(cwd), head, fingerprint: hash.digest("hex"), dirty: files.length > 0, files };
+    return { cwd: await realpath(cwd), root: await realpath(root), head, fingerprint: hash.digest("hex"), dirty: files.length > 0, files };
   } catch {
     // Not a Git checkout, unreadable file, timeout or concurrent deletion: no baseline.
     return undefined;

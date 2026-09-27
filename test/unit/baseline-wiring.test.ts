@@ -1,5 +1,8 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { resolve } from "node:path";
+import { join, resolve } from "node:path";
+import { execFileSync } from "node:child_process";
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { createVerificationWiring } from "../../src/verify/wiring";
 import { createChangedFileStore, type TreeSnapshot } from "../../src/verify/dispatch";
 import { accept } from "../../src/verify/gate";
@@ -28,6 +31,49 @@ function harness() {
   const store = createChangedFileStore();
   return { cfg, wiring, store };
 }
+describe("tree snapshot against a real git repository", () => {
+  const withRepo = async (body: (repo: string) => Promise<void>) => {
+    const repo = mkdtempSync(join(tmpdir(), "omr-tree-"));
+    const git = (...args: string[]) => execFileSync("git", args, { cwd: repo, windowsHide: true });
+    try {
+      git("init", "-q");
+      git("config", "user.email", "t@example.invalid"); git("config", "user.name", "t");
+      git("config", "commit.gpgsign", "false");
+      mkdirSync(join(repo, "sub"));
+      writeFileSync(join(repo, "a.test.ts"), "export const a = 1;\n");
+      writeFileSync(join(repo, "sub", "keep.ts"), "export {};\n");
+      git("add", "-A"); git("commit", "-q", "-m", "init");
+      git("mv", "a.test.ts", "b.test.ts");
+      await body(repo);
+    } finally {
+      rmSync(repo, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+    }
+  };
+  const real = () => vi.importActual<typeof import("../../src/verify/tree")>("../../src/verify/tree");
+
+  it("records the rename source as previousPath", async () => {
+    const { snapshotTree } = await real();
+    await withRepo(async repo => {
+      const snapshot = await snapshotTree(repo, new AbortController().signal);
+      const top = realpathSync.native(repo);
+      const renamed = snapshot?.files.find(f => f.status.includes("R"));
+      expect(renamed).toBeDefined();
+      expect(realpathSync.native(renamed!.path)).toBe(join(top, "b.test.ts"));
+      expect(renamed!.previousPath && resolve(renamed!.previousPath).toLowerCase())
+        .toBe(resolve(snapshot!.root!, "a.test.ts").toLowerCase());
+    });
+  });
+
+  it("records the real top-level path when captured from a subdirectory", async () => {
+    const { snapshotTree } = await real();
+    await withRepo(async repo => {
+      const snapshot = await snapshotTree(join(repo, "sub"), new AbortController().signal);
+      expect(snapshot?.root).toBe(realpathSync.native(repo));
+      expect(snapshot?.cwd).toBe(realpathSync.native(join(repo, "sub")));
+    });
+  });
+});
+
 describe("baseline wiring", () => {
   it("does not await capture and consumes the original reference after the producer changes the tree", async () => {
     const { wiring, store } = harness(); state.held = true;
