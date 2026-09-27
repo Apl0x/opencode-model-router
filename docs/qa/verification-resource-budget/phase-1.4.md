@@ -2246,3 +2246,90 @@ Verification: `npx vitest run --maxWorkers=2 test/unit/slot.test.ts` unloaded 62
 
 **Open, not deferred:** QA-1.4-39 and QA-1.4-40 (nits, neither a product defect). Phase 1.4 QA is
 **not** clean.
+
+## QA re-review (round 7)
+
+Reviewer: adversarial QA, `[tier:heavy]` (CAP:12).
+
+- **Scope:** `git diff 42dd845..4e1a5ad` (`efc70fa`, `4e1a5ad`). It was checked against QA-1.4-39,
+  QA-1.4-40 and round 6's `:661` observation, and searched for defects the diff introduces. Code
+  cleared in rounds 1–6 was not re-audited. Line numbers refer to `src/verify/slot.ts` and
+  `test/unit/slot.test.ts` at `4e1a5ad`.
+- **`slot.ts` changes only comments.**
+  - All 7 changed lines in `git diff -U0 42dd845..HEAD -- src/verify/slot.ts` are comment lines
+    (checked by script).
+  - Both versions were emitted with `tsc` 7.0.2 (`--ignoreConfig --removeComments --declaration
+    --noCheck`, ES2022 / ESNext). `slot.js` (38 890 bytes) and `slot.d.ts` (2 351 bytes) are
+    byte-identical, and the JS has no comment left. The `.d.ts` covers the exported types, which a
+    JS-only comparison would miss.
+  - The working tree matched `HEAD`.
+- **Environment:** as in round 6: 16 logical CPUs, Node v24.21.0. Other agents' sessions shared the
+  machine.
+- **Cleanup:**
+  - The mutations were made in place in `slot.ts`, inside a `try`/`finally` that ran
+    `git checkout -- src/verify/slot.ts`. Afterwards `git status` and `git diff` were empty.
+  - The 8 busy loops were killed by PID. None was alive afterwards, and no `node.exe` was running
+    `for(;;){}`.
+  - The runs left no new `omr-slot-*` dir. The 19 in `%TEMP%` predate this review and were left
+    alone.
+  - The scratch files in `%TEMP%\opencode` were deleted. The worktree is clean.
+
+**Test runs** (`npx vitest run --maxWorkers=2 test/unit/slot.test.ts`):
+
+| run | result | duration |
+|---|---|---|
+| unloaded | 62/62 passed | 62.2 s |
+| 8 busy loops (`node -e "for(;;){}"`, 16 CPUs) | 62/62 passed | 62.7 s |
+
+Under load, the QA-1.4-34 test took 653 ms. The QA-1.4-20 claim test (`:645-664`, with the `:661`
+wait) took 2.3 s, and the QA-1.4-26 test (`:707`) 4.1 s.
+
+**Mutations** (`npx vitest run test/unit/slot.test.ts -t "QA-1.4-34"`, unloaded; `slot.ts:566`
+mutated in place, then restored):
+
+| mutant | the `from` rule at `:566` | result |
+|---|---|---|
+| B (padding reverted) | `at - old.last > maxGap` | fails: `["BUSY","BUSY","HELD"]: expected false to be true` |
+| S (one slack) | `at - old.last > maxGap - slack` | fails with the same message |
+| restored | `at - old.last > maxGap - (slack + old.slack)` | passes |
+
+### Verdicts
+
+| ID | verdict | evidence |
+|---|---|---|
+| QA-1.4-39 | verified | **Fix:** after `writeLock`, `:929-932` take `wall0 = Date.now()` and `mono0 = performance.now()` once, and the seam clocks are `wall0 + shift` and `mono0 + shift`. Real time no longer enters a gap, so load cannot spend the 700 ms side's 100 ms margin.<br>**Mutations:** B and S both fail (above). The resolution's claims reproduce.<br>**Runs:** it passes unloaded and under 8 busy loops (653 ms).<br>**Side effects:** none found. `:943` still moves the frozen clock 1 000 000 ms, past the background watch's `until`. With `waitMs: 0`, no call waits on the frozen clock. |
+| QA-1.4-40 | verified | **Wording:** `slot.ts:48-49`, `:79` and `:527` now say "2 heartbeats minus this look's slack and the view's". That is what `:566` computes: `maxGap - (slack + old.slack)`, where `old.slack` is the largest slack of the view's writers. Notes `:72-73` say the same, and the 8 s stands.<br>**Test comment:** `:708-709` now name the 2.2 s witness (2 × `claimHoldMaxMs` + the slacks) as the deciding term. The bound stays 900 ms, which round 6 found valid.<br>**Rewrap:** the 139-character `:48` is now `:48-49`. |
+| `:661` wait | verified | **Change:** the wait goes from 5 s to 10 s, like `:707`.<br>**What it proves:** `:662`'s lower bound (≥ 950 ms) and `:663` are unchanged. The test has no upper bound, so nothing is weakened. The 20 s test timeout still covers the wait plus the two `waitMs: 0` looks before it.<br>**Runs:** it passed in both runs (2.3 s under load). Round 6's 2 × load was not re-run; it is outside the requested protocol. |
+
+### New findings
+
+None. `efc70fa` changes comments in `slot.ts`, and in the test it changes one test's clocks, one
+test's wait and one comment. `4e1a5ad` changes only this file.
+
+### Observations (not findings)
+
+- **`slot.ts:79` is now 98 characters.**
+  - The rewording lengthened it. Apart from `:107` (113 characters, unchanged), it is the only
+    header line over 84 characters.
+  - It also reads a little awkwardly: "…minus this look's slack and the view's apart".
+  - Cosmetic: rewrap it when the header is next touched.
+- **A line reference in the resolution.** The QA-1.4-40 resolution calls the changed line "the
+  residual paragraph (`:78`)". It is `:79`, in the paragraph before the one that starts
+  "Residual (accepted in QA-1.4-21)". The change itself is right.
+- **S is killed at its boundary.**
+  - S's limit is 1 s − 100 ms = 900 ms, which equals the 900 ms step. The comparison is strict, so
+    under S a 900 ms gap accumulates and the side ends HELD.
+  - The frozen clocks make the gaps the shift alone (up to float rounding of `mono0 + shift`), so
+    the kill no longer depends on load.
+  - A step above 900 ms, or a `>=` in S, would let S pass. Keep the step at 900 ms if the test is
+    edited.
+
+### Deferred by plan (round 7)
+
+- **QA-1.4-18** (Phase 2.1 / 2.2), nested acquisition: unchanged.
+- **QA-1.4-19** (Phase 1.1 schema, Phase 2.1 wiring), non-finite `max`: unchanged.
+- **QA-1.4-31** (Phase 1.1): the clamp is in the code; validating `slotWaitMs` stays with Phase 1.1.
+- **QA-1.4-21 residual** (Phase 1.1 / 2.1): state it next to `slotWaitMs`, with looks 8 s apart.
+
+**Open, not deferred:** none. QA-1.4-39 and QA-1.4-40 are verified, and this round found nothing
+new. Phase 1.4 QA is **CLEAN**.
