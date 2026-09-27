@@ -1,9 +1,9 @@
-import { afterAll, afterEach, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { hostname, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { acquireSlot, withSlot, type SlotDeps, type SlotHandle, type SlotResult } from "../../src/verify/slot";
+import { acquireSlot, isPidAlive, withSlot, type SlotDeps, type SlotHandle, type SlotResult } from "../../src/verify/slot";
 
 // Every test uses its own slot dir, never the real shared one, so parallel runs
 // cannot interfere. Timing constants are scaled down through the deps seam.
@@ -12,6 +12,16 @@ const HOLDER = resolve(__dirname, "../fixtures/slot/holder.mjs");
 const dirs: string[] = [];
 const children: ChildProcess[] = [];
 const handles: SlotHandle[] = [];
+/** JS build of slot.ts for the child processes (Node 20 has no type stripping). */
+let slotJs = "";
+
+beforeAll(async () => {
+  // The real slot.ts, transpiled with the oxc transformer that vitest's vite already ships.
+  const { transformWithOxc } = await import("vite");
+  const out = await transformWithOxc(readFileSync(SLOT_TS, "utf8"), SLOT_TS, { lang: "ts" });
+  slotJs = join(freshDir(), "slot.mjs");
+  writeFileSync(slotJs, out.code);
+});
 
 function freshDir(): string {
   const d = mkdtempSync(join(tmpdir(), "omr-slot-"));
@@ -35,29 +45,72 @@ function setAge(path: string, ageMs: number): void {
   const t = new Date(Date.now() - ageMs);
   utimesSync(path, t, t);
 }
-function deadPid(): number {
-  const r = spawnSync(process.execPath, ["-e", "process.stdout.write(String(process.pid))"]);
-  return Number(r.stdout.toString());
+const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+/** A PID that is not running now (Windows reuses PIDs quickly, so check it). */
+async function deadPid(): Promise<number> {
+  for (;;) {
+    const r = spawnSync(process.execPath, ["-e", "process.stdout.write(String(process.pid))"]);
+    const pid = Number(r.stdout.toString());
+    for (let i = 0; i < 50 && isPidAlive(pid); i++) await sleep(20);
+    if (!isPidAlive(pid)) return pid;
+  }
 }
 function killHard(child: ChildProcess): void {
   if (process.platform === "win32") spawnSync("taskkill", ["/F", "/T", "/PID", String(child.pid)]);
   else child.kill("SIGKILL");
 }
-function runHolder(cfg: Record<string, unknown>): { child: ChildProcess; line: Promise<string>; exit: Promise<number | null> } {
-  const child = spawn(process.execPath, [HOLDER, SLOT_TS, JSON.stringify(cfg)], { stdio: ["ignore", "pipe", "pipe"] });
+interface Holder {
+  child: ChildProcess;
+  /** Resolves with the first stdout line matching `want`, or "EXIT <stdout> <stderr>" if the child exits first. */
+  waitFor(want: RegExp): Promise<string>;
+  exit: Promise<number | null>;
+}
+function runHolder(cfg: Record<string, unknown>): Holder {
+  const child = spawn(process.execPath, [HOLDER, slotJs, JSON.stringify(cfg)], { stdio: ["ignore", "pipe", "pipe"] });
   children.push(child);
-  let out = "";
+  const lines: string[] = [];
+  let buf = "";
   let err = "";
-  const line = new Promise<string>((res) => {
-    child.stdout!.on("data", (d: Buffer) => {
-      out += d.toString();
-      if (out.includes("\n")) res(out.trim());
-    });
-    child.on("exit", () => res(out.trim() || `EXIT ${err}`));
+  let exited = false;
+  const wake: Array<() => void> = [];
+  const poke = () => {
+    for (const w of wake.splice(0)) w();
+  };
+  child.stdout!.on("data", (d: Buffer) => {
+    buf += d.toString();
+    for (let i = buf.indexOf("\n"); i >= 0; i = buf.indexOf("\n")) {
+      lines.push(buf.slice(0, i).trim());
+      buf = buf.slice(i + 1);
+    }
+    poke();
   });
   child.stderr!.on("data", (d: Buffer) => (err += d.toString()));
-  const exit = new Promise<number | null>((res) => child.on("exit", (c) => res(c)));
-  return { child, line, exit };
+  const exit = new Promise<number | null>((res) =>
+    child.on("exit", (c) => {
+      exited = true;
+      poke();
+      res(c);
+    }),
+  );
+  const waitFor = (want: RegExp) =>
+    new Promise<string>((res) => {
+      const check = () => {
+        const hit = lines.find((l) => want.test(l));
+        if (hit !== undefined) res(hit);
+        else if (exited) res(`EXIT ${lines.join("|")} ${err}`);
+        else wake.push(check);
+      };
+      check();
+    });
+  return { child, waitFor, exit };
+}
+/** Start children behind a barrier: each loads the module, prints READY, then waits for the go file. */
+async function startTogether(dir: string, cfgs: Array<Record<string, unknown>>): Promise<Holder[]> {
+  const go = join(dir, "go");
+  const hs = cfgs.map((c) => runHolder({ ...c, go }));
+  expect(await Promise.all(hs.map((h) => h.waitFor(/^READY$/)))).toEqual(cfgs.map(() => "READY"));
+  writeFileSync(go, "");
+  return hs;
 }
 
 afterEach(async () => {
@@ -86,38 +139,48 @@ function maxOverlap(iv: Array<[number, number]>): number {
   return max;
 }
 
+async function cycleSix(dir: string, max: number, holdMs: number): Promise<void> {
+  const log = join(dir, "log.txt");
+  writeFileSync(log, "");
+  const hs = await startTogether(
+    dir,
+    Array.from({ length: 6 }, (_, i) => ({ dir, max, waitMs: 20_000, holdMs, log, id: `p${i}`, mode: "cycle", deps: { backoffMinMs: 10, backoffMaxMs: 60 } })),
+  );
+  const codes = await Promise.all(hs.map((h) => h.exit));
+  expect(codes).toEqual([0, 0, 0, 0, 0, 0]);
+  const iv = intervals(log);
+  expect(iv).toHaveLength(6);
+  expect(maxOverlap(iv)).toBeLessThanOrEqual(max);
+  if (max === 2) expect(maxOverlap(iv)).toBe(2); // the second slot is actually used
+}
+
 describe("slot: multi-process exclusion", () => {
-  it.each([1, 2])("max=%i: never more than max holders across 6 processes", async (max) => {
-    const dir = freshDir();
-    const log = join(dir, "log.txt");
-    writeFileSync(log, "");
-    const runs = Array.from({ length: 6 }, (_, i) =>
-      runHolder({ dir, max, waitMs: 20_000, holdMs: 120, log, id: `p${i}`, mode: "cycle", deps: { backoffMinMs: 10, backoffMaxMs: 60 } }),
-    );
-    const codes = await Promise.all(runs.map((r) => r.exit));
-    expect(codes).toEqual([0, 0, 0, 0, 0, 0]);
-    const iv = intervals(log);
-    expect(iv).toHaveLength(6);
-    expect(maxOverlap(iv)).toBeLessThanOrEqual(max);
-    if (max === 2) expect(maxOverlap(iv)).toBe(2); // the second slot is actually used
+  it.each([
+    [1, 150],
+    [2, 500],
+  ])("max=%i: never more than max holders across 6 processes (hold %i ms)", async (max, holdMs) => {
+    await cycleSix(freshDir(), max, holdMs);
   }, 30_000);
 
-  it("a crashed holder (hard kill) is reclaimed by the next waiter within the backoff window", async () => {
+  it("a crashed holder (hard kill) is reclaimed by a waiter that was already waiting, within the backoff window", async () => {
     const dir = freshDir();
     const h = runHolder({ dir, max: 1, waitMs: 1_000, mode: "hang" });
-    expect(await h.line).toBe("HELD");
+    expect(await h.waitFor(/^(HELD|BUSY)$/)).toBe("HELD");
     expect(await acquireSlot({ max: 1, waitMs: 0, meta }, fast(dir))).toEqual({ busy: true });
+    // The waiter starts first (production backoff 250 ms -> 2 s) and is in backoff when the holder dies.
+    const waiting = acquireSlot({ max: 1, waitMs: 10_000, meta }, { dir });
+    await sleep(700);
     killHard(h.child);
     await h.exit;
     const t0 = Date.now();
-    held(await acquireSlot({ max: 1, waitMs: 5_000, meta }, { dir, backoffMinMs: 250, backoffMaxMs: 2_000 }));
-    expect(Date.now() - t0).toBeLessThan(2_500);
-  }, 15_000);
+    held(await waiting);
+    expect(Date.now() - t0).toBeLessThan(3_000);
+  }, 20_000);
 
   it("the heartbeat timer is unref'd: a holder exits on its own and the exit hook frees the slot", async () => {
     const dir = freshDir();
     const h = runHolder({ dir, max: 1, waitMs: 1_000, mode: "exit", deps: { heartbeatMs: 50 } });
-    expect(await h.line).toBe("HELD");
+    expect(await h.waitFor(/^(HELD|BUSY)$/)).toBe("HELD");
     expect(await h.exit).toBe(0);
     expect(existsSync(join(dir, "slot-0.lock"))).toBe(false);
   }, 15_000);
@@ -134,17 +197,17 @@ describe("slot: stale detection", () => {
 
   it("a long hold (3x the stale threshold) keeps its slot because the heartbeat is fresh", async () => {
     const dir = freshDir();
-    const deps = fast(dir, { staleMs: 400, heartbeatMs: 80 });
+    const deps = fast(dir, { staleMs: 2_000, heartbeatMs: 100 });
     const a = held(await acquireSlot({ max: 1, waitMs: 0, meta }, deps));
-    expect(await acquireSlot({ max: 1, waitMs: 1_200, meta }, deps)).toEqual({ busy: true });
+    expect(await acquireSlot({ max: 1, waitMs: 6_000, meta }, deps)).toEqual({ busy: true });
     await a.release();
     held(await acquireSlot({ max: 1, waitMs: 0, meta }, deps));
-  });
+  }, 15_000);
 
   it("a foreign host lock is never judged by PID: fresh heartbeat kept, old heartbeat reclaimed", async () => {
     const dir = freshDir();
     const p = join(dir, "slot-0.lock");
-    writeLock(p, { hostname: "some-other-host", pid: deadPid() });
+    writeLock(p, { hostname: "some-other-host", pid: await deadPid() });
     expect(await acquireSlot({ max: 1, waitMs: 400, meta }, fast(dir, { staleMs: 5_000 }))).toEqual({ busy: true });
     setAge(p, 6_000);
     held(await acquireSlot({ max: 1, waitMs: 0, meta }, fast(dir, { staleMs: 5_000 })));
@@ -152,7 +215,7 @@ describe("slot: stale detection", () => {
 
   it("same host + dead PID is stale immediately, even with a fresh heartbeat", async () => {
     const dir = freshDir();
-    writeLock(join(dir, "slot-0.lock"), { pid: deadPid() });
+    writeLock(join(dir, "slot-0.lock"), { pid: await deadPid() });
     held(await acquireSlot({ max: 1, waitMs: 0, meta }, fast(dir, { staleMs: 60_000 })));
   });
 
