@@ -410,6 +410,14 @@ function tree(mode: "early-exit" | "unreachable" | "broken-tree") {
   };
 }
 
+/**
+ * The note of a run whose deadline or abort ended what the exited child left
+ * running. Windows: the sweep's own note, or, when the sweep is slower than the
+ * kill grace, the grace's force-close note or the still-reporting note
+ * (QA-1.2-24, QA-1.2-26).
+ */
+const LEFTOVER_KILLED = /left running by the exited command|output streams force-closed \d+ ms after the kill: a descendant still held them|orphan sweep still reporting at settle/;
+
 describe("process lifecycle around the direct child's exit", () => {
   // The holder inherits the run's stdout/stderr, so `close` cannot fire while it lives.
 
@@ -418,11 +426,14 @@ describe("process lifecycle around the direct child's exit", () => {
     const start = Date.now();
     try {
       const r = await runArgv(process.execPath, t.args, { cwd: tmpdir(), timeoutMs: 3000 });
-      expect(alive(t.pid("holder"))).toBe(false);
-      expect(Date.now() - start).toBeLessThan(3000 + 3000);
+      const settledIn = Date.now() - start;
+      // G4: dead within 3 s of the deadline. The run may settle first, when the
+      // grace (2 s) ends before a slow sweep has reported (QA-1.2-26).
+      expect(await waitForExit(t.pid("holder"), Math.max(0, start + 3000 + 3000 - Date.now()))).toBe(true);
+      expect(settledIn).toBeLessThan(3000 + 3000);
       // The direct child exited 0, but the deadline had to end its leftovers.
       expect(r).toMatchObject({ code: 1, timedOut: true });
-      expect(r.stderr).toMatch(/left running by the exited command/);
+      expect(r.stderr).toMatch(LEFTOVER_KILLED);
     } finally {
       await t.release();
     }
@@ -440,10 +451,12 @@ describe("process lifecycle around the direct child's exit", () => {
       const abortedAt = Date.now();
       controller.abort();
       const r = await pending;
-      expect(alive(holder)).toBe(false);
-      expect(Date.now() - abortedAt).toBeLessThan(3000);
+      const settledIn = Date.now() - abortedAt;
+      // G4: dead within 3 s of the abort, not necessarily when the run settles (QA-1.2-26).
+      expect(await waitForExit(holder, Math.max(0, abortedAt + 3000 - Date.now()))).toBe(true);
+      expect(settledIn).toBeLessThan(3000);
       expect(r).toMatchObject({ code: 1, timedOut: true });
-      expect(r.stderr).toMatch(/left running by the exited command/);
+      expect(r.stderr).toMatch(LEFTOVER_KILLED);
     } finally {
       await t.release();
       await pending;
@@ -667,7 +680,7 @@ describe("lowPriority", () => {
   it.runIf(isWin)("keeps the exit code of a .cmd target run through runShell (Windows-only: .cmd is a Windows batch file)", async () => {
     const dir = scratch();
     writeFileSync(join(dir, "t.cmd"), `@echo off\r\n${node} -e "process.exit(3)"\r\nexit /b %ERRORLEVEL%\r\n`);
-    const r = await runShell(`"${join(dir, "t.cmd")}"`, { cwd: dir, timeoutMs: 20000, lowPriority: true });
+    const r = await runShell(`"${join(dir, "t.cmd")}"`, { cwd: dir, timeoutMs: 60_000, lowPriority: true });
     expect(r.code).toBe(3);
     const ok = await runShell("npm.cmd --version", { cwd: dir, timeoutMs: 60000, lowPriority: true });
     expect(ok.code).toBe(0);
