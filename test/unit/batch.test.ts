@@ -18,6 +18,7 @@ import {
 } from "../../src/verify/batch";
 import type { BatchPlanInput, BatchPlanner, BatchRuntime } from "../../src/verify/batch";
 import type { DispatchReference } from "../../src/verify/reference";
+import { readResult } from "../../src/verify/runner";
 import type { RunResult, RunnerKind, ScopedSpec, ScopingPlan } from "../../src/verify/runner";
 import type {
   Deadline,
@@ -308,6 +309,69 @@ describe("attributeUnion", () => {
     // On posix the same spellings do not match.
     const ppy = spec({ runner: "pytest", cwd: "/R/Py", inputs: ["/R/Py/tests/test_a.py"], inputsAreTests: true });
     expect(attributeUnion(run({ failingIds: ["Tests/test_a.py::t"] }), undefined, ppy, "linux")).toEqual({ kind: "own-run", cause: "zero-test-ambiguous" });
+  });
+});
+
+describe("QA-2.2-1: pytest static attribution through the real readResult", () => {
+  const XML = "/tmp/omr-verify-00000000-0000-0000-0000-000000000000.xml";
+  const X = "/r/tests/test_x.py";
+  const Y = "/r/tests/test_y.py";
+  const SUB = "/r/sub/tests/test_x.py";
+  const host = { platform: "linux" as const, tmpdir: "/tmp" };
+  const pyspec = (inputs: string[], pinned = true): ScopedSpec =>
+    spec({
+      runner: "pytest",
+      file: "/usr/bin/pytest",
+      entry: "/usr/bin/pytest",
+      cwd: "/r",
+      gitRoot: "/r",
+      reportPath: XML,
+      args: ["-p", "no:cacheprovider", `--junitxml=${XML}`, "--maxfail=0", ...(pinned ? ["--rootdir=/r"] : []), "--", ...inputs],
+      inputs,
+      inputsAreTests: true,
+      workers: null,
+    });
+  const junit = (...cases: string[]) => `<?xml version="1.0"?><testsuites><testsuite>${cases.join("")}</testsuite></testsuites>`;
+  const failing = (classname: string, name: string) => `<testcase classname="${classname}" name="${name}"><failure message="boom">x</failure></testcase>`;
+  const passing = (classname: string, name: string) => `<testcase classname="${classname}" name="${name}"/>`;
+  async function readReport(s: ScopedSpec, xml: string, code: number): Promise<RunResult> {
+    const fs = {
+      fileExists: async (p: string) => p === XML,
+      readFile: async (p: string) => {
+        if (p !== XML) throw new Error(`ENOENT ${p}`);
+        return xml;
+      },
+      unlink: async () => undefined,
+    };
+    return readResult(s, { code, stdout: "", stderr: "" }, fs, host);
+  }
+  // A owns tests/test_x.py (failing) and tests/test_y.py; B owns sub/tests/test_x.py (green).
+  const unionXml = junit(failing("tests.test_x", "test_1"), passing("sub.tests.test_x", "test_1"), passing("sub.tests.test_x", "test_2"), passing("tests.test_y", "test_1"));
+
+  it("the owner of the failing tests/test_x.py is charged, never excused by sub/tests/test_x.py", async () => {
+    const a = pyspec([X, Y]);
+    const b = pyspec([SUB]);
+    const union = await readReport(pyspec([SUB, X, Y]), unionXml, 1);
+    const soloA = await readReport(a, junit(failing("tests.test_x", "test_1"), passing("tests.test_y", "test_1")), 1);
+    const soloB = await readReport(b, junit(passing("sub.tests.test_x", "test_1"), passing("sub.tests.test_x", "test_2")), 0);
+    expect(soloA).toMatchObject({ failingIds: ["tests/test_x.py::test_1"], complete: true });
+
+    const derivedA = attributeUnion(union, union.testsByFile, a, "linux");
+    expect(derivedA).toEqual({
+      kind: "derived",
+      exitCode: 1,
+      result: { failingIds: soloA.failingIds, failingFiles: soloA.failingFiles, collectionError: false, total: 2, complete: true, source: "report" },
+    });
+    const derivedB = attributeUnion(union, union.testsByFile, b, "linux");
+    expect(derivedB).toEqual({ kind: "derived", exitCode: 0, result: run({ total: soloB.total }) });
+  });
+
+  it("without a pinned rootdir the union is ambiguous: not comparable, so every member runs its own spec", async () => {
+    const union = await readReport(pyspec([SUB, X, Y], false), unionXml, 1);
+    expect(union.complete).toBe(false);
+    for (const member of [pyspec([X, Y], false), pyspec([SUB], false)]) {
+      expect(attributeUnion(union, union.testsByFile, member, "linux")).toEqual({ kind: "own-run", cause: "not-comparable" });
+    }
   });
 });
 

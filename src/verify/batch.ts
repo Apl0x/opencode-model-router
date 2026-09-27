@@ -201,6 +201,10 @@
 //          non-empty -> derived, with complete, no collection error, exit 1, and total = the
 //          count sum when counts exist (else U.total). ids empty -> the pytest rule of 7.2b (its
 //          files all passed, or ran nothing).
+//          This is only sound because the union's ids name the file that really ran each case:
+//          runner.ts I step 3 maps a classname by its exact rootdir-relative path, and a classname
+//          two inputs could own makes the union incomplete (7.1), never a guess (QA-2.2-1: with
+//          "the first input wins", tests/test_x.py's failure landed on sub/tests/test_x.py).
 //       b. vitest/jest -> own-run (cause "mode-b"). vitest cannot intersect `related` with a file
 //          filter, so the member's own spec runs, covering its whole affected set. That run
 //          contains exactly the failures the member would see alone.

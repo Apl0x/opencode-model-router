@@ -721,17 +721,29 @@
 //     - <skipped> is not a failure.
 //     - QA-1.3-35: a case with no <failure>/<error> only counts toward total; its attributes are
 //       not decoded. Each input's cwd-relative id prefix is computed once.
-//     Module mapping. For each spec input f:
-//       dotted(f) = its gitRoot-relative path without ".py", with "/" replaced by ".".
-//       The candidates are the segment-suffixes of dotted(f), kept in a map (first input wins).
-//       The longest candidate D with classname === D or classname.startsWith(D + ".") names the
-//       file: walk the classname's dot prefixes from the longest, one map lookup each. rest = the
-//       part of classname after D, split on ".".
+//     Module mapping (QA-2.2-1). pytest's classname is the case's nodeid path relative to its
+//     rootdir, without ".py" and with "/" replaced by ".", followed by the enclosing class names.
+//       The rootdir R is the last `--rootdir=<v>` or `--rootdir <v>` of spec.args (D.4's pin, or
+//       the user's kept value; argv follows PYTEST_ADDOPTS, so its last value wins), resolved
+//       against spec.cwd. A value pytest would expand ("$", or "%" on win32) is not trusted.
+//       Keys: with R, each input f inside R has exactly ONE key, dotted(P.relative(R, f)).
+//       Without R (an explicit -c, a --rootdir in PYTEST_ADDOPTS, QA-1.3-49's unpinned spawn),
+//       each input's keys are every segment-suffix of its gitRoot-relative dotted path: the
+//       true file is always among them while R lies inside gitRoot.
+//       A classname is resolved by walking ALL of its dot prefixes, one map lookup each. It maps
+//       only when exactly one input answers (a key two inputs share answers for both). rest = the
+//       part of classname after the matching prefix, split on ".".
 //       id = `${P.relative(spec.cwd, f) with "/"}::${[...rest, name].join("::")}`. This matches
 //       pytest's "FAILED <nodeid>" text.
 //       A collection pseudo-case maps `name` the same way and gets a bare file id.
 //       An unmatched case gets id `${classname}::${name}`, complete = false, and the note
 //       `pytest classname not mapped to a test file: <classname>`.
+//       A classname that more than one input answers is never charged to either (a suffix
+//       shared by tests/test_x.py and sub/tests/test_x.py, or a module next to a package of the
+//       same name). Failing or passing, it makes the result complete = false with the note
+//       `pytest classname maps to more than one test file: <classname>`, and it is left out of
+//       testsByFile. Fail closed: "the first input wins" let a batch union charge one request's
+//       failure to another request and pass its producer (QA-2.2-1).
 //     total = the number of testcases that are not collection pseudo-cases.
 //     Exit codes:
 //       5 -> total 0 and no failures (no tests collected).
@@ -4749,29 +4761,69 @@ function decodeXml(s: string): string {
 }
 
 /**
+ * I step 3 (QA-2.2-1): the rootdir pytest's classnames are relative to, when spec.args names it:
+ * the last `--rootdir=<v>` or `--rootdir <v>`, resolved against spec.cwd as pytest resolves it.
+ * undefined when the argv gives none or an empty one, or a value pytest would expand.
+ */
+function junitRootdir(ctx: Ctx, spec: ScopedSpec): string | undefined {
+  let value: string | undefined;
+  for (let i = 0; i < spec.args.length; i++) {
+    const a = spec.args[i];
+    if (a === "--") break;
+    if (a === "--rootdir") value = spec.args[++i];
+    else if (a.startsWith("--rootdir=")) value = a.slice("--rootdir=".length);
+  }
+  if (value === undefined || value === "" || value.includes("$") || (ctx.win && value.includes("%"))) return undefined;
+  return ctx.P.resolve(spec.cwd, value);
+}
+
+/** A junit classname's resolution: one input, none, or more than one (QA-2.2-1: never charged). */
+type JunitHit = { readonly file: string; readonly rest: string[] } | "ambiguous" | undefined;
+
+/**
  * I step 3: pytest junit XML, parsed without an XML library. undefined = unusable (truncated or
- * malformed). QA-1.3-25: linear in the report and the inputs. Each dotted suffix of each input is
- * put in a map once (the first input wins a shared suffix), a classname walks its own dot
- * prefixes from the longest, and testcases are found with indexOf, never a backtracking regex.
+ * malformed). QA-1.3-25: linear in the report and the inputs. Each input's keys are put in a map
+ * once (a key two inputs share is marked ambiguous), a classname walks its own dot prefixes once
+ * (memoized per classname), and testcases are found with indexOf, never a backtracking regex.
  */
 function parseJunit(ctx: Ctx, spec: ScopedSpec, text: string, code: number): RunResult | undefined {
   if (!text.includes("</testsuites>")) return undefined;
-  const suffixes = new Map<string, string>();
+  // QA-2.2-1: key -> the one input it names, or null when two inputs share it.
+  const keys = new Map<string, string | null>();
+  const addKey = (d: string, f: string) => {
+    const had = keys.get(d);
+    if (had === undefined) keys.set(d, f);
+    else if (had !== f) keys.set(d, null);
+  };
+  const rootdir = junitRootdir(ctx, spec);
   for (const f of spec.inputs) {
-    const segs = relSlash(ctx, spec.gitRoot, f).replace(/\.py$/, "").split("/");
-    for (let i = 0; i < segs.length; i++) {
-      const d = segs.slice(i).join(".");
-      if (!suffixes.has(d)) suffixes.set(d, f);
+    if (rootdir !== undefined) {
+      const rel = relSlash(ctx, rootdir, f);
+      // An input outside the rootdir has no classname pytest would write for it.
+      if (rel === "" || rel === ".." || rel.startsWith("../") || ctx.P.isAbsolute(rel)) continue;
+      addKey(rel.replace(/\.py$/, "").split("/").join("."), f);
+      continue;
     }
+    const segs = relSlash(ctx, spec.gitRoot, f).replace(/\.py$/, "").split("/");
+    for (let i = 0; i < segs.length; i++) addKey(segs.slice(i).join("."), f);
   }
-  const map = (dotted: string): { file: string; rest: string[] } | undefined => {
+  const hits = new Map<string, JunitHit>();
+  const map = (dotted: string): JunitHit => {
+    if (hits.has(dotted)) return hits.get(dotted);
+    let hit: JunitHit;
     for (let d = dotted; ; ) {
-      const file = suffixes.get(d);
-      if (file !== undefined) return { file, rest: dotted.slice(d.length + 1).split(".").filter(Boolean) };
+      const file = keys.get(d);
+      if (file === null || (file !== undefined && hit !== undefined)) {
+        hit = "ambiguous";
+        break;
+      }
+      if (file !== undefined) hit = { file, rest: dotted.slice(d.length + 1).split(".").filter(Boolean) };
       const dot = d.lastIndexOf(".");
-      if (dot < 0) return undefined;
+      if (dot < 0) break;
       d = d.slice(0, dot);
     }
+    hits.set(dotted, hit);
+    return hit;
   };
   // QA-1.3-35: at most one relativisation per input file, however many cases fail in it.
   const rels = new Map<string, string>();
@@ -4788,8 +4840,9 @@ function parseJunit(ctx: Ctx, spec: ScopedSpec, text: string, code: number): Run
   let collectionError = false;
   let total = 0;
   let unmapped: string | undefined;
+  let ambiguous: string | undefined;
   const counts: Record<string, number> = Object.create(null) as Record<string, number>;
-  // P1: raw classname attribute -> the file key it maps to (null when unmapped), decoded once each.
+  // P1: raw classname attribute -> the file key it maps to (null when unmapped or ambiguous), decoded once each.
   const classKeys = new Map<string, string | null>();
   const countCase = (attrs: string) => {
     let raw = "";
@@ -4801,8 +4854,11 @@ function parseJunit(ctx: Ctx, spec: ScopedSpec, text: string, code: number): Run
     }
     let key = classKeys.get(raw);
     if (key === undefined) {
-      const hit = map(decodeXml(raw));
-      key = hit ? relOf(hit.file) : null;
+      const classname = decodeXml(raw);
+      const hit = map(classname);
+      // QA-2.2-1: a passing case two inputs answer is charged to neither, and the run is not trusted.
+      if (hit === "ambiguous") ambiguous ??= classname;
+      key = hit !== undefined && hit !== "ambiguous" ? relOf(hit.file) : null;
       classKeys.set(raw, key);
     }
     if (key !== null) addCount(counts, key, 1);
@@ -4829,22 +4885,24 @@ function parseJunit(ctx: Ctx, spec: ScopedSpec, text: string, code: number): Run
       collectionError = true;
       const target = classname || name;
       const hit = map(target);
-      if (hit) {
+      if (hit !== undefined && hit !== "ambiguous") {
         ids.add(relOf(hit.file));
         files.add(hit.file);
       } else {
         ids.add(target);
-        unmapped ??= target;
+        if (hit === "ambiguous") ambiguous ??= target;
+        else unmapped ??= target;
       }
       continue;
     }
     const hit = map(classname);
-    if (hit) {
+    if (hit !== undefined && hit !== "ambiguous") {
       ids.add(`${relOf(hit.file)}::${[...hit.rest, name].join("::")}`);
       files.add(hit.file);
     } else {
       ids.add(`${classname}::${name}`);
-      unmapped ??= classname === "" ? `"" (${name})` : classname;
+      if (hit === "ambiguous") ambiguous ??= classname;
+      else unmapped ??= classname === "" ? `"" (${name})` : classname;
     }
   }
   const forced =
@@ -4854,7 +4912,9 @@ function parseJunit(ctx: Ctx, spec: ScopedSpec, text: string, code: number): Run
         ? "pytest internal error (exit 3)"
         : unmapped !== undefined
           ? `pytest classname not mapped to a test file: ${unmapped}`
-          : undefined;
+          : ambiguous !== undefined
+            ? `pytest classname maps to more than one test file: ${ambiguous}`
+            : undefined;
   return finishResult(ids, files, collectionError, total, code, forced, code === 0 || code === 5, counts);
 }
 

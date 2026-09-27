@@ -2458,11 +2458,106 @@ describe("QA-1.3-25: junit parsing is linear", () => {
     expect(ms).toBeLessThan(1000);
   });
 
-  it("the first input wins a shared suffix; the longest suffix wins", async () => {
+  it("QA-2.2-1: without a rootdir a suffix shared by several inputs is ambiguous (never the first input); a unique suffix maps", async () => {
     const sp = mkSpec({ runner: "pytest", reportPath: RPT_XML, cwd: "/root", gitRoot: "/root", inputs: ["/root/a/test_x.py", "/root/b/test_x.py", "/root/c/a/test_x.py"], inputsAreTests: true });
     const xml = '<testsuites><testcase classname="test_x" name="t"><failure/></testcase><testcase classname="c.a.test_x.K" name="u"><failure/></testcase></testsuites>';
-    expect((await read(sp, { [RPT_XML]: xml }, 1)).failingIds).toEqual(["a/test_x.py::t", "c/a/test_x.py::K::u"]);
+    expect(await read(sp, { [RPT_XML]: xml }, 1)).toMatchObject({
+      failingIds: ["c/a/test_x.py::K::u", "test_x::t"],
+      failingFiles: ["/root/c/a/test_x.py"],
+      complete: false,
+      note: "pytest classname maps to more than one test file: test_x",
+      testsByFile: { "c/a/test_x.py": 1 },
+    });
   });
+});
+
+describe("QA-2.2-1: junit classnames map by the exact rootdir-relative path", () => {
+  const X = "/r/tests/test_x.py";
+  const Y = "/r/tests/test_y.py";
+  const SUB = "/r/sub/tests/test_x.py";
+  const WIN_XML = `C:\\Temp\\omr-verify-${UUID}.xml`;
+  const pspec = (args: string[], inputs = [SUB, X, Y], cwd = "/r") =>
+    mkSpec({ runner: "pytest", reportPath: RPT_XML, cwd, gitRoot: "/r", args: [...args, "--", ...inputs], inputs, inputsAreTests: true });
+  const xml = (...cases: string[]) => `<?xml version="1.0"?><testsuites><testsuite>${cases.join("")}</testsuite></testsuites>`;
+  const pass = (classname: string, name: string) => `<testcase classname="${classname}" name="${name}"/>`;
+  const fail = (classname: string, name: string) => `<testcase classname="${classname}" name="${name}"><failure message="boom">x</failure></testcase>`;
+  const qa = xml(fail("tests.test_x", "test_1"), pass("sub.tests.test_x", "test_1"), pass("sub.tests.test_x", "test_2"), pass("tests.test_y", "test_1"));
+
+  it("the pinned rootdir tells tests/test_x.py from sub/tests/test_x.py", async () => {
+    const r = await read(pspec(["--junitxml=x", "--rootdir=/r"]), { [RPT_XML]: qa }, 1);
+    expect(r).toMatchObject({ failingIds: ["tests/test_x.py::test_1"], failingFiles: [X], total: 4, complete: true });
+    expect(r.testsByFile).toEqual({ "sub/tests/test_x.py": 2, "tests/test_x.py": 1, "tests/test_y.py": 1 });
+  });
+
+  it("without a rootdir the same report is ambiguous: incomplete, and the case is charged to no file", async () => {
+    const r = await read(pspec(["--junitxml=x"]), { [RPT_XML]: qa }, 1);
+    expect(r).toMatchObject({
+      failingIds: ["tests.test_x::test_1"],
+      failingFiles: [],
+      complete: false,
+      note: "pytest classname maps to more than one test file: tests.test_x",
+    });
+    expect(r.testsByFile).toEqual({ "sub/tests/test_x.py": 2, "tests/test_y.py": 1 });
+  });
+
+  it("an ambiguous PASSING case also makes the run incomplete", async () => {
+    const r = await read(pspec(["--junitxml=x"]), { [RPT_XML]: xml(pass("tests.test_x", "ok"), pass("tests.test_y", "ok")) }, 0);
+    expect(r).toMatchObject({ failingIds: [], total: 2, complete: false, note: "pytest classname maps to more than one test file: tests.test_x" });
+    expect(r.testsByFile).toEqual({ "tests/test_y.py": 1 });
+  });
+
+  it("the two-token form, a relative value against cwd, and the last value wins", async () => {
+    const r = await read(pspec(["--rootdir=/elsewhere", "--rootdir", ".."], [SUB, X, Y], "/r/tests"), { [RPT_XML]: qa }, 1);
+    expect(r).toMatchObject({ failingIds: ["test_x.py::test_1"], failingFiles: [X], complete: true });
+    expect(r.testsByFile).toEqual({ "../sub/tests/test_x.py": 2, "test_x.py": 1, "test_y.py": 1 });
+  });
+
+  it("a rootdir pytest would expand, an empty one, or one after -- is not trusted: the suffix rule applies", async () => {
+    for (const args of [["--rootdir=$HOME"], ["--rootdir="], ["--"]]) {
+      const sp = pspec(args);
+      const r = await read({ ...sp, args: [...sp.args, "--rootdir=/r"] }, { [RPT_XML]: qa }, 1);
+      expect(r, JSON.stringify(args)).toMatchObject({ complete: false, note: "pytest classname maps to more than one test file: tests.test_x" });
+    }
+    const win = await read(
+      mkSpec({ runner: "pytest", reportPath: WIN_XML, cwd: "C:\\r", gitRoot: "C:\\r", args: ["--rootdir=%ROOT%"], inputs: ["C:\\r\\sub\\tests\\test_x.py", "C:\\r\\tests\\test_x.py"], inputsAreTests: true }),
+      { [WIN_XML]: xml(fail("tests.test_x", "t")) },
+      1,
+      WIN_HOST,
+    );
+    expect(win).toMatchObject({ complete: false, note: "pytest classname maps to more than one test file: tests.test_x" });
+  });
+
+  it("classes nested in the module keep their names in the id", async () => {
+    const r = await read(pspec(["--rootdir=/r"]), { [RPT_XML]: xml(fail("tests.test_x.TestA.TestB", "test_1"), pass("sub.tests.test_x.TestC", "ok")) }, 1);
+    expect(r).toMatchObject({ failingIds: ["tests/test_x.py::TestA::TestB::test_1"], failingFiles: [X], complete: true });
+    expect(r.testsByFile).toEqual({ "sub/tests/test_x.py": 1, "tests/test_x.py": 1 });
+  });
+
+  it("with a rootdir, a module next to a package of the same name is ambiguous", async () => {
+    const pkg = "/r/tests/test_x/TestA.py";
+    const r = await read(pspec(["--rootdir=/r"], [X, pkg]), { [RPT_XML]: xml(fail("tests.test_x.TestA", "test_1")) }, 1);
+    expect(r).toMatchObject({ failingFiles: [], complete: false, note: "pytest classname maps to more than one test file: tests.test_x.TestA" });
+  });
+
+  it("an input outside the rootdir gets no key; its case is unmapped", async () => {
+    const r = await read(pspec(["--rootdir=/r/sub"], [SUB, X]), { [RPT_XML]: xml(fail("tests.test_x", "t"), pass("", "outside")) }, 1);
+    expect(r).toMatchObject({ failingIds: ["sub/tests/test_x.py::t"], failingFiles: [SUB], complete: true });
+    const out = await read(pspec(["--rootdir=/r/sub"], [X]), { [RPT_XML]: xml(fail("tests.test_x", "t")) }, 1);
+    expect(out).toMatchObject({ failingFiles: [], complete: false, note: "pytest classname not mapped to a test file: tests.test_x" });
+  });
+
+  it("win32: a rootdir in another case and a drive-relative input resolve", async () => {
+    const inputs = ["C:\\R\\sub\\tests\\test_x.py", "C:\\R\\tests\\test_x.py"];
+    const sp = mkSpec({ runner: "pytest", reportPath: WIN_XML, cwd: "C:\\R", gitRoot: "C:\\R", args: ["--rootdir=c:\\r"], inputs, inputsAreTests: true });
+    const r = await read(sp, { [WIN_XML]: xml(fail("tests.test_x", "t"), pass("sub.tests.test_x", "ok")) }, 1, WIN_HOST);
+    expect(r).toMatchObject({ failingIds: ["tests/test_x.py::t"], failingFiles: ["C:\\R\\tests\\test_x.py"], complete: true });
+    expect(r.testsByFile).toEqual({ "sub/tests/test_x.py": 1, "tests/test_x.py": 1 });
+    const other = await read({ ...sp, inputs: ["D:\\x\\tests\\test_x.py"], args: ["--rootdir=C:\\R"] }, { [WIN_XML]: xml(fail("tests.test_x", "t")) }, 1, WIN_HOST);
+    expect(other).toMatchObject({ complete: false, note: "pytest classname not mapped to a test file: tests.test_x" });
+  });
+});
+
+describe("QA-1.3-25: malformed junit stays linear", () => {
 
   it.each([
     ["8000 unclosed testcases", `<testsuites>${'<testcase classname="a" name="b">'.repeat(8000)}</testsuites>`],
