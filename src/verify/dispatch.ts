@@ -255,8 +255,18 @@ export function createChangedFileStore(options: ChangedFileStoreOptions = {}) {
      * The producer's change since the dispatch reference. `childID` joins the dispatch's lineage:
      * the tool-observed files are those of EVERY producer session gated against `id` so far
      * (QA-2.1-1), so a retry never drops a file an earlier attempt edited.
+     *
+     * `committed` (QA-2.1-12): the files of the commits made since the dispatch snapshot's head
+     * (absolute paths), which `git status` no longer lists; "unavailable" when HEAD moved and they
+     * could not be listed, which makes the whole change set unavailable. Absent: HEAD did not move.
      */
-    delta(id: string, childID: string, current?: TreeSnapshot, fallbackCwd?: string): { changedFiles: ChangedFile[]; changeBaseline: "available" | "unavailable" } {
+    delta(
+      id: string,
+      childID: string,
+      current?: TreeSnapshot,
+      fallbackCwd?: string,
+      committed?: readonly ChangedFile[] | "unavailable",
+    ): { changedFiles: ChangedFile[]; changeBaseline: "available" | "unavailable" } {
       const d = dispatches.get(id);
       const snapshot = d?.snapshot;
       const files = new Map<string, ChangedFile>();
@@ -300,6 +310,18 @@ export function createChangedFileStore(options: ChangedFileStoreOptions = {}) {
               files.set(key, listed.get(key) ?? files.get(key) ?? { path, status: after === ABSENT_DIGEST ? " D" : " M" });
             }
           }
+        }
+      }
+      // QA-2.1-12: a shell edit to a file clean at dispatch, then committed, leaves nothing in the
+      // tree listing. A path the current listing also holds keeps its current status (the newer
+      // state) and gains the commit's rename source when it has none.
+      if (committed === "unavailable") available = false;
+      else if (committed) {
+        for (const file of committed) {
+          const key = pathKey(file.path);
+          const prev = files.get(key);
+          if (!prev) files.set(key, file);
+          else if (prev.previousPath === undefined && file.previousPath !== undefined) files.set(key, { ...prev, previousPath: file.previousPath });
         }
       }
       return { changedFiles: [...files.values()], changeBaseline: available ? "available" : "unavailable" };

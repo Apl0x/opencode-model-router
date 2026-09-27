@@ -105,6 +105,36 @@ export const REFERENCE_GC_START_DELAY_MS = 45_000;
 export const GRADE_SNAPSHOT_TIMEOUT_MS = 10_000;
 /** T3: each git test search, bounded further by a gate deadline. */
 export const TEST_SEARCH_TIMEOUT_MS = 10_000;
+/** QA-2.1-12: the `git diff <dispatch head> HEAD` of a gate whose HEAD moved, bounded further by a gate deadline. */
+export const COMMIT_DIFF_TIMEOUT_MS = 10_000;
+/** A full object name (SHA-1 or SHA-256); anything else (e.g. an unborn HEAD) is an unknown head. */
+const OBJECT_NAME = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i;
+
+/**
+ * QA-2.1-12: parses `git diff --name-status -z -M` into absolute paths under `root`: one status
+ * token, then one path, or two (source, destination) for a rename or copy. Undefined when malformed.
+ */
+export function parseNameStatusZ(out: string, root: string): ChangedFile[] | undefined {
+  const tokens = out.split("\0");
+  if (tokens[tokens.length - 1] === "") tokens.pop();
+  const files: ChangedFile[] = [];
+  for (let i = 0; i < tokens.length;) {
+    const status = tokens[i++];
+    if (!/^[A-Z][0-9]*$/.test(status)) return undefined;
+    const letter = status[0];
+    if (letter === "R" || letter === "C") {
+      const source = tokens[i++];
+      const dest = tokens[i++];
+      if (!source || !dest) return undefined;
+      files.push({ path: resolve(root, dest), status: letter, previousPath: resolve(root, source) });
+    } else {
+      const path = tokens[i++];
+      if (!path) return undefined;
+      files.push({ path: resolve(root, path), status: letter });
+    }
+  }
+  return files;
+}
 /** P5: the per-check timeout (DeterministicDeps.timeoutMs default). */
 const CHECK_TIMEOUT_MS = 120_000;
 
@@ -260,6 +290,37 @@ export function createVerificationWiring(deps: {
         if (!(err instanceof Error && "code" in err && err.code === "ENOENT")) throw err;
       }
     },
+  };
+
+  /**
+   * QA-2.1-12: the files of the commits made since the dispatch snapshot. A shell edit to a file
+   * clean at dispatch, then committed, is invisible to `git status`. Undefined when HEAD did not
+   * move (nothing is spawned) or either snapshot is missing (delta is unavailable then anyway).
+   * "unavailable" when HEAD moved and the diff failed, timed out, or could not run, or when either
+   * head is unknown (e.g. an unborn repository at dispatch).
+   */
+  const committedSinceDispatch = async (
+    before: TreeSnapshot | undefined,
+    now: TreeSnapshot | undefined,
+    deadline: Deadline | undefined,
+  ): Promise<ChangedFile[] | "unavailable" | undefined> => {
+    if (!before || !now || before.head === now.head) return undefined;
+    const root = now.root;
+    if (!root || !OBJECT_NAME.test(before.head) || !OBJECT_NAME.test(now.head)) return "unavailable";
+    const timeoutMs = deadline ? deadline.bound(COMMIT_DIFF_TIMEOUT_MS) : COMMIT_DIFF_TIMEOUT_MS;
+    if (timeoutMs <= 0 || deadline?.signal.aborted) return "unavailable";
+    try {
+      const r = await argvSeam("git", ["--no-optional-locks", "-C", root, "diff", "--name-status", "-z", "-M", before.head, "HEAD"], {
+        cwd: root,
+        timeoutMs,
+        lowPriority: resolveVerifyBudget(getConfig()).lowPriority,
+        ...(deadline ? { signal: deadline.signal } : {}),
+      });
+      if (r.timedOut === true || r.code !== 0) return "unavailable";
+      return parseNameStatusZ(r.stdout, root) ?? "unavailable";
+    } catch {
+      return "unavailable"; // The diff could not run: never the same as "no commit touched a file".
+    }
   };
 
   /** T9 1.3: the planners' git searches through the argv seam; no shell, no optional locks. */
@@ -535,8 +596,9 @@ export function createVerificationWiring(deps: {
         deadline?.signal.removeEventListener("abort", onAbort);
         controller.abort();
       }
+      const committed = await committedSinceDispatch(store.baselineSnapshot(id), snapshot, deadline);
       const reference = await store.reference(id, deadline?.signal);
-      return { ...store.delta(id, childID, snapshot, base), reference, snapshot };
+      return { ...store.delta(id, childID, snapshot, base, committed), reference, snapshot };
     },
     graderSessions,
     disposeChildSession,

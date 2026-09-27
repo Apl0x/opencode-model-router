@@ -1,9 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { join, resolve } from "node:path";
-import { execFileSync } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { awaitBounded, createVerificationWiring, DISPOSED_MEMO_MAX, REFERENCE_GC_START_DELAY_MS, TEST_SEARCH_TIMEOUT_MS } from "../../src/verify/wiring";
+import { awaitBounded, COMMIT_DIFF_TIMEOUT_MS, createVerificationWiring, DISPOSED_MEMO_MAX, REFERENCE_GC_START_DELAY_MS, TEST_SEARCH_TIMEOUT_MS } from "../../src/verify/wiring";
 import { resolveVerifyBudget } from "../../src/router/config";
 import type { Deadline } from "../../src/verify/types";
 import { createHash } from "node:crypto";
@@ -245,6 +245,134 @@ describe("shell edits to files already dirty at dispatch, against a real git rep
       expect(r.verdict.pass).toBe(false);
       expect(state.commands).toEqual([]);
     });
+  });
+});
+
+describe("commits made since dispatch, against a real git repository (QA-2.1-12)", () => {
+  const real = () => vi.importActual<typeof import("../../src/verify/tree")>("../../src/verify/tree");
+  const key = (p: string) => resolve(p).toLowerCase();
+  /** A clean repository: src/a.js and src/b.js committed. */
+  const withRepo = async (body: (repo: string, git: (...args: string[]) => void) => Promise<void>) => {
+    const repo = realpathSync.native(mkdtempSync(join(tmpdir(), "omr-qa2112-")));
+    const git = (...args: string[]) => { execFileSync("git", args, { cwd: repo, windowsHide: true }); };
+    try {
+      git("init", "-q");
+      git("config", "user.email", "t@example.invalid"); git("config", "user.name", "t");
+      git("config", "commit.gpgsign", "false"); git("config", "core.autocrlf", "false");
+      mkdirSync(join(repo, "src"));
+      writeFileSync(join(repo, "src", "a.js"), "export const add = (x, y) => x + y;\n");
+      writeFileSync(join(repo, "src", "b.js"), "export const mul = (x, y) => x * y;\n");
+      git("add", "-A"); git("commit", "-q", "-m", "init");
+      await body(repo, git);
+    } finally {
+      rmSync(repo, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+    }
+  };
+  /** The real snapshotTree, and the argv seam running real git (every call is still recorded). */
+  const wiringAt = async (repo: string) => {
+    const { snapshotTree } = await real();
+    state.snapshotImpl = snapshotTree;
+    state.argvImpl = (file, args, opts) => new Promise(done => {
+      execFile(file, [...args], { cwd: opts.cwd, windowsHide: true }, (error, stdout, stderr) => done({
+        code: error ? (typeof error.code === "number" ? error.code : 1) : 0, stdout: String(stdout), stderr: String(stderr), timedOut: false,
+      }));
+    });
+    const cfg: RouterConfig = { ...harness().cfg, enforcement: { verify: { baselineTimeoutMs: 30_000 } } };
+    return { wiring: createVerificationWiring({ client: {}, directory: repo, getConfig: () => cfg, logger: { warn: () => {} } }), store: createChangedFileStore() };
+  };
+
+  it("a file clean at dispatch, edited through the shell and committed, is in the change set", async () => {
+    await withRepo(async (repo, git) => {
+      const { wiring, store } = await wiringAt(repo);
+      await wiring.beginVerification(store, "d", undefined, dod);
+      const head = store.baselineSnapshot("d")?.head;
+      expect(head).toMatch(/^[0-9a-f]{40}$/);
+      writeFileSync(join(repo, "src", "b.js"), "export const mul = (x, y) => x + y;\n"); // `sed -i`: no tool record
+      git("commit", "-q", "-am", "producer commit");
+      const prepared = await wiring.prepareVerification(store, "d", "d");
+      expect(prepared.changeBaseline).toBe("available");
+      expect(prepared.changedFiles.map(f => ({ ...f, path: key(f.path) }))).toEqual([{ path: key(join(repo, "src", "b.js")), status: "M" }]);
+      // One git diff, through the argv seam, at low priority, bounded, rooted at the repository.
+      expect(state.commands).toEqual([`git --no-optional-locks -C ${repo} diff --name-status -z -M ${head} HEAD`]);
+      expect(state.execOpts[0]).toMatchObject({ cwd: repo, timeoutMs: COMMIT_DIFF_TIMEOUT_MS, lowPriority: resolveVerifyBudget(harness().cfg).lowPriority });
+    });
+  });
+
+  it("a rename commit carries the rename source as previousPath", async () => {
+    await withRepo(async (repo, git) => {
+      const { wiring, store } = await wiringAt(repo);
+      await wiring.beginVerification(store, "d", undefined, dod);
+      git("mv", "src/b.js", "src/c.js");
+      git("commit", "-q", "-m", "rename");
+      const prepared = await wiring.prepareVerification(store, "d", "d");
+      expect(prepared.changeBaseline).toBe("available");
+      expect(prepared.changedFiles).toHaveLength(1);
+      const [file] = prepared.changedFiles;
+      expect(file.status).toBe("R");
+      expect(key(file.path)).toBe(key(join(repo, "src", "c.js")));
+      expect(file.previousPath && key(file.previousPath)).toBe(key(join(repo, "src", "b.js")));
+    });
+  });
+
+  it("an unchanged HEAD spawns no git process", async () => {
+    await withRepo(async repo => {
+      const { wiring, store } = await wiringAt(repo);
+      await wiring.beginVerification(store, "d", undefined, dod);
+      writeFileSync(join(repo, "src", "b.js"), "export const mul = (x, y) => x + y;\n");
+      const prepared = await wiring.prepareVerification(store, "d", "d");
+      expect(prepared.changeBaseline).toBe("available");
+      expect(prepared.changedFiles.map(f => key(f.path))).toEqual([key(join(repo, "src", "b.js"))]);
+      expect(state.commands).toEqual([]);
+    });
+  });
+});
+
+describe("commits made since dispatch, failure paths (QA-2.1-12)", () => {
+  const A = "a".repeat(40);
+  const B = "b".repeat(40);
+  /** The dispatch snapshot at `before`; the gate snapshot at `after` (same tree otherwise). */
+  const moved = async (before: string, after: string, deadline?: Deadline) => {
+    const { wiring, store } = harness();
+    state.snapshot = { ...state.snapshot!, root: cwd, head: before };
+    await wiring.beginVerification(store, "d", undefined, dod);
+    state.snapshot = { ...state.snapshot!, head: after };
+    return wiring.prepareVerification(store, "d", "d", undefined, deadline);
+  };
+
+  it("a failing, timed-out or unspawnable diff makes the change set unavailable", async () => {
+    state.argvImpl = async () => ({ code: 128, stdout: "", stderr: "fatal: bad object", timedOut: false });
+    expect((await moved(A, B)).changeBaseline).toBe("unavailable");
+    expect(state.commands).toEqual([`git --no-optional-locks -C ${cwd} diff --name-status -z -M ${A} HEAD`]);
+    state.argvImpl = async () => ({ code: 0, stdout: `M\0src/x.js\0`, stderr: "", timedOut: true });
+    expect((await moved(A, B)).changeBaseline).toBe("unavailable");
+    state.argvImpl = async () => { throw new Error("spawn ENOENT"); };
+    expect((await moved(A, B)).changeBaseline).toBe("unavailable");
+    state.argvImpl = async () => ({ code: 0, stdout: `R100\0src/x.js\0`, stderr: "", timedOut: false }); // malformed
+    expect((await moved(A, B)).changeBaseline).toBe("unavailable");
+  });
+
+  it("a successful diff adds the committed files", async () => {
+    state.argvImpl = async () => ({ code: 0, stdout: `M\0src/x.js\0D\0src/y.js\0`, stderr: "", timedOut: false });
+    const prepared = await moved(A, B);
+    expect(prepared.changeBaseline).toBe("available");
+    expect(prepared.changedFiles).toEqual([
+      { path: resolve(cwd, "src/x.js"), status: "M" },
+      { path: resolve(cwd, "src/y.js"), status: "D" },
+    ]);
+  });
+
+  it("an unknown dispatch head (an unborn repository) with a known one now is unavailable, with no spawn", async () => {
+    expect((await moved("HEAD", B)).changeBaseline).toBe("unavailable");
+    expect(state.commands).toEqual([]);
+  });
+
+  it("the diff is bounded by the deadline, and a spent one runs no git and is unavailable", async () => {
+    const ctl = new AbortController();
+    await moved(A, B, fakeDeadline(2_500, ctl));
+    expect(state.execOpts[0]).toMatchObject({ timeoutMs: 2_500, signal: ctl.signal });
+    state.commands = [];
+    expect((await moved(A, B, fakeDeadline(0))).changeBaseline).toBe("unavailable");
+    expect(state.commands).toEqual([]);
   });
 });
 
