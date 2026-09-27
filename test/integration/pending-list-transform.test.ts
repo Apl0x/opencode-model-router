@@ -162,6 +162,22 @@ describe("the pending list in the orchestrator's system prompt (2.4.4)", () => {
     expect(pendingBlock(await systemFor(transform, "orch"))).toBeUndefined();
   });
 
+  it("a TTL-expired entry leaves the list at read time, with no sweep", async () => {
+    // Faked before the plugin starts, so the registry's clock is the fake Date.
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      const transform = await makePlugin();
+      const handle = register("orch", 1);
+      expect(pendingBlock(await systemFor(transform, "orch"))).toContain(handle);
+      vi.setSystemTime(Date.now() + 3_600_000 - 1);
+      expect(pendingBlock(await systemFor(transform, "orch"))).toContain(handle);
+      vi.setSystemTime(Date.now() + 1);
+      expect(pendingBlock(await systemFor(transform, "orch"))).toBeUndefined();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("sessions never see each other's entries", async () => {
     const transform = await makePlugin();
     const mine = register("orch", 1);

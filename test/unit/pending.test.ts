@@ -1240,6 +1240,39 @@ describe("background queue (R14, 2.4.5)", () => {
     expect(queue.stats()).toMatchObject({ queued: 1, superseded: 1 });
   });
 
+  it("a fresh request during a backoff re-arms the timer earlier: it runs after the settle delay, not the backoff", async () => {
+    const { queue, calls, advance, add, scheduled } = harness();
+    add(1);
+    await advance(BACKGROUND_SETTLE_MS);
+    calls[0].resolve([judged(H(1), unverifiable("verification slot busy", true))]);
+    await flush();
+    expect(scheduled.map(s => s.at)).toEqual([BACKGROUND_SETTLE_MS + BACKGROUND_RETRY_BASE_MS]);
+    add(2, undefined, "orch2");
+    expect(scheduled.map(s => s.at)).toEqual([2 * BACKGROUND_SETTLE_MS]);
+    await advance(BACKGROUND_SETTLE_MS);
+    expect(calls[1].handles).toEqual([H(2)]);
+    calls[1].resolve([judged(H(2), PASS)]);
+    await flush();
+    // Back to the backed-off retry.
+    expect(scheduled.map(s => s.at)).toEqual([BACKGROUND_SETTLE_MS + BACKGROUND_RETRY_BASE_MS]);
+    expect(queue.stats().queued).toBe(1);
+  });
+
+  it("a timer left armed for a forgotten request fires, finds nothing due, and re-arms for the next one", async () => {
+    const { queue, calls, advance, add, scheduled } = harness();
+    add(1);
+    await advance(BACKGROUND_SETTLE_MS / 2);
+    add(2, undefined, "orch2");
+    queue.forgetSession("orch");
+    // The earlier timer is kept (never moved later); it now has nothing due.
+    expect(scheduled.map(s => s.at)).toEqual([BACKGROUND_SETTLE_MS]);
+    await advance(BACKGROUND_SETTLE_MS / 2);
+    expect(calls).toHaveLength(0);
+    expect(scheduled.map(s => s.at)).toEqual([BACKGROUND_SETTLE_MS * 1.5]);
+    await advance(BACKGROUND_SETTLE_MS / 2);
+    expect(calls.map(c => c.handles)).toEqual([[H(2)]]);
+  });
+
   it("a retry is dropped when a newer overlapping request of the session arrived during its run", async () => {
     const { queue, calls, advance, add } = harness();
     add(1, ["/src/a.ts"]);

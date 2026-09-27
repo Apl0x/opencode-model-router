@@ -19,6 +19,7 @@ import { dirname, isAbsolute, join, relative } from "node:path";
 import ModelRouterPlugin from "../../src/index";
 import { invalidateConfigCache } from "../../src/router/config";
 import {
+  backgroundOutcomes,
   createVerificationWiring,
   digestFiles,
   DRIFT_NOTICE,
@@ -43,6 +44,7 @@ import {
 import type { RouterConfig } from "../../src/router/config";
 import type { DoD } from "../../src/verify/dod";
 import { createChangedFileStore, type TreeSnapshot } from "../../src/verify/dispatch";
+import { REFERENCE_NONE } from "../../src/verify/baseline";
 import type { DispatchReference } from "../../src/verify/reference";
 import type { ReferenceState, Verdict } from "../../src/verify/types";
 
@@ -607,6 +609,86 @@ describe("verifyHandles (2.4.3a)", () => {
 });
 
 // ---------------------------------------------------------------------------------------------
+// Remaining plan tests (2.4.6): the deadline mid-run, a capture invalidated after the wait
+// ---------------------------------------------------------------------------------------------
+
+describe("router_verify edge cases (2.4.6)", () => {
+  it("the deadline expires mid-run: nothing is judged, the tree is killed, and the entries go back to unverified", async () => {
+    state.hang = true;
+    const { wiring } = makeWiring({ gateBudgetMs: 1_500 });
+    const handles = [await register(wiring.pending, "a"), await register(wiring.pending, "b")];
+    barrier(2);
+    const t0 = Date.now();
+    const report = await wiring.verifyHandles("orch", { kind: "handles", handles });
+    expect(Date.now() - t0).toBeLessThan(10_000);
+    expect(report.items).toHaveLength(2);
+    for (const item of report.items) {
+      const v = verdictOf(item);
+      expect(v.via).toBe("run");
+      expect(v.result.retryable).toBe(true);
+      expect(v.result.verdict.outcome).toBe("unverifiable");
+      expect(report.text).toContain(`- ${v.handle} \u00b7 ${v.description} \u00b7 not judged`);
+    }
+    // The scoped run started and its argv seam's signal was aborted: the tree was killed.
+    expect(state.runs.length).toBeGreaterThan(0);
+    expect(state.killed).toBe(state.runs.length);
+    for (const h of handles) expect(wiring.pending.get("orch", h)).toMatchObject({ kind: "found", entry: { state: "unverified" } });
+    await vi.waitFor(() => expect(state.holds).toBe(0));
+    // Still verifiable later: the next call judges them.
+    state.hang = false;
+    const again = await wiring.verifyHandles("orch", { kind: "handles", handles });
+    expect(again.items.map(i => verdictOf(i).result.verdict.outcome)).toEqual(["pass", "pass"]);
+  });
+
+  it("a capture that resolves after the wait: valid without an edit in between; an edit discards it and router_verify says no reference, never a pass", async () => {
+    exactReference();
+    // t2 fails now and at the reference: pre-existing when there IS a valid reference.
+    state.failing = { a: ["t2"] };
+    state.failingAtRef = { a: ["t2"] };
+    const late = (): (() => void) => {
+      let release: () => void = () => {};
+      state.capture = signal =>
+        new Promise<DispatchReference>((resolveCapture, rejectCapture) => {
+          const ref = captured();
+          release = () => {
+            if (ref.kind === "captured") resolveCapture(ref.reference);
+          };
+          signal.addEventListener("abort", () => rejectCapture(new Error("capture aborted")), { once: true });
+        });
+      return () => release();
+    };
+    const { wiring } = makeWiring();
+    const store = createChangedFileStore();
+
+    // Control: the producer starts at once (VERIFY_WAIT:0s), the capture resolves later, no edit.
+    const releaseOk = late();
+    await wiring.startDispatch(store, "task:orch:ok", state.root, DOD, "VERIFY_WAIT:0s", false);
+    releaseOk();
+    expect((await store.reference("task:orch:ok")).kind).toBe("captured");
+    const ok = await register(wiring.pending, "a", { reference: store.reference("task:orch:ok") });
+
+    // The same, but the producer edits in an overlapping directory before the capture resolves.
+    const releaseBad = late();
+    await wiring.startDispatch(store, "task:orch:bad", state.root, DOD, "VERIFY_WAIT:0s", false);
+    store.observeEdit("edit", state.root);
+    releaseBad();
+    expect(await store.reference("task:orch:bad")).toEqual({ kind: "none", reason: REFERENCE_NONE.contaminated });
+    const bad = await register(wiring.pending, "a", { dispatchID: "task:orch:bad", producerSessionID: "child-bad", reference: store.reference("task:orch:bad") });
+
+    const good = verdictOf((await wiring.verifyHandles("orch", { kind: "handles", handles: [ok] })).items[0]);
+    expect(good.result.verdict.outcome).toBe("pass");
+
+    const report = await wiring.verifyHandles("orch", { kind: "handles", handles: [bad] });
+    const item = verdictOf(report.items[0]);
+    expect(item.result.verdict.outcome).toBe("unverifiable");
+    expect(item.result.verdict.pass).toBe(false);
+    expect([...item.result.verdict.reasons, ...(item.result.verdict.caveats ?? [])].join(" ")).toContain(REFERENCE_NONE.contaminated);
+    expect(report.text).toContain(`- ${bad} \u00b7 work a \u00b7 unverifiable`);
+    expect(report.text).not.toContain(`- ${bad} \u00b7 work a \u00b7 pass`);
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
 // Background mode (2.4.5, section 1.5-19; pending.ts R14) on the wiring
 // ---------------------------------------------------------------------------------------------
 
@@ -620,6 +702,26 @@ describe("background mode (2.4.5)", () => {
   const enqueue = (wiring: VerificationWiring, handle: string, x: string, sessionID = "orch"): void =>
     queueOf(wiring).enqueue({ sessionID, handle, files: [src(x)] });
   const counts = () => ({ runs: state.runs.length, acquires: state.acquires, git: state.git, snapshots: state.snapshots });
+
+  it("backgroundOutcomes: only this run's own verdict is judged; another call's is reported; unknown and expired are gone", () => {
+    const result = { verdict: { pass: true, outcome: "pass" as const, method: "deterministic" as const, reasons: [] }, retryable: false, handle: "vrf_1", settledAt: 0 };
+    const base = { handle: "vrf_1", description: "d", producerTier: "fast", result };
+    expect(backgroundOutcomes([
+      { kind: "verdict", ...base, via: "run" },
+      { kind: "verdict", ...base, via: "joined" },
+      { kind: "verdict", ...base, via: "cached" },
+      { kind: "elsewhere", handle: "vrf_2", description: "d" },
+      { kind: "unknown", input: "vrf_3" },
+      { kind: "expired", handle: "vrf_4" },
+    ])).toEqual([
+      { kind: "judged", handle: "vrf_1", description: "d", result },
+      { kind: "reported", handle: "vrf_1" },
+      { kind: "reported", handle: "vrf_1" },
+      { kind: "reported", handle: "vrf_2" },
+      { kind: "gone", handle: "vrf_3" },
+      { kind: "gone", handle: "vrf_4" },
+    ]);
+  });
 
   it("off by default: no queue is constructed, so nothing can ever run in the background", async () => {
     const { wiring } = makeWiring();

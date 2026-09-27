@@ -422,6 +422,24 @@ export function formatVerifyReport(
   return [`[router] router_verify: one verdict per handle (${items.length}${excess > 0 ? ` of ${items.length + excess}` : ""}).`, ...blocks].join("\n");
 }
 
+/**
+ * 2.4.5 (pending.ts R14): a background run's report as queue outcomes. Only this run's own verdict
+ * ("run") is "judged"; a verdict another router_verify call produced or had cached, and a run that
+ * call still owns ("elsewhere"), are "reported" (that caller has or gets it); unknown and expired
+ * handles are "gone". Pure.
+ */
+export function backgroundOutcomes(items: readonly HandleReport[]): BackgroundOutcome[] {
+  return items.map((item): BackgroundOutcome => {
+    if (item.kind === "verdict") {
+      return item.via === "run"
+        ? { kind: "judged", handle: item.handle, description: item.description, result: item.result }
+        : { kind: "reported", handle: item.handle };
+    }
+    if (item.kind === "elsewhere") return { kind: "reported", handle: item.handle };
+    return { kind: "gone", handle: item.kind === "unknown" ? item.input : item.handle };
+  });
+}
+
 /** A never-rejecting wait for `promise` that ends with `fallback()` once `signal` aborts. */
 function untilAborted<T>(promise: Promise<T>, signal: AbortSignal, fallback: () => T): Promise<T> {
   if (signal.aborted) return Promise.resolve(fallback());
@@ -1554,18 +1572,8 @@ export function createVerificationWiring(deps: {
     background = createBackgroundQueue({
       ...deps.background,
       ttlMs: pendingBudget.pendingTtlMs,
-      verify: async (sessionID, handles, signal) => {
-        const report = await verifyHandles(sessionID, { kind: "handles", handles }, { signal, background: true });
-        return report.items.map((item): BackgroundOutcome => {
-          if (item.kind === "verdict") {
-            return item.via === "run"
-              ? { kind: "judged", handle: item.handle, description: item.description, result: item.result }
-              : { kind: "reported", handle: item.handle };
-          }
-          if (item.kind === "elsewhere") return { kind: "reported", handle: item.handle };
-          return { kind: "gone", handle: item.kind === "unknown" ? item.input : item.handle };
-        });
-      },
+      verify: async (sessionID, handles, signal) =>
+        backgroundOutcomes((await verifyHandles(sessionID, { kind: "handles", handles }, { signal, background: true })).items),
       onError: error => logger.warn("[verify] background verification run failed", { error: errorText(error) }),
     });
   }
