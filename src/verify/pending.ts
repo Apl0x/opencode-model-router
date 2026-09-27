@@ -1263,7 +1263,15 @@ export interface BackgroundQueueOptions {
   readonly platform?: NodeJS.Platform;
   /** Logging hook for a rejected run; never throws into the queue. */
   readonly onError?: (error: unknown) => void;
+  /**
+   * QA-2.4-5: true while foreground verification (a required gate or router_verify) is running. A
+   * run is then not started: its due requests back off (not counted as an attempt) and retry later.
+   */
+  readonly busy?: () => boolean;
 }
+
+/** QA-2.4-5: the exponent cap of the backoff of requests that were preempted or postponed. */
+export const BACKGROUND_MAX_BACKOFF_STEPS = 5;
 
 export interface BackgroundQueueStats {
   readonly queued: number;
@@ -1288,6 +1296,13 @@ export interface BackgroundQueue {
   stats(): BackgroundQueueStats;
   /** Resolves once no run is in flight and no request is fresh or due (tests, diagnostics). */
   whenIdle(): Promise<void>;
+  /**
+   * QA-2.4-5: foreground verification takes precedence. Aborts the run in flight (its deadline, so
+   * its tree dies and the slot is freed); its requests go back to the queue with backoff, not
+   * counted as an attempt, and a verdict it already reached is kept. Resolves once that run has
+   * finished (at once when none is in flight). Never rejects.
+   */
+  preempt(): Promise<void>;
   /** Plugin dispose: aborts the run in flight, clears the timer, drops everything. Idempotent. */
   dispose(): void;
 }
@@ -1317,8 +1332,10 @@ export function createBackgroundQueue(options: BackgroundQueueOptions): Backgrou
     readonly sessionID: string;
     readonly handle: string;
     readonly files: ReadonlySet<string>;
-    /** Runs already made for this request (0 = fresh). */
+    /** Runs already made for this request that counted (fresh when this and `deferrals` are 0). */
     readonly attempts: number;
+    /** QA-2.4-5: preemptions and postponements; they back off but never count as attempts. */
+    readonly deferrals: number;
     readonly notBefore: number;
   }
   interface Run {
@@ -1326,6 +1343,11 @@ export function createBackgroundQueue(options: BackgroundQueueOptions): Backgrou
     readonly items: readonly QueuedItem[];
     readonly controller: AbortController;
     cancelled: boolean;
+    /** QA-2.4-5: aborted for foreground verification. */
+    preempted: boolean;
+    /** Resolves when the run has finished (finish). */
+    readonly done: Promise<void>;
+    readonly markDone: () => void;
   }
   interface StoredNotice {
     readonly notice: LateNotice;
@@ -1399,10 +1421,21 @@ export function createBackgroundQueue(options: BackgroundQueueOptions): Backgrou
     for (const resolveIdle of idleWaiters.splice(0)) resolveIdle();
   }
 
+  /** A request that has never run, been preempted or been postponed. */
+  function isFresh(item: QueuedItem): boolean {
+    return item.attempts === 0 && item.deferrals === 0;
+  }
+
+  /** Backoff: retryBaseMs * 2^(attempts + deferrals - 1), the exponent capped (QA-2.4-5). */
+  function backoffFrom(at: number, attempts: number, deferrals: number): number {
+    const steps = Math.min(Math.max(attempts + deferrals, 1) - 1, BACKGROUND_MAX_BACKOFF_STEPS);
+    return at + retryBaseMs * 2 ** steps;
+  }
+
   /** Quiet: no run in flight, and every queued request is backing off into the future. */
   function isQuiet(at: number): boolean {
     if (running !== undefined) return false;
-    for (const item of queue.values()) if (item.attempts === 0 || item.notBefore <= at) return false;
+    for (const item of queue.values()) if (isFresh(item) || item.notBefore <= at) return false;
     return true;
   }
 
@@ -1440,27 +1473,33 @@ export function createBackgroundQueue(options: BackgroundQueueOptions): Backgrou
     }
   }
 
-  /** A retryable result: back off, never a hot loop; after maxAttempts it stays unverified. */
-  function retry(item: QueuedItem): void {
-    const attempts = item.attempts + 1;
-    if (attempts >= maxAttempts) return;
+  /**
+   * A retryable result: back off, never a hot loop; after maxAttempts it stays unverified.
+   * QA-2.4-5: a run preempted for foreground verification is not `counted`: it backs off without
+   * using an attempt (bounded by the entry's TTL, which ends it as "gone").
+   */
+  function retry(item: QueuedItem, counted = true): void {
+    const attempts = counted ? item.attempts + 1 : item.attempts;
+    if (counted && attempts >= maxAttempts) return;
+    const deferrals = counted ? item.deferrals : item.deferrals + 1;
     for (const other of queue.values()) {
       if (other.sessionID === item.sessionID && overlaps(other.files, item.files)) {
         counters.superseded += 1;
         return;
       }
     }
-    queue.set(item.handle, { ...item, attempts, notBefore: now() + retryBaseMs * 2 ** (attempts - 1) });
+    queue.set(item.handle, { ...item, attempts, deferrals, notBefore: backoffFrom(now(), attempts, deferrals) });
     enforceCap();
   }
 
   function apply(run: Run, outcomes: readonly BackgroundOutcome[]): void {
     const byHandle = new Map(outcomes.map(o => [o.handle, o] as const));
+    const counted = !run.preempted;
     for (const item of run.items) {
       const outcome = byHandle.get(item.handle);
-      if (outcome === undefined) retry(item);
+      if (outcome === undefined) retry(item, counted);
       else if (outcome.kind !== "judged") continue;
-      else if (outcome.result.retryable) retry(item);
+      else if (outcome.result.retryable) retry(item, counted);
       else {
         const notice = lateNoticeFor(item.handle, outcome.description, outcome.result);
         if (notice !== undefined) addNotice(run.sessionID, notice);
@@ -1474,6 +1513,26 @@ export function createBackgroundQueue(options: BackgroundQueueOptions): Backgrou
     } finally {
       if (running === run) running = undefined;
       reschedule();
+      run.markDone();
+    }
+  }
+
+  /** QA-2.4-5: foreground verification is running: the due requests back off, uncounted. */
+  function postponeDue(at: number): void {
+    for (const item of [...queue.values()]) {
+      if (item.notBefore > at) continue;
+      const deferrals = item.deferrals + 1;
+      queue.set(item.handle, { ...item, deferrals, notBefore: backoffFrom(at, item.attempts, deferrals) });
+    }
+    reschedule();
+  }
+
+  function foregroundBusy(): boolean {
+    try {
+      return options.busy?.() === true;
+    } catch (error) {
+      report(error);
+      return false;
     }
   }
 
@@ -1488,12 +1547,21 @@ export function createBackgroundQueue(options: BackgroundQueueOptions): Backgrou
       reschedule();
       return;
     }
+    // QA-2.4-5: never start while foreground verification runs; never queue for the slot.
+    if (foregroundBusy()) {
+      postponeDue(at);
+      return;
+    }
     const lead = first;
     // One session per run (verifyHandles is session-scoped): its fresh and due requests ride along.
-    const riders = [...queue.values()].filter(i => i !== lead && i.sessionID === lead.sessionID && (i.attempts === 0 || i.notBefore <= at));
+    const riders = [...queue.values()].filter(i => i !== lead && i.sessionID === lead.sessionID && (isFresh(i) || i.notBefore <= at));
     const items = [lead, ...riders].slice(0, MAX_HANDLES_PER_CALL);
     for (const item of items) queue.delete(item.handle);
-    const run: Run = { sessionID: lead.sessionID, items, controller: new AbortController(), cancelled: false };
+    let markDone: () => void = () => undefined;
+    const done = new Promise<void>(resolveDone => {
+      markDone = resolveDone;
+    });
+    const run: Run = { sessionID: lead.sessionID, items, controller: new AbortController(), cancelled: false, preempted: false, done, markDone };
     running = run;
     counters.runs += 1;
     let outcome: Promise<readonly BackgroundOutcome[]>;
@@ -1527,7 +1595,7 @@ export function createBackgroundQueue(options: BackgroundQueueOptions): Backgrou
         }
       }
       const at = now();
-      queue.set(request.handle, { sessionID: request.sessionID, handle: request.handle, files, attempts: 0, notBefore: at + settleMs });
+      queue.set(request.handle, { sessionID: request.sessionID, handle: request.handle, files, attempts: 0, deferrals: 0, notBefore: at + settleMs });
       enforceCap();
       if (running === undefined) arm(at + settleMs);
     },
@@ -1585,6 +1653,15 @@ export function createBackgroundQueue(options: BackgroundQueueOptions): Backgrou
     whenIdle() {
       if (disposed || isQuiet(now())) return Promise.resolve();
       return new Promise<void>(resolveIdle => idleWaiters.push(resolveIdle));
+    },
+    preempt() {
+      const run = running;
+      if (run === undefined) return Promise.resolve();
+      if (!run.cancelled && !run.preempted) {
+        run.preempted = true;
+        run.controller.abort();
+      }
+      return run.done;
     },
     dispose() {
       if (disposed) return;

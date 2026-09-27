@@ -1548,3 +1548,92 @@ describe("QA-2.4-3: a background verdict that did not pass stays listed until it
     expect(registry.register(reg())).toMatchObject({ ok: true, evicted: [judged] });
   });
 });
+
+describe("QA-2.4-5: foreground precedence in the background queue", () => {
+  const H = (n: number): string => `vrf_${n.toString(16).padStart(24, "0")}`;
+  const flush = async (): Promise<void> => {
+    for (let i = 0; i < 20; i += 1) await Promise.resolve();
+  };
+  const retryable: VerificationResult = { verdict: { pass: false, outcome: "unverifiable", method: "deterministic", reasons: ["router_verify was cancelled before a verdict"] }, retryable: true };
+  const judged = (handle: string, result: VerificationResult): BackgroundOutcome => ({ kind: "judged", handle, description: "d", result: { ...result, handle, settledAt: 0 } });
+
+  function harness(busy: () => boolean = () => false) {
+    const c = clock(0);
+    const scheduled: Array<{ at: number; cb: () => void; id: number }> = [];
+    let ids = 0;
+    const timers: BackgroundTimers = {
+      setTimeout(cb, ms) {
+        ids += 1;
+        scheduled.push({ at: c.now() + ms, cb, id: ids });
+        return ids;
+      },
+      clearTimeout(handle) {
+        const i = scheduled.findIndex(s => s.id === handle);
+        if (i >= 0) scheduled.splice(i, 1);
+      },
+    };
+    const calls: Array<{ handles: readonly string[]; signal: AbortSignal; resolve: (o: readonly BackgroundOutcome[]) => void }> = [];
+    const verify = vi.fn(
+      (_sid: string, handles: readonly string[], signal: AbortSignal) =>
+        new Promise<readonly BackgroundOutcome[]>(resolve => {
+          calls.push({ handles: [...handles], signal, resolve });
+        }),
+    );
+    const queue = createBackgroundQueue({ verify, ttlMs: TTL, now: c.now, timers, platform: "linux", maxAttempts: 1, busy });
+    const advance = async (ms: number): Promise<void> => {
+      c.advance(ms);
+      for (;;) {
+        const due = scheduled.filter(s => s.at <= c.now()).sort((a, b) => a.at - b.at)[0];
+        if (due === undefined) break;
+        scheduled.splice(scheduled.indexOf(due), 1);
+        due.cb();
+        await flush();
+      }
+      await flush();
+    };
+    return { queue, calls, verify, advance, scheduled, c };
+  }
+
+  it("preempt aborts the run, resolves when it finished, and requeues it with backoff without using an attempt", async () => {
+    const { queue, calls, verify, advance } = harness();
+    await expect(queue.preempt()).resolves.toBeUndefined();
+    queue.enqueue({ sessionID: "orch", handle: H(1), files: ["/a"] });
+    await advance(BACKGROUND_SETTLE_MS);
+    expect(calls).toHaveLength(1);
+    let finished = false;
+    const preempted = queue.preempt().then(() => {
+      finished = true;
+    });
+    expect(calls[0].signal.aborted).toBe(true);
+    await flush();
+    expect(finished).toBe(false);
+    calls[0].resolve([judged(H(1), retryable)]);
+    await preempted;
+    // maxAttempts is 1: a counted retry would have ended the request here.
+    expect(queue.stats()).toMatchObject({ queued: 1, running: false, notices: 0 });
+    await advance(BACKGROUND_RETRY_BASE_MS - 1);
+    expect(verify).toHaveBeenCalledTimes(1);
+    await advance(1);
+    expect(verify).toHaveBeenCalledTimes(2);
+    // A verdict the preempted run had already reached is kept (not requeued).
+    calls[1].resolve([judged(H(1), { verdict: { pass: true, outcome: "pass", method: "deterministic", reasons: [] }, retryable: false })]);
+    await flush();
+    expect(queue.stats()).toMatchObject({ queued: 0, running: false });
+  });
+
+  it("no run starts while foreground verification is busy: the due requests back off, uncounted, and run once it is not", async () => {
+    let busy = true;
+    const { queue, calls, advance } = harness(() => busy);
+    queue.enqueue({ sessionID: "orch", handle: H(1), files: ["/a"] });
+    await advance(BACKGROUND_SETTLE_MS);
+    expect(calls).toHaveLength(0);
+    // Postponed requests are neither fresh nor due: the queue is idle, and no hot loop runs.
+    await expect(queue.whenIdle()).resolves.toBeUndefined();
+    await advance(BACKGROUND_RETRY_BASE_MS);
+    expect(calls).toHaveLength(0);
+    busy = false;
+    await advance(BACKGROUND_RETRY_BASE_MS * 2);
+    expect(calls).toHaveLength(1);
+    expect(calls[0].handles).toEqual([H(1)]);
+  });
+});

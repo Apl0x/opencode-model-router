@@ -797,6 +797,8 @@ export function createVerificationWiring(deps: {
    * (pending.ts R14). With background off this stays undefined: no queue, no timer, no run.
    */
   let background: BackgroundQueue | undefined;
+  /** QA-2.4-5: foreground testsPass requests in flight (the background queue's `busy`). */
+  const foreground = { tests: 0 };
   /** 2.4.2b: native `task` dispatch starts, before hook -> after hook (bounded FIFO, swept). */
   const dispatchStarts = new Map<string, DispatchStart>();
   /**
@@ -1041,7 +1043,8 @@ export function createVerificationWiring(deps: {
     const cfg = getConfig();
     const resolved = resolveVerifyBudget(cfg);
     // 2.4.5 (section 1.5-19): background runs are low priority whatever `lowPriority` says.
-    const budget: VerifyBudget = forceLowPriority ? { ...resolved, lowPriority: true } : resolved;
+    // QA-2.4-5: and they never wait for the slot (waitMs 0): busy means back off and retry later.
+    const budget: VerifyBudget = forceLowPriority ? { ...resolved, lowPriority: true, slotWaitMs: 0 } : resolved;
     // QA-2.1-5: the recheck's git processes (GC, materialize, dispose) run at the configured
     // priority too, like the capture and the start-up GC (QA-1.2-13).
     const referenceArgv: ArgvSeam = (file, args, opts) => argvSeam(file, args, { ...opts, lowPriority: budget.lowPriority });
@@ -1081,6 +1084,21 @@ export function createVerificationWiring(deps: {
         failureRecheck: budget.failureRecheck,
         ...currentTree,
       });
+    }
+    // QA-2.4-5: foreground testsPass (a required gate, router_verify) takes precedence over a
+    // background run: the run in flight is preempted before this request plans or asks for the
+    // slot, and no background run starts while one is active.
+    if (!forceLowPriority) {
+      const inner = testsPass;
+      testsPass = async request => {
+        foreground.tests += 1;
+        try {
+          void background?.preempt();
+          return await inner(request);
+        } finally {
+          foreground.tests -= 1;
+        }
+      };
     }
     return {
       deterministic: {
@@ -1591,6 +1609,13 @@ export function createVerificationWiring(deps: {
       if (callSignal?.aborted === true) owned.abort(ROUTER_VERIFY_CANCELLED_REASON);
       else callSignal?.addEventListener("abort", onCallAbort, { once: true });
 
+      // QA-2.4-5: router_verify is foreground work. A background run in flight is preempted, and
+      // its claims settle (retryable) before this call claims, so no handle joins a run that is
+      // being aborted. The wait is bounded by this call's deadline.
+      if (options.background !== true && background !== undefined && targets.length > 0 && sessionID !== "") {
+        await untilAborted(background.preempt(), owned.signal, () => undefined);
+      }
+
       // 3. Claims (R8: synchronous, so two calls for one handle make one "claimed").
       type Claimed = Extract<ReturnType<PendingRegistry["markVerifying"]>, { kind: "claimed" }>;
       const claims: Claimed[] = [];
@@ -1710,6 +1735,8 @@ export function createVerificationWiring(deps: {
       verify: async (sessionID, handles, signal) =>
         backgroundOutcomes((await verifyHandles(sessionID, { kind: "handles", handles }, { signal, background: true })).items),
       onError: error => logger.warn("[verify] background verification run failed", { error: errorText(error) }),
+      // QA-2.4-5: no background run starts while foreground testsPass verification is active.
+      busy: () => foreground.tests > 0,
     });
   }
 

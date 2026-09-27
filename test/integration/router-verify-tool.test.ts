@@ -48,6 +48,8 @@ import {
 import type { RouterConfig } from "../../src/router/config";
 import type { DoD } from "../../src/verify/dod";
 import { createChangedFileStore, type TreeSnapshot } from "../../src/verify/dispatch";
+import { createDeadline } from "../../src/verify/deterministic";
+import { accept } from "../../src/verify/gate";
 import { REFERENCE_NONE } from "../../src/verify/baseline";
 import type { DispatchReference } from "../../src/verify/reference";
 import type { ReferenceState, Verdict } from "../../src/verify/types";
@@ -82,6 +84,12 @@ const state = vi.hoisted(() => ({
   deadlines: 0,
   /** acquireSlot answers busy while set. */
   slotBusy: false,
+  /** When > 0: at most this many holds; a caller waits up to its waitMs for a release, then busy. */
+  slotMax: 0,
+  /** The waitMs of every acquireSlot call, in call order. */
+  slotWaits: [] as number[],
+  /** While set, only low-priority (background) scoped runs hang until killed. */
+  hangLow: false,
   /** When set, materialize returns an exact reference over this copy of the project. */
   refRoot: "",
   /** Further exact references, by DispatchReference.commit: their copy and what fails there. */
@@ -149,10 +157,25 @@ vi.mock("../../src/verify/runner", async importOriginal => {
   };
 });
 
+/** Callers waiting for a slot release (state.slotMax). */
+const slotWaiters: Array<() => void> = [];
+
 vi.mock("../../src/verify/slot", async importOriginal => ({
   ...(await importOriginal<typeof import("../../src/verify/slot")>()),
-  acquireSlot: async (opts: { signal?: AbortSignal }) => {
+  acquireSlot: async (opts: { signal?: AbortSignal; waitMs?: number }) => {
+    state.slotWaits.push(opts.waitMs ?? -1);
     if (opts.signal?.aborted === true || state.slotBusy) return { busy: true as const };
+    if (state.slotMax > 0 && state.holds >= state.slotMax) {
+      // Like the real slot: wait up to waitMs for a release, else busy.
+      const freed = await new Promise<boolean>(resolveWait => {
+        const timer = setTimeout(() => resolveWait(false), Math.max(0, opts.waitMs ?? 0));
+        slotWaiters.push(() => {
+          clearTimeout(timer);
+          resolveWait(true);
+        });
+      });
+      if (!freed || state.holds >= state.slotMax) return { busy: true as const };
+    }
     state.acquires++;
     state.holds++;
     state.maxHolds = Math.max(state.maxHolds, state.holds);
@@ -164,6 +187,7 @@ vi.mock("../../src/verify/slot", async importOriginal => ({
         released = true;
         state.releases++;
         state.holds--;
+        slotWaiters.shift()?.();
       },
     };
   },
@@ -223,7 +247,7 @@ async function fakeVitest(args: readonly string[], opts?: { signal?: AbortSignal
   const inputs = args.filter(a => isAbsolute(a) && a.startsWith(root) && !a.includes("node_modules"));
   state.runs.push({ inputs: [...inputs].sort(), holds: state.holds, lowPriority: opts?.lowPriority });
   if (atRef && state.refDelayMs > 0) await new Promise(resolve => setTimeout(resolve, state.refDelayMs));
-  if (state.hang) {
+  if (state.hang || (state.hangLow && opts?.lowPriority === true)) {
     // Like a real tree: it runs until the run's signal kills it, and writes no report.
     await new Promise<void>(resolve => {
       const signal = opts?.signal;
@@ -379,6 +403,10 @@ beforeEach(() => {
   state.failing = {};
   state.failingAtRef = {};
   state.slotBusy = false;
+  state.slotMax = 0;
+  state.slotWaits = [];
+  state.hangLow = false;
+  slotWaiters.length = 0;
   state.refRoot = "";
   state.otherRefs = {};
   state.refDelayMs = 0;
@@ -974,7 +1002,7 @@ describe("background mode (2.4.5)", () => {
     expect(client.session.create).not.toHaveBeenCalled();
   });
 
-  it("a router_verify call that joined the background run received the verdict: no late notice repeats it", async () => {
+  it("QA-2.4-5: a router_verify call during a background run preempts it and judges the handle itself; no late notice repeats the verdict", async () => {
     exactReference();
     state.failing = { a: ["t2"] };
     const { wiring } = makeWiring({ background: true }, undefined, FAST);
@@ -982,13 +1010,56 @@ describe("background mode (2.4.5)", () => {
     const release = holdPlanning("a");
     enqueue(wiring, h, "a");
     await vi.waitFor(() => expect(wiring.pending.get("orch", h)).toMatchObject({ entry: { state: "verifying" } }));
-    const joined = wiring.verifyHandles("orch", { kind: "handles", handles: [h] });
+    const call = wiring.verifyHandles("orch", { kind: "handles", handles: [h] });
     release();
-    const report = await joined;
-    expect(verdictOf(report.items[0]).via).toBe("joined");
+    const report = await call;
+    const item = verdictOf(report.items[0]);
+    // Foreground precedence: not a join of the aborted background run, a run of its own.
+    expect(item.via).toBe("run");
+    expect(item.result.verdict.outcome).toBe("fail");
     await queueOf(wiring).whenIdle();
     expect(queueOf(wiring).takeNotices("orch")).toEqual([]);
-    expect(inputsOf("a")).toBe(1);
+    expect(wiring.pending.get("orch", h)).toMatchObject({ entry: { state: "verified" } });
+  });
+
+  it("QA-2.4-5: a required gate arriving during a background run is judged, not 'slot busy'; the background entry is retried later, uncounted", async () => {
+    state.slotMax = 1;
+    state.hangLow = true;
+    // maxAttempts 1: a preemption counted as an attempt would end the background request.
+    const { wiring } = makeWiring(
+      { background: true, lowPriority: false, slotWaitMs: 2_000, gateBudgetMs: 20_000 },
+      undefined,
+      { settleMs: 5, retryBaseMs: 50, maxAttempts: 1 },
+    );
+    const queue = queueOf(wiring);
+    const ha = await register(wiring.pending, "a");
+    enqueue(wiring, ha, "a");
+    // The background run holds the only slot, and its test run hangs.
+    await vi.waitFor(() => expect(state.runs.some(r => r.lowPriority === true)).toBe(true));
+    expect(state.holds).toBe(1);
+    // The background asked for the slot without waiting for it.
+    expect(state.slotWaits[0]).toBe(0);
+
+    // index.ts's required gate on another delegation: buildGateDeps + accept under one deadline.
+    const deadline = createDeadline(20_000);
+    const changedFiles = [{ path: src("b"), status: " M" }];
+    const deps = wiring.buildGateDeps("orch", new Set(), { changedFiles, changeBaseline: "available", reference: captured(), snapshot: undefined }, deadline);
+    const res = await accept(
+      { dod: DOD, trivial: false, mode: "modeA", cwd: state.root },
+      { changedFiles, changeBaseline: "available", finalReturnText: "", declaredOutputs: [], producerSessionID: "child-b", producerTier: "fast" },
+      deps,
+    );
+    deadline.dispose();
+    expect(res.verdict.outcome).toBe("pass");
+    expect(res.verdict.reasons.join(" ")).not.toContain("slot busy");
+    expect(state.killed).toBeGreaterThanOrEqual(1);
+    expect(inputsOf("b")).toBe(1);
+
+    // Preempted, back to unverified, then retried after its backoff (not counted: it runs again).
+    state.hangLow = false;
+    await vi.waitFor(() => expect(wiring.pending.get("orch", ha)).toMatchObject({ entry: { state: "verified", result: { verdict: { outcome: "pass" } } } }), { timeout: 5_000 });
+    await queue.whenIdle();
+    expect(queue.takeNotices("orch")).toEqual([]);
   });
 
   it("coalescing: a newer overlapping request supersedes a queued older one, which stays unverified and listed", async () => {
