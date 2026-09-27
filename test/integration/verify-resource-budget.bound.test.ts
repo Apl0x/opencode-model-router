@@ -24,7 +24,19 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { e2eEnabled, prepareFixtureRepo, type FixtureRepo } from "./e2e/fixture-repo";
 import { acceptance, createE2EPlugin, type E2EPlugin, type E2ETaskResult } from "./e2e/harness";
-import { ancestorsOf, descendantsOf, peak, priorityViolations, seen, startSampler, type ProcSample, type Snapshot } from "./e2e/sampler";
+import {
+  ancestorsOf,
+  descendantsOf,
+  peak,
+  peakRunning,
+  priorityViolations,
+  seen,
+  startSampler,
+  workerCensus,
+  workerKey,
+  type ProcSample,
+  type Snapshot,
+} from "./e2e/sampler";
 import type { ChildConfig, ChildSummary } from "./e2e/child-instance";
 
 const suite = e2eEnabled() ? describe.sequential : describe.skip;
@@ -131,6 +143,39 @@ function isWorkerArgs(args: string): boolean {
 function isMainArgs(args: string): boolean {
   const a = norm(args);
   return !isWorkerArgs(args) && /vitest\/vitest\.mjs\b|node_modules\/\.bin\/vitest\b|vitest\/dist\/cli/.test(a);
+}
+
+/**
+ * Every snapshot where more than `bound` matching workers are alive under rootPid, with each
+ * worker's parent, creation time and first/last sighting, and the parent's args. It tells two
+ * runs at once (the slot) from one run's finished forks still exiting: vitest 4 starts a runner's
+ * termination and schedules the next file's fork without awaiting it ("Runner terminations are
+ * started but not awaited until the end of full run", vitest/dist/chunks/cli-api.*.js).
+ */
+function overBound(
+  snapshots: Snapshot[],
+  rootPid: number,
+  exclude: number[],
+  isWorker: (p: ProcSample) => boolean,
+  bound: number,
+): string[] {
+  const census = workerCensus(snapshots, rootPid, exclude, isWorker, MAX_WORKERS);
+  const out: string[] = [];
+  for (const c of census) {
+    if (c.workers.length <= bound) continue;
+    const byPid = new Map(c.snapshot.procs.map(p => [p.pid, p] as const));
+    out.push(`  snapshot t=${c.snapshot.t}: ${c.workers.length} workers alive, ${c.running} running`);
+    for (const w of c.workers) {
+      const x = c.sightings.get(workerKey(w));
+      const parent = byPid.get(w.ppid);
+      out.push(
+        `    worker ${w.pid}${c.retiring.has(w.pid) ? " (retiring)" : ""} ppid=${w.ppid} created=${w.createdMs ?? "?"}` +
+          ` seen ${x === undefined ? "?" : `${x.first - c.snapshot.t}..+${x.last - c.snapshot.t}ms`}` +
+          ` parent: ${parent === undefined ? "(not in snapshot)" : `${isMainArgs(parent.args) ? "runner main" : "other"} ${parent.args.slice(0, 160)}`}`,
+      );
+    }
+  }
+  return out;
 }
 
 /** Test-file tokens in a runner command line. */
@@ -289,7 +334,9 @@ suite("verify resource budget: machine-wide bound (3.1.2.b-e)", () => {
     const workers = seen(snapshots, process.pid, excl, isWorker);
     const mains = seen(snapshots, process.pid, excl, isMain);
     const peakWorkers = peak(snapshots, process.pid, excl, isWorker);
+    const runningPeak = peakRunning(snapshots, process.pid, excl, isWorker, MAX_WORKERS);
     const peakMains = peak(snapshots, process.pid, excl, isMain);
+    const over = overBound(snapshots, process.pid, excl, isWorker, WORKER_BOUND);
     const violations = priorityViolations(snapshots, process.pid, excl, isRunnerTree, 250);
     const gitCmdNormal = all.filter(p => /\b(git|cmd)(\.exe)?\b/i.test(p.args) && p.lowPriority === false);
     const beforeWindows = [...required, ...deferred].map(r => [r.produceStartedAt - r.beforeMs, r.produceStartedAt] as const);
@@ -308,7 +355,9 @@ suite("verify resource budget: machine-wide bound (3.1.2.b-e)", () => {
       [
         `[3.1.2.b] cores=${CORES} maxWorkers=${MAX_WORKERS} x maxConcurrentVerifications=${MAX_CONCURRENT} -> bound ${WORKER_BOUND}`,
         `[3.1.2.b] sampler snapshots=${snapshots.length} interval ${intervalStats(snapshots)}`,
-        `[3.1.2.b] peak workers=${peakWorkers} distinct workers=${workers.length} peak mains=${peakMains} distinct runner-main invocations=${mains.length}`,
+        `[3.1.2.b] peak workers=${peakWorkers} (running ${runningPeak}) distinct workers=${workers.length} peak mains=${peakMains} distinct runner-main invocations=${mains.length}`,
+        `[3.1.2.b] snapshots over the worker bound=${over.filter(l => l.startsWith("  snapshot")).length}`,
+        ...over,
         `[3.1.2.b] priority violations=${violations.length} ${violations.map(p => `${p.pid}:${String(p.priority)}:${p.args}`).join(" | ")}`,
         `[3.1.2.b] git/cmd descendants seen at normal priority=${gitCmdNormal.length} ${gitCmdNormal.map(p => `${p.pid}:${p.args.slice(0, 120)}`).join(" | ")}`,
         `[3.1.2.b] snapshots inside before-hook windows=${inBefore.length} runners in them=${runnersInBefore.length}`,
@@ -328,8 +377,8 @@ suite("verify resource budget: machine-wide bound (3.1.2.b-e)", () => {
     expect(peakWorkers).toBeGreaterThanOrEqual(1);
     expect(workers.length).toBeGreaterThanOrEqual(1);
     expect(mains.length).toBeGreaterThanOrEqual(1);
-    // The bound.
-    expect(peakWorkers).toBeLessThanOrEqual(WORKER_BOUND);
+    // The bound, on workers running a test file (finished forks vitest is still reaping are not; see workerCensus).
+    expect(runningPeak, over.join("\n")).toBeLessThanOrEqual(WORKER_BOUND);
     // Below normal priority for the whole runner tree (after the documented spawn race).
     expect(violations.map(p => `${p.pid} prio=${String(p.priority)} ${p.args}`)).toEqual([]);
     // Nothing runs inside a before hook.
@@ -410,15 +459,19 @@ suite("verify resource budget: machine-wide bound (3.1.2.b-e)", () => {
     });
     const excl = [sampler.pid];
     const peakWorkers = peak(snapshots, process.pid, excl, isWorker);
+    const runningPeak = peakRunning(snapshots, process.pid, excl, isWorker, MAX_WORKERS);
     const workers = seen(snapshots, process.pid, excl, isWorker);
     const mains = seen(snapshots, process.pid, excl, isMain);
     const perChildPeak = summaries.map(s =>
       s === undefined ? -1 : peak(snapshots, s.pid, excl, isWorker),
     );
+    const over = overBound(snapshots, process.pid, excl, isWorker, WORKER_BOUND);
     emit(
       [
         `[3.1.2.c] bound ${WORKER_BOUND}; sampler snapshots=${snapshots.length} interval ${intervalStats(snapshots)}`,
-        `[3.1.2.c] peak workers (both children)=${peakWorkers} per child=${perChildPeak.join(",")} distinct workers=${workers.length} runner-main invocations=${mains.length}`,
+        `[3.1.2.c] peak workers (both children)=${peakWorkers} (running ${runningPeak}) per child=${perChildPeak.join(",")} distinct workers=${workers.length} runner-main invocations=${mains.length}`,
+        `[3.1.2.c] snapshots over the worker bound=${over.filter(l => l.startsWith("  snapshot")).length}`,
+        ...over,
         ...runs.map((r, i) => `[3.1.2.c] child ${i + 1} exit=${String(r.code)} stderr:\n${r.stderr.slice(-2000)}`),
         ...summaries.flatMap(s => (s === undefined ? [] : s.dispatches.map(d => `  --- ${d.callID} after=${d.afterMs.toFixed(0)}ms\n${d.output}`))),
       ].join("\n"),
@@ -478,7 +531,8 @@ suite("verify resource budget: machine-wide bound (3.1.2.b-e)", () => {
     }
     expect(peakWorkers).toBeGreaterThanOrEqual(1);
     expect(workers.length).toBeGreaterThanOrEqual(1);
-    expect(peakWorkers).toBeLessThanOrEqual(WORKER_BOUND);
+    // The bound, on workers running a test file (see workerCensus).
+    expect(runningPeak, over.join("\n")).toBeLessThanOrEqual(WORKER_BOUND);
   }, TEST_TIMEOUT_MS);
 
   it("3.1.2.d: a gate that hits its budget returns on time and leaves no orphan", async () => {

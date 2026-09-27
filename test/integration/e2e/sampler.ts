@@ -355,3 +355,83 @@ export function priorityViolations(
   }
   return [...violations.values()];
 }
+
+export interface WorkerCensus {
+  snapshot: Snapshot;
+  workers: ProcSample[];
+  /** Finished forks still exiting, excused from `running` (see workerCensus). */
+  retiring: Set<number>;
+  running: number;
+  /** First and last sighting per process, keyed by workerKey (pid reuse on Windows keeps two lives apart). */
+  sightings: Map<string, { first: number; last: number }>;
+}
+
+/** A process identity across snapshots: the pid, plus the creation time where it is known. */
+export function workerKey(p: ProcSample): string {
+  return `${p.pid}@${p.createdMs ?? "?"}`;
+}
+
+/**
+ * Per snapshot: the matching workers alive under rootPid, and how many of them are running a test
+ * file. vitest 4 starts a finished fork's termination and forks the next file's worker without
+ * awaiting it ("Runner terminations are started but not awaited until the end of full run",
+ * vitest/dist/chunks/cli-api.*.js), so a sampler can see a run's `perRunCap` running forks plus
+ * finished ones still exiting (CI round 1: 3 workers against a bound of 2).
+ *
+ * Only that excess is excused. Under one parent main with more than `perRunCap` workers alive,
+ * up to (alive - perRunCap) of them retire, oldest first, and only workers that are (a) in their
+ * last sighting, never the final snapshot's, since a worker seen again later was not exiting, and
+ * (b) older than a sibling under the same main (created later, or first seen later where creation
+ * times are unknown), since a fork with no successor was not replaced. A main never counts fewer
+ * than min(alive, perRunCap) running workers, so two runs at once still add up.
+ */
+export function workerCensus(
+  snapshots: Snapshot[],
+  rootPid: number,
+  exclude: number[],
+  isWorker: (p: ProcSample) => boolean,
+  perRunCap: number,
+): WorkerCensus[] {
+  const sightings = new Map<string, { first: number; last: number }>();
+  const perSnapshot = snapshots.map(s => ({ snapshot: s, workers: descendantsOf(s, rootPid, exclude).filter(isWorker) }));
+  for (const { snapshot, workers } of perSnapshot) {
+    for (const w of workers) {
+      const x = sightings.get(workerKey(w));
+      if (x === undefined) sightings.set(workerKey(w), { first: snapshot.t, last: snapshot.t });
+      else x.last = snapshot.t;
+    }
+  }
+  const age = (p: ProcSample): number => p.createdMs ?? sightings.get(workerKey(p))?.first ?? 0;
+  const newer = (a: ProcSample, b: ProcSample): boolean =>
+    a.createdMs !== undefined && b.createdMs !== undefined
+      ? a.createdMs > b.createdMs
+      : (sightings.get(workerKey(a))?.first ?? 0) > (sightings.get(workerKey(b))?.first ?? 0);
+  const final = snapshots[snapshots.length - 1];
+  return perSnapshot.map(({ snapshot, workers }) => {
+    const retiring = new Set<number>();
+    const byMain = new Map<number, ProcSample[]>();
+    for (const w of workers) byMain.set(w.ppid, [...(byMain.get(w.ppid) ?? []), w]);
+    for (const siblings of byMain.values()) {
+      const excess = siblings.length - perRunCap;
+      if (excess <= 0 || snapshot === final) continue;
+      siblings
+        .filter(w => sightings.get(workerKey(w))?.last === snapshot.t)
+        .filter(w => siblings.some(o => o.pid !== w.pid && newer(o, w)))
+        .sort((a, b) => age(a) - age(b))
+        .slice(0, excess)
+        .forEach(w => retiring.add(w.pid));
+    }
+    return { snapshot, workers, retiring, running: workers.length - retiring.size, sightings };
+  });
+}
+
+/** The largest number of running workers (workerCensus) in any snapshot. */
+export function peakRunning(
+  snapshots: Snapshot[],
+  rootPid: number,
+  exclude: number[],
+  isWorker: (p: ProcSample) => boolean,
+  perRunCap: number,
+): number {
+  return Math.max(0, ...workerCensus(snapshots, rootPid, exclude, isWorker, perRunCap).map(c => c.running));
+}

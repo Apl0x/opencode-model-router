@@ -8,7 +8,7 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { acceptance, createE2EPlugin } from "./harness";
-import { ancestorsOf, descendantsOf, startSampler, type ProcSample, type Snapshot } from "./sampler";
+import { ancestorsOf, descendantsOf, startSampler, workerCensus, type ProcSample, type Snapshot } from "./sampler";
 
 const enabled = process.env.RUN_VERIFY_E2E === "1";
 const suite = enabled ? describe : describe.skip;
@@ -63,6 +63,92 @@ describe("e2e sampler helpers: process tree under Windows pid reuse", () => {
     };
     expect(ancestorsOf(posix, 1000).map(p => p.pid)).toEqual([5336, 5448, 1]);
     expect(descendantsOf(posix, 1000, []).map(p => p.pid)).toEqual([3000, 3001]);
+  });
+});
+
+// Always runs (pure): running vs retiring vitest forks (CI round 1, 3.1.2.c: 3 workers, bound 2).
+describe("e2e sampler helpers: workerCensus", () => {
+  const W = "node C:/r/node_modules/vitest/dist/workers/forks.js";
+  const isWorker = (p: ProcSample): boolean => p.args === W;
+  const proc = (pid: number, ppid: number, createdMs: number | undefined, args = W): ProcSample => ({
+    pid,
+    ppid,
+    priority: 6,
+    lowPriority: true,
+    args,
+    ...(createdMs === undefined ? {} : { createdMs }),
+  });
+  const main = (pid: number): ProcSample => proc(pid, 1, 0, "node C:/r/node_modules/vitest/vitest.mjs run");
+  const snap = (t: number, procs: ProcSample[]): Snapshot => ({ t, procs: [proc(1, 0, 0, "test"), ...procs] });
+
+  it("does not count a finished fork in its last sighting once the same main forked its successor", () => {
+    // Measured shape (16 cores, CPU-loaded, 2 mains): main 6952 had 55044 (last seen here) and two
+    // newer forks; main 47168 two running forks. 5 alive, 4 running.
+    const snaps = [
+      snap(100, [main(10), main(20), proc(55044, 10, 50), proc(57316, 20, 60), proc(7440, 20, 70)]),
+      snap(200, [main(10), main(20), proc(55044, 10, 50), proc(52960, 10, 150), proc(59456, 10, 190), proc(57316, 20, 60), proc(7440, 20, 70)]),
+      snap(300, [main(10), main(20), proc(52960, 10, 150), proc(59456, 10, 190), proc(57316, 20, 60), proc(7440, 20, 70)]),
+    ];
+    const census = workerCensus(snaps, 1, [], isWorker, 2);
+    expect(census.map(c => [c.workers.length, c.running])).toEqual([[3, 3], [5, 4], [4, 4]]);
+    expect([...census[1].retiring]).toEqual([55044]);
+  });
+
+  it("counts a fork seen again later, and a fork with no newer sibling, as running", () => {
+    const snaps = [
+      // 3 forks under one main, all seen again: 3 running (a real excess stays visible).
+      snap(100, [main(10), proc(501, 10, 10), proc(502, 10, 20), proc(503, 10, 30)]),
+      snap(200, [main(10), proc(501, 10, 10), proc(502, 10, 20), proc(503, 10, 30)]),
+      // Last sighting of all three: one over the cap of 2, so only the oldest (501) retires.
+      snap(300, [main(10), main(20), proc(501, 10, 10), proc(502, 10, 20), proc(503, 10, 30), proc(601, 20, 5)]),
+      snap(400, [main(10), main(20)]),
+    ];
+    const census = workerCensus(snaps, 1, [], isWorker, 2);
+    expect(census.map(c => c.running)).toEqual([3, 3, 3, 0]);
+    // A newer fork under another main is no successor: 601 (main 20) is alone, so it runs.
+    expect([...census[2].retiring]).toEqual([501]);
+  });
+
+  it("keeps two lives of a reused pid apart (Windows)", () => {
+    const snaps = [
+      snap(100, [main(10), proc(901, 10, 10), proc(902, 10, 20)]),
+      snap(200, [main(10), proc(901, 10, 10), proc(902, 10, 20), proc(903, 10, 150)]),
+      // pid 901 again, a new fork created at 250: the first 901 was last seen at 200.
+      snap(300, [main(10), proc(902, 10, 20), proc(901, 10, 250)]),
+      snap(400, [main(10)]),
+    ];
+    const census = workerCensus(snaps, 1, [], isWorker, 2);
+    expect([...census[1].retiring]).toEqual([901]);
+    expect(census.map(c => c.running)).toEqual([2, 2, 2, 0]);
+  });
+
+  it("never excuses a main's forks below the per-run cap: two runs at once still add up", () => {
+    // Each main has 2 forks, the older in its last sighting with a newer sibling: no excess, so
+    // all 4 run (against a machine-wide bound of 2 with one slot, a violation stays visible).
+    const snaps = [
+      snap(100, [main(10), main(20), proc(1001, 10, 10), proc(1002, 10, 20), proc(2001, 20, 10), proc(2002, 20, 20)]),
+      snap(200, [main(10), main(20), proc(1002, 10, 20), proc(2002, 20, 20)]),
+    ];
+    expect(workerCensus(snaps, 1, [], isWorker, 2).map(c => c.running)).toEqual([4, 2]);
+  });
+
+  it("retires nothing in the final snapshot, where no last sighting is known", () => {
+    const snaps = [
+      snap(100, [main(10), proc(801, 10, 10), proc(802, 10, 20)]),
+      snap(200, [main(10), proc(801, 10, 10), proc(802, 10, 20), proc(803, 10, 30)]),
+    ];
+    expect(workerCensus(snaps, 1, [], isWorker, 2).map(c => c.running)).toEqual([2, 3]);
+  });
+
+  it("orders forks by first sighting when creation times are unknown (POSIX)", () => {
+    const snaps = [
+      snap(100, [main(10), proc(701, 10, undefined), proc(702, 10, undefined)]),
+      snap(200, [main(10), proc(701, 10, undefined), proc(702, 10, undefined), proc(703, 10, undefined)]),
+      snap(300, [main(10), proc(702, 10, undefined), proc(703, 10, undefined)]),
+    ];
+    const census = workerCensus(snaps, 1, [], isWorker, 2);
+    expect(census.map(c => c.running)).toEqual([2, 2, 2]);
+    expect([...census[1].retiring]).toEqual([701]);
   });
 });
 
