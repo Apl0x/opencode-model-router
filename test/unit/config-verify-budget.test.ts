@@ -236,6 +236,26 @@ describe("validateConfig — enforcement.verify budget keys", () => {
   });
 });
 
+describe("resolveVerifyBudget — captureWaitMs clamp (QA-1.6-8)", () => {
+  it("clamps captureWaitMs to baselineTimeoutMs", () => {
+    const b = resolveVerifyBudget(cfgWith({ captureWaitMs: 20_000, baselineTimeoutMs: 3000 }), { cores: 1 });
+    expect(b.captureWaitMs).toBe(3000);
+    expect(b.baselineTimeoutMs).toBe(3000);
+  });
+  it("clamps an explicit captureWaitMs to the default baselineTimeoutMs", () => {
+    expect(resolveVerifyBudget(cfgWith({ captureWaitMs: 60_000 }), { cores: 1 }).captureWaitMs).toBe(15_000);
+  });
+  it("clamps the default captureWaitMs to a smaller baselineTimeoutMs", () => {
+    expect(resolveVerifyBudget(cfgWith({ baselineTimeoutMs: 2000 }), { cores: 1 }).captureWaitMs).toBe(2000);
+  });
+  it("leaves a captureWaitMs at or below baselineTimeoutMs unchanged", () => {
+    expect(
+      resolveVerifyBudget(cfgWith({ captureWaitMs: 4000, baselineTimeoutMs: 4000 }), { cores: 1 }).captureWaitMs,
+    ).toBe(4000);
+    expect(resolveVerifyBudget(cfgWith({ captureWaitMs: 0 }), { cores: 1 }).captureWaitMs).toBe(0);
+  });
+});
+
 describe("resolveVerifyBudget — testBaseline deprecation", () => {
   it("testBaseline:false maps to failureRecheck:false", () => {
     expect(resolveVerifyBudget(cfgWith({ testBaseline: false })).failureRecheck).toBe(false);

@@ -9,6 +9,8 @@ import {
   overridePath,
   localOverridePath,
   findProjectOverride,
+  resolveVerifyBudget,
+  warnDeprecatedVerifyKeys,
 } from "./router/config";
 import type { RouterConfig, TierConfig, Preset, ModeConfig } from "./router/config";
 import { buildAgentOptions, warnAgentOptionsEffortOnce } from "./router/agent-options";
@@ -77,9 +79,9 @@ import { tool } from "@opencode-ai/plugin";
 import { scrubText } from "./guard/scrub";
 import { accept, unverifiableGateResult } from "./verify/gate";
 import { createVerificationWiring, extractAssistantText } from "./verify/wiring";
+import { createDeadline } from "./verify/deterministic";
 import {
   DEFAULT_DELEGATE_PROMPT_TIMEOUT_MS,
-  DEFAULT_GATE_BUDGET_MS,
   RouterTimeoutError,
   timeoutMs,
   withTimeout,
@@ -338,12 +340,24 @@ const ModelRouterPlugin: Plugin = async (ctx: PluginInput) => {
   // Layer-2's impure corner: exec, fs, and the opencode client, built once and
   // read back through getConfig so a reloaded cfg (from /preset, /budget or
   // /router enforce) applies to graded work too.
-  const { graderSessions, dispatchGrader, buildGateDeps, disposeChildSession, beginVerification, prepareVerification } =
-    createVerificationWiring({
-      client: ctx.client,
-      directory: ctx.directory,
-      getConfig: () => cfg,
-    });
+  // Passive warnings go to opencode's log rather than stderr: console output
+  // from a plugin paints over the TUI. Falls back to console when the server
+  // has no /log endpoint. See src/router/logger.ts.
+  const logger = createPluginLogger(ctx.client);
+
+  const {
+    graderSessions, dispatchGrader, buildGateDeps, disposeChildSession,
+    beginVerificationBounded, prepareVerification, startReferenceGc,
+  } = createVerificationWiring({
+    client: ctx.client,
+    directory: ctx.directory,
+    getConfig: () => cfg,
+    logger,
+  });
+  // 2.1.5b: sweep reference dirs a crashed instance left behind. Fire-and-forget; never throws.
+  // QA-2.1-11: deferred (unref'd timer), so plugin start never holds the project directory with a
+  // git child; dispose cancels it.
+  const stopReferenceGc = startReferenceGc();
 
   // Best-effort, secret-free delegate scorecard dump (counts only).
   const dumpDelegateScorecard = (
@@ -367,10 +381,7 @@ const ModelRouterPlugin: Plugin = async (ctx: PluginInput) => {
   // current plugin lifetime (i.e., until OpenCode is restarted).
   let bypassed = false;
 
-  // Passive warnings go to opencode's log rather than stderr: console output
-  // from a plugin paints over the TUI. Falls back to console when the server
-  // has no /log endpoint. See src/router/logger.ts.
-  const logger = createPluginLogger(ctx.client);
+  warnDeprecatedVerifyKeys(cfg, logger);
 
   // Fetch and normalize opencode's live provider/model catalog. Best-effort:
   // returns null when the client call fails, e.g. the server is not ready yet.
@@ -427,6 +438,7 @@ const ModelRouterPlugin: Plugin = async (ctx: PluginInput) => {
     // enough for that to be the normal case. Verified against opencode 1.18.16
     // that dispose is both called and awaited, so flushing here is enough.
     dispose: async () => {
+      stopReferenceGc();
       await logger.flush();
     },
     tool: {
@@ -472,6 +484,7 @@ const ModelRouterPlugin: Plugin = async (ctx: PluginInput) => {
             let activeCfg = cfg;
             try {
               activeCfg = loadConfig();
+              warnDeprecatedVerifyKeys(activeCfg, logger);
             } catch {
               activeCfg = cfg;
             }
@@ -533,7 +546,8 @@ const ModelRouterPlugin: Plugin = async (ctx: PluginInput) => {
               // recapturing after a failed attempt would excuse its regression.
               if (!baselineID) {
                 baselineID = producerSid;
-                beginVerification(changedFileStore, baselineID, args.cwd, dod);
+                // 2.1.5b: wait at most captureWaitMs; the capture continues in the background.
+                await beginVerificationBounded(changedFileStore, baselineID, args.cwd, dod);
               }
               // Compose with Layer 1: guard the plugin-created producer session.
               try {
@@ -580,7 +594,21 @@ const ModelRouterPlugin: Plugin = async (ctx: PluginInput) => {
                 producerText = "";
               }
 
-              const verification = await prepareVerification(changedFileStore, baselineID, producerSid, args.cwd);
+              const { gateBudgetMs } = resolveVerifyBudget(activeCfg);
+              // One deadline per gate invocation: every step inside the gate
+              // is bounded by it, and it is aborted (killing any spawned
+              // tree) when the gate's own withTimeout rejects. It exists
+              // before prepareVerification (T2 P0, QA-2.1-4), so the grade
+              // snapshot and the wait for a pending reference count against
+              // gateBudgetMs too.
+              const gateDeadline = createDeadline(gateBudgetMs);
+              let verification;
+              try {
+                verification = await prepareVerification(changedFileStore, baselineID, producerSid, args.cwd, gateDeadline);
+              } catch (error) {
+                gateDeadline.dispose();
+                throw error;
+              }
               const artefact = {
                 changedFiles: verification.changedFiles,
                 changeBaseline: verification.changeBaseline,
@@ -590,15 +618,10 @@ const ModelRouterPlugin: Plugin = async (ctx: PluginInput) => {
                 producerTier: tier,
               };
 
-              const gateBudgetMs = timeoutMs(
-                activeCfg.enforcement?.verify?.gateBudgetMs,
-                DEFAULT_GATE_BUDGET_MS,
-              );
               // Grader sessions opened by THIS accept() call, and only those.
               const gateGraderSessions = new Set<string>();
               const completedFailures: string[] = [];
-              const gateDeps = buildGateDeps(toolCtx?.sessionID, gateGraderSessions);
-              gateDeps.deterministic.testBaseline = verification.testBaseline;
+              const gateDeps = buildGateDeps(toolCtx?.sessionID, gateGraderSessions, verification, gateDeadline);
               gateDeps.deterministic.onFailure = reason => completedFailures.push(reason);
               let gateRes;
               try {
@@ -623,7 +646,8 @@ const ModelRouterPlugin: Plugin = async (ctx: PluginInput) => {
                         artefact,
                         gateDeps,
                       ),
-                      gateBudgetMs,
+                      // What preparation left of the gate budget (QA-2.1-4).
+                      gateDeadline.remaining(),
                       "verification gate",
                     );
               } catch (error) {
@@ -637,6 +661,9 @@ const ModelRouterPlugin: Plugin = async (ctx: PluginInput) => {
                 // someone else's delegation — reachable with the shipped
                 // config, where a deterministic check may run a command for up
                 // to 120s against a 90s gate budget.
+                gateDeadline.abort(
+                  error instanceof RouterTimeoutError ? "verification gate timed out" : "verification gate failed",
+                );
                 if (error instanceof RouterTimeoutError) {
                   for (const gsid of gateGraderSessions) {
                     try {
@@ -654,6 +681,8 @@ const ModelRouterPlugin: Plugin = async (ctx: PluginInput) => {
                   activeCfg.enforcement?.verify?.strictUnverifiable,
                   completedFailures,
                 );
+              } finally {
+                gateDeadline.dispose();
               }
 
               // Per-attempt cleanup (drop producer session tracking + state).
@@ -784,6 +813,7 @@ const ModelRouterPlugin: Plugin = async (ctx: PluginInput) => {
       // Re-read cfg so /preset switches take effect without restart
       try {
         cfg = loadConfig();
+        warnDeprecatedVerifyKeys(cfg, logger);
       } catch {}
       try {
         sweepIdleStores();
@@ -891,7 +921,8 @@ const ModelRouterPlugin: Plugin = async (ctx: PluginInput) => {
       if (input?.tool === "task" && typeof input.callID === "string" && typeof input.sessionID === "string") {
         const mode = resolveEnforcementMode({ config: cfg, env: process.env }).mode;
         if (shouldVerifyTask("task", mode, cfg.enforcement?.verify?.require)) {
-          beginVerification(changedFileStore, `task:${input.sessionID}:${input.callID}`,
+          // 2.1.5b: wait at most captureWaitMs; the capture continues in the background.
+          await beginVerificationBounded(changedFileStore, `task:${input.sessionID}:${input.callID}`,
             typeof output?.args?.cwd === "string" ? output.args.cwd : undefined,
             buildDelegationDoD({
               prompt: typeof output?.args?.prompt === "string" ? output.args.prompt : undefined,
@@ -1081,7 +1112,20 @@ const ModelRouterPlugin: Plugin = async (ctx: PluginInput) => {
               description: input?.args?.description,
             });
             const dispatchID = `task:${input.sessionID}:${input.callID}`;
-            const verification = await prepareVerification(changedFileStore, dispatchID, childSessionID ?? "", input?.args?.cwd);
+            // Same bound as the delegate gate: one deadline per invocation,
+            // a withTimeout ceiling, and abort-on-reject so a hung check or
+            // grader cannot hold the after-hook (and its process tree) open.
+            // The deadline exists before prepareVerification (T2 P0,
+            // QA-2.1-4), so preparation counts against gateBudgetMs.
+            const { gateBudgetMs } = resolveVerifyBudget(cfg);
+            const gateDeadline = createDeadline(gateBudgetMs);
+            let verification;
+            try {
+              verification = await prepareVerification(changedFileStore, dispatchID, childSessionID ?? "", input?.args?.cwd, gateDeadline);
+            } catch (error) {
+              gateDeadline.dispose();
+              throw error;
+            }
             const artefact = {
               changedFiles: verification.changedFiles,
               changeBaseline: verification.changeBaseline,
@@ -1106,28 +1150,62 @@ const ModelRouterPlugin: Plugin = async (ctx: PluginInput) => {
               dod.kind === "checker" &&
               artefact.changedFiles.length === 0
             ) {
+              gateDeadline.dispose();
               if (childSessionID) changedFileStore.clear(childSessionID);
               changedFileStore.clear(dispatchID);
               return;
             }
 
-            const gateDeps = buildGateDeps();
-            gateDeps.deterministic.testBaseline = verification.testBaseline;
-            const res = await accept(
-              {
-                dod,
-                trivial,
-                mode: "modeA",
-                // The built-in task tool declares no cwd of its own, but if a
-                // caller supplies one it scopes verification the same way the
-                // delegate tool's does.
-                ...(typeof input?.args?.cwd === "string" && input.args.cwd
-                  ? { cwd: input.args.cwd }
-                  : {}),
-              },
-              artefact,
-              gateDeps,
-            );
+            const gateGraderSessions = new Set<string>();
+            const completedFailures: string[] = [];
+            const gateDeps = buildGateDeps(undefined, gateGraderSessions, verification, gateDeadline);
+            gateDeps.deterministic.onFailure = reason => completedFailures.push(reason);
+            let res;
+            try {
+              res = await withTimeout(
+                accept(
+                  {
+                    dod,
+                    trivial,
+                    mode: "modeA",
+                    // The built-in task tool declares no cwd of its own, but if a
+                    // caller supplies one it scopes verification the same way the
+                    // delegate tool's does.
+                    ...(typeof input?.args?.cwd === "string" && input.args.cwd
+                      ? { cwd: input.args.cwd }
+                      : {}),
+                  },
+                  artefact,
+                  gateDeps,
+                ),
+                // What preparation left of the gate budget (QA-2.1-4).
+                gateDeadline.remaining(),
+                "verification gate",
+              );
+            } catch (error) {
+              gateDeadline.abort(
+                error instanceof RouterTimeoutError ? "verification gate timed out" : "verification gate failed",
+              );
+              if (error instanceof RouterTimeoutError) {
+                for (const gsid of gateGraderSessions) {
+                  try {
+                    await ctx.client.session.abort({ path: { id: gsid } });
+                  } catch {
+                    // best-effort: the gate result stands either way
+                  }
+                }
+              }
+              res = unverifiableGateResult(
+                error instanceof RouterTimeoutError
+                  ? `verification gate timed out after ${gateBudgetMs}ms`
+                  : `verification unavailable: ${scrubText(String(error))}`,
+                dod.source,
+                cfg.enforcement?.verify?.strictUnverifiable,
+                completedFailures,
+              );
+            } finally {
+              gateDeadline.dispose();
+            }
             if (!res.accepted && !res.verdict.skipped) {
               const ladder = cfg.enforcement?.escalate?.ladder ?? ["fast", "medium", "heavy"];
               const li = ladder.indexOf(producerTier);
@@ -1407,6 +1485,7 @@ const ModelRouterPlugin: Plugin = async (ctx: PluginInput) => {
       if (bypassed) return;
       try {
         cfg = loadConfig(); // Returns cache unless invalidated
+        warnDeprecatedVerifyKeys(cfg, logger);
       } catch {
         // Use last known config if file read fails
       }
@@ -1472,6 +1551,7 @@ const ModelRouterPlugin: Plugin = async (ctx: PluginInput) => {
       if (input.command === "tiers") {
         try {
           cfg = loadConfig();
+          warnDeprecatedVerifyKeys(cfg, logger);
         } catch {}
         output.parts.push({
           type: "text" as const,
@@ -1482,6 +1562,7 @@ const ModelRouterPlugin: Plugin = async (ctx: PluginInput) => {
       if (input.command === "preset") {
         try {
           cfg = loadConfig();
+          warnDeprecatedVerifyKeys(cfg, logger);
         } catch {}
         output.parts.push({
           type: "text" as const,
@@ -1507,6 +1588,7 @@ const ModelRouterPlugin: Plugin = async (ctx: PluginInput) => {
       if (input.command === "budget") {
         try {
           cfg = loadConfig();
+          warnDeprecatedVerifyKeys(cfg, logger);
         } catch {}
         output.parts.push({
           type: "text" as const,
@@ -1517,6 +1599,7 @@ const ModelRouterPlugin: Plugin = async (ctx: PluginInput) => {
       if (input.command === "router") {
         try {
           cfg = loadConfig();
+          warnDeprecatedVerifyKeys(cfg, logger);
         } catch {}
         const args = (input.arguments ?? "").trim();
         const parts = args.split(/\s+/).filter(Boolean);

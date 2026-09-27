@@ -1,3 +1,4 @@
+import { resolveVerifyBudget } from "../../src/router/config";
 // ---------------------------------------------------------------------------
 // Phase 3B — the shipped `enforcement` block in tiers.json must be a pure
 // documentation change: every value it pins has to equal the effective default
@@ -337,11 +338,6 @@ describe("tiers.json enforcement block — behaviour invariance", () => {
         absent.enforcement?.verify?.graderTimeoutMs,
         DEFAULT_GRADER_PROMPT_TIMEOUT_MS,
       ],
-      [
-        shipped.enforcement?.verify?.gateBudgetMs,
-        absent.enforcement?.verify?.gateBudgetMs,
-        DEFAULT_GATE_BUDGET_MS,
-      ],
     ];
     for (const [shippedValue, absentValue, fallback] of ceilings) {
       expect(timeoutMs(shippedValue, fallback)).toBe(
@@ -349,6 +345,13 @@ describe("tiers.json enforcement block — behaviour invariance", () => {
       );
       expect(shippedValue).toBe(fallback);
     }
+    // The gate budget resolves through resolveVerifyBudget; tiers.json leaves
+    // it unset so the code default applies.
+    expect(shipped.enforcement?.verify?.gateBudgetMs).toBeUndefined();
+    expect(resolveVerifyBudget(shipped).gateBudgetMs).toBe(
+      resolveVerifyBudget(absent).gateBudgetMs,
+    );
+    expect(resolveVerifyBudget(shipped).gateBudgetMs).toBe(DEFAULT_GATE_BUDGET_MS);
   });
 
   it("resolves the same proportional trivial-bypass gate with and without the block", () => {
