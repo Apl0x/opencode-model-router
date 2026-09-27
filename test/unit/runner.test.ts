@@ -3355,3 +3355,82 @@ describe("QA-1.3-47: the argv length is checked before the pytest config lookup"
     expectS6(await planRerun(det, paths.map((p) => `/r/${p}`), "/r", { maxWorkers: 2 }, { fs, host: { ...POSIX_HOST, pathEnv: "/usr/bin" } }), "argv-too-long", why);
   });
 });
+describe("QA-1.3-44: setup files a project's own config names are triggers", () => {
+  const BOOT = "packages/a/testing/boot.js";
+  const plan = (command: string, extra: Record<string, string>, paths = [BOOT]) =>
+    planScopedRun(input({ command, files: jsRepo({}, { [`/r/${BOOT}`]: "", "/r/src/a.js": "", ...extra }), changedFiles: changed(...paths) }));
+
+  it("jest: packages/a/jest.config.js under the root config's projects", async () => {
+    const extra = {
+      "/r/jest.config.js": "module.exports = { projects: ['<rootDir>/packages/a'] };\n",
+      "/r/packages/a/jest.config.js": "module.exports = { setupFilesAfterEnv: ['<rootDir>/testing/boot.js'] };\n",
+    };
+    expectS6(await plan("jest", extra), "config-changed", `config file changed: ${BOOT}`);
+    expect(spec(await plan("jest", extra, ["src/a.js"])).inputs).toEqual(["/r/src/a.js"]);
+  });
+
+  it("vitest: packages/a/vitest.config.mjs under test.projects, and a deleted setup file", async () => {
+    const extra = {
+      "/r/vitest.config.mjs": "export default { test: { projects: ['packages/a'] } };\n",
+      "/r/packages/a/vitest.config.mjs": "export default { test: { setupFiles: ['./testing/boot.js'] } };\n",
+    };
+    expectS6(await plan("vitest", extra), "config-changed", `config file changed: ${BOOT}`);
+    const { [`/r/${BOOT}`]: _gone, ...rest } = jsRepo({}, { "/r/src/a.js": "", ...extra });
+    expectS6(await planScopedRun(input({ files: rest, changedFiles: changed(BOOT) })), "config-changed", `config file changed: ${BOOT}`);
+  });
+
+  it("vitest: an inline project's literal root is a base", async () => {
+    const extra = { "/r/vitest.config.ts": "export default defineConfig({ test: { projects: [{ test: { root: './packages/b', setupFiles: ['./boot/init.js'] } }] } });\n" };
+    expectS6(await plan("vitest", { ...extra, "/r/packages/b/boot/init.js": "" }, ["packages/b/boot/init.js"]), "config-changed", "config file changed: packages/b/boot/init.js");
+  });
+
+  it("only modules are walked from: test files and non-JS files add no directory", async () => {
+    const files = jsRepo({}, { "/r/a/b/c/x.test.js": "", "/r/a/b/c/notes.json": "", "/r/a/b/c/d.js": "" });
+    const base = memFs(files);
+    const probed: string[] = [];
+    const fs: FsSeam = { fileExists: (p) => (/config/.test(p) && probed.push(p), base.fileExists(p)), readFile: base.readFile };
+    spec(await planScopedRun(input({ fs, changedFiles: changed("a/b/c/x.test.js", "a/b/c/notes.json") })));
+    expect(probed.filter((p) => p.startsWith("/r/a"))).toEqual([]);
+    spec(await planScopedRun(input({ fs, changedFiles: changed("a/b/c/d.js") })));
+    expect(new Set(probed.filter((p) => p.startsWith("/r/a")).map((p) => path.posix.dirname(p)))).toEqual(new Set(["/r/a/b/c", "/r/a/b", "/r/a"]));
+  });
+
+  it("the cheap S6s come first, so a large change reads no project config", async () => {
+    const names = Array.from({ length: 400 }, (_, i) => `d${i}/${"x".repeat(80)}.ts`);
+    const base = memFs(jsRepo({}, Object.fromEntries(names.map((n) => [`/r/${n}`, ""]))));
+    let probes = 0;
+    const fs: FsSeam = { fileExists: (p) => (/config/.test(p) && probes++, base.fileExists(p)), readFile: base.readFile };
+    expectS6(await planScopedRun(input({ fs, changedFiles: changed(...names) })), "argv-too-long", "too many inputs for one command line: 400 files");
+    const gone = Array.from({ length: SEARCH_LIMIT + 1 }, (_, i) => `g${i}/m.ts`);
+    expectS6(await planScopedRun(input({ fs, changedFiles: changed(...gone) })), "too-many-searches");
+    expect(probes).toBe(0);
+  });
+});
+
+describe("QA-1.3-45: the jest --rootDir argument and scalar call values", () => {
+  const BOOT = "src/testing/bootstrap.js";
+  const planJest = (command: string, cfg: string, paths = [BOOT]) =>
+    planScopedRun(input({ command, files: jsRepo({}, { [`/r/${BOOT}`]: "", "/r/src/a.js": "", "/r/jest.config.js": cfg }), changedFiles: changed(...paths) }));
+
+  it.each(["jest --rootDir src", "jest --root-dir=src", "jest --rootDir=/r/src"])("(a) %s is a base and the <rootDir>", async (command) => {
+    expectS6(await planJest(command, "module.exports = { setupFilesAfterEnv: ['<rootDir>/testing/bootstrap.js'] };"), "config-changed", `config file changed: ${BOOT}`);
+    expectS6(await planJest(command, "module.exports = { setupFiles: ['testing/bootstrap'] };"), "config-changed");
+  });
+
+  it.each([
+    "module.exports = { globalSetup: require.resolve('./src/testing/bootstrap.js') };",
+    "module.exports = { globalSetup: path.resolve(__dirname, 'src/testing/bootstrap.js'), other: 1 };",
+    "module.exports = { globalTeardown: process.env.CI ? './src/testing/bootstrap.js' : undefined };",
+    "module.exports = { setupFiles: [['./nested'], /* c */ './src/testing/bootstrap.js'] };",
+    "module.exports = { setupFiles: someList, globalSetup: `./src/testing/bootstrap.js` };",
+  ])("(b) %s names the file", async (cfg) => {
+    expectS6(await planJest("jest", cfg), "config-changed", `config file changed: ${BOOT}`);
+  });
+
+  it("(b) the value ends at the enclosing bracket, a template with ${}, or an unterminated string", async () => {
+    expect(spec(await planJest("jest", "module.exports = { a: { globalSetup: x }, b: './src/testing/bootstrap.js' };")).inputs).toEqual([`/r/${BOOT}`]);
+    expect(spec(await planJest("jest", "module.exports = { globalSetup: `./src/${d}/bootstrap.js` };")).inputs).toEqual([`/r/${BOOT}`]);
+    expect(spec(await planJest("jest", "module.exports = { globalSetup: require('x\n'), b: './src/testing/bootstrap.js' };")).inputs).toEqual([`/r/${BOOT}`]);
+    expect(spec(await planJest("jest", "module.exports = { globalSetup: 'unterminated")).inputs).toEqual([`/r/${BOOT}`]);
+  });
+});

@@ -483,13 +483,24 @@
 //                (G.7a) any file a vitest/jest config names statically.
 //   7a. (QA-1.3-29) vitest.config.*/vite.config.* (vitest) or jest.config.*/package.json (jest)
 //      in every directory from runnerCwd up to gitRoot, plus the --config file, are read once
-//      (CONFIG_SIZE_LIMIT; over it -> S6 config-too-large). The string literals of setupFiles,
-//      setupFilesAfterEnv, globalSetup and globalTeardown (one literal, or the literal elements
-//      of an array, calls such as require.resolve('./x') included) resolve against the config's
-//      directory and runnerCwd (vitest) or rootDir (jest: `<rootDir>` is the config's directory
-//      and every literal rootDir); a reference without an extension also matches <ref>.<ext> and
-//      <ref>/index.<ext>. Each such file is a trigger. A non-literal value names nothing; the
-//      name rule above still applies (P). QA-1.3-41: jest's inline JSON `--config '{...}'` (a
+//      (CONFIG_SIZE_LIMIT; over it -> S6 config-too-large). QA-1.3-44: so are those in every
+//      directory from each changed JS/TS module that is not a test file (existing or gone) up to
+//      gitRoot, because a project's own config (jest/vitest `projects`) sits in the project's
+//      directory, at or above its setup files; those directories are bases for their configs.
+//      Before those reads, the S6s a large change reaches without them come first: more than
+//      SEARCH_LIMIT gone modules (too-many-searches), and existing inputs whose quoted paths
+//      alone exceed MAX_ARGV_CHARS (argv-too-long); the reads are then bounded by one command
+//      line. The string literals of setupFiles, setupFilesAfterEnv, globalSetup and
+//      globalTeardown resolve against the config's directory and runnerCwd (vitest, plus every
+//      literal `root`, against both: QA-1.3-44's inline projects) or rootDir (jest: `<rootDir>`
+//      is the config's directory, every literal rootDir, and QA-1.3-45 the command line's
+//      --rootDir, which jest-config's setFromArgv puts over the config's); a reference without
+//      an extension also matches <ref>.<ext> and <ref>/index.<ext>. QA-1.3-45: a key's value is
+//      the whole expression up to the next "," or ";" at depth 0 or the bracket that closes the
+//      object, and every string literal in it counts: 'x', [...defaults, 'x'],
+//      require.resolve('x'), path.resolve(__dirname, 'x'), c ? 'x' : 'y'. Each such file is a
+//      trigger. A value with no literal names nothing; the name rule above still applies (P).
+//      QA-1.3-41: jest's inline JSON `--config '{...}'` (a
 //      value that starts with "{" and ends with "}", jest's own test) is the config itself: it
 //      is parsed with JSON.parse (S6 unsupported-argument when it does not parse), rooted at
 //      runnerCwd, and is not a config file path. JSON configs (jest.config.json, package.json)
@@ -909,8 +920,12 @@
 //     config-driven tests). vitest adds setupFiles to them (QA-1.3-15 evidence; globalSetup is
 //     not verified). Setup files are triggers by name (G.7) and by static reference (G.7a); what
 //     remains is a setup file under an unconventional name that a config names only through a
-//     non-literal expression (a variable, a computed path). Under vitest that change reruns
-//     every test file (correct, at full cost); under jest the related graph does not see it.
+//     non-literal expression (a variable, a computed path), or that a project config outside
+//     the file's own directory chain names (packages/a's config naming ../../shared/boot.js).
+//     Such a change is not verified by either runner: jest's related graph does not see it, and
+//     vitest does not rerun a project's setupFiles either (QA-1.3-44: `vitest related` ran 0
+//     tests for a changed packages/a setup file under `test.projects`); round 3's "vitest reruns
+//     every test file" held only without projects.
 //   - A change made only to test files the vitest/jest config excludes (Playwright specs in the
 //     create-vue and Vite layouts) is unverifiable, not a pass: the specs stay inputs (G.8a,
 //     QA-1.3-38) and the run reports 0 tests (I 2a). This is the pre-round-3 behaviour, restored
@@ -3453,14 +3468,17 @@ const JS_CONFIG_NAMES: Readonly<Record<"vitest" | "jest", readonly string[]>> = 
 };
 /** Config keys whose values name setup files (vitest and jest share them). */
 const SETUP_KEYS = ["setupFiles", "setupFilesAfterEnv", "globalSetup", "globalTeardown"] as const;
-const CONFIG_KEY_RE = /(?<![\w$])["']?(setupFiles|setupFilesAfterEnv|globalSetup|globalTeardown|rootDir)["']?[ \t]*:[ \t\r\n]*/g;
+const CONFIG_KEY_RE = /(?<![\w$])["']?(setupFiles|setupFilesAfterEnv|globalSetup|globalTeardown|rootDir|root)["']?[ \t]*:[ \t\r\n]*/g;
 
 /**
- * G.7a: the string literals a JS/TS/JSON config assigns to CONFIG_KEY_RE's keys, statically: the
- * value is one literal or an array whose literal elements are taken (spreads, calls and variables
- * are skipped; `require.resolve('./x')` inside the array still yields './x'). A key present with no
- * literal value maps to []. Comments are skipped; a template literal with `${` is not static. One
- * forward pass: the key search resumes after each scanned value, so the cost stays linear.
+ * G.7a: the string literals a JS/TS/JSON config assigns to CONFIG_KEY_RE's keys, statically.
+ * QA-1.3-45: the value is the whole expression up to the next "," or ";" at depth 0, or the
+ * bracket that closes the enclosing object, so a scalar call counts like an array element:
+ * `globalSetup: require.resolve('./x')`, `path.resolve(__dirname, 'x')`, a ternary's branches and
+ * the literal elements of `[...defaults, './x']` all yield their literals. A key present with no
+ * literal value maps to []. Comments are skipped; a template literal with `${` is not static, and
+ * an unterminated string ends the value. One forward pass: the key search resumes after each
+ * scanned value, so the cost stays linear.
  */
 const isQuote = (c: string | undefined): boolean => c === '"' || c === "'" || c === "`";
 
@@ -3471,31 +3489,31 @@ function configLiterals(text: string): Map<string, string[]> {
     const vals = out.get(m[1]) ?? [];
     out.set(m[1], vals);
     let i = m.index + m[0].length;
-    const literal = (): boolean => {
-      const q = text[i];
-      let v = "";
-      for (i++; i < text.length && text[i] !== q; i++) {
-        if (text[i] === "\\") v += text[++i] ?? "";
-        else if (text[i] === "\n" && q !== "`") return false;
-        else v += text[i];
-      }
-      i++;
-      if (!(q === "`" && v.includes("${"))) vals.push(v);
-      return true;
-    };
-    if (isQuote(text[i])) literal();
-    else if (text[i] === "[") {
-      for (i++; i < text.length && text[i] !== "]"; ) {
-        if (isQuote(text[i])) {
-          if (!literal()) break;
-        } else if (text.startsWith("//", i)) {
-          const nl = text.indexOf("\n", i);
-          i = nl < 0 ? text.length : nl;
-        } else if (text.startsWith("/*", i)) {
-          const end = text.indexOf("*/", i + 2);
-          i = end < 0 ? text.length : end + 2;
-        } else i++;
-      }
+    for (let depth = 0; i < text.length; ) {
+      const c = text[i];
+      if (isQuote(c)) {
+        let v = "";
+        let j = i + 1;
+        for (; j < text.length && text[j] !== c && !(text[j] === "\n" && c !== "`"); j++) v += text[j] === "\\" ? (text[++j] ?? "") : text[j];
+        i = j + 1;
+        if (text[j] !== c) break;
+        if (!(c === "`" && v.includes("${"))) vals.push(v);
+      } else if (text.startsWith("//", i)) {
+        const nl = text.indexOf("\n", i);
+        i = nl < 0 ? text.length : nl;
+      } else if (text.startsWith("/*", i)) {
+        const end = text.indexOf("*/", i + 2);
+        i = end < 0 ? text.length : end + 2;
+      } else if (c === "(" || c === "[" || c === "{") {
+        depth++;
+        i++;
+      } else if (c === ")" || c === "]" || c === "}") {
+        if (depth === 0) break;
+        depth--;
+        i++;
+      } else if ((c === "," || c === ";") && depth === 0) {
+        break;
+      } else i++;
     }
     re.lastIndex = Math.max(re.lastIndex, i);
   }
@@ -3520,17 +3538,39 @@ interface JsConfigFacts {
  * stem, or its directory for an index file: `names`) is resolved, each distinct one once, within
  * SETUP_REF_LIMIT resolutions per plan (else S6 config-too-large); a planted config of 262000
  * literals cost 3.6 s of path resolution under Bun. Exclusions are not read (G.8a, QA-1.3-38).
+ * QA-1.3-44: a project's own config (jest/vitest `projects`) lies in the project's directory, at
+ * or above its setup files, so the configs in every directory from each changed JS/TS module (not
+ * a test file) up to gitRoot are read too, with that directory as a base. vitest's literal `root`
+ * values (inline projects) are bases, against the config's directory and runnerCwd. QA-1.3-45:
+ * jest's `--rootDir` on the command line (jest-config's setFromArgv) is a base and a `<rootDir>`.
  */
-async function jsConfigFacts(ctx: Ctx, fs: PlannerFs, det: DetectedRunner, names: ReadonlySet<string>): Promise<JsConfigFacts | Unverifiable> {
+async function jsConfigFacts(
+  ctx: Ctx,
+  fs: PlannerFs,
+  det: DetectedRunner,
+  names: ReadonlySet<string>,
+  changed: readonly FileRef[],
+): Promise<JsConfigFacts | Unverifiable> {
   const P = ctx.P;
   const kind = det.kind === "jest" ? "jest" : "vitest";
   const files = new Set<string>(det.configFiles ?? []);
-  for (const d of ancestors(ctx, det.runnerCwd, det.gitRoot)) {
+  const dirs = new Map(ancestors(ctx, det.runnerCwd, det.gitRoot).map((d) => [ctx.key(d), d]));
+  const top = ctx.key(det.gitRoot);
+  for (const f of changed) {
+    if (!JS_EXT_RE.test(f.abs) || isJsTestPath(f.rel)) continue;
+    // Every directory already listed has its parents listed too, so the walk stops at the first one.
+    for (let d = P.dirname(f.abs); !dirs.has(ctx.key(d)); d = P.dirname(d)) {
+      dirs.set(ctx.key(d), d);
+      if (ctx.key(d) === top || P.dirname(d) === d) break;
+    }
+  }
+  for (const d of dirs.values()) {
     for (const n of JS_CONFIG_NAMES[kind]) {
       const p = P.join(d, n);
       if (await existsCached(ctx, fs, p)) files.add(p);
     }
   }
+  const cliRoot = kind === "jest" ? jestCliRootDir(det) : undefined;
   const setupKeys = new Set<string>();
   const setupStems = new Set<string>();
   const trailing = ctx.win ? /[\\/]+$/ : /\/+$/;
@@ -3549,10 +3589,14 @@ async function jsConfigFacts(ctx: Ctx, fs: PlannerFs, det: DetectedRunner, names
       for (const v of lits.get(key) ?? []) if (v.trim() !== "" && !/[*?{}]/.test(v) && wanted(v)) refs.add(v);
     }
     if (refs.size === 0) return undefined;
-    const roots = kind === "jest" ? [...new Set(lits.get("rootDir"))] : [det.runnerCwd];
-    budget -= refs.size * (roots.length + 1) + roots.length;
+    const rootLits = [...new Set(lits.get(kind === "jest" ? "rootDir" : "root"))];
+    const fixed = kind === "jest" ? (cliRoot === undefined ? [] : [P.resolve(det.runnerCwd, cliRoot)]) : [det.runnerCwd];
+    const perLit = kind === "jest" ? 1 : 2;
+    // Counted before any root literal is resolved, so a planted config cannot buy the cost back.
+    budget -= refs.size * (1 + fixed.length + rootLits.length * perLit) + rootLits.length * perLit;
     if (budget < 0) return s6("config-too-large", `too many setup references in ${where} (limit ${SETUP_REF_LIMIT})`);
-    const bases = [...new Set([dir, ...roots.map((r) => P.resolve(dir, r))])];
+    const roots = rootLits.flatMap((r) => (kind === "jest" ? [P.resolve(dir, r)] : [P.resolve(dir, r), P.resolve(det.runnerCwd, r)]));
+    const bases = [...new Map([dir, ...fixed, ...roots].map((b) => [ctx.key(b), b])).values()];
     for (const v of refs) {
       for (const b of bases) {
         const abs = P.resolve(b, v.replace(/<rootDir>/g, b));
@@ -3577,6 +3621,18 @@ async function jsConfigFacts(ctx: Ctx, fs: PlannerFs, det: DetectedRunner, names
     if (bad) return bad;
   }
   return { setupKeys, setupStems };
+}
+
+/** QA-1.3-45: the last jest `--rootDir` in the kept arguments; jest-config's setFromArgv puts it over every config's rootDir. */
+function jestCliRootDir(det: DetectedRunner): string | undefined {
+  const K = det.keptArgs;
+  let v: string | undefined;
+  for (let i = 0; i < K.length; i++) {
+    const t = camelOption(K[i]);
+    if (t === "--rootDir") v = K[++i];
+    else if (t.startsWith("--rootDir=")) v = t.slice("--rootDir=".length);
+  }
+  return v;
 }
 
 /** The keys configLiterals and jsonLiterals collect. */
@@ -3666,7 +3722,11 @@ async function plan(input: StaticScopingInput, search: TestSearchSeam | undefine
   const sourcePj = det.source.type === "script" ? ctx.key(det.source.packageJson) : undefined;
   const configKeys = new Set((det.configFiles ?? []).map((p) => ctx.key(p)));
   const js = det.kind === "vitest" || det.kind === "jest";
-  const facts = js ? await jsConfigFacts(ctx, fs, det, changedNames(ctx, sorted)) : undefined;
+  if (js) {
+    const early = await jsCheapChecks(ctx, fs, sorted);
+    if (early) return early;
+  }
+  const facts = js ? await jsConfigFacts(ctx, fs, det, changedNames(ctx, sorted), sorted) : undefined;
   if (facts && isS6(facts)) return facts;
   for (const f of sorted) {
     const names = namesOf(ctx, f);
@@ -3683,6 +3743,38 @@ async function plan(input: StaticScopingInput, search: TestSearchSeam | undefine
     }
   }
   return classify(ctx, input, det, sorted, notes, search);
+}
+
+/** G.8: docs, licences and .github files are never inputs. */
+function isNonInput(ctx: Ctx, f: FileRef): boolean {
+  const base = ctx.P.basename(f.abs);
+  return NON_INPUT_EXT_RE.test(base) || NON_INPUT_NAMES.has(base) || f.rel.split("/").includes(".github");
+}
+
+/**
+ * QA-1.3-44/47 (vitest, jest): the S6s a large change reaches without reading any config come
+ * before G.7a's per-directory config reads, which then stay bounded by what one command line and
+ * SEARCH_LIMIT allow. Every existing changed file that is not a non-input is a spec input (a
+ * trigger among them is S6 anyway), so their quoted lengths are a lower bound of the argv (H);
+ * every gone module is a pending search (G.9a).
+ */
+async function jsCheapChecks(ctx: Ctx, fs: PlannerFs, sorted: readonly FileRef[]): Promise<Unverifiable | undefined> {
+  let pending = 0;
+  let chars = 0;
+  let n = 0;
+  for (const f of sorted) {
+    if (isNonInput(ctx, f)) continue;
+    if (await existsCached(ctx, fs, f.abs)) {
+      chars += (ctx.win ? winQuotedLength(f.abs) : f.abs.length) + 1;
+      n++;
+    } else if (!isJsTestPath(f.rel)) pending++;
+  }
+  if (pending > SEARCH_LIMIT) return tooManySearches(pending);
+  return chars > MAX_ARGV_CHARS ? argvTooLong(n) : undefined;
+}
+
+function tooManySearches(n: number): Unverifiable {
+  return s6("too-many-searches", `too many changed modules to map: ${n} test searches (limit ${SEARCH_LIMIT})`);
 }
 
 /** Change attribution that names only paths the planner cannot use (G.4a). */
@@ -3775,12 +3867,11 @@ async function classify(
 
   for (const f of sorted) {
     const base = P.basename(f.abs);
-    const nonInput = NON_INPUT_EXT_RE.test(base) || NON_INPUT_NAMES.has(base) || f.rel.split("/").includes(".github");
-    if (nonInput || (det.kind === "pytest" && !base.endsWith(".py"))) {
+    if (isNonInput(ctx, f) || (det.kind === "pytest" && !base.endsWith(".py"))) {
       skipped++;
       continue;
     }
-    const exists = await fs.fileExists(f.abs);
+    const exists = await existsCached(ctx, fs, f.abs);
     if (det.kind === "pytest") {
       const isTest = isPyTestFile(ctx, pyFiles, f.abs);
       if (exists && isTest) {
@@ -3802,7 +3893,7 @@ async function classify(
   // G.9a (QA-1.3-26): the searches are sequential processes (a git grep costs ~0.3 s in a large
   // repo), so their number is bounded. Decided before any search, so static scoping agrees.
   if (pending > SEARCH_LIMIT) {
-    return s6("too-many-searches", `too many changed modules to map: ${pending} test searches (limit ${SEARCH_LIMIT})`);
+    return tooManySearches(pending);
   }
 
   if (!search) {
