@@ -609,3 +609,335 @@ batch and hold the slot across the recheck (plan 1.4.1.b), never acquire a neste
 `slot.ts:439`: `Math.max(1, Math.floor(NaN))` is `NaN`, so the acquire loop never runs and every
 call returns `busy` after `waitMs`. `maxConcurrentVerifications` is validated as an "integer ≥ 1"
 by the configuration surface (Phase 1.1), and Phase 2.1 passes the validated value.
+
+## QA re-review (round 2)
+
+Reviewer: adversarial QA, `[tier:heavy]` (CAP:none).
+
+- **Scope:** `git diff c44c377..HEAD`, i.e. `d2bdeef`, `4d627ed`, `25a7d4f`, `d05d95e`, `65df39a`,
+  `0024c3b` and the docs commit `3eea511`. Checked against plan "#### Phase 1.4" and the round-1
+  findings. Line numbers below refer to `src/verify/slot.ts` at `3eea511`.
+- **Environment:** Windows 11, NTFS, 16 cores, Node v24.21.0. A real Node v20.20.2 was also used,
+  from the `node-win-x64@20` npm package. There is no Linux host.
+
+The repro scripts are in `%TEMP%\opencode\qa14r2\` and are not committed: `fence.mjs`,
+`liveness.mjs`, `dirgone.mjs`, `ticketblock.mjs`, `pidreuse.mjs` and `burn.mjs`.
+- Each script imports the real `src/verify/slot.ts` through Node 24 type stripping.
+- Two module instances (`slot.ts?a`, `slot.ts?b`) stand for two processes: each has its own
+  observation map, claim table and exit hook.
+- The scripts use only the public `deps` seams: `unlink` to freeze one call, `now` for a
+  wall-clock step and `mono` to advance the monotonic clock. Every other constant is the
+  production `SLOT_DEFAULTS` value.
+- After the runs, no `node.exe` with `qa14r2`, `holder.mjs` or `burn.mjs` in its command line was
+  left, and no `qa14r2-*` dir.
+
+**Test runs** (`npx vitest run --maxWorkers=2 test/unit/slot.test.ts`):
+
+| run | result | duration |
+|---|---|---|
+| Node v24.21.0 | 42/42 | 28.3 s |
+| Node v20.20.2 (vitest, its workers and the spawned children all on Node 20) | 42/42 | 28.0 s |
+| Node v24.21.0 under load: 14 CPU-spinning threads (`burn.mjs 14 75`) | 42/42 | 28.2 s |
+
+Note: 16 `omr-slot-*` dirs were already in `%TEMP%`, dated 22:26:29–22:26:45, before this review's
+first run (22:28:38). The last one holds a `slot-0.lock` and a ticket, so it comes from an
+interrupted run whose `afterAll` never ran. None of the three runs above left a dir. The old dirs
+were left in place.
+
+**Summary (round 2):** QA-1.4-1…17 are all verified. New findings: 0 critical, 1 major, 2 minor
+and 4 nit (QA-1.4-20…26).
+
+### Verification of QA-1.4-1…17
+
+- **QA-1.4-1 — verified.**
+  - `lockStale`/`observedStale` (`:315-323`) reap by age only when the age is over `staleMs`
+    **and** the same `token@mtime` has been seen for ≥ 2 heartbeats of monotonic time, with no
+    gap over 2 heartbeats (`observe`, `:296-307`).
+  - P1 and P1b with the production defaults → busy (`slot.test.ts:279-287`).
+  - Side effect: QA-1.4-21.
+- **QA-1.4-2 — verified.**
+  - Claims are per identity (`:361-363`), and the target is re-read before every unlink attempt,
+    retries included (`unlinkWhile`, `:371-398`).
+  - A claim is reclaimed only for a dead same-host PID or once inert (`:325-328`, `:433-442`).
+  - P2 step 5 cannot recur. There is no shared reap file, and a claim reclaim re-reads
+    `identity@mtime`, so it returns `changed` for a fresh claim.
+  - P2 step 7 cannot recur either: R4's retry re-reads the file and finds R5's token.
+  - The P3 replay passes (`slot.test.ts:441-457`).
+  - Residual: the self-fencing is a check, not a fence (QA-1.4-20).
+- **QA-1.4-3 — verified.** `probeDir` (`:632-650`) judges only `mkdir`/`open(wx)` codes, and the
+  verdict is memoized (`:611-623`). The P6 replay passes (`slot.test.ts:751-773`). A side effect of
+  the memo is QA-1.4-22.
+- **QA-1.4-4 — verified.**
+  - `readLock` maps EBUSY/EPERM/EACCES to `unreadable` (`:260-272`).
+  - `runAttempt` catches everything (`:866-871`), and `release` shares only the in-flight attempt
+    (`:885-891`).
+  - `withSlot` keeps `fn`'s value and error (`:968-984`).
+  - `slot.test.ts:484-527` pass.
+- **QA-1.4-5 — verified on a real Node 20.** The Node v20.20.2 run passes 42/42 (table above). The
+  children are spawned with `process.execPath`, so they run on Node 20 too. The Ubuntu legs cannot
+  run here. Caveat: the build relies on a transitive `vite` (QA-1.4-23).
+- **QA-1.4-6 — verified.** `LockState` has four kinds (`:162-166`). A deferred release keeps the
+  heartbeat and the `held` entry (`:873-883`). `slot.test.ts:529-547` passes.
+- **QA-1.4-7 — verified.** See `notOurs` (`:801-812`). It was also seen live in `fence.mjs`: the
+  victim got `lost: true` and exactly one `onLost` call within one heartbeat.
+- **QA-1.4-8 — verified.**
+  - The deadline and the remaining time come from `cfg.mono()` (`:928`, `:944`).
+  - A lock seen unchanged for `staleMs` is stale whatever its mtime says (`:317`).
+  - `slot.test.ts:302-327` pass.
+- **QA-1.4-9 — verified.**
+  - The tickets (`:652-751`) gate the wait loop (`:934`).
+  - The fairness test passes in all three runs, and `ticketblock.mjs` leaves no ticket behind.
+  - Residuals: the wall-clock order (declared) and QA-1.4-24.
+- **QA-1.4-10 — verified by reading; the mutation run was not repeated.**
+  - The test counts `utimes` calls through the seam and puts the released handle's *own* lock back,
+    aged (`slot.test.ts:331-354`).
+  - A heartbeat still running would pass its token check (`:817`) and call `utimes`, so
+    `touches === count` would fail.
+- **QA-1.4-11 — verified.** Both tests pass in all runs:
+  - `slot.test.ts:459-475`: 6 children against a planted dead lock, with and without a crashed
+    claimer's claim and the legacy files.
+  - `:206-219`: the waiter starts first, and the holder is killed during its backoff.
+- **QA-1.4-12 — verified.** `slot.test.ts:776-808` passes non-elevated on Windows in all runs. The
+  POSIX `chmod 0555` branch was not run here.
+- **QA-1.4-13 — verified.**
+  - The barrier is in place (`holder.mjs:24-25`, `slot.test.ts:149-155`), with holds of 150 and
+    500 ms.
+  - The long hold uses 100 ms / 2 000 ms / 6 000 ms, and `deadPid()` loops.
+  - Suspected new flake, measured with `pidreuse.mjs`: could one of the 6 children spawned right
+    after `deadPid()` reuse the planted "dead" PID? In 0/60 trials, and the PID was not alive again
+    100 ms later in 0/60. Not a finding.
+  - The file passes under 14-thread CPU load.
+- **QA-1.4-14 — verified.** `createOwned` re-reads the file (`:338-354`). A corrupt file's
+  `(mtime,size)` identity is used for its claim (`:275-277`) and for its observation (`:321`,
+  `:326`). Caveat: an unreadable re-read counts as owned (QA-1.4-26).
+- **QA-1.4-15 — verified.** `slot.test.ts:703-705`.
+- **QA-1.4-16 — verified.** `nextBackoffMs` (`:906-909`); `slot.test.ts:707-724`.
+- **QA-1.4-17 — verified.**
+  - The tick re-checks the phase before each `utimes` (`:819`), and release awaits the tick
+    (`:865`).
+  - The exit hook takes the claim (`:470-495`).
+  - `slot.test.ts:549-597` pass.
+
+### Answers to the round-2 focus questions
+
+- **Two claimers.** A claim is created with `open(claim,"wx")`, a write and a re-read (`:338-354`),
+  so one claimer wins. The loser's `reclaimClaim` sees a live owner and an unconfirmed observation,
+  and returns `contended` (`:427`). Six real processes against a planted dead lock exercise this
+  (`slot.test.ts:459-464`). It is sound except under the timing conditions of QA-1.4-20.
+- **Crashed claimer.**
+  - Same host and dead PID: the claim is cleared on the first look, one level up
+    (`slot.test.ts:416-423`).
+  - Reused PID or foreign host: the inert rule applies. The wall age must be over 30 s, and the
+    claim must be seen unchanged for ≥ 10 s.
+  - The chain stops at depth 3 (`:358`, `:427`), so the recursion is bounded.
+- **"A live reaper never deletes after holding its claim 5 s".** This is a timing assumption. The
+  deadline is checked at the top of each iteration (`:374`). A whole `readLock` (open, fstat, read,
+  close on the libuv pool) and a queued `unlink` follow it. Two holders are proven in QA-1.4-20.
+- **Ticket FIFO.**
+  - A crashed same-host waiter (dead PID) is removed on the next scan.
+  - A crashed waiter whose PID is live (reused) or foreign blocks the queue until its ticket is
+    older than `staleMs`: 30.6 s measured, with the slot free (QA-1.4-24).
+  - Tickets are removed in `finally`, by the exit hook, and as dead by later scans. No ticket file
+    leaked in any run.
+  - Wall-clock ordering: a backward step lets newer waiters jump ahead. This is declared, and
+    bounded by `waitMs`.
+  - A waiter whose ticket was deleted as dead re-creates it under its old name, so it keeps its
+    place.
+- **Observed-stale liveness for a process with no history.** The process must be one of the `max`
+  oldest waiters. It then reclaims a crashed foreign or reused-PID lock at about
+  max(first look + 2 × `heartbeatMs`, last heartbeat + `staleMs`), plus up to one wake-up (≤ 2 s).
+  - Measured: 10.4 s for a 60 s-old lock (`liveness.mjs`).
+  - It **never** reclaims if its wait is shorter than 10 s and its calls are more than 10 s apart
+    (QA-1.4-21).
+- **lost/onLost.** Verified. Detection takes at most one heartbeat (5 s). A loss found while a
+  release is pending only completes that release, with no `lost`; that is by design.
+- **Exit hook.** It follows the claim protocol. On EEXIST it leaves the file to the other claimer,
+  and failures are counted in `exitReleaseFailures`.
+- **Retries are bounded.** There is no unbounded loop:
+  - `unlinkWhile`: ≤ `unlinkRetries` and the claim deadline.
+  - `unlinkRetry`, the heartbeat `utimes`, and `deleteOwn` on `contended`: ≤ 6 each.
+  - Deferred release retries: ≤ `staleMs/heartbeatMs` = 6.
+  - Probe: 3 tries. `tryAcquireOnce`: 3 per slot.
+  - Claim chain: depth ≤ 3, with 2 rounds each.
+- **No busy wait; timers.**
+  - Every wait sleeps ≥ `backoffMinMs` except the last, which is cut to the deadline (`:948`).
+    `slot.test.ts:692-701` passes.
+  - The heartbeat (`:847`) and the deferred-release timer (`:882`) are unref'd.
+  - The wait timer (`:954`) and the in-process wait timer (`:582`) are ref'd on purpose, because
+    the caller awaits them. Retry sleeps are ref'd but bounded (≤ 3.15 s).
+- **Test realism.** A run takes about 28 s, stable across Node 24, Node 20 and CPU load. The
+  compiled child works on Node 20 (verified). `vite` is not a direct devDependency (QA-1.4-23).
+
+### QA-1.4-20 — minor — The claim self-fencing is a check, not a fence: a frozen reaper deletes a newer holder's lock (two holders); the documented window is not "microseconds"
+
+- **Where:**
+  - `slot.ts:371-398` (`unlinkWhile`): the deadline is checked at `:374`, then comes `readLock`
+    at `:378`, then `cfg.unlink` at `:384`.
+  - `slot.ts:325-328`: a claim is inert when the wall age is over `staleMs` (or the span is
+    ≥ `staleMs`) and the span is ≥ 2 × `claimHoldMaxMs`.
+  - Header `slot.ts:39-41`: "so the second rule never removes the claim of a claimer that still
+    acts".
+  - This report's implementation notes: "a window of microseconds".
+- **Evidence (`fence.mjs`, proven):**
+  1. `slot-0.lock` holds a dead same-host lock `T`.
+  2. Reaper A (instance `?a`, `waitMs:0`) takes the claim `C_T`, passes its deadline check and the
+     re-read, and is frozen inside `unlink(slot-0.lock)` through the seam.
+  3. Reaper B (instance `?b`, production defaults, `waitMs 60 000`) sees a claim owned by a live
+     PID. Once the claim is inert, B removes it under a meta-claim, takes `C_T`, deletes `T` and
+     creates its own lock `U`.
+  4. A is released. Its unlink deletes `U`, it returns `removed`, and it creates its own lock.
+
+  The same interleaving was run twice:
+  - B's wall clock stepped +31 s (an NTP step or a VM resume makes the claim look old):
+    `{"step":31000,"aHeld":true,"bHeld":true,"bHeldAfterMs":10323,"aFrozenMs":10337,"bFileDeletedByA":true,"bLost":true,"bOnLostCalls":1,"warnsA":["verification slot: claim held too long, delete abandoned"]}`
+  - No clock step:
+    `{"step":0,"aHeld":true,"bHeld":true,"bHeldAfterMs":30567,"aFrozenMs":30575,"bFileDeletedByA":true,"bLost":true,"bOnLostCalls":1,…}`
+
+  What this shows:
+  - The deadline stops only the *next* attempt. A logs "claim held too long" for its claim drop
+    after its target delete has already gone through.
+  - Without a clock step, the needed freeze is about 30 s, about as rare as the holder-side
+    contract.
+  - After a forward step of ≥ 25 s, a freeze of about 10 s is enough. The wall-age term is then
+    met at once, and only 2 × `claimHoldMaxMs` of observation remains.
+  - The claim-drop phase (`:424`) has a smaller margin under a step (analysis, not run). It may act
+    until 1.5 × `claimHoldMaxMs` (7.5 s), and the claim is judged inert at 10 s. So a 2.5 s freeze
+    between its token re-read and its unlink deletes a successor's claim. An ABA then still needs a
+    third claimer.
+  - The victim learns of the loss within one heartbeat (`lost`, `onLost`), so the over-commit is
+    detected, not silent.
+- **Fix:**
+  1. For claims, drop the wall-age shortcut: a claim is inert once seen unchanged for ≥ `staleMs`
+     of monotonic time. Claims are never refreshed, so the wall age only adds exposure to clock
+     steps. The freeze needed is then ≥ 25 s under any clock behaviour.
+  2. In `unlinkWhile`, re-check the deadline after `readLock`, just before `cfg.unlink`. The window
+     then shrinks to one queued syscall instead of five.
+  3. Correct the header (`:39-41`) and the implementation note. The rule assumes no freeze longer
+     than (inert confirmation − `claimHoldMaxMs`) between the check and the syscall; state the
+     numbers.
+
+### QA-1.4-21 — major — Regression from the QA-1.4-1 fix: with `slotWaitMs` < 10 s, a lock that is not provably dead is never reclaimed
+
+- **Where:**
+  - `slot.ts:296-307`: the observation map is per process and restarts after a gap of 2
+    heartbeats.
+  - `slot.ts:320-323`: staleness by age needs ≥ 2 × `heartbeatMs` of the observer's own continuous
+    observation.
+  - The plan's configuration table: `slotWaitMs` is an "integer ≥ 0", and `slotWaitMs: 0` is valid
+    and means "no wait" (plan lines 259 and 537).
+  - Plan 1.4.1.c(b), and the goal "recovers from crashes and never deadlocks".
+- **Evidence (`liveness.mjs`, production defaults, proven):** `slot-0.lock` names a live, unrelated
+  same-host PID (a crashed holder whose PID was reused). Its heartbeat is 60 s old.
+  `{"freshProcessesWaitMs0":["busy","busy","busy","busy","busy"],"oneProcessWaitMs0Every11s":["busy","busy","busy","busy","busy","busy"],"oneProcessWaitMs0Every4s":["busy","busy","busy","held"],"freshWaitMs8000":{"result":"busy","ms":8003},"freshWaitMs30000":{"result":"held","ms":10430}}`
+  - Five fresh processes with `waitMs:0` stay busy, and so does one process calling every 11 s.
+    Neither ever reclaims the lock.
+  - Only a caller that looks at the lock for 10 s, with no 10 s gap, reclaims it. The round-1 code
+    reclaimed it on one look.
+  - The same holds for a foreign-host lock, and for a live same-host holder that stopped
+    heartbeating, such as a hung opencode process or one suspended with `Ctrl+Z`.
+  - With `slotWaitMs: 0`, or under about 10 s, every verification is `unverifiable` until that PID
+    exits. The lockout is unbounded.
+- **Fix:** make the observation outlive the call and the process.
+  - Record the first sighting of `token@mtime` in a sidecar created with `wx`, for example
+    `slot-<i>.lock.seen-<hash(token@mtime)>`. It holds `{firstHr, lastHr}` on the host-wide
+    monotonic clock `process.hrtime.bigint()`: `CLOCK_MONOTONIC` on Linux, `mach_absolute_time` on
+    macOS, QPC on Windows.
+  - Each observer updates `lastHr`, and the same gap rule applies. Any process on the host can then
+    confirm staleness with one look once the sidecar spans ≥ 2 heartbeats.
+  - Keep the same-host dead-PID fast path. Delete the sidecar together with the lock; it is keyed by
+    the lock identity, so a leftover is inert.
+  - Whether QPC advances during a Windows sleep was not verified here. The gap rule on `lastHr`
+    covers both cases.
+  - Add a test: fresh processes with `waitMs:0`, ≥ 10 s apart, reclaim an aged live-PID lock.
+  - Weaker alternative if the sidecar is rejected: Phase 1.1 documents that a `slotWaitMs` under
+    about 12 s cannot reclaim a lock whose owner is not provably dead, and warns about it.
+
+### QA-1.4-22 — minor — The "writable" memo never re-creates the slot dir: once a temp cleaner removes it, every acquire in that process rejects with ENOENT
+
+- **Where:**
+  - `slot.ts:611-623`: the verdict is memoized for the life of the process.
+  - `slot.ts:632-650`: `mkdir` runs only in the probe.
+  - `slot.ts:341-345`: `createOwned` rethrows every error except EEXIST and the transient codes.
+  - `slot.ts:916-965`: nothing catches around `tryAcquireOnce`.
+- **Evidence (`dirgone.mjs`, proven):** acquire and release in `<tmp>/…/verify-slots`, then
+  `rmSync(dir)`.
+  `{"first":"held","afterRemoval_waitMs0":"rejected ENOENT","afterRemoval_waitMs500":"rejected ENOENT","afterRemoval_withSlot":"rejected ENOENT","stillRejectsLater":"rejected ENOENT","dirRecreated":false,"warns":["verification slot: waiter ticket I/O failed, fairness is best effort"]}`
+  - The only log line is the ticket warning, which is misleading.
+  - Before `4d627ed`, every call ran `mkdir(recursive)`.
+  - Temp cleaners remove idle entries: systemd-tmpfiles age rules for `/tmp`, macOS `dirhelper`,
+    Windows Disk Cleanup and Storage Sense. Which of them removes an empty dir was not verified
+    here.
+  - A long-lived process such as `opencode serve` would then never verify again.
+- **Fix:**
+  - On ENOENT from `open(slot|claim|ticket, "wx")` or `readdir`, run `mkdir(dir, {recursive:true})`
+    once and retry the attempt. If that `mkdir` fails, drop the memo entry so that the next call
+    probes again.
+  - Decide what `acquireSlot` does with other unexpected fs errors (EMFILE, ENOSPC, EIO): return
+    `busy` with one warning, or document that it can reject. Today the doc says only "never rejects
+    for contention".
+  - Add a test: the dir is removed between two acquires, and the second one holds.
+
+### QA-1.4-23 — nit — The test's JS build relies on a transitive `vite`, and some allowed versions lack `transformWithOxc`
+
+- **Where:** `test/unit/slot.test.ts:33-39` (`await import("vite")`, then `transformWithOxc`);
+  `package.json` devDependencies, which have no `vite`.
+- **Evidence:**
+  - `npm ls vite` gives only `vitest@4.1.11 → vite@8.2.2`, and vitest 4.1.11 declares
+    `"vite": "^6.0.0 || ^7.0.0 || ^8.0.0"`.
+  - In the packed `vite@6.4.3` and `vite@7.3.6`, `dist/node/index.d.ts` has no `transformWithOxc`
+    (0 matches). 8.2.2 exports it.
+  - If a dedupe or an override resolves vite 6 or 7, `beforeAll` throws and all 42 tests fail. A
+    strict pnpm install would not resolve `vite` at all.
+  - Today the lockfile pins 8.2.2, so CI is not affected.
+- **Fix:** add `"vite": "^8.2.2"` to devDependencies, or fall back to `transformWithEsbuild` when
+  `transformWithOxc` is missing.
+
+### QA-1.4-24 — nit — A crashed waiter whose PID is live (reused) or foreign holds the FIFO head for `staleMs` while the slot is free
+
+- **Where:** `slot.ts:705-713` (`ticketLive`: a ticket is live while its age ≤ `staleMs`);
+  `slot.ts:720-751`.
+- **Evidence (`ticketblock.mjs`, production defaults, proven):** a fresh ticket names a live,
+  unrelated PID. The slot is free. A waiter with `waitMs 45 000` starts, and a `waitMs:0` caller
+  runs every 5 s.
+  `{"slotWasFree":true,"waiter":"held","waitedMs":30623,"waitMs0CallersMeanwhile":["busy","busy","busy","busy","busy","busy"],"ticketsLeft":[]}`
+  This is bounded and heals itself, but for 30 s nothing verifies although nothing runs. A live
+  waiter refreshes its ticket on every wake-up: at least every `backoffMaxMs` (2 s), plus one
+  `tryAcquireOnce`.
+- **Fix (optional):** give tickets a TTL of 2 × `heartbeatMs` (10 s) instead of `staleMs`. A live
+  waiter misjudged by that TTL only re-creates its ticket, under its old name, at its next wake-up.
+  That is a fairness blip with no effect on exclusion.
+
+### QA-1.4-25 — nit — Orphaned claim, meta-claim, legacy and probe files are never collected
+
+- **Where:**
+  - The only `readdir` is in `eligible` (`slot.ts:723`), and it looks only at `wait-*.ticket`
+    names (`:659`, `:729`).
+  - Claims are visited only through `removeUnderClaim`, for a known identity (`:412`).
+- **Evidence (analysis):** these files stay in the slot dir for good:
+  - the claim of a claimer that crashes after its target is gone (after `unlinkWhile` returned,
+    before the drop at `:424`), and likewise a meta-claimer's claim;
+  - a probe whose delete failed (`:644`);
+  - the legacy `slot-<i>.lock.reap` and `.reap.dead-*` files, which the protocol ignores
+    (`slot.test.ts:471-472`).
+
+  They cost only bytes, with no effect on exclusion or liveness.
+- **Fix:** during the `eligible` pass, collect `*.reap-*` files through `reclaimClaim` (under the
+  meta-claim, with the key re-checked) once they are inert and more than 1 h old. Delete
+  `.probe-*` files older than 1 h by path; their names are unique. Or document the leak.
+
+### QA-1.4-26 — nit (theoretical) — `createOwned` counts an unreadable re-read as ownership, and nothing re-verifies a claim
+
+- **Where:** `slot.ts:352-353`; claims are created through `createOwned` at `:416`.
+- **Evidence (analysis, not run):** for a slot lock, the heartbeat re-reads the token within 5 s
+  and reports a loss (QA-1.4-7). A claim is never re-read by its holder before the drop. The
+  sequence:
+  1. Claimer R1 is frozen for ≥ 2 s between `open(claim,"wx")` and its write.
+  2. The empty claim is reaped as corrupt after 2 s of observation (`:326`), and R2 takes the claim.
+  3. R1 resumes, writes into its orphaned handle, and re-reads while a scanner holds R2's claim.
+     The re-read gets EBUSY, which counts as `unreadable`.
+  4. Both believe they hold the claim, and the claim's ABA protection is gone.
+
+  This needs a freeze and a scanner hit at the same instant.
+- **Fix:** in `createOwned`, retry an unreadable re-read on the unlink schedule. For claims, hold
+  only on an `ok` read with our own token; a claim that cannot be confirmed is left to the inert
+  rule.
