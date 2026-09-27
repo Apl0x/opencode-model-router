@@ -705,3 +705,10 @@ Open non-deferred findings: QA-1.5-18 (Medium), QA-1.5-19 (Low), QA-1.5-20 (Low)
 - QA-1.5-10 (2.1 part): materialize only inside the S3 slot, and run GC before each materialize.
 - QA-1.5-4 (2.1 part): "reference vanished → unverifiable". It is also the backstop for the namespace residual above.
 - POSIX: the 1.5.3 key safety test on POSIX CI. Bun smoke on POSIX and on the plugin's real load path (3.1).
+
+### Resolutions (round 4)
+- Resolution: a27c4be — QA-1.5-18: the `ls-files --eol -z` listing is full again on both sides and the two calls run concurrently (Promise.all); a spent budget or failing call still adds the `"` reason. Every git call now overrides GIT_LITERAL/GLOB/NOGLOB/ICASE_PATHSPECS with `0`. Regression tests: legacy `crlf` attribute, `working-tree-encoding=UTF-16LE-BOM` added after checkout, a file last checked out under `core.autocrlf=true`, and GIT_LITERAL_PATHSPECS=1.
+- Resolution: 714079b — QA-1.5-19: documented in OPEN RISKS, not changed. A capture-time `w/` class needs a full `ls-files --eol` inside the capture budget, and the error is in the safe direction (`unverifiable`, never a wrong excuse).
+- Resolution: a27c4be, 714079b — QA-1.5-20: `EOL_ATTR_PATHSPECS` is removed, so `parseEolList` has its JSDoc again. Section 2e, step 7b and OPEN RISKS now match the code.
+
+Verification: `npx vitest run --maxWorkers=2 test/unit/reference.test.ts` 51/51 passed; `npm run typecheck` clean.
