@@ -861,3 +861,165 @@ Method:
 Outcome: QA-1.6-18..26 are verified (QA-1.6-26 accepted as Info). Open and not deferred: two Low
 (QA-1.6-27, QA-1.6-28) and five Info (QA-1.6-29..33). No High or Medium finding is open. Phase 1.6 QA is
 **not** clean until QA-1.6-27 and QA-1.6-28 are resolved, or explicitly accepted.
+
+## QA re-review (round 4)
+
+Reviewer: @heavy, adversarial re-review of `fe7a82b..959b831` (288cb6a, 7267b6c, 959b831):
+`src/verify/directives.ts`, `src/verify/risk.ts`, both test files and the QA-1.6-27..33 resolutions above.
+
+Method:
+- `npx vitest run --maxWorkers=2 test/unit/directives.test.ts test/unit/risk.test.ts` → 2 files, 52 passed.
+- Throwaway scripts in `%TEMP%\omr-qa16r4` (deleted afterwards), run with `node --experimental-strip-types`
+  (node v24.21.0). They import both modules, the `fe7a82b` versions of both (for old-vs-new
+  differentials), and a verbatim copy of `parseCapDirective` (sessions.ts:59-66). Bracketed labels are
+  probe cases; the quoted results are their actual output.
+- Timing: one parse per child process, 30 s kill timeout, after a warm-up call. Fix prototypes were
+  patched **copies** of directives.ts in the temp dir, timed in-process. The repository has no code changes.
+
+### Round-3 findings — verification
+
+| Finding | Status | Evidence |
+|---|---|---|
+| QA-1.6-27 | Verified; Info residual QA-1.6-35 | [L1] `verify:required verify_wait:2s` → required/directive + 2000; [L2] `verify: required, VERIFY_WAIT:2s` → required + 2000; [L3] `verify:required cap:none` → required (`parseCapDirective` → `none`); [L6] `\| verify:required \|` → required; [L8] `Verify: required; Verify_Wait: 2s` → required + 2000. [L4] `(per QA)`, [L5] `-- tests must pass`, [L7] `<!-- … -->` → default (documented, directives.ts:20-21). [L9]/[L10] 300 spaces/dots + prose → default, while 300 trailing spaces/dots with nothing after → required, and a 600k-char `" ."` run + CRLF → required: the 256-char slice is gone. Old-vs-new differential (112 inputs × 2 defaults, including the 42 string literals passed directly to `parseVerifyDirectives` in directives.test.ts): 42 differences, all intended (key-terminated tail, table pipe, removed slice, log escaping). |
+| QA-1.6-28 | Verified for the round-3 shapes; residual QA-1.6-34 (Low) | 1M chars: `"VERIFY:".repeat` 39.1 ms, `VERIFY_WAIT:` 20.2 ms, `verify:` 44.7 ms, `VERIFY:a,` 40.0 ms (round 3: killed > 30 s); `verify_wait:` 21.0, `verify:a,` 38.2, spaced keys 33.7, key + 1000 spaces without colon 3.0, `verify` + 1M NBSP 4.2, 1M-letter value 4.4, 1M-digit wait 3.7, minified blob 15.7 ms. New tail rule: one key + 1M `" ."` run 15.2 ms, `cap` + 1M spaces without colon 4.4, 100 spaces per key 10.0, punctuation per key 9.5, `verify:a cap:` chain 26.9 ms. |
+| QA-1.6-29 | Verified | U+E0049 → `\u{e0049}`, U+034F → `\u034f`, U+202E, curly quotes → `\u201c`/`\u201d`, emoji → `\u{1f600}`. A pair cut at 32 units is escaped by `JSON.stringify` first (`\ud83d`). Old vs new: only the log text differs (5 inputs); results are identical. |
+| QA-1.6-30 | Verified | With the tests' stripper and regex copied verbatim, all 16 round-3 misses are caught (`import ("fs")`, `import\n(`, `require (`, `fetch (`, `fetch?.(`, `process?.env`, `= process`, `process["env"]`, `import{…}from"fs"`, `export*from"fs"`, `Worker`, `EventSource`, `sendBeacon`, `Bun.`, indented import, `export {…} from "node:os"`). Comment false positives are gone; `"node:"` inside a string still fails closed (acceptable). See "Other checks" for what stripping cannot see. |
+| QA-1.6-31 | Verified as scoped; Info residual QA-1.6-36 | `requirements.in`, `requirements-dev.in`, `Pipfile`, `playwright.config.{ts,mjs}`, `setup-jest`, `jest-setup`, `vitest-setup`, `global-teardown` (any case, `.[cm]?[jt]sx?`) → config; `src/teardown.ts`, `src/Pipfile.md`, `setup-jest.json` → not config. Classifier differential (58 paths × 3 classifiers): 19 differences, all these names turning into config. |
+| QA-1.6-32 | Verified | `assessRisk` differential old vs new: 36,652 cases (14 roots incl. `/repo//`, `//`, `/`, `D:/`, `d:/REPO///`, `D:`, a UNC root with a trailing `\`, `""`; 7 statuses; both references; two tiers; three scoping plans; 7 multi-file sets): 4,788 differences, **all** explained by the added config reason on QA-1.6-31 names; 0 from the new trim. 1M chars: trailing slashes 18.9 ms, leading slashes 2.0 ms, 1M backslashes 137.1 ms (100k: 14.6 ms, linear). |
+| QA-1.6-33 | Verified in the header; report nit QA-1.6-37 | directives.ts:22-23 records the deviation. The round-3 fix also asked for a line under "Result"; that list (above) was not updated. |
+
+Upper-case `CAP:` parity: 46 wrappers × 22 inner forms = 1,012 pairs each for `VERIFY:required` and
+`VERIFY_WAIT:2s` against `CAP:3`. Each key has 313 differences, all in documented classes: one leading
+mark accepted (129, QA-1.6-1), no line-break straddle (123, QA-1.6-3), `|` placeholder (61, QA-1.6-4).
+**0** unexpected.
+
+Risk rows (no regression): empty → low; docs → low; 1 file → low; 6 → medium; 16 → high; deleted test →
+high; test renamed to a non-test path → high; modified test → medium; deleted source → medium; `Pipfile`
+→ medium, and high without a reference; Unverifiable → medium; fast tier → medium; no reference → medium.
+
+Line endings: `git ls-files --eol` → `i/lf w/lf`. 862 LF, 0 CRLF: **not mixed**. The file had no final
+newline since `fe7a82b` (pre-existing); this append ends with one.
+
+### New findings
+
+| ID | Severity | Summary |
+|---|---|---|
+| QA-1.6-34 | Low | The prose-guard tail at the run end is re-evaluated for every other key: quadratic, 1M killed > 30 s |
+| QA-1.6-35 | Info | The key-terminated tail accepts any following key + colon, so narrow prose passes |
+| QA-1.6-36 | Info | QA-1.6-31 was narrower than its fix text, and the omissions are not recorded |
+| QA-1.6-37 | Info | Report hygiene: the "Result" deviation list and the round-3 handoff item 4 are stale |
+
+**QA-1.6-34 — Low — the tail at the run end is re-evaluated for every other key (quadratic)**
+- Where: directives.ts:135-137 and :152-157 (the single-slot `tailAt`/`tailOk` memo).
+- Evidence: a value-less lower-case key (`verify:1`) sets `end = tokEnd`, and a valued one (`verify:a`)
+  sets `end` inside the run. When the two alternate in one whitespace-free run, the one-slot memo misses
+  every time. The tail at `tokEnd` then walks, and backtracks over, the whole horizontal-space/punctuation
+  run after the token. Cost: O(keys in the run × trailing run). Ends inside the run cannot share work,
+  because each of their tails stops at the next key's letters, so `tokEnd` is the only repeated position.
+
+  | input (half keys, half trailing run, then `x`) | 10k | 20k | 40k | 100k | 1M |
+  |---|---|---|---|---|---|
+  | `"verify:1,verify:a,".repeat` + spaces | 5.8 ms | 27.2 ms | 93.9 ms | 603.4 ms | killed > 30 s |
+  | same + `" ."` run | 10.1 ms | 45.1 ms | 170.4 ms | 1052.0 ms | killed > 30 s |
+  | `verify_wait:x,verify_wait:1s!x,` + spaces | 3.9 ms | 14.7 ms | 64.5 ms | 377.6 ms | – |
+  | `verify:1,verify:a!x,` + spaces | 5.6 ms | 26.8 ms | 85.6 ms | 585.0 ms | – |
+  | `Verify:1,Verify:a,` + tabs | 6.8 ms | 25.7 ms | 95.7 ms | 616.2 ms | – |
+
+  Controls, 1M: the same run without the trailing spaces → 28.5 ms; upper-case `VERIFY:1,VERIFY:a,` +
+  spaces → 15.2 ms (no guard). The QA-1.6-28 unit timing test uses only homogeneous runs, so it cannot
+  catch this. Same class and exposure as QA-1.6-28: 2.4 parses synchronously on the dispatch path.
+- Fix (prototyped on a temp copy, not committed): cache the tail result for `tokEnd` per run. Add
+  `let tokTail: boolean | null = null`, reset it where `tokEnd` is recomputed, and inside
+  `if (end !== tailAt)` reuse it when `end === tokEnd` (store it after computing). Measured at 1M
+  (in-process): 28.7 / 99.7 / 13.9 ms for rows 1-3. **0** behaviour differences on 77 inputs × 2
+  defaults (the 42 direct string-literal inputs of the unit file plus 35 probes from this round). Add
+  `"verify:1,verify:a,".repeat(27_778) + " ".repeat(500_000) + "x"` to the timing test.
+
+**QA-1.6-35 — Info — the key-terminated tail accepts any following key + colon**
+- Where: directives.ts:99-102 (`(?:VERIFY(?:_WAIT)?|CAP)${HWS}:`, no value, no leading `\b`).
+- Evidence (default `deferred` unless marked R = `defaultVerify:"required"`; every case is silent, and
+  `fe7a82b` returned the default for all of them):
+  - [T1] `please verify: required cap: the budget is tight` → required/directive (`parseCapDirective` → null);
+  - [T5] `Things to verify: deferred. Cap: the budget matters.` (R) → deferred/directive, a downgrade
+    ("Cap: the budget matters." is the round-1 prose example);
+  - [T6] `Things to verify: deferred, verify: the rest later` (R) → deferred;
+  - [T7] `Steps to verify: required. Verify: also the docs.` → required;
+  - [T8] `What to verify: deferred; verify_wait: none given` (R) → deferred;
+  - [T29] `Things to verify: deferred cap: see below` (R) → deferred;
+  - [T3] `verify:required CAP:` (no value) → required; [T11] `verify: required _cap: 3` → required.
+
+  Rejected correctly: `capacity:`, `recap:`, `verifyx:`, `VERIFY_WAITX:`, a key without a colon, a colon
+  on the next line, an em dash before `CAP:`. The leak needs a one-word value followed by
+  `verify:`/`verify_wait:`/`cap:` on the same line. `Steps to verify: deferred.` alone is already accepted
+  by design ([L11], round 3), so this is narrow.
+- Fix (optional): make the tail's key alternative directive-shaped:
+  `\b(?:VERIFY${HWS}:${HWS}["'`*_]?(?:required|deferred)\b|VERIFY_WAIT${HWS}:${HWS}["'`*_]?\d+(?:ms|s)\b|CAP${HWS}:${HWS}(?:none|\d+)\b)`.
+  Prototype (on top of the QA-1.6-34 memo): 0 differences on the 42 direct unit-test literals and on L1, L2, L3, L6,
+  L8, T13; T1, T3, T5-T8, T11, T29 and `verify: required cap:3x` → default; linear (1M ≤ 127 ms
+  in-process). Trade-off: `verify:required CAP:` with an empty `CAP:` then falls back silently.
+  Otherwise, accept it and record the decision in the header.
+
+**QA-1.6-36 — Info — QA-1.6-31 was narrower than its fix text**
+- Where: risk.ts:148-149, :181-183; the QA-1.6-31 resolution line.
+- Evidence (classifier output identical to `fe7a82b`, i.e. still not config):
+  - `requirements/base.in`: the fix text asked for `.in` in **both** requirements rules; only the
+    basename rule got it;
+  - `setupVitest.ts`, `setup-vitest.ts`, `src/testSetup.ts`, `globalTeardown.js`: in the suggested regex
+    but not added, although `globalSetup` and `global-teardown` are config. The resolution names only
+    cypress/karma/mocharc/babel/environment.yml as left out;
+  - `Requirements/base.txt` (capitalised directory).
+
+  These are rated at the file-count level, never below it. §1.5-17 does not name them.
+- Fix (optional): add them, or list them in the QA-1.6-31 resolution as out of scope.
+
+**QA-1.6-37 — Info — report hygiene**
+- The QA-1.6-33 fix asked for a "Deviation (QA-1.6-18)" line under "Result"; "Result" still lists only the
+  `modeSource`/`waitSource` deviation. The record exists in directives.ts:22-23 and the resolution line.
+- The QA-1.6-27..33 "Resolution" bullets were inserted before "Where:". Earlier rounds put them last or in
+  a "Round-N resolutions" list. Cosmetic.
+- Round-3 "Handoff to 2.4" item 4 is stale: it is superseded below.
+- Fix: add the "Result" line in the next doc pass.
+
+### Other checks (no finding)
+
+- A lower-case directive in a table cell that is not the last one (`| verify:required | 2s |`,
+  `| verify:required | notes |`) → default, silently; `| cap:3 | notes |` → 3. This follows the documented
+  rule (a pipe, then the end of the line). Upper-case keys are unaffected.
+- The tail now accepts punctuation and spaces in any order (`verify: required . . .`, `) ] ! ?` →
+  required; `fe7a82b` rejected them). Harmless.
+- U+2028 after the value ends the line → required; NEL does not (not a JS line terminator) → default.
+  `VERIFY:\u0085required` and `CAP:\u00853` → both unmatched (parity).
+- Purity guards: stripping comments first creates a blind spot for comment markers inside strings or
+  regex literals (`const a = "/*"; fetch(u); const b = "*/";`, `const s = "//"; fetch(u)` → missed).
+  Computed access (`globalThis["fe" + "tch"]`) and `new Function(…)` → missed. The guards are tripwires
+  for accidental imports, not a sandbox, and neither module's code has `/*` or an unescaped `//` outside
+  comments. Acceptable.
+- The value, key and `LINE_TAIL` regexes run in place on `text` with sticky flags; only the ≤ 32-unit
+  logged value is sliced. The 200 × `A` log (QA-1.6-7) is unchanged.
+- Plan contract: directives.ts still has no imports; risk.ts has only
+  `import type { ChangedPath, StaticScoping } from "./runner"` (unit guard green).
+
+### Deferred by plan (unchanged; nothing new deferred)
+
+| Item | Phase |
+|---|---|
+| Golden check that `parseVerifyDirectives` returns defaults over the final header/protocol text (QA-1.6-4) | 2.3 / 2.4 |
+| "Subagent cannot self-select" enforcement test; parse only the orchestrator `prompt` (QA-1.6-5) | 2.4 |
+| Clamp `captureWaitMs ≤ baselineTimeoutMs` (QA-1.6-8) | §1.4 config resolver phase |
+| Fill `previousPath` from the porcelain rename source (QA-1.6-13) | 2.1 |
+| Unknown or failed attribution must not become `[]` → low (QA-1.6-14) | 2.4 |
+| Expose the git top-level on `TreeSnapshot` and pass it as `root` (QA-1.6-22) | 2.1 / 2.4 |
+| Tool-observed `ChangedFile` never carries a deletion (`written`/`modified` only) | 2.1 / 2.4 |
+| Amend the plan's 1.6.1 signature (`source` → `modeSource`/`waitSource`) and record the QA-1.6-18 guard (QA-1.6-33) | next plan revision |
+
+### Handoff to 2.4 (delta)
+
+Item 4 of the round-3 handoff now reads: **Key case:** a lower-case key counts only when its value ends
+the line, is followed by closing marks/punctuation/a table pipe up to the end of the line, or is followed
+on the same line by another `VERIFY:`/`VERIFY_WAIT:`/`CAP:` key (QA-1.6-18, QA-1.6-27; see QA-1.6-35).
+In a multi-cell table row only the last cell qualifies. Protocol text (2.3) and any router-authored
+example should show upper-case `VERIFY:`/`VERIFY_WAIT:`. The other items are unchanged.
+
+Outcome: QA-1.6-27..33 are verified (QA-1.6-27 and QA-1.6-28 with residuals). Open and not deferred:
+one Low (QA-1.6-34) and three Info (QA-1.6-35..37). No High or Medium finding is open. Phase 1.6 QA is
+**not** clean until QA-1.6-34 is resolved or explicitly accepted.
