@@ -663,11 +663,12 @@
 //   - Output cap (QA-1.5-24, owner 2.1): the seam caps each stream (p12
 //     runArgv default 10 M chars) and a cut listing is a failed call. Capture's
 //     `ls-files --stage` hits the cap first, at ~95-150k tracked paths (path
-//     length 60-20), so such a repository gets no reference at all (fail
-//     closed, recheck unverifiable). The "" fallback of materialize step 7b
-//     applies only when the `--eol` listing alone overflows (an index grown
-//     after capture, long `attr/` fields). If 2.1 needs large monorepos, pass
-//     a per-call maxBuffer through the seam for the listing calls.
+//     length 60-20; SHA-1 ids, ~78-110k under SHA-256), so such a repository
+//     gets no reference at all (fail closed, recheck unverifiable). An `--eol`
+//     entry is always shorter than a `--stage` one, so the "" fallback of
+//     materialize step 7b applies only when the index grew after capture. If
+//     2.1 needs large monorepos, pass a per-call maxBuffer through the seam
+//     for the listing calls.
 //   - An ignored file that tests need (.env, generated code) is absent at the
 //     reference. The recheck must classify the resulting failure as a setup
 //     failure (§1.5-8). `unreproduced` supports that decision but cannot make
