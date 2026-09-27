@@ -56,6 +56,8 @@ const state = vi.hoisted(() => ({
   refRoot: "",
   /** When set, each scoped run waits for it and ignores its abort signal (QA-2.2-19, R3). */
   hang: undefined as Promise<void> | undefined,
+  /** Called with each scoped run's index (0 = the first); a returned promise holds that run (QA-2.2-22). */
+  runGate: undefined as undefined | ((index: number) => Promise<void> | undefined),
 }));
 
 vi.mock("../../src/verify/exec", () => ({
@@ -159,6 +161,7 @@ async function fakeVitest(args: readonly string[]): Promise<ExecOut> {
   const inputs = args.filter(a => isAbsolute(a) && a.startsWith(root) && !a.includes("node_modules"));
   state.runs.push({ inputs: [...inputs].sort(), holds: state.holds });
   if (state.hang !== undefined) await state.hang;
+  await state.runGate?.(state.runs.length - 1);
   if (state.runMs > 0) await new Promise(resolve => setTimeout(resolve, state.runMs));
   const letters = [...new Set(inputs.map(a => /[\\/]([a-z])(?:\.test)?\.ts$/.exec(a)?.[1]).filter((x): x is string => x !== undefined))].sort();
   const testResults = letters.map(x => {
@@ -315,6 +318,7 @@ beforeEach(() => {
   state.fifo = false;
   state.refRoot = "";
   state.hang = undefined;
+  state.runGate = undefined;
   resetCounters();
 });
 
@@ -355,15 +359,34 @@ describe("batch coordinator behind the verification wiring (2.2.3)", () => {
   });
 
   it("QA-2.2-5: a member settles while its batch still holds the slot for the others' own runs", async () => {
-    state.failing = { c: ["t2"] };
-    const holdsAtSettle: number[] = [];
+    // QA-2.2-22: the order is forced. a has the least time left, so after the union (run 0) its
+    // own run (run 1) is first (B5.5) and reproduces the failure: a is final and settles. Every
+    // later own run waits until a gate has settled.
+    state.failing = { a: ["t2"] };
+    let firstSettled: () => void = () => {};
+    const settled = new Promise<void>(resolve => {
+      firstSettled = resolve;
+    });
+    state.runGate = index => (index >= 2 ? settled : undefined);
+    const order: { x: string; holds: number }[] = [];
     const wiring = wiringWith({ batchWindowMs: WINDOW_MS });
     void barrier(LETTERS.length);
-    await Promise.all(LETTERS.map(x => gate(wiring, x, { onSettled: () => holdsAtSettle.push(state.holds) })));
+    await Promise.all(
+      LETTERS.map(x =>
+        gate(wiring, x, {
+          budgetMs: x === "a" ? 100_000 : 120_000,
+          onSettled: () => {
+            order.push({ x, holds: state.holds });
+            firstSettled();
+          },
+        }),
+      ),
+    );
     await wiring.disposeVerification();
-    // Settled early: the batch's hold was still live for at least one gate's verdict ...
-    expect(holdsAtSettle.some(h => h === 1)).toBe(true);
-    // ... and it is released exactly once, after the last run (B10: an accepted cost, never a deadlock).
+    // Settled early: a's verdict came in while the batch's hold was live for the others' runs ...
+    expect(order[0]).toEqual({ x: "a", holds: 1 });
+    expect(state.runs).toHaveLength(1 + 5);
+    // ... and the hold is released exactly once, after the last run (B10: an accepted cost, never a deadlock).
     expect(state.releases).toBe(1);
     expect(state.holds).toBe(0);
   });
