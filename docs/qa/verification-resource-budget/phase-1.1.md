@@ -83,6 +83,8 @@ scratch script that imports `src/router/config.ts`. The script is outside the re
      throws. No existing test passes a non-object `verify` (`rg "verify: null" test` only matches
      this file).
 
+   - Resolution: OPEN (blocked) — the fix needs `test/unit/config.validate.test.ts:196-201` ("permissive skip", which pins `verify: "x"` as accepted) to be flipped, and that file is outside this dispatch's edit scope. Attempted and reverted; not committed.
+
 2. **QA-1.1-2 — minor — no upper bound on millisecond and count keys: a huge budget becomes an
    immediately-expiring one.** `src/router/config.ts:767-798`.
    - Evidence: `Number.isInteger(1e300)` is `true`. Proof output:
@@ -107,6 +109,8 @@ scratch script that imports `src/router/config.ts`. The script is outside the re
      `Number.isSafeInteger` (or an explicit ceiling such as 1024). Add `2 ** 31` and `1e21` to the
      test's bad-value lists.
 
+   - Resolution: 277a200 — `MAX_TIMER_MS = 2_147_483_647` upper bound on all nine millisecond keys (message `… >= 1 and <= 2147483647 (milliseconds)`); `Number.isSafeInteger` for `maxWorkers`/`maxConcurrentVerifications`; tests add `2 ** 31` and `1e21`.
+
 3. **QA-1.1-3 — minor — the Phase 2.1 switch-over list in the pre-flight section is incomplete.**
    `docs/qa/verification-resource-budget/phase-1.1.md:10-14` (plan 1.1.1.b: "Any existing reads of
    `baselineTimeoutMs`/`gateBudgetMs` defaults elsewhere … are listed in the QA report for Phase 2.1").
@@ -130,6 +134,8 @@ scratch script that imports `src/router/config.ts`. The script is outside the re
      `index.ts:82` import and `tiers.json:21` to the Phase 2.1 list. For `tiers.json:21`, either
      drop the key in this phase (it is config surface and no other phase owns the file) or assign
      the removal to 2.1 explicitly.
+
+   - Resolution: 8bc503d — added `wiring.ts:258/276`, the `index.ts:82` import and `tiers.json:21` (removal assigned to Phase 2.1) to the pre-flight Phase 2.1 list.
 
 4. **QA-1.1-4 — minor — `resolveVerifyBudget` is not pure, and the spec'd deprecation warning is
    not guaranteed to fire.** `src/router/config.ts:1264-1294`. Acceptance criterion: "it is pure and
@@ -161,6 +167,8 @@ scratch script that imports `src/router/config.ts`. The script is outside the re
      `resolveVerifyBudget(cfgWith({ testBaseline: false }), { cores: 1 })` performs no warning (it
      no longer takes a logger).
 
+   - Resolution: ca98fdc — `resolveVerifyBudget` is pure (no flag, no logger, `logger` option removed). New export `warnDeprecatedVerifyKeys(cfg, logger)` with a required logger owns the once-per-process flag (`resetVerifyBudgetWarnings()` resets it); warning tests moved. Calling it from `src/index.ts` after each `loadConfig()` is deferred by plan (2.1).
+
 5. **QA-1.1-5 — nit — the `__proto__` test claims more than it proves.**
    `test/unit/config-verify-budget.test.ts:188` ("neither bypasses validation nor pollutes").
    - Evidence: the payload `{"maxWorkers": 99, "testScope": "all"}` is **never validated**:
@@ -174,6 +182,8 @@ scratch script that imports `src/router/config.ts`. The script is outside the re
    - Fix: rename the test to "an own `__proto__` key is inert and does not pollute", and assert
      `Object.getPrototypeOf(verify) === Object.prototype`. Optionally reject own
      `__proto__`/`constructor`/`prototype` keys inside `enforcement.verify` in `validateEnforcement`.
+
+   - Resolution: 277a200 — test renamed "an own `__proto__` key is inert and does not pollute" and asserts `Object.getPrototypeOf(verify) === Object.prototype`; `validateEnforcement` now rejects own `__proto__`/`constructor`/`prototype` keys inside `verify` (`tiers.json: enforcement.verify must not contain the key "…"`), tested.
 
 6. **QA-1.1-6 — nit — test gaps against the plan's "New tests" list and the adversarial focus.**
    `test/unit/config-verify-budget.test.ts`.
@@ -192,6 +202,8 @@ scratch script that imports `src/router/config.ts`. The script is outside the re
      - Add a fresh-flag test where `{ testBaseline: true }` with a logger calls `warn` once.
      - Add `[15.9, 1]`, `[16.5, 2]` and `[Infinity, 1]` to the cores table.
      - The merge-path `null` case is covered by the fix for QA-1.1-1.
+
+   - Resolution: ca98fdc — exact formula test against `os.availableParallelism()`; fresh-flag `testBaseline: true` warns once; cores `15.9→1`, `16.5→2`, `Infinity→1` (the existing non-finite rule already maps `Infinity` to 1; now documented in the docstring).
 
 **Deferred by plan (not open):**
 
