@@ -79,7 +79,7 @@ import { tool } from "@opencode-ai/plugin";
 import { scrubText } from "./guard/scrub";
 import { accept, unverifiableGateResult } from "./verify/gate";
 import { createVerificationWiring, dispatchDirectiveText, extractAssistantText, parseRouterVerifyArgs, type DispatchStart } from "./verify/wiring";
-import { appendRouterFooter } from "./verify/pending";
+import { appendRouterFooter, buildPendingListBlock } from "./verify/pending";
 import { createDeadline } from "./verify/deterministic";
 import {
   DEFAULT_DELEGATE_PROMPT_TIMEOUT_MS,
@@ -1708,6 +1708,17 @@ const ModelRouterPlugin: Plugin = async (ctx: PluginInput) => {
       let enfOn = false;
       try { enfOn = resolveEnforcementMode({ config: cfg, env: process.env }).mode !== "off"; } catch {}
       output.system.push(assembleSystemPrompt(cfg, orchestratorModel, enfOn));
+
+      // 2.4.4, section 1.5-20: this orchestrator's still-unverified delegations (at most 5 shown,
+      // newest first), as one short block. Nothing is pushed when the list is empty, so the prompt
+      // does not grow for sessions that never defer. Orchestrator path only: every child returned
+      // above. (2.4.5 adds the background late notices here, behind `background: true`.)
+      try {
+        const block = buildPendingListBlock(pending.listUnverified(sessionID));
+        if (block !== undefined) output.system.push(block);
+      } catch (error) {
+        logger.warn("[verify] pending list not injected", { error: scrubText(String(error)) });
+      }
     },
 
     // -----------------------------------------------------------------------
