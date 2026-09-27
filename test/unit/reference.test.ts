@@ -384,6 +384,37 @@ describe("materialize / dispose", { timeout: 60_000 }, () => {
     expect(await fsp.readFile(join(repo, "packages", "a", "node_modules", "sentinel.txt"), "utf8")).toBe("keep me");
   });
 
+  it("QA-1.5-3: a link created after the sweep never costs its target; git runs only once the dir is gone", async () => {
+    const victim = join(base, "victim");
+    await fsp.mkdir(join(victim, "pkg"), { recursive: true });
+    await fsp.writeFile(join(victim, "pkg", "sentinel.txt"), "real data");
+    let refDir = "";
+    let dirAtGitRemove: boolean | undefined;
+    const lateLinkFs: ReferenceDeps["fs"] = {
+      ...nodeReferenceFs,
+      rm: async (path, options) => {
+        // The race: a junction appears between the sweep and the recursive removal.
+        if (await exists(join(path, ".git"))) await fsp.symlink(victim, join(path, "packages", "late-link"), linkType);
+        return nodeReferenceFs.rm(path, options);
+      },
+    };
+    const watching: CaptureDeps["argv"] = async (file, args, opts) => {
+      if (refDir && args.includes("worktree") && args.includes("remove")) {
+        dirAtGitRemove = await exists(refDir);
+        if (dirAtGitRemove) await fsp.symlink(victim, join(refDir, "late-link-2"), linkType);
+      }
+      return argv(file, args, opts);
+    };
+    const handle = await mat(await capture(), { fs: lateLinkFs, argv: watching });
+    refDir = handle.dir;
+    await handle.dispose();
+    expect(await exists(handle.dir)).toBe(false);
+    expect(dirAtGitRemove).toBe(false);
+    expect(await fsp.readFile(join(victim, "pkg", "sentinel.txt"), "utf8")).toBe("real data");
+    expect(await fsp.readFile(join(repo, "node_modules", "sentinel.txt"), "utf8")).toBe("keep me");
+    expect(await fsp.readFile(join(repo, "packages", "a", "node_modules", "sentinel.txt"), "utf8")).toBe("keep me");
+  });
+
   it("dispose twice returns the same promise and never rejects", async () => {
     const handle = await mat(await capture());
     const first = handle.dispose();

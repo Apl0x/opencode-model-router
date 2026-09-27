@@ -261,31 +261,42 @@
 //   the leftover is left for GC. Contract: call it only after the recheck's
 //   process tree has exited. It does not use the caller's signal, because
 //   cleanup must still run after an abort.
-//   Order: Spike D method 8 (the proven-safe order), plus a sweep (D6):
+//   Order: unlink-first as in Spike D method 8, plus a sweep (D6), but git
+//   never deletes a tree (QA-1.5-3):
 //   1. Recorded links, in reverse order. Check isStrictlyInside(link, dir),
 //      then lstat. ENOENT: skip. isSymbolicLink(): fs.unlink, retrying
 //      transient errors. A real file or directory at that path is worktree
 //      content: leave it for the later steps.
 //   2. Link sweep. Walk dir with lstat, never descending into a link (the
-//      worktree's `.git` is a file), and fs.unlink every link found. Tests can
+//      worktree's `.git` is a file), and fs.unlink every link found. Before
+//      each readdir, realpath(current) must be dir's realpath or inside it,
+//      so a real directory swapped for a junction after its lstat is not
+//      walked into (the race window shrinks to realpath..readdir). Tests can
 //      create links, and `git worktree remove --force` follows junctions and
 //      DELETES TARGET CONTENTS (Spike D, BANNED list). If a link survives step
 //      1 or 2, or the walk exceeds MAX_SWEEP_ENTRIES, STOP: nothing more is
 //      removed. Warn "reference worktree left in place: <reason>"; GC retries
 //      later.
 //   3. Run assertSafeRefDir(dir) and confirm lstat(dir) is a real directory.
-//      Then `git worktree remove --force <dir>` (cwd: root, timeout
-//      CLEANUP_GIT_TIMEOUT_MS). The tree is link-free at this point.
-//   4. If dir still exists (e.g. EBUSY), run assertSafeRefDir(dir) again, then
-//      fs.rm(dir, { recursive: true, force: true, maxRetries: CLEANUP_RETRIES,
-//      retryDelay: CLEANUP_RETRY_BASE_MS }). This is Spike D SAFE #5, allowed
-//      only on a link-free tree.
-//   5. If the admin entry is still registered (dir now gone), run
-//      `git worktree remove --force <dir>` again. Measured in 1.5.1: on an
-//      already-deleted dir it exited 0 and removed only that entry;
+//      Then fs.rm(dir, { recursive: true, force: true, maxRetries:
+//      CLEANUP_RETRIES, retryDelay: CLEANUP_RETRY_BASE_MS }): Spike D SAFE #5,
+//      the only recursive deleter. fs.rm removes a link without following it,
+//      so a junction created after the sweep costs nothing (QA-1.5-3 repro:
+//      `git worktree remove` in this slot deleted the late junction's target
+//      contents; fs.rm left them intact). The sweep stays, because fs.rm's
+//      non-following is proven only on Node v24.21.0 and engines is >=20. If
+//      dir still exists afterwards (EBUSY from a process whose cwd is inside),
+//      warn and leave it for GC; git is not run.
+//   4. Only once dir is gone, and while the admin entry is still registered:
+//      assertSafeRefDir(dir), lstat(dir) must be ENOENT, then
+//      `git worktree remove --force <dir>` (cwd: root, timeout
+//      CLEANUP_GIT_TIMEOUT_MS). Measured in 1.5.1: on an already-deleted dir
+//      it exited 0 and removed only that entry, with no recursion;
 //      `git worktree prune -v` afterwards found nothing. `git worktree prune`
-//      is never run (D5).
-//   6. Remove dir from ACTIVE.
+//      is never run (D5). Residual race: a dir recreated between that lstat
+//      and git's own check would be deleted by git; only this module creates
+//      omr-ref names, under an in-use entry.
+//   5. Remove dir from the in-use set.
 //   Transient errors (TRANSIENT_FS_CODES: EBUSY, EPERM, EACCES, ENOTEMPTY,
 //   caused by Windows AV scans or open handles) are retried up to
 //   CLEANUP_RETRIES times with CLEANUP_RETRY_BASE_MS * 2^n backoff, then
@@ -297,17 +308,19 @@
 // ----------------------------------------------------------------------------
 //   R1 Every removal is preceded by an lstat check. A link is only ever removed
 //      with fs.unlink, which is single-entry and never recursive.
-//   R2 A recursive removal (`git worktree remove --force` or fs.rm with
-//      recursive) is allowed only on a path that (i) passed assertSafeRefDir
-//      immediately before, (ii) lstat shows is a real directory, not a link,
-//      and (iii) the sweep proved link-free.
+//   R2 A recursive removal (fs.rm with recursive; nothing else) is allowed
+//      only on a path that (i) passed assertSafeRefDir immediately before,
+//      (ii) lstat shows is a real directory, not a link, and (iii) the sweep
+//      proved link-free. `git worktree remove --force` is only ever run on a
+//      dir that passed assertSafeRefDir and that lstat shows is gone, so it
+//      only drops the admin entry (QA-1.5-3).
 //   R3 assertSafeRefDir(dir, tmpRoots) accepts dir only if it is absolute,
 //      has no "." or ".." segment, its basename matches REF_DIR_PATTERN
 //      (omr-ref-<pid>-<16 hex>), and its parent IS one of the tmp roots:
 //      resolve(tmpdir) or realpath(tmpdir), compared case-insensitively on
 //      win32. It must be a direct child: never the tmp root itself, never
 //      deeper, and never under a tmp root that is a filesystem root.
-//   R4 Banned in this module: `git worktree remove` while links are inside,
+//   R4 Banned in this module: `git worktree remove` on a dir that exists,
 //      `git worktree prune`, `git clean`, any `git stash` other than `create`,
 //      `git reset/checkout/update-ref/gc`, fs.rm on a path that fails R2, any
 //      shell, and importing child_process.
@@ -375,8 +388,8 @@
 //      - its dir is missing (prunable).
 //   4. Each stale candidate goes through the section 6 pipeline with no
 //      recorded links. The sweep finds and unlinks every node_modules link,
-//      step 5 removes a missing-dir entry, and `git worktree prune` is never
-//      run.
+//      fs.rm removes the dir, step 4 then removes the missing-dir entry, and
+//      `git worktree prune` is never run.
 //   5. Orphans are tmp-root entries matching REF_DIR_PATTERN that are not
 //      registered in root's list. An orphan is removed (sweep, then R2 fs.rm)
 //      only if it is stale AND it either has no `.git` file or its `gitdir:`
@@ -417,9 +430,11 @@
 //      touch non-omr worktrees. Replacement: `git worktree remove --force
 //      <dir>` on an already-deleted dir. Measured in 1.5.1, it exited 0 and
 //      removed only that entry.
-//   D6 dispose adds a full link sweep before `git worktree remove --force`.
-//      Spike D proved the order for the links we create; tests may create
-//      others.
+//   D6 dispose adds a full link sweep before the recursive removal. Spike D
+//      proved the order for the links we create; tests may create others.
+//      Unlike Spike D method 8, the recursive removal is fs.rm, and
+//      `git worktree remove --force` runs only after the dir is gone
+//      (QA-1.5-3: git follows a junction that appears after the sweep).
 //   D7 capture refuses (returns undefined) above MAX_UNTRACKED_FILES /
 //      MAX_UNTRACKED_BYTES, and GC also removes this repository's stale
 //      orphan omr-ref dirs. Both address temp-dir exhaustion; the plan does
@@ -449,11 +464,14 @@
 //     failure (§1.5-8). `unreproduced` supports that decision but cannot make
 //     it.
 //   - POSIX directory-symlink behaviour of `git worktree remove` is unverified
-//     (Spike D ran on win32 only). The unlink-first order and the sweep apply
-//     on every platform. The 1.5.3 key safety test must run on POSIX CI.
+//     (Spike D ran on win32 only). It no longer matters for deletion: git only
+//     ever sees a dir that is already gone. The unlink-first order and the
+//     sweep apply on every platform. The 1.5.3 key safety test must run on
+//     POSIX CI.
 //   - On Node versions other than v24.21.0, fs.rm's non-following of junctions
-//     is not proven (Spike D). R2 makes this irrelevant, since fs.rm only ever
-//     runs on link-free trees.
+//     is not proven (Spike D). R2 limits this to a link created between the
+//     sweep and fs.rm (the QA-1.5-3 window), which only a process running
+//     after the dispose contract was broken can create.
 // ============================================================================
 
 import * as fsp from "node:fs/promises";
@@ -865,12 +883,17 @@ async function sweepLinks(ctx: CleanupContext, dir: string): Promise<string | un
   const root = await lstatOrMissing(ctx.fs, dir);
   if (!root) return undefined;
   if (root.isSymbolicLink() || !root.isDirectory()) return "reference dir is not a real directory";
+  const realDir = p.resolve(await ctx.fs.realpath(dir));
   const stack = [dir];
   let entries = 0;
   while (stack.length > 0) {
     const current = stack.pop() as string;
     let names: string[];
     try {
+      // The lexical check below cannot see a real dir swapped for a junction after
+      // its lstat (QA-1.5-3); realpath narrows that window to this call and readdir.
+      const real = p.resolve(await ctx.fs.realpath(current));
+      if (!insideOrEqual(real, realDir, ctx.platform)) return `sweep reached ${current} resolving outside the dir`;
       names = await withRetry(() => ctx.fs.readdir(current));
     } catch (error) {
       if (errorCode(error) === "ENOENT") continue;
@@ -905,7 +928,7 @@ async function isRegistered(ctx: CleanupContext, dir: string): Promise<boolean |
 }
 
 /**
- * Section 6 steps 1-5. Returns true when dir is gone (and, with `git`, unregistered).
+ * Section 6 steps 1-4. Returns true when dir is gone (and, with `git`, unregistered).
  * Never throws; every failure is logged and the leftover is left for GC.
  */
 async function removeReferenceDir(
@@ -929,18 +952,10 @@ async function removeReferenceDir(
     // 2. Sweep: prove the tree link-free before any recursive removal (R2 iii).
     const sweepFailure = await sweepLinks(ctx, dir);
     if (sweepFailure) return leftInPlace(ctx, dir, sweepFailure);
-    // 3. git worktree remove --force on a link-free, guarded, real directory.
-    let stats = await lstatOrMissing(ctx.fs, dir);
-    if (stats && git) {
-      assertSafeRefDir(dir, ctx.tmpRoots, ctx.platform);
-      if (stats.isSymbolicLink() || !stats.isDirectory()) return leftInPlace(ctx, dir, "not a real directory");
-      const removed = await runGit(ctx.argv, ["worktree", "remove", "--force", dir], { cwd: ctx.root, timeoutMs: CLEANUP_GIT_TIMEOUT_MS });
-      if (!removed || removed.code !== 0) {
-        ctx.logger?.warn("git worktree remove failed; falling back to fs.rm", { dir, stderr: removed?.stderr.trim() });
-      }
-    }
-    // 4. Whatever is left: guarded recursive fs.rm (Spike D SAFE #5) on the link-free tree.
-    stats = await lstatOrMissing(ctx.fs, dir);
+    // 3. The only recursive deleter: guarded fs.rm (Spike D SAFE #5) on the link-free
+    //    tree. fs.rm never follows a link that appears after the sweep (QA-1.5-3);
+    //    `git worktree remove` on an existing dir would.
+    const stats = await lstatOrMissing(ctx.fs, dir);
     if (stats) {
       assertSafeRefDir(dir, ctx.tmpRoots, ctx.platform);
       if (stats.isSymbolicLink() || !stats.isDirectory()) return leftInPlace(ctx, dir, "not a real directory");
@@ -951,7 +966,8 @@ async function removeReferenceDir(
       }
       if (await lstatOrMissing(ctx.fs, dir)) return leftInPlace(ctx, dir, "dir still exists after fs.rm");
     }
-    // 5. Drop a still-registered admin entry; never `git worktree prune` (D5).
+    // 4. Only now that the dir is gone: drop the admin entry with
+    //    `git worktree remove --force`, which then deletes no tree. Never prune (D5).
     if (git && (await isRegistered(ctx, dir)) !== false) {
       assertSafeRefDir(dir, ctx.tmpRoots, ctx.platform);
       if (await lstatOrMissing(ctx.fs, dir)) return leftInPlace(ctx, dir, "dir reappeared before admin-entry removal");
