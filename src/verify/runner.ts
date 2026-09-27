@@ -235,8 +235,8 @@
 //     xdist evidence (QA-1.3-3). pytest reads options from three places, in this order, and the
 //     last cap wins: the config file's addopts, PYTEST_ADDOPTS, the command. The adapter reads
 //     all three the way pytest does:
-//       - Config file (pytest 9 findpaths): the -c/--config-file file alone, when given (read
-//         by its extension, always accepted). Otherwise walk from the start directory up to the
+//       - Config file (pytest 9 findpaths): the -c/--config-file file alone, when given on the
+//         command line or in PYTEST_ADDOPTS (read by its extension, always accepted). Otherwise walk from the start directory up to the
 //         FILESYSTEM ROOT (not gitRoot: pytest does not stop there) and, in each directory,
 //         take the first of pytest.toml, .pytest.toml, pytest.ini, .pytest.ini, pyproject.toml,
 //         tox.ini, setup.cfg that pytest accepts: pytest.toml/.pytest.toml ([pytest] table) and
@@ -274,7 +274,12 @@
 //         reading it (QA-1.3-34). Each file is read once per planner call and parsed once per
 //         reading (ctx.cache); with PlannerFs.stat the size is checked before the read.
 //       - PYTEST_ADDOPTS: host.pytestAddopts and the cross-env value (C.3). Both are scanned for
-//         evidence; the cap comes from the value the spawn will see (cross-env wins).
+//         xdist and cov evidence; the cap and "-p no:xdist" come from the value the spawn will
+//         see (cross-env wins). QA-1.3-39: pytest prepends that value to the command line before
+//         it picks its config, so its -c/--config-file chooses the config file, its
+//         -o addopts=/python_files= override the file's keys, and its --rootdir turns off the
+//         fallback below, exactly like the command's, which comes later and wins (the last -c,
+//         -o and --rootdir count). A -c from PYTEST_ADDOPTS is a config trigger too.
 //       - The command (D.1).
 //     Each addopts source goes through D.1 with the pytest table in "addopts" mode: a positional
 //     -> S6 unsupported-argument `... "<p>" in addopts of <file>` / `in PYTEST_ADDOPTS` /
@@ -287,9 +292,17 @@
 //     Start directory: runnerCwd at detection (pytest with no file arguments). The spec redoes
 //     the lookup from the common ancestor of its inputs (pytest's rootdir/inifile rule for file
 //     arguments), from DetectedRunner.pytestFacts, so tests/unit/pytest.ini counts for inputs
-//     under tests/unit. A false xdist match can only add "-n N" without xdist: pytest exit 4,
-//     readResult complete=false, unverifiable, never a false pass. Residual (P): a conftest.py
-//     or plugin that adds -n through a hook.
+//     under tests/unit. QA-1.3-40, determine_setup's fallback: when that lookup finds no
+//     rootdir (no accepted config, no setup.py at or above the ancestor and, for pytest >= 8.1,
+//     no pyproject.toml either; pytest 8.0 and 7 lack that rule, so the legacy lines ignore it),
+//     no --rootdir is given, and the argument directories are not just the ancestor, pytest
+//     looks again from each argument directory in order and takes the first accepted file. The
+//     adapter does the same per release line: at spec time over the inputs' directories (F's
+//     order), at detection over the path arguments (the user's order) for python_files. With
+//     tests/a/pytest.ini as the only config, `pytest tests/a tests/b` reads it, and so does a
+//     spec whose inputs lie in tests/a and tests/b. A false xdist match can only add "-n N"
+//     without xdist: pytest exit 4, readResult complete=false, unverifiable, never a false
+//     pass. Residual (P): a conftest.py or plugin that adds -n through a hook.
 //
 //   D.5 eslint (lint scoping, K)
 //     DROP 0  --fix --fix-dry-run
@@ -1188,6 +1201,8 @@ export interface PytestFacts {
   readonly overrideAddopts?: string;
   /** The patterns of every `-o python_files=<v>` on the command line (QA-1.3-33): they replace the config's. */
   readonly pythonFiles?: readonly string[];
+  /** The last `--rootdir` value on the command line. A non-empty one turns off pytest's per-argument config fallback (D.4, QA-1.3-40). */
+  readonly rootdir?: string;
 }
 
 /** What resolveEntry needs. DetectedRunner satisfies it. */
@@ -1937,6 +1952,8 @@ interface ArgResult {
   readonly overrideAddopts: string | undefined;
   /** pytest: the values of every `-o python_files=<v>` (QA-1.3-33). */
   readonly overridePythonFiles: string[];
+  /** pytest: the last `--rootdir` value (QA-1.3-40: it turns off the per-argument config fallback). */
+  readonly rootdir: string | undefined;
   readonly notes: string[];
 }
 
@@ -1980,6 +1997,7 @@ async function processArgs(
   let cov = false;
   let overrideAddopts: string | undefined;
   const overridePythonFiles: string[] = [];
+  let rootdir: string | undefined;
   let firstPositional = true;
   const badArg = (t: string) => s6("unsupported-argument", `unsupported ${kind} argument "${t}" in ${where}`);
 
@@ -2030,6 +2048,7 @@ async function processArgs(
         if (value.startsWith("addopts=")) overrideAddopts = value.slice("addopts=".length);
         if (value.startsWith("python_files=")) overridePythonFiles.push(value.slice("python_files=".length));
       }
+      if (kind === "pytest" && m.name === "--rootdir" && value !== undefined) rootdir = value;
       switch (m.entry.action) {
         case "drop":
           break;
@@ -2100,7 +2119,7 @@ async function processArgs(
     userWorkers = parseCap(kind, capRaw);
     if (!userWorkers) notes.add(`invalid worker cap "${capRaw}" ignored`);
   }
-  return { kept, capRaw, userWorkers, pathScopes, noXdist, xdistArg, cov, configs, overrideAddopts, overridePythonFiles, notes: [...notes] };
+  return { kept, capRaw, userWorkers, pathScopes, noXdist, xdistArg, cov, configs, overrideAddopts, overridePythonFiles, rootdir, notes: [...notes] };
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -2428,6 +2447,8 @@ interface PytestConfig extends ConfigValues {
  * unreadable file is noted and skipped; a file over CONFIG_SIZE_LIMIT is S6 config-too-large
  * (QA-1.3-34). A `bad` key is S6 (some pytest reads it) unless it is in `ignore` (overridden with
  * -o on the command line). Files are read and parsed once per call (ctx.cache).
+ * `fallbackDirs` are the argument directories, in pytest's order, for determine_setup's
+ * per-argument fallback (QA-1.3-40); [] when there is none (no arguments, or --rootdir).
  * `everyLine` is false when some release line found no config at all.
  */
 async function findPytestConfigs(
@@ -2437,6 +2458,7 @@ async function findPytestConfigs(
   start: string,
   notes: string[],
   ignore: ReadonlySet<string>,
+  fallbackDirs: readonly string[],
 ): Promise<{ configs: PytestConfig[]; everyLine: boolean } | Unverifiable> {
   const load = async (p: string, isExplicit: boolean, legacy: boolean): Promise<ConfigParse | "unreadable" | Unverifiable> => {
     const t = await readConfigText(ctx, fs, p);
@@ -2467,25 +2489,58 @@ async function findPytestConfigs(
     return { configs: out, everyLine: out.length > 0 };
   }
   const done = PYTEST_CONFIG_LINES.map(() => false);
-  let d = start;
-  for (;;) {
-    for (let l = 0; l < PYTEST_CONFIG_LINES.length; l++) {
-      if (done[l]) continue;
-      for (const name of PYTEST_CONFIG_LINES[l].names) {
+  // locate_config for the lines in `todo`, from `from` up to the filesystem root; each line keeps its first accepted file.
+  const walk = async (from: string, todo: readonly number[]): Promise<Unverifiable | undefined> => {
+    for (let d = from; ; ) {
+      for (const l of todo) {
+        if (done[l]) continue;
+        for (const name of PYTEST_CONFIG_LINES[l].names) {
+          const p = ctx.P.join(d, name);
+          if (!(await existsCached(ctx, fs, p))) continue;
+          const r = await load(p, false, PYTEST_CONFIG_LINES[l].legacy);
+          if (r === undefined || r === "unreadable") continue;
+          if (isS6(r)) return r;
+          add(p, r);
+          done[l] = true;
+          break;
+        }
+      }
+      const up = ctx.P.dirname(d);
+      if (todo.every((l) => done[l]) || up === d) return undefined;
+      d = up;
+    }
+  };
+  const bad = await walk(start, PYTEST_CONFIG_LINES.map((_, l) => l));
+  if (bad) return bad;
+  // QA-1.3-40: determine_setup's fallback. When the lookup from the common ancestor found no
+  // rootdir (no accepted config, no setup.py at or above it, and for pytest >= 8.1 no
+  // pyproject.toml either) and the arguments' directories are not just that ancestor, pytest
+  // runs locate_config again over the argument directories, in order: the first accepted file
+  // wins. pytest 8.0 and 7 lack the pyproject.toml rule, so the legacy lines always fall back.
+  const open = done.flatMap((x, l) => (x ? [] : [l]));
+  if (open.length > 0 && fallbackDirs.some((f) => ctx.key(f) !== ctx.key(start))) {
+    const isFileAbove = async (name: string): Promise<boolean> => {
+      for (let d = start; ; ) {
         const p = ctx.P.join(d, name);
-        if (!(await existsCached(ctx, fs, p))) continue;
-        const r = await load(p, false, PYTEST_CONFIG_LINES[l].legacy);
-        if (r === undefined || r === "unreadable") continue;
-        if (isS6(r)) return r;
-        add(p, r);
-        done[l] = true;
-        break;
+        if ((await existsCached(ctx, fs, p)) && (await statOf(fs, p))?.isFile !== false) return true;
+        const up = ctx.P.dirname(d);
+        if (up === d) return false;
+        d = up;
+      }
+    };
+    if (!(await isFileAbove("setup.py"))) {
+      const pyproject = await isFileAbove("pyproject.toml");
+      for (const l of open) {
+        if (pyproject && !PYTEST_CONFIG_LINES[l].legacy) continue;
+        for (const f of fallbackDirs) {
+          const r = await walk(f, [l]);
+          if (r) return r;
+          if (done[l]) break;
+        }
       }
     }
-    const up = ctx.P.dirname(d);
-    if (done.every(Boolean) || up === d) return { configs: out, everyLine: done.every(Boolean) };
-    d = up;
   }
+  return { configs: out, everyLine: done.every(Boolean) };
 }
 
 /** QA-1.3-21: the lower of two raw config caps (count n < auto; an invalid value ranks last). */
@@ -2504,12 +2559,16 @@ interface PytestEvidence {
   readonly userWorkers?: UserWorkerCap;
   /** The union of the python_files patterns every source can apply (QA-1.3-33). */
   readonly pythonFiles: readonly string[];
+  /** The -c/--config-file pytest reads, from the command or PYTEST_ADDOPTS (QA-1.3-39); a config trigger. */
+  readonly configFile?: string;
 }
 
 /**
  * D.4: xdist, cov and the user cap from every source pytest reads, in pytest's order (config
  * addopts, then PYTEST_ADDOPTS, then the command; the last cap wins). Both the cross-env and the
- * host PYTEST_ADDOPTS are scanned for evidence; the cap comes from the one the spawn will see.
+ * host PYTEST_ADDOPTS are scanned for xdist/cov evidence; the cap, "-p no:xdist" and the options
+ * that choose the config come from the one the spawn will see (QA-1.3-39). `fallbackDirs`: the
+ * argument directories for determine_setup's fallback (QA-1.3-40).
  */
 async function pytestEvidence(
   ctx: Ctx,
@@ -2520,59 +2579,87 @@ async function pytestEvidence(
   runnerCwd: string,
   gitRoot: string,
   notes: string[],
+  fallbackDirs: readonly string[] = [],
 ): Promise<PytestEvidence | Unverifiable> {
-  // cap: "config" sources are alternatives (one per pytest line, QA-1.3-21): the lowest cap wins.
-  // Later sources override in pytest's order: "wins" always, "if-last" unless cross-env follows.
-  const sources: { where: string; text?: string; tokens?: readonly string[]; cap: "config" | "wins" | "none" }[] = [];
+  const exists = (p: string) => fs.fileExists(p);
+  const parse = (tokens: readonly string[] | undefined, where: string): Promise<ArgResult | Unverifiable> =>
+    tokens ? processArgs(ctx, "pytest", tokens, where, runnerCwd, gitRoot, { addopts: { exists } }) : Promise.resolve(s6("unterminated-quote", `unterminated quote in ${where}`));
+  // QA-1.3-39: pytest prepends PYTEST_ADDOPTS to the command line BEFORE it picks its config, so a
+  // -c/--config-file, --rootdir or -o there counts like one on the command line (which comes
+  // later and wins). The spawn sees the cross-env value when there is one, else the host's.
+  const crossEnv = Object.hasOwn(env, "PYTEST_ADDOPTS");
+  const envs: { readonly r: ArgResult; readonly seen: boolean }[] = [];
+  for (const [text, seen] of [[ctx.host.pytestAddopts, !crossEnv], [crossEnv ? env.PYTEST_ADDOPTS : "", true]] as const) {
+    if (text === "") continue;
+    const r = await parse(tokenize(text), "PYTEST_ADDOPTS");
+    if (isS6(r)) return r;
+    envs.push({ r, seen });
+  }
+  const seenEnv = envs.find((x) => x.seen)?.r;
+  const envConfig = seenEnv?.configs.at(-1);
+  const configFile = facts.configFile ?? (envConfig === undefined ? undefined : await realOf(ctx, fs, ctx.P.resolve(runnerCwd, stripWinPrefix(ctx, envConfig))));
+  const overrideAddopts = facts.overrideAddopts ?? seenEnv?.overrideAddopts;
+  const rootdir = facts.rootdir ?? seenEnv?.rootdir;
   // The config is always looked up: python_files comes from it even when -o addopts replaces its
   // addopts. A key the command line overrides with -o is not S6 when the file spells it oddly.
   const ignore = new Set<string>();
-  if (facts.overrideAddopts !== undefined) ignore.add("addopts");
-  if (facts.pythonFiles !== undefined) ignore.add("python_files");
-  const found = await findPytestConfigs(ctx, fs, facts.configFile, start, notes, ignore);
+  if (overrideAddopts !== undefined) ignore.add("addopts");
+  if (facts.pythonFiles !== undefined || (seenEnv?.overridePythonFiles.length ?? 0) > 0) ignore.add("python_files");
+  const found = await findPytestConfigs(ctx, fs, configFile, start, notes, ignore, rootdir ? [] : fallbackDirs);
   if (isS6(found)) return found;
   // QA-1.3-33: every line's config applies its python_files, or pytest's default when it sets none
   // or the line found no config. The union only ever classifies more files as tests.
   const pythonFiles = new Set<string>(found.everyLine ? [] : DEFAULT_PYTHON_FILES);
   for (const cfg of found.configs) for (const p of cfg.pythonFiles ?? DEFAULT_PYTHON_FILES) pythonFiles.add(p);
   for (const p of facts.pythonFiles ?? []) pythonFiles.add(p);
+  // cap: "config" sources are alternatives (one per pytest line, QA-1.3-21): the lowest cap wins.
+  // Later sources override in pytest's order: "wins" always; "none" (a host PYTEST_ADDOPTS that
+  // cross-env replaces) is evidence for xdist and cov only.
+  const sources: { readonly where: string; readonly r: ArgResult; readonly cap: "config" | "wins" | "none" }[] = [];
   // "-p no:xdist" in a config disables xdist only when every pytest line reads a config that says
   // so: a line whose config does not block xdist would still honour an -n (QA-1.3-21).
   let configsBlock: boolean;
-  if (facts.overrideAddopts !== undefined) {
-    sources.push({ where: "-o addopts", text: facts.overrideAddopts, cap: "config" });
+  if (overrideAddopts !== undefined) {
+    const r = await parse(tokenize(overrideAddopts), "-o addopts");
+    if (isS6(r)) return r;
+    sources.push({ where: "-o addopts", r, cap: "config" });
     configsBlock = true;
   } else {
     configsBlock = found.everyLine && found.configs.every((c) => c.addopts !== undefined);
-    for (const cfg of found.configs) if (cfg.addopts) sources.push({ where: `addopts of ${cfg.path}`, tokens: cfg.addopts, cap: "config" });
+    for (const cfg of found.configs) {
+      if (!cfg.addopts) continue;
+      const where = `addopts of ${cfg.path}`;
+      const r = await parse(cfg.addopts, where);
+      if (isS6(r)) return r;
+      sources.push({ where, r, cap: "config" });
+    }
   }
-  const crossEnv = Object.hasOwn(env, "PYTEST_ADDOPTS");
-  if (ctx.host.pytestAddopts !== "") sources.push({ where: "PYTEST_ADDOPTS", text: ctx.host.pytestAddopts, cap: crossEnv ? "none" : "wins" });
-  if (crossEnv) sources.push({ where: "PYTEST_ADDOPTS", text: env.PYTEST_ADDOPTS, cap: "wins" });
+  for (const x of envs) sources.push({ where: "PYTEST_ADDOPTS", r: x.r, cap: x.seen ? "wins" : "none" });
 
   let capRaw: string | undefined;
   let xdist = facts.xdist;
   let noXdist = facts.noXdist;
   let cov = false;
-  const exists = (p: string) => fs.fileExists(p);
-  for (const src of sources) {
-    const tokens = src.tokens ?? tokenize(src.text ?? "");
-    if (!tokens) return s6("unterminated-quote", `unterminated quote in ${src.where}`);
-    const r = await processArgs(ctx, "pytest", tokens, src.where, runnerCwd, gitRoot, { addopts: { exists } });
-    if (isS6(r)) return r;
+  for (const { where, r, cap } of sources) {
     xdist ||= r.xdistArg;
-    if (src.cap === "config") configsBlock &&= r.noXdist;
-    else noXdist ||= r.noXdist;
+    if (cap === "config") configsBlock &&= r.noXdist;
+    else if (cap === "wins") noXdist ||= r.noXdist;
     cov ||= r.cov;
-    if (r.capRaw !== undefined && (src.cap === "wins" || (src.cap === "config" && lowerCap(r.capRaw, capRaw)))) capRaw = r.capRaw;
+    if (r.capRaw !== undefined && (cap === "wins" || (cap === "config" && lowerCap(r.capRaw, capRaw)))) capRaw = r.capRaw;
     for (const n of r.notes) if (n.startsWith("invalid worker cap") && !notes.includes(n)) notes.push(n);
-    const pf = pythonFilesOverride(r.overridePythonFiles, src.where);
+    const pf = pythonFilesOverride(r.overridePythonFiles, where);
     if (isS6(pf)) return pf;
     for (const p of pf) pythonFiles.add(p);
   }
   if (facts.cap !== undefined) capRaw = facts.cap;
   const userWorkers = capRaw === undefined ? undefined : parseCap("pytest", capRaw);
-  return { xdist: xdist && !noXdist && !configsBlock, covInConfig: cov, ...(userWorkers ? { userWorkers } : {}), pythonFiles: [...pythonFiles] };
+  return {
+    xdist: xdist && !noXdist && !configsBlock,
+    covInConfig: cov,
+    ...(userWorkers ? { userWorkers } : {}),
+    pythonFiles: [...pythonFiles],
+    ...(configFile !== undefined ? { configFile } : {}),
+  };
 }
 
 /** The patterns of `-o python_files=<v>` values, split like pytest's shlex (QA-1.3-33). */
@@ -2611,7 +2698,9 @@ async function pytestAtInputs(
   if (det.kind !== "pytest") return undefined;
   const facts = det.pytestFacts ?? { xdist: det.xdist, noXdist: false };
   const own: string[] = [];
-  const ev = await pytestEvidence(ctx, fs, facts, det.env, commonDir(ctx, F), runnerCwd, det.gitRoot, own);
+  // QA-1.3-40: the spawn's arguments are F, so their directories, in F's order, are the fallback's.
+  const dirs = [...new Map(F.map((f) => [ctx.key(ctx.P.dirname(f)), ctx.P.dirname(f)])).values()];
+  const ev = await pytestEvidence(ctx, fs, facts, det.env, commonDir(ctx, F), runnerCwd, det.gitRoot, own, dirs);
   if (isS6(ev)) return ev;
   for (const n of own) if (!notes.includes(n)) notes.push(n);
   if (det.pytestFacts) return ev;
@@ -2820,16 +2909,21 @@ async function finishDetection<K extends ToolKind>(
       ...(configFile !== undefined ? { configFile } : {}),
       ...(a.overrideAddopts !== undefined ? { overrideAddopts: a.overrideAddopts } : {}),
       ...(a.overridePythonFiles.length > 0 ? { pythonFiles: pf } : {}),
+      ...(a.rootdir !== undefined ? { rootdir: a.rootdir } : {}),
     };
     // Detection has no inputs yet: start where pytest would with no file arguments.
     const ev = await pytestEvidence(ctx, fs, pytestFacts, env, runnerCwd, runnerCwd, gitRoot, allNotes);
     if (isS6(ev)) return ev;
     ({ xdist, covInConfig, userWorkers } = ev);
+    // QA-1.3-39: a -c/--config-file from PYTEST_ADDOPTS is a config trigger like the command's.
+    const envConfig = ev.configFile;
+    if (envConfig !== undefined && !configFiles.some((c) => ctx.key(c) === ctx.key(envConfig))) configFiles.push(envConfig);
     // QA-1.3-33: with path arguments the user's pytest reads the config above their common
-    // ancestor (a directory argument is its own start), so its python_files count as well.
+    // ancestor (a directory argument is its own start), so its python_files count as well, and
+    // (QA-1.3-40) the per-argument fallback looks from each path argument in the user's order.
     const patterns = new Set(ev.pythonFiles);
     if (pathScopes.length > 0) {
-      const scoped = await pytestEvidence(ctx, fs, pytestFacts, env, commonDir(ctx, pathScopes.map((s) => ctx.P.join(s, "_"))), runnerCwd, gitRoot, allNotes);
+      const scoped = await pytestEvidence(ctx, fs, pytestFacts, env, commonDir(ctx, pathScopes.map((s) => ctx.P.join(s, "_"))), runnerCwd, gitRoot, allNotes, pathScopes);
       if (isS6(scoped)) return scoped;
       for (const p of scoped.pythonFiles) patterns.add(p);
     }

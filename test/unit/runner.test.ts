@@ -3130,3 +3130,101 @@ describe("QA-1.3-42: only references that can name a changed file are resolved",
     expectS6(await planScopedRun(input({ win: true, command: "jest", files: W, cwd: "C:\\repo", host: WIN_HOST, changedFiles: changed("tools\\env.js") })), "config-changed");
   });
 });
+
+describe("QA-1.3-39: -c, -o, -p and --rootdir in PYTEST_ADDOPTS count like the command's", () => {
+  const H = (pytestAddopts: string): Partial<RunnerHost> => ({ ...POSIX_HOST, pathEnv: "/usr/bin", pytestAddopts });
+  const planPy = (files: Record<string, string>, paths: string[], over: Partial<PlanScopedRunInput> = {}) =>
+    planScopedRun(input({ command: "pytest", files: pyRepo(files), changedFiles: changed(...paths), ...over }));
+  const CI = { "/r/ci/ci.ini": "[pytest]\npython_files = check_*.py\naddopts = -n 3\n", "/r/tests/check_math.py": "" };
+
+  it("host PYTEST_ADDOPTS -c: python_files and the cap come from that file", async () => {
+    const s = spec(await planPy(CI, ["tests/check_math.py"], { host: H("-c ci/ci.ini --rootdir=.") }));
+    expect(s.inputs).toEqual(["/r/tests/check_math.py"]);
+    expect(xdistArgs(s)).toEqual(["-n", "2"]);
+    expect(isNoAffected(await planPy(CI, ["tests/check_math.py"]))).toBe(true);
+  });
+
+  it("cross-env PYTEST_ADDOPTS -c through a package script", async () => {
+    const files = { ...CI, "/r/package.json": JSON.stringify({ name: "p", scripts: { test: 'cross-env PYTEST_ADDOPTS="-c ci/ci.ini --rootdir=." pytest' } }) };
+    const s = spec(await planPy(files, ["tests/check_math.py"], { command: "npm test" }));
+    expect(s.inputs).toEqual(["/r/tests/check_math.py"]);
+    expect(xdistArgs(s)).toEqual(["-n", "2"]);
+  });
+
+  it("the command's -c wins; a host value that cross-env replaces does not choose the config", async () => {
+    const files = { ...CI, "/r/other.ini": "[pytest]\n" };
+    expect(isNoAffected(await planPy(files, ["tests/check_math.py"], { command: "pytest -c other.ini", host: H("-c ci/ci.ini") }))).toBe(true);
+    expect(isNoAffected(await planPy(files, ["tests/check_math.py"], { command: "cross-env PYTEST_ADDOPTS=-q pytest", host: H("-c ci/ci.ini") }))).toBe(true);
+    expect(isNoAffected(await planPy(files, ["tests/check_math.py"], { command: "cross-env PYTEST_ADDOPTS= pytest", host: H("-c ci/ci.ini") }))).toBe(true);
+  });
+
+  it("-o addopts= and -o python_files= in PYTEST_ADDOPTS override the config's keys", async () => {
+    const files = { "/r/pytest.ini": "[pytest]\naddopts = -n 3\npython_files = 'open\n", "/r/tests/check_x.py": "" };
+    const s = spec(await planPy(files, ["tests/check_x.py"], { host: H("-o addopts=-q -o python_files=check_*.py") }));
+    expect(s.inputs).toEqual(["/r/tests/check_x.py"]);
+    expect(xdistArgs(s)).toEqual([]);
+    expectS6(await planPy(files, ["tests/check_x.py"]), "unsupported-argument", 'unsupported pytest argument "python_files" in /r/pytest.ini');
+    const plain = { "/r/pytest.ini": "[pytest]\naddopts = -n 3\n", "/r/tests/test_x.py": "" };
+    expectS6(await planPy(plain, ["tests/test_x.py"], { host: H('-o "addopts=-n 2 \'x"') }), "unterminated-quote", "unterminated quote in -o addopts");
+  });
+
+  it("-p no:xdist in a host value that cross-env replaces disables nothing", async () => {
+    const files = { "/r/tests/test_a.py": "" };
+    expect(xdistArgs(spec(await planPy(files, ["tests/test_a.py"], { command: "cross-env PYTEST_ADDOPTS=-n4 pytest", host: H("-p no:xdist") })))).toEqual(["-n", "2"]);
+    expect(xdistArgs(spec(await planPy(files, ["tests/test_a.py"], { command: "pytest -n 4", host: H("-p no:xdist") })))).toEqual([]);
+  });
+
+  it("a -c from PYTEST_ADDOPTS is a config trigger", async () => {
+    expectS6(await planPy(CI, ["ci/ci.ini"], { host: H("-c ci/ci.ini") }), "config-changed", "config file changed: ci/ci.ini");
+    expect((await detect("pytest -c ci/ci.ini", pyRepo(CI), H("-c ci/ci.ini"))).configFiles).toEqual(["/r/ci/ci.ini"]);
+  });
+});
+
+describe("QA-1.3-40: pytest's per-argument config fallback (determine_setup)", () => {
+  const H = (pytestAddopts: string): Partial<RunnerHost> => ({ ...POSIX_HOST, pathEnv: "/usr/bin", pytestAddopts });
+  const planPy = (files: Record<string, string>, paths: string[], over: Partial<PlanScopedRunInput> = {}) =>
+    planScopedRun(input({ command: "pytest", files: pyRepo(files), changedFiles: changed(...paths), ...over }));
+  const BASE = { "/r/tests/a/pytest.ini": "[pytest]\naddopts = -n 3\n", "/r/tests/a/test_w.py": "", "/r/tests/b/test_b.py": "" };
+  const TWO = ["tests/a/test_w.py", "tests/b/test_b.py"];
+
+  it("(a) path arguments: tests/a/pytest.ini decides python_files for tests/b", async () => {
+    const files = { "/r/tests/a/pytest.ini": "[pytest]\npython_files = check_*.py\n", "/r/tests/b/check_math.py": "" };
+    expect(spec(await planPy(files, ["tests/b/check_math.py"], { command: "pytest tests/a tests/b" })).inputs).toEqual(["/r/tests/b/check_math.py"]);
+    expect(isNoAffected(await planPy(files, ["tests/b/check_math.py"], { command: "pytest tests/b" }))).toBe(true);
+  });
+
+  it("(b) spec time: inputs in two directories read tests/a/pytest.ini, so the cap lands", async () => {
+    expect(xdistArgs(spec(await planPy(BASE, TWO)))).toEqual(["-n", "2"]);
+    expect(xdistArgs(spec(await planPy(BASE, ["tests/b/test_b.py"])))).toEqual([]);
+    // planStaticScoping runs the same lookup over the inputs it knows (QA-1.3-27).
+    const bad = pyRepo({ ...BASE, "/r/tests/a/pytest.ini": "[pytest]\naddopts = tests\n" });
+    const why = 'unsupported pytest argument "tests" in addopts of /r/tests/a/pytest.ini';
+    expectS6(await planStaticScoping(input({ command: "pytest", files: bad, changedFiles: changed(...TWO) })), "unsupported-argument", why);
+    expect(isUnverifiable(await planStaticScoping(input({ command: "pytest", files: bad, changedFiles: changed("tests/b/test_b.py") })))).toBe(false);
+  });
+
+  it("the first argument directory with a config wins, in the inputs' order", async () => {
+    const files = { "/r/tests/a/pytest.ini": "[pytest]\n", "/r/tests/b/pytest.ini": "[pytest]\naddopts = -n 3\n", "/r/tests/a/test_w.py": "", "/r/tests/b/test_b.py": "" };
+    expect(xdistArgs(spec(await planPy(files, TWO)))).toEqual([]);
+  });
+
+  it("no fallback below a setup.py or with a --rootdir; an empty --rootdir is none", async () => {
+    expect(xdistArgs(spec(await planPy({ ...BASE, "/r/setup.py": "" }, TWO)))).toEqual([]);
+    expect(xdistArgs(spec(await planPy(BASE, TWO, { fs: statFs(pyRepo({ ...BASE, "/r/setup.py": "" }), false, {}, ["/r/setup.py"]) })))).toEqual(["-n", "2"]);
+    expect(xdistArgs(spec(await planPy(BASE, TWO, { command: "pytest --rootdir=/r" })))).toEqual([]);
+    expect(xdistArgs(spec(await planPy(BASE, TWO, { host: H("--rootdir /r") })))).toEqual([]);
+    expect(xdistArgs(spec(await planPy(BASE, TWO, { command: "pytest --rootdir=" })))).toEqual(["-n", "2"]);
+  });
+
+  it("a table-less pyproject.toml stops pytest >= 8.1 only: pytest 8.0 and 7 still fall back", async () => {
+    const toml = { "/r/tests/a/pytest.toml": '[pytest]\naddopts = ["-n", "3"]\n', "/r/tests/a/test_w.py": "", "/r/tests/b/test_b.py": "" };
+    expect(xdistArgs(spec(await planPy(toml, TWO)))).toEqual(["-n", "2"]);
+    expect(xdistArgs(spec(await planPy({ ...toml, "/r/pyproject.toml": "[project]\n" }, TWO)))).toEqual([]);
+    expect(xdistArgs(spec(await planPy({ ...BASE, "/r/pyproject.toml": "[project]\n" }, TWO)))).toEqual(["-n", "2"]);
+  });
+
+  it("a bad config found by the fallback is S6", async () => {
+    const files = { ...BASE, "/r/tests/a/pytest.ini": "[pytest]\npython_files = 'open\n" };
+    expectS6(await planPy(files, TWO), "unsupported-argument", 'unsupported pytest argument "python_files" in /r/tests/a/pytest.ini');
+  });
+});
