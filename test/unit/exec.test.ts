@@ -1,11 +1,11 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { execFileSync } from "node:child_process";
 import { getEventListeners } from "node:events";
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { KILL_GRACE_MS, runArgv, runShell } from "../../src/verify/exec";
+import { DEFAULT_TIMEOUT_MS, KILL_GRACE_MS, deadlineOf, runArgv, runShell, setSweeperExecutableForTests } from "../../src/verify/exec";
 
 // Real processes, no mocks: the defect this guards against only exists in how
 // the OS tears a process tree down, which a fake child_process cannot model.
@@ -283,6 +283,29 @@ describe("timeoutMs", () => {
     expect(warnings.stop()).toEqual([]);
   }, 20000);
 
+  it("defaults to DEFAULT_TIMEOUT_MS with neither timeoutMs nor signal, and to no deadline with only a signal (QA-1.2-16)", () => {
+    expect(DEFAULT_TIMEOUT_MS).toBe(120_000);
+    expect(deadlineOf({})).toBe(DEFAULT_TIMEOUT_MS);
+    expect(deadlineOf({ timeoutMs: Number.NaN })).toBe(DEFAULT_TIMEOUT_MS);
+    const signal = new AbortController().signal;
+    expect(deadlineOf({ signal })).toBeUndefined();
+    expect(deadlineOf({ signal, timeoutMs: 500 })).toBe(500);
+  });
+
+  it("arms a DEFAULT_TIMEOUT_MS timer for a run with neither timeoutMs nor signal (QA-1.2-16)", async () => {
+    const spy = vi.spyOn(globalThis, "setTimeout");
+    try {
+      const r = await runArgv(process.execPath, ["-e", "process.stdout.write('ok')"], { cwd: tmpdir() });
+      expect(r).toEqual({ code: 0, stdout: "ok", stderr: "", timedOut: false });
+      expect(spy.mock.calls.some(([, ms]) => ms === DEFAULT_TIMEOUT_MS)).toBe(true);
+      spy.mockClear();
+      await runArgv(process.execPath, ["-e", ""], { cwd: tmpdir(), signal: new AbortController().signal });
+      expect(spy.mock.calls.some(([, ms]) => ms === DEFAULT_TIMEOUT_MS)).toBe(false);
+    } finally {
+      spy.mockRestore();
+    }
+  }, 20000);
+
   it("treats timeoutMs <= 0 as already expired", async () => {
     const start = Date.now();
     const r = await runArgv(process.execPath, ["-e", "setTimeout(() => {}, 15000)"], { cwd: tmpdir(), timeoutMs: -5 });
@@ -358,6 +381,30 @@ describe("process lifecycle around the direct child's exit", () => {
       expect(r).toMatchObject({ code: 1, timedOut: true });
       expect(r.stderr).toMatch(/left running by the exited command/);
     } finally {
+      await t.release();
+      await pending;
+    }
+  }, 30000);
+
+  it.runIf(isWin).each([
+    ["a missing executable", join(tmpdir(), "omr-no-such-powershell.exe"), /\[orphan sweep unavailable: spawn error: [^\]]*ENOENT[^\]]*\]/],
+    ["one that exits non-zero before the marker", process.execPath, /\[orphan sweep unavailable: exit \d+\]/],
+  ])("reports an orphan sweep that could not run: %s (QA-1.2-15, Windows-only: the sweeper is PowerShell)", async (_name, file, note) => {
+    setSweeperExecutableForTests(file);
+    const t = tree("early-exit");
+    const controller = new AbortController();
+    const pending = runArgv(process.execPath, t.args, { cwd: tmpdir(), timeoutMs: 30000, signal: controller.signal });
+    try {
+      await waitForFile(t.file("holder"));
+      expect(await t.childExited()).toBe(true);
+      controller.abort();
+      const r = await pending;
+      expect(r.timedOut).toBe(true);
+      expect(r.stderr).toMatch(note);
+      // Nothing was swept, so the grace period force-closed the pipes.
+      expect(r.stderr).toMatch(/output streams force-closed/);
+    } finally {
+      setSweeperExecutableForTests(undefined);
       await t.release();
       await pending;
     }

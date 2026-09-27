@@ -63,8 +63,17 @@ const MAX_TIMER_MS = 2 ** 31 - 1;
 const DEFAULT_MAX_BUFFER = 10 * 1024 * 1024;
 /** Windows: pipes still open this long after the child exited arm the orphan sweeper. */
 const SWEEP_ARM_MS = 200;
-/** Windows: the most the sweeper's kill phase may take before it is abandoned. */
-const SWEEP_TIMEOUT_MS = 5000;
+/**
+ * Windows: the most the sweeper's kill phase may take before it is abandoned.
+ * It only bounds a hung sweeper: by then the kill grace has already settled the
+ * run, so a late kill costs the run nothing, while a short limit turned a slow
+ * sweep under normal-priority CPU saturation into no kill at all (QA-1.2-14).
+ */
+const SWEEP_TIMEOUT_MS = 30_000;
+/** Windows: the most `taskkill /T` on a live direct child may take. */
+const TASKKILL_TIMEOUT_MS = 5000;
+/** Printed by the sweeper once pinning is done; its absence means the sweep did not run. */
+const SWEEP_MARKER = "pinned";
 /** Windows: clock tolerance between Date.now() and the kernel's creation times. */
 const SWEEP_CLOCK_SLACK_MS = 50;
 
@@ -192,8 +201,11 @@ function run(file: string, args: string[], shell: boolean, opts: RunOptions, nic
       resolve({ code: finalCode, stdout: out.text, stderr, timedOut: killed });
     };
 
-    const onSwept = (pids: number[]) => {
+    const onSwept = (pids: number[], unavailable?: string) => {
       sweepPending = false;
+      // Reported only while the run is still pending; after the grace settled
+      // it there is no result left to carry the note.
+      if (unavailable && !settled) notes.push(`[orphan sweep unavailable: ${unavailable}]`);
       if (pids.length > 0) {
         killed = true;
         notes.push(`[killed ${pids.length} process tree(s) left running by the exited command: pid ${pids.join(", ")}]`);
@@ -283,8 +295,8 @@ function run(file: string, args: string[], shell: boolean, opts: RunOptions, nic
   });
 }
 
-/** The timer to arm, or undefined for none. */
-function deadlineOf(opts: RunOptions): number | undefined {
+/** The timer to arm, or undefined for none. Exported for tests. */
+export function deadlineOf(opts: RunOptions): number | undefined {
   const t = opts.timeoutMs;
   if (t === undefined || Number.isNaN(t)) return opts.signal ? undefined : DEFAULT_TIMEOUT_MS;
   if (t === Infinity) return undefined;
@@ -346,7 +358,7 @@ function killTree(child: ChildProcess): void {
     return;
   }
   if (isWin) {
-    execFile("taskkill", ["/pid", String(pid), "/T", "/F"], { windowsHide: true, timeout: SWEEP_TIMEOUT_MS }, (err) => {
+    execFile("taskkill", ["/pid", String(pid), "/T", "/F"], { windowsHide: true, timeout: TASKKILL_TIMEOUT_MS }, (err) => {
       // taskkill fails when the child exited meanwhile; the direct kill is then
       // a no-op and the exit handler sweeps what it left running.
       if (err) child.kill();
@@ -399,15 +411,24 @@ function groupAlive(pgid: number): boolean {
 }
 
 interface Sweeper {
-  /** Kill the pinned trees; `done` receives the root PIDs taskkill ended. Never throws. */
-  kill(done: (pids: number[]) => void): void;
+  /**
+   * Kill the pinned trees; `done` receives the root PIDs taskkill ended and,
+   * when the sweep could not run, why. Never throws.
+   */
+  kill(done: (pids: number[], unavailable?: string) => void): void;
   /** Release the pins without killing anything. */
   dispose(): void;
 }
 
-const POWERSHELL = process.env.SystemRoot
+const DEFAULT_POWERSHELL = process.env.SystemRoot
   ? join(process.env.SystemRoot, "System32", "WindowsPowerShell", "v1.0", "powershell.exe")
   : "powershell.exe";
+let powershell = DEFAULT_POWERSHELL;
+
+/** Test-only: run the sweeper with another executable; undefined restores the default. */
+export function setSweeperExecutableForTests(file: string | undefined): void {
+  powershell = file ?? DEFAULT_POWERSHELL;
+}
 
 /**
  * Windows: find and kill what an exited child left running, without ever
@@ -436,31 +457,47 @@ const POWERSHELL = process.env.SystemRoot
  * not through `run` — with its own kill timeout; every failure degrades to
  * "nothing killed". The script is passed with single quotes only, so Node's
  * argument quoting cannot alter it.
+ *
+ * It needs PowerShell in FullLanguage mode: under Constrained Language Mode
+ * (AppLocker/WDAC) the .NET calls it relies on fail, so it exits 3 at once.
+ * After pinning it prints `pinned <n>`. When a kill was requested and that
+ * marker is missing (spawn error, non-zero exit, no marker, or the
+ * SWEEP_TIMEOUT_MS limit), `kill` reports why, and the run appends
+ * `[orphan sweep unavailable: <reason>]` to stderr if it has not settled yet
+ * (QA-1.2-15). A failure after the run settled has no result to report to.
  */
 function armSweeper(pid: number, spawnedAt: number, exitedAt: number): Sweeper {
   const from = Math.floor(spawnedAt - SWEEP_CLOCK_SLACK_MS);
   const to = Math.ceil(exitedAt + SWEEP_CLOCK_SLACK_MS);
   const script = [
     "$ErrorActionPreference = 'Stop'",
+    "if ($ExecutionContext.SessionState.LanguageMode -ne 'FullLanguage') { exit 3 }",
     "function Ms($d) { ([DateTimeOffset]$d).ToUnixTimeMilliseconds() }",
     "function Pin($ppid, $from, $to) { foreach ($c in @(Get-CimInstance -ClassName Win32_Process -Filter ('ParentProcessId=' + $ppid))) { try { $t = Ms $c.CreationDate; if ($t -ge $from -and $t -le $to) { $p = [Diagnostics.Process]::GetProcessById([int]$c.ProcessId); $null = $p.Handle; $s = Ms $p.StartTime; if ($s -ge $from -and $s -le $to) { $p } } } catch { $null = $_ } } }",
     "function Stop-Trees($roots) { foreach ($p in $roots) { if (-not $p.HasExited) { & taskkill.exe /pid $p.Id /T /F *> $null; if ($LASTEXITCODE -eq 0) { [Console]::Out.WriteLine([string]$p.Id) } } else { Stop-Trees @(Pin $p.Id (Ms $p.StartTime) (Ms $p.ExitTime)) } } }",
     `$roots = @(Pin ${pid} ${from} ${to})`,
+    `[Console]::Out.WriteLine('${SWEEP_MARKER} ' + $roots.Count)`,
     "if ($roots.Count -eq 0) { exit 0 }",
     "if ([Console]::In.ReadLine() -eq 'kill') { Stop-Trees $roots }",
   ].join("; ");
   let output = "";
   let ended = false;
+  /** Why the sweep could not run, once known. */
+  let failure: string | undefined;
   const waiters: Array<() => void> = [];
   const end = () => {
     if (ended) return;
     ended = true;
     for (const w of waiters.splice(0)) w();
   };
-  const killedPids = () => output.split(/\r?\n/).filter((l) => /^\d+$/.test(l)).map(Number);
+  const lines = () => output.split(/\r?\n/);
+  const killedPids = () => lines().filter((l) => /^\d+$/.test(l)).map(Number);
+  const pinned = () => lines().some((l) => l.startsWith(`${SWEEP_MARKER} `));
+  /** Undefined when the sweep ran; otherwise the reason it did not. */
+  const unavailable = () => failure ?? (pinned() ? undefined : "no marker");
   let ps: ChildProcess | undefined;
   try {
-    ps = spawn(POWERSHELL, ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], {
+    ps = spawn(powershell, ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], {
       windowsHide: true,
       stdio: ["pipe", "pipe", "ignore"],
     });
@@ -468,9 +505,16 @@ function armSweeper(pid: number, spawnedAt: number, exitedAt: number): Sweeper {
     ps.stdout?.on("data", (s: string) => { output += s; });
     // EPIPE: the sweeper exited before reading (it found nothing to pin).
     ps.stdin?.on("error", end);
-    ps.on("error", end);
-    ps.on("close", end);
-  } catch {
+    ps.on("error", (e) => {
+      failure ??= `spawn error: ${e.message}`;
+      end();
+    });
+    ps.on("close", (code, signal) => {
+      if (code !== 0 && !pinned()) failure ??= code === null ? `killed by ${signal}` : `exit ${code}`;
+      end();
+    });
+  } catch (e) {
+    failure = `spawn error: ${String(e)}`;
     ps = undefined;
     end();
   }
@@ -482,7 +526,7 @@ function armSweeper(pid: number, spawnedAt: number, exitedAt: number): Sweeper {
         if (called) return;
         called = true;
         clearTimeout(limit);
-        done(killedPids());
+        done(killedPids(), unavailable());
       };
       if (ended || !ps) {
         report();
@@ -491,9 +535,13 @@ function armSweeper(pid: number, spawnedAt: number, exitedAt: number): Sweeper {
       const sweeperProcess = ps;
       waiters.push(report);
       limit = setTimeout(() => {
+        if (!pinned()) failure ??= `timed out after ${SWEEP_TIMEOUT_MS} ms`;
         sweeperProcess.kill();
         report();
       }, SWEEP_TIMEOUT_MS);
+      // A settled run must not keep opencode alive for a hung sweeper; the
+      // sweeper itself is a non-detached child and dies with opencode (libuv job).
+      limit.unref();
       sweeperProcess.stdin?.end("kill\n");
     },
     dispose() {
