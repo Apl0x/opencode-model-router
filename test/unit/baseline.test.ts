@@ -228,6 +228,29 @@ describe("dispatch reference capture in the changed-file store", () => {
     expect(prompt).not.toContain(old);
     expect(prompt).toContain(edited); expect(prompt).toContain(added);
   });
+  it("a retry's change set keeps every earlier attempt's tool edits (QA-2.1-1)", async () => {
+    const h = harness();
+    const a = resolve(cwd, "src/a.js"); const b = resolve(cwd, "src/b.js"); const c = resolve(cwd, "src/c.js");
+    // src/a.js is already dirty at dispatch, so the snapshot part never adds it.
+    const before = tree({ dirty: true, files: [{ path: a, status: " M" }] });
+    h.setTree(before); await h.start("p1");
+    h.store.record("p1", "edit", { filePath: a });
+    expect(h.store.delta("p1", "p1", before).changedFiles.map(f => f.path)).toEqual([a]);
+    // Attempt 2 is a new producer session judged against p1's reference; it only creates b.
+    h.store.record("p2", "write", { filePath: b });
+    h.store.record("unrelated", "edit", { filePath: resolve(cwd, "elsewhere.ts") });
+    const second = h.store.delta("p1", "p2", { ...before, files: [...before.files, { path: b, status: "??" }] });
+    expect(second.changedFiles.map(f => f.path).sort()).toEqual([a, b].sort());
+    // The ladder clears a retry's session after its gate: attempt 3 still sees a and b.
+    h.store.clear("p2");
+    h.store.record("p3", "edit", { filePath: b });
+    h.store.record("p3", "edit", { filePath: c });
+    const third = h.store.delta("p1", "p3", before);
+    expect(third.changedFiles.map(f => f.path).sort()).toEqual([a, b, c].sort());
+    expect(third.changedFiles).toContainEqual({ path: a, status: " M" });
+    expect(third.changedFiles).toContainEqual({ path: b, status: "written" });
+    expect(third.changedFiles).toContainEqual({ path: c, status: "modified" });
+  });
   it("tool-observed paths take the snapshot's status letters and rename source", async () => {
     const h = harness(); await h.start("dispatch");
     const gone = resolve(cwd, "gone.ts"); const old = resolve(cwd, "old.ts"); const moved = resolve(cwd, "moved.ts");

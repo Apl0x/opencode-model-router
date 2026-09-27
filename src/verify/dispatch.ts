@@ -102,6 +102,16 @@ interface DispatchRecord {
   ready: Promise<void>;
   /** The snapshot and the reference settled. */
   settled: Promise<void>;
+  /**
+   * QA-2.1-1: every producer session gated against this dispatch (its lineage: the first attempt,
+   * then each retry or escalation, all judged against the one reference).
+   */
+  producers: Set<string>;
+  /**
+   * QA-2.1-1: the tool-observed files of every session in `producers`, keyed by pathKey. A retry
+   * gate judges the cumulative change since the reference, not only its own attempt's edits.
+   */
+  observed: Map<string, ChangedFile>;
 }
 
 /**
@@ -135,7 +145,20 @@ export function createChangedFileStore(options: ChangedFileStoreOptions = {}) {
     lastTouch.set(sessionID, now());
   }
 
+  /** QA-2.1-1: folds one producer session's tool-observed files into its dispatch's lineage. */
+  function fold(d: DispatchRecord, sessionID: string): void {
+    for (const [path, status] of bySession.get(sessionID) ?? []) {
+      const absolute = resolve(d.cwd, path);
+      const key = pathKey(absolute);
+      // "written" (created) stays stickier than a later attempt's "modified", as in record().
+      const prev = d.observed.get(key);
+      d.observed.set(key, { path: absolute, status: prev?.status === "written" ? "written" : status });
+    }
+  }
+
   function evict(sessionID: string): void {
+    // A retry's session is cleared after its gate: keep its edits in every lineage it belongs to.
+    for (const d of dispatches.values()) if (d.producers.has(sessionID)) fold(d, sessionID);
     bySession.delete(sessionID);
     lastTouch.delete(sessionID);
     dispatches.get(sessionID)?.captureController.abort();
@@ -160,6 +183,8 @@ export function createChangedFileStore(options: ChangedFileStoreOptions = {}) {
         captureController: new AbortController(),
         reference: Promise.resolve(deps.uncaptured ?? none(REFERENCE_NONE.notRequested)),
         ready: Promise.resolve(), settled: Promise.resolve(),
+        // The delegate ladder's dispatch id is its first producer session.
+        producers: new Set([id]), observed: new Map(),
       };
       dispatches.set(id, d);
       d.ready = (async (): Promise<void> => {
@@ -214,12 +239,25 @@ export function createChangedFileStore(options: ChangedFileStoreOptions = {}) {
         });
       });
     },
+    /**
+     * The producer's change since the dispatch reference. `childID` joins the dispatch's lineage:
+     * the tool-observed files are those of EVERY producer session gated against `id` so far
+     * (QA-2.1-1), so a retry never drops a file an earlier attempt edited.
+     */
     delta(id: string, childID: string, current?: TreeSnapshot, fallbackCwd?: string): { changedFiles: ChangedFile[]; changeBaseline: "available" | "unavailable" } {
       const d = dispatches.get(id);
       const snapshot = d?.snapshot;
       const files = new Map<string, ChangedFile>();
       const listed = new Map((current?.files ?? []).map(f => [pathKey(f.path), f] as const));
-      for (const [path, status] of bySession.get(childID) ?? []) {
+      let observed: Iterable<[string, string]>;
+      if (d) {
+        d.producers.add(childID);
+        for (const producer of d.producers) fold(d, producer);
+        observed = [...d.observed.values()].map(f => [f.path, f.status] as [string, string]);
+      } else {
+        observed = bySession.get(childID) ?? [];
+      }
+      for (const [path, status] of observed) {
         const base = d?.cwd ?? current?.cwd ?? fallbackCwd;
         const absolute = base ? resolve(base, path) : path;
         const key = base ? pathKey(absolute) : path;

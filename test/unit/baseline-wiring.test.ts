@@ -167,6 +167,27 @@ describe("dispatch reference wiring", () => {
     // G6: the dispatch and the gate (whose hook is faked) spawned nothing.
     expect(state.commands).toEqual([]);
   });
+  it("a delegate retry hands testsPass the first attempt's files too (QA-2.1-1)", async () => {
+    const { wiring, store } = harness();
+    // old.ts is dirty at dispatch (the harness snapshot lists it) and attempt 1 edits it.
+    const old = resolve(cwd, "old.ts"); const other = resolve(cwd, "other.ts");
+    await wiring.beginVerification(store, "p1", undefined, dod);
+    store.record("p1", "edit", { filePath: old });
+    expect((await wiring.prepareVerification(store, "p1", "p1")).changedFiles.map(f => f.path)).toEqual([old]);
+    // Attempt 2: a new producer session, the same dispatch reference, and only other.ts edited.
+    store.record("p2", "edit", { filePath: other });
+    const retry = await wiring.prepareVerification(store, "p1", "p2");
+    expect(retry.changeBaseline).toBe("available");
+    const deps = wiring.buildGateDeps(undefined, undefined, retry);
+    const seen: TestsPassRequest[] = [];
+    deps.deterministic.testsPass = async req => {
+      seen.push(req);
+      return { scoped: { kind: "ran", exitCode: 0, notes: [], result: { failingIds: [], failingFiles: [], collectionError: false, total: 2, complete: true, source: "report" } }, recheck: undefined };
+    };
+    await accept({ dod }, { ...retry, finalReturnText: "done", declaredOutputs: [], producerSessionID: "p2", producerTier: "medium" }, deps);
+    const sent = seen[0]?.changedFiles;
+    expect(sent === "unavailable" ? sent : sent?.map(f => f.path).sort()).toEqual([old, other].sort());
+  });
   it("failureRecheck off (deprecated testBaseline false) captures nothing but still snapshots changed files", async () => {
     const { cfg, wiring, store } = harness();
     cfg.enforcement!.verify!.testBaseline = false;
