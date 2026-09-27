@@ -4,7 +4,7 @@
  * worktrees; no mocks) against a temp git copy of the `vitest-app` fixture. Gated by RUN_VERIFY_E2E=1.
  */
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { existsSync, realpathSync } from "node:fs";
+import { existsSync } from "node:fs";
 import { mkdir, mkdtemp, readdir, readFile, rm } from "node:fs/promises";
 import os from "node:os";
 import { join } from "node:path";
@@ -119,10 +119,10 @@ suite("verify resource budget: deferred (3.1.2.f-h)", () => {
   }
 
   beforeAll(async () => {
-    // realpath: os.tmpdir() may be an 8.3 short path (C:\Users\ABCDEF~1\...). The reference
-    // worktree then fails its node_modules link check (reference.ts compares realpath(parent) with
-    // the unexpanded dir) and every rerun reports "runner not installed: vitest".
-    root = await mkdtemp(join(realpathSync.native(os.tmpdir()), "omr-e2e-def-"));
+    // The raw os.tmpdir() on purpose: on Windows it is often an 8.3 short path
+    // (C:\Users\ABCDEF~1\...), and the plugin directory, TEMP and the reference worktrees must all
+    // work under that spelling (E2E-2).
+    root = await mkdtemp(join(os.tmpdir(), "omr-e2e-def-"));
     await mkdir(join(root, "repos"), { recursive: true });
     await mkdir(join(root, "tmp"), { recursive: true });
     await mkdir(join(root, "home"), { recursive: true });
