@@ -944,8 +944,8 @@ under **Bun 1.3.14**, not Node.
     Under that load, "runs grandchildren of runShell below normal priority" failed once, and two
     other `lowPriority` runs hit their 20 s deadline (`expected 1 to be 3`). The tests passed in
     isolation and in every run once the load dropped. The two deadline hits match below-normal
-  priority starved by normal-priority load (the QA-1.2-14 conditions). The priority test's own
-  message was not captured.
+    priority starved by normal-priority load (the QA-1.2-14 conditions). The priority test's own
+    message was not captured.
 
 ## QA re-review (round 4)
 
