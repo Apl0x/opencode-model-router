@@ -21,12 +21,18 @@
  * - `timedOut` is true exactly when the deadline or abort had to end something
  *   (the command, a descendant it left running, or the held pipes). An abort
  *   that finds nothing left running is a no-op: the natural result stands.
- * - POSIX process groups still running when opencode exits are killed from one
- *   `process.once("exit")` hook. Death by an unhandled signal (the host's
- *   SIGTERM/SIGHUP policy) skips `exit` hooks and remains opencode's concern.
- *   On Windows, non-detached children sit in libuv's kill-on-close job.
+ * - Runs still in flight when opencode exits are killed from one
+ *   `process.once("exit")` hook: on POSIX their process groups (QA-1.2-6), on
+ *   Windows the tree of each direct child that has not exited (QA-1.2-18).
+ *   libuv's kill-on-close job does not do this on Windows: its job allows
+ *   silent breakaway, so it holds only the processes libuv spawned itself. It
+ *   ends the direct child (cmd.exe) but not the tree below it (npm, vitest).
+ *   Not covered: death by an unhandled signal (the host's SIGTERM/SIGHUP/Ctrl-C
+ *   policy), which skips `exit` hooks and remains opencode's concern, and on
+ *   Windows what an already-exited direct child left running (only the sweep
+ *   reaches that).
  */
-import { execFile, spawn, type ChildProcess } from "node:child_process";
+import { execFile, spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { constants as osConstants, setPriority } from "node:os";
 import { join } from "node:path";
 import type { ArgvSeam, ExecOptions, ExecSeam } from "./types";
@@ -72,12 +78,21 @@ const SWEEP_ARM_MS = 200;
 const SWEEP_TIMEOUT_MS = 30_000;
 /** Windows: the most `taskkill /T` on a live direct child may take. */
 const TASKKILL_TIMEOUT_MS = 5000;
+/** Windows: the most the exit hook's single `taskkill /T` may delay opencode's exit. */
+const EXIT_TASKKILL_TIMEOUT_MS = 2000;
 /** Printed by the sweeper once pinning is done; its absence means the sweep did not run. */
 const SWEEP_MARKER = "pinned";
 /** Windows: clock tolerance between Date.now() and the kernel's creation times. */
 const SWEEP_CLOCK_SLACK_MS = 50;
 
 const isWin = process.platform === "win32";
+/**
+ * Windows tools by absolute path: a bare name is looked up in the working
+ * directory before PATH (libuv), and that directory is the user's project.
+ */
+const SYSTEM32 = process.env.SystemRoot ? join(process.env.SystemRoot, "System32") : undefined;
+const TASKKILL = SYSTEM32 ? join(SYSTEM32, "taskkill.exe") : "taskkill.exe";
+const DEFAULT_POWERSHELL = SYSTEM32 ? join(SYSTEM32, "WindowsPowerShell", "v1.0", "powershell.exe") : "powershell.exe";
 
 /** Run `command` through the platform shell (`cmd.exe` / `/bin/sh`). */
 export function runShell(command: string, opts: RunOptions = {}): Promise<ShellResult> {
@@ -167,7 +182,7 @@ function run(file: string, args: string[], shell: boolean, opts: RunOptions, nic
       return;
     }
     const pid = child.pid;
-    if (!isWin && pid) trackGroup(pid);
+    if (pid) track(pid);
     if (opts.lowPriority && isWin && pid) {
       // Windows low priority (Spike A, docs/qa/verification-resource-budget/phase-1.2.md):
       // lower the direct child right after spawn; descendants inherit the class
@@ -201,7 +216,9 @@ function run(file: string, args: string[], shell: boolean, opts: RunOptions, nic
       clearTimeout(grace);
       clearTimeout(armTimer);
       opts.signal?.removeEventListener("abort", kill);
-      if (!isWin && pid) untrackGroup(pid);
+      // Windows keeps the child tracked until its `exit`: one that outlived
+      // the grace is exactly what the exit hook must still end.
+      if (!isWin && pid) untrack(pid);
       // A sweep that is killing must finish; one that is only armed is released.
       if (sweeper && !sweepPending) sweeper.dispose();
       let finalCode = killed ? code || 1 : code ?? 1;
@@ -284,9 +301,11 @@ function run(file: string, args: string[], shell: boolean, opts: RunOptions, nic
       exited = true;
       exitCode = code;
       exitedAt = Date.now();
+      // Windows: libuv has closed the child's handle, so its PID may be recycled from here on.
+      if (isWin && pid) untrack(pid);
       if (!isWin && pid && !groupAlive(pid)) {
         groupGone = true;
-        untrackGroup(pid);
+        untrack(pid);
       }
       if (isWin && pid) {
         // Pipes still open shortly after exit mean a descendant holds them.
@@ -375,7 +394,7 @@ function killTree(child: ChildProcess): void {
     return;
   }
   if (isWin) {
-    execFile("taskkill", ["/pid", String(pid), "/T", "/F"], { windowsHide: true, timeout: TASKKILL_TIMEOUT_MS }, (err) => {
+    execFile(TASKKILL, ["/pid", String(pid), "/T", "/F"], { windowsHide: true, timeout: TASKKILL_TIMEOUT_MS }, (err) => {
       // taskkill fails when the child exited meanwhile; the direct kill is then
       // a no-op and the exit handler sweeps what it left running.
       if (err) child.kill();
@@ -386,27 +405,44 @@ function killTree(child: ChildProcess): void {
   if (!signalGroup(pid, "SIGKILL")) child.kill("SIGKILL");
 }
 
-// POSIX: detached children lead their own process group and session, so a
-// terminal hang-up or Ctrl-C that ends opencode never reaches them. Groups of
-// runs still in flight are killed when opencode exits.
-const liveGroups = new Set<number>();
+// Runs still in flight are killed when opencode exits.
+// - POSIX (QA-1.2-6): the process group of each run. Detached children lead
+//   their own group and session, so a terminal hang-up or Ctrl-C that ends
+//   opencode never reaches them.
+// - Windows (QA-1.2-18): the tree of each direct child that has not exited.
+//   libuv's kill-on-close job ends the direct child only. Until the child's
+//   `exit`, libuv holds its process handle, so its PID cannot be recycled.
+const tracked = new Set<number>();
 let exitHookInstalled = false;
 
-function trackGroup(pgid: number): void {
-  liveGroups.add(pgid);
+function track(pid: number): void {
+  tracked.add(pid);
   if (exitHookInstalled) return;
   exitHookInstalled = true;
-  process.once("exit", killTrackedProcessGroups);
+  process.once("exit", killTrackedProcesses);
 }
 
-function untrackGroup(pgid: number): void {
-  liveGroups.delete(pgid);
+function untrack(pid: number): void {
+  tracked.delete(pid);
 }
 
 /** The `exit` hook: synchronous, as `exit` listeners must be. */
-function killTrackedProcessGroups(): void {
-  for (const pgid of liveGroups) signalGroup(pgid, "SIGKILL");
-  liveGroups.clear();
+function killTrackedProcesses(): void {
+  const pids = [...tracked];
+  tracked.clear();
+  if (!isWin) {
+    for (const pgid of pids) signalGroup(pgid, "SIGKILL");
+    return;
+  }
+  if (pids.length === 0) return;
+  // One taskkill for every tree, so the hook delays opencode's exit by at most
+  // EXIT_TASKKILL_TIMEOUT_MS however many runs are in flight. A tree that is
+  // already gone only makes taskkill report it as not found.
+  spawnSync(TASKKILL, [...pids.flatMap((pid) => ["/pid", String(pid)]), "/T", "/F"], {
+    windowsHide: true,
+    stdio: "ignore",
+    timeout: EXIT_TASKKILL_TIMEOUT_MS,
+  });
 }
 
 function signalGroup(pgid: number, signal: NodeJS.Signals): boolean {
@@ -437,9 +473,6 @@ interface Sweeper {
   dispose(): void;
 }
 
-const DEFAULT_POWERSHELL = process.env.SystemRoot
-  ? join(process.env.SystemRoot, "System32", "WindowsPowerShell", "v1.0", "powershell.exe")
-  : "powershell.exe";
 let powershell = DEFAULT_POWERSHELL;
 
 /** Test-only: run the sweeper with another executable; undefined restores the default. */

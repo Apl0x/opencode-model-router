@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { getEventListeners } from "node:events";
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -22,10 +22,16 @@ function forkingFixture() {
   writeFileSync(script, [
     "const { spawn } = require('node:child_process');",
     "const g = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' });",
+    "require('node:fs').writeFileSync(process.argv[2] + '.middle', String(process.pid));",
     "require('node:fs').writeFileSync(process.argv[2], String(g.pid));",
     "setInterval(() => {}, 1000);",
   ].join("\n"));
-  return { command: `${node} "${script}" "${pidFile}"`, script, pidFile, dir, grandchild: () => Number(readFileSync(pidFile, "utf8")) };
+  return {
+    command: `${node} "${script}" "${pidFile}"`, script, pidFile, dir,
+    grandchild: () => Number(readFileSync(pidFile, "utf8")),
+    /** The node process between the shell (or runArgv) and the grandchild. */
+    middle: () => Number(readFileSync(`${pidFile}.middle`, "utf8")),
+  };
 }
 
 function alive(pid: number): boolean {
@@ -53,12 +59,26 @@ function zombieOrReaped(pid: number): boolean {
   }
 }
 
-async function waitForExit(pid: number): Promise<boolean> {
-  for (let i = 0; i < 50; i++) {
+async function waitForExit(pid: number, limitMs = 5000): Promise<boolean> {
+  const end = Date.now() + limitMs;
+  for (;;) {
     if (!alive(pid)) return true;
+    if (Date.now() >= end) return false;
     await new Promise(r => setTimeout(r, 100));
   }
-  return false;
+}
+
+/** Test cleanup: end whatever a failed assertion left running. */
+function killIfAlive(...pids: number[]): void {
+  for (const pid of pids) {
+    if (!(pid > 0) || !alive(pid)) continue;
+    try {
+      process.kill(pid, "SIGKILL");
+    } catch (err) {
+      // It ended between the probe and the kill.
+      if ((err as NodeJS.ErrnoException).code !== "ESRCH") throw err;
+    }
+  }
 }
 
 describe("runShell", () => {
@@ -328,6 +348,35 @@ describe("timeoutMs", () => {
 });
 
 const TREE = fileURLToPath(new URL("../fixtures/exec/tree.cjs", import.meta.url));
+const HOST = fileURLToPath(new URL("../fixtures/exec/host.mjs", import.meta.url));
+/** host.mjs imports src/verify/exec.ts directly, which needs Node's type stripping (22.18+, 23.6+). */
+const typeStripping = Boolean(process.features.typescript);
+
+/** Run test/fixtures/exec/host.mjs in its own node process. */
+function startHost(args: string[]) {
+  const child = spawn(process.execPath, [HOST, ...args], { stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
+  let stdout = "";
+  let stderr = "";
+  child.stdout.setEncoding("utf8");
+  child.stderr.setEncoding("utf8");
+  const firstLine = new Promise<{ line: string; at: number }>((resolve) => {
+    child.stdout.on("data", (s: string) => {
+      stdout += s;
+      const end = stdout.indexOf("\n");
+      if (end >= 0) resolve({ line: stdout.slice(0, end), at: Date.now() });
+    });
+  });
+  child.stderr.on("data", (s: string) => { stderr += s; });
+  const exited = new Promise<{ code: number | null; stdout: string; stderr: string; at: number }>((resolve) => {
+    child.on("close", (code) => resolve({ code, stdout, stderr, at: Date.now() }));
+  });
+  return {
+    firstLine,
+    exited,
+    /** Cleanup: end the host if a failed assertion left it running. */
+    kill: () => { if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL"); },
+  };
+}
 
 /** A test/fixtures/exec/tree.cjs run: argv for runArgv plus its PID files. */
 function tree(mode: "early-exit" | "unreachable" | "broken-tree") {
@@ -466,19 +515,43 @@ describe("process lifecycle around the direct child's exit", () => {
     }
   }, 30000);
 
-  it.runIf(!isWin)("kills live process groups from a single process 'exit' hook (POSIX-only: detached groups escape a hang-up; Windows children die with libuv's job)", async () => {
+  it("kills the trees of runs in flight from a single process 'exit' hook (QA-1.2-6 POSIX process groups, QA-1.2-18 Windows direct children)", async () => {
     const f = forkingFixture();
-    const pending = runArgv(process.execPath, [f.script, f.pidFile], { cwd: f.dir, timeoutMs: 30000 });
-    await waitForFile(f.pidFile);
-    await Promise.all([1, 2, 3].map(() => runArgv(process.execPath, ["-e", ""], { cwd: tmpdir(), timeoutMs: 20000 })));
-    const hooks = process.listeners("exit").filter(l => l.name === "killTrackedProcessGroups");
-    expect(hooks).toHaveLength(1);
-    // What runs when opencode exits mid-run.
-    hooks[0](0);
-    const r = await pending;
-    expect(r.code).not.toBe(0);
-    expect(await waitForExit(f.grandchild())).toBe(true);
-    expect(process.listeners("exit").filter(l => l.name === "killTrackedProcessGroups")).toHaveLength(1);
+    // Windows: through cmd.exe, whose children libuv's kill-on-close job does not hold.
+    const pending = isWin
+      ? runShell(f.command, { cwd: f.dir, timeoutMs: 30000 })
+      : runArgv(process.execPath, [f.script, f.pidFile], { cwd: f.dir, timeoutMs: 30000 });
+    try {
+      await waitForFile(f.pidFile);
+      await Promise.all([1, 2, 3].map(() => runArgv(process.execPath, ["-e", ""], { cwd: tmpdir(), timeoutMs: 20000 })));
+      const hooks = process.listeners("exit").filter(l => l.name === "killTrackedProcesses");
+      expect(hooks).toHaveLength(1);
+      // What runs when opencode exits mid-run.
+      hooks[0](0);
+      const r = await pending;
+      expect(r.code).not.toBe(0);
+      expect(await waitForExit(f.grandchild())).toBe(true);
+      expect(await waitForExit(f.middle())).toBe(true);
+      expect(process.listeners("exit").filter(l => l.name === "killTrackedProcesses")).toHaveLength(1);
+    } finally {
+      if (existsSync(f.pidFile)) killIfAlive(f.grandchild(), f.middle());
+      await pending;
+    }
+  }, 30000);
+
+  it.runIf(isWin && typeStripping)("a host that exits mid-run takes the run's whole tree with it within 3 s (QA-1.2-18, Windows-only: POSIX is the hook test above; needs Node type stripping)", async () => {
+    const f = forkingFixture();
+    const h = startHost(["exit-mid-run", f.pidFile, f.command]);
+    try {
+      expect(await h.exited).toMatchObject({ code: 0, stdout: "ready\n" });
+      const exitedAt = Date.now();
+      // Without the hook, libuv's job ends only cmd.exe: its node child and grandchild keep running.
+      expect(await waitForExit(f.middle(), 3000)).toBe(true);
+      expect(await waitForExit(f.grandchild(), Math.max(0, exitedAt + 3000 - Date.now()))).toBe(true);
+    } finally {
+      h.kill();
+      if (existsSync(f.pidFile)) killIfAlive(f.grandchild(), f.middle());
+    }
   }, 30000);
 });
 
