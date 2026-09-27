@@ -311,3 +311,122 @@ the e2e run are the ones listed under E2E-2.
 **Residual risk (not fixed).** A tool that writes under a non-writing name (for example a custom tool
 called `lsp`) is not caught. A write with no tool event at all (an MCP server that writes after its
 tool returned, an external editor) cannot be seen by any hook.
+
+## CI round 1 (PR #54, head fa01168, Test run 36355282226)
+
+Four e2e failures, in the `e2e (node 22, ubuntu-latest)`, `coverage (node 22, ubuntu-latest)` (step
+"Linux e2e coverage") and `e2e (node 22, windows-latest)` jobs. The same run's unit-job failures
+(baseline-wiring, exec, batch-wiring) are handled separately and are not covered here. Log excerpts
+are from `gh run view 36355282226 --job <id> --log` (ubuntu e2e 108721679255, coverage 108721679116,
+windows e2e 108721679488).
+
+| # | Test | Jobs | Verdict | Fix |
+|---|------|------|---------|-----|
+| CI1-a | bound 3.1.2.c: non-vacuity of a verified pass | ubuntu e2e, ubuntu coverage | test | 88d4e2d |
+| CI1-b | fixtures self-check: vitest-app pre-existing failure | ubuntu e2e, ubuntu coverage, windows e2e | test | 4c894db |
+| CI1-c | bound 3.1.2.d: no orphan 3 s after the gate | windows e2e | test | 1e26ca2 |
+| CI1-d | deferred 3.1.2.f: before hook within VERIFY_WAIT | windows e2e | product (in part) and test | ab81633, 4a2e4b8 |
+
+### CI1-a — 3.1.2.c: a duration floor is no proof that verification ran
+
+`AssertionError: c2 src/m20.js: <task_result> DONE </task_result>: expected 686.17 to be greater than or
+equal to 1000` (ubuntu e2e; 587.15 in the coverage job), at `bound.test.ts:461`. A clean required pass
+adds no router text, so the test used an after-hook floor of 1000 ms as a proxy for "the gate ran
+tests".
+
+**Verification did run on Linux.** The same log: `[3.1.2.c] c2 src/m20.js: after=686ms runner mains
+naming it=1 3673` and `c2 src/m13.js: after=684ms runner mains naming it=1 3673` (coverage job: m20
+mains 7313,7449). The POSIX `ps` sampler works (this was its first CI run): it saw c2's runner main,
+in c2's repo, naming m20. The two neutral dispatches reached the gate together and ran as one batched
+scoped run, which on the Linux runner took well under a second.
+
+**Verdict: test defect.** The floor is replaced by the direct evidence: a runner main of that child,
+in its repo, naming the dispatch's module, seen in a snapshot within that dispatch's own gate window
+(`returnedAt - afterMs` to `returnedAt`, widened by `SNAPSHOT_SKEW_MS` = 250 ms for the snapshot
+timestamp skew). This is stronger than before: the old `mains.length >= 1` accepted a main seen at
+any time.
+
+### CI1-b — fixtures self-check: the summary parser did not strip colours
+
+`expected undefined to be 1` at `fixtures.e2e-check.test.ts:79`, although the output carried
+`Tests  1 failed | 126 passed (127)`. The raw log line is
+`\x1b[2m      Tests \x1b[22m \x1b[1m\x1b[31m1 failed\x1b[39m...` (14 ESC bytes; checked on the downloaded
+log: the old regex does not match it and matches once the escapes are stripped). vitest colours its
+output whenever `CI` is set, even into a pipe; locally, without `CI`, the output is plain, so the
+self-check passed. The `::error` annotation GitHub shows is uncoloured, which hid this in the job
+summary.
+
+**Verdict: test defect.** `countFailed` strips CSI sequences and CRLF and matches the summary per line
+(vitest, jest and pytest forms). Always-on parser cases use the CI bytes verbatim. The fixture's test
+command still runs with the inherited environment, as the product runs it.
+
+### CI1-c — 3.1.2.d: the "orphans" were the test process's own ancestors
+
+`expected [ …(57) ] to deeply equal []` at `bound.test.ts:573` (`lateMachine`). The log lists them:
+19 late snapshots (+3058 ms to +4959 ms) x 3 processes, always the same three:
+
+```
+alive at +3058ms 5448 ppid=2620 "C:\hostedtoolcache\windows\node\22.23.2\x64\node.exe" ...\npx-cli.js vitest run --maxWorkers=1 --coverage ...
+alive at +3058ms 5288 ppid=5448 C:\Windows\system32\cmd.exe /d /s /c vitest run --maxWorkers=1 --coverage ...
+alive at +3058ms 5336 ppid=5288 "node"   "D:\a\opencode-model-router\...\node_modules\.bin\\..\vitest\vitest.mjs" run --maxWorkers=1 --coverage ...
+```
+
+and `descendants=0 machine-wide=57 direct kill(0) at +5111ms=3 [5448,5288,5336]`. These are the CI
+step's `npx vitest ...`, its `cmd.exe` shim and the vitest main: the chain that launched the test
+process, alive because the test run was. None of the timed-out gate's processes (main 4440 and
+workers 7940, 5960, 4004, 3044, 4212, 6716, 736) was alive in any late snapshot.
+
+They were counted because Windows never reparents. npx's parent (2620) had exited; during the run a
+short-lived child of the test process got pid 2620, and the ppid walk (`descendantsOf`) followed
+npx's stale ppid to it. That put npx, cmd and the vitest main among the test process's
+"descendants", and the `/vitest/` attribution rule tracked them by pid and creation time.
+
+**Verdict: test defect (case iii of the dispatch: the test's own processes). No G4 violation.**
+
+- `sampler.ts`: `descendantsOf` drops a child created before the process holding its ppid (a process
+  cannot predate its parent), and `ancestorsOf` lists the test process's own ancestors. Without
+  creation times (POSIX `ps`, where orphans are reparented) the ppid is used as is.
+- 3.1.2.d counts only processes created since the dispatch (where the creation time is known), never
+  an ancestor, and prints pid, ppid, creation time and args for any late match.
+- Always-on pure cases in `harness.e2e-check.test.ts` rebuild the CI shape: without the check the
+  walk returns 5448, 5288 and 5336 as descendants; with it, only the reused-pid child.
+
+### CI1-d — 3.1.2.f: before hooks up to 104 ms past VERIFY_WAIT
+
+`expected 5018.3856 to be less than or equal to 5000` at `deferred.test.ts:201`, with
+`capture wait (beforeMs) p50=5032ms p95=5090ms max=5104ms` for the 20 parallel deferred dispatches
+(windows-latest, 4 cores, `--coverage`). Every capture outlived the 5 s wait, so every hook waited the
+full VERIFY_WAIT and then some.
+
+**Product part.** `beginVerificationBounded` armed its timer only after `beginVerification`'s
+synchronous start-up had returned (the directive read, `captureDepsFor`, `store.beginDispatch`, the
+snapshot's first git spawn). So the wait was VERIFY_WAIT after that start-up, not VERIFY_WAIT from the
+dispatch's start. Fix (ab81633): `startDispatch` takes the time on entry and waits only for what is
+left (`boundedCaptureWait`). `beginVerificationBounded` counts from its own entry. It uses `Date.now`,
+so fake clocks drive it with the timer, and a clock stepped backwards never lengthens the wait past
+`waitMs`. Regression test: `deferred-verification.test.ts` "counts the wait from the dispatch's
+start". A 300 ms synchronous start-up must release the dispatch at 4700 ms of timer time. It fails
+on fa01168's wiring.ts (checked by swapping the file) and passes with the fix.
+
+**Test part.** What remains is outside any timer's control: the timer firing late on a busy event
+loop, and the rest of the hook after the wait, serialised over 20 releases that fall due together.
+3.1.2.f now allows `HOOK_LATENCY_SLACK_MS` = 250 ms past VERIFY_WAIT (4a2e4b8). The worst case
+measured before the product fix was 104 ms.
+
+### Local verification
+
+- `tsc --noEmit` passes. `deferred-verification.test.ts` and `router-verify-tool.test.ts` pass
+  108/108; `baseline-wiring.test.ts` (read-only here) passes 47/47. The always-on parser and
+  sampler-helper cases pass.
+- e2e with `RUN_VERIFY_E2E=1`: the fixtures self-check passes 9/9 with `CI=true` (the colour
+  condition of CI1-b), and the deferred file passes 6/6.
+- The bound file could not be validated locally. During this round the host ran at 100% CPU: a
+  concurrent task had 14 `node -e "for(;;){}"` processes running for a CPU-saturation repro. Under
+  that load the local bound run failed in ways the CI run did not: captures timed out, gates took up
+  to 90 s, and in 3.1.2.d no runner had started before the 6 s budget ran out. The bound fixes are
+  checked by CI.
+- **Open observation (not verified, local, CPU-saturated host only).** In that saturated run, 3.1.2.b
+  and c measured peak workers 6 against a bound of 4 (3 per child with maxWorkers 2), with sampler
+  intervals of 420 ms (median) to 1085 ms. It did not happen on any CI runner (peak 2, bound 2). A
+  likely cause is workers of a killed or finishing run still exiting while the next run holds the
+  slot, but this was not investigated. Re-measure on an idle host before drawing a conclusion.
