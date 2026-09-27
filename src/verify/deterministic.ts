@@ -405,7 +405,8 @@ export function resolveRepoCommand(
 //     g. For each failing file f (absolute live path): r = toRefPath(f). undefined (outside the
 //        root) -> f stays unclassified. !fileExists(r) -> absentFiles. Else -> the rerun list.
 //     h. Rerun list empty -> { kind: "exact", result: undefined, ranFiles: [], absentFiles }.
-//     i. entry = resolveEntry(runner, liveCwd) on the LIVE tree (the reference links its
+//     i. entry = resolveEntry(runner, runner.runnerCwd) on the LIVE tree, the canonical start
+//        the scoped plan used (E2E-2: the raw liveCwd may be an 8.3 short path; the reference links its
 //        node_modules); spec = planRerun(runner, rerunList, toRefPath(runner.runnerCwd), budget,
 //        { fs, entry, host }). S6, or NoAffected (contradicts g) -> unusable "rerun-unplannable".
 //     j. Run it exactly as P5/P6 with timeoutMs = rd.bound(recheckTimeoutMs). A timeout or an
@@ -1072,7 +1073,10 @@ export function createScopeOpener(deps: ScopeOpenerDeps): OpenCheckScope {
       }
       if (rerunList.length === 0) return { kind: "exact", result: undefined, ranFiles: [], absentFiles, notes: [] };
 
-      const entry = await seams.resolveEntry(runner, liveCwd, fs, host);
+      // E2E-2: from runner.runnerCwd, the canonical start the scoped plan resolved its own entry
+      // from (runner.ts planScopedRun). liveCwd is the request's spelling (the plugin directory
+      // may be an 8.3 short path); resolveEntry canonicalises it too.
+      const entry = await seams.resolveEntry(runner, runner.runnerCwd, fs, host);
       if (isUnverifiable(entry)) return unusable("rerun-unplannable", entry.reason);
       const refCwd = ref.toRefPath(runner.runnerCwd);
       if (refCwd === undefined) return unusable("rerun-unplannable", "the runner cwd is outside the reference root");

@@ -4566,14 +4566,22 @@ export async function detectRunner(
   return detectImpl(makeCtx(host), command, cwd, fs, TEST_HEADS);
 }
 
-/** 1.3.2.b: locate the JS bin entry or the native executable (F), walking from cwd up to runner.gitRoot. */
+/**
+ * 1.3.2.b: locate the JS bin entry or the native executable (F), walking from cwd up to runner.gitRoot.
+ * E2E-2: cwd and gitRoot are canonicalised first (G.3a), as every internal caller does. detectRunner
+ * returns a realpath'd gitRoot, so a caller's cwd spelled differently (a win32 8.3 short name such as
+ * C:\Users\ABCDEF~1\..., a junction) was never inside it: the walk found nothing and every reference
+ * recheck reported "runner not installed".
+ */
 export async function resolveEntry(
   runner: EntryRequest,
   cwd: string,
-  fs: FsSeam,
+  fs: PlannerFs,
   host?: Partial<RunnerHost>,
 ): Promise<ResolvedEntry | Unverifiable> {
-  const r = await resolveEntryImpl(makeCtx(host), runner, cwd, fs);
+  const ctx = makeCtx(host);
+  const req: EntryRequest = { kind: runner.kind, launcher: runner.launcher, gitRoot: await canonicalCwd(ctx, fs, runner.gitRoot) };
+  const r = await resolveEntryImpl(ctx, req, await canonicalCwd(ctx, fs, cwd), fs);
   return isS6(r) ? r : r.entry;
 }
 

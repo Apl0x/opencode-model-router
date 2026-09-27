@@ -1,7 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { join } from "node:path";
+import { spawn, spawnSync } from "node:child_process";
+import * as fsp from "node:fs/promises";
+import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import { judgeScoped } from "../../src/verify/baseline";
+import { captureReference, materialize as realMaterialize, nodeReferenceFs } from "../../src/verify/reference";
+import { detectRunner as realDetectRunner, resolveEntry as realResolveEntry } from "../../src/verify/runner";
 import { createChangedFileStore } from "../../src/verify/dispatch";
 import type { VerifyBudget } from "../../src/router/config";
 import type {
@@ -1382,5 +1386,207 @@ describe("gate pipeline end to end (2.1.6c): real opener, rechecker, hook, plann
       expect(s.acquire).not.toHaveBeenCalled();
       d.dispose();
     });
+  });
+});
+
+/**
+ * E2E-2: the win32 8.3 spelling of an existing path (cmd's `%~sI`, spawned with an argv), or
+ * undefined when the volume has 8.3 name generation disabled (the spelling comes back unchanged).
+ */
+function shortPathOf(path: string): string | undefined {
+  const r = spawnSync("cmd.exe", ["/d", "/s", "/c", `"for %I in ("${path}") do @echo %~sI"`], {
+    encoding: "utf8",
+    windowsHide: true,
+    windowsVerbatimArguments: true,
+  });
+  if (r.status !== 0) throw new Error(`cmd.exe %~sI failed for ${path}: ${r.stderr}`);
+  const short = r.stdout.trim();
+  return short.toLowerCase() === path.toLowerCase() ? undefined : short;
+}
+
+// E2E-2 (phase 3.1): the plugin directory (the recheck's liveCwd) and os.tmpdir() are 8.3 short
+// paths on many Windows hosts. Before the fix every recheck there was "reference unusable
+// (rerun-unplannable): runner not installed: vitest", so introduced failures were accepted with a
+// caveat. Real opener, real detectRunner/resolveEntry/planRerun/materialize/GC, real git and a
+// real node_modules junction; only the rerun spawn and its report are stubbed.
+describe("scope.rechecker under 8.3 short paths (E2E-2)", { timeout: 60_000 }, () => {
+  const BUDGET: VerifyBudget = {
+    testScope: "affected",
+    maxWorkers: 2,
+    lowPriority: true,
+    maxConcurrentVerifications: 1,
+    defaultVerify: "required",
+    captureWaitMs: 5_000,
+    background: false,
+    pendingTtlMs: 600_000,
+    slotWaitMs: 60_000,
+    batchWindowMs: 250,
+    failureRecheck: true,
+    recheckTimeoutMs: 120_000,
+    baselineTimeoutMs: 60_000,
+    gateBudgetMs: 300_000,
+  };
+  /** The production RunnerFs shape (wiring.ts): fs.promises with the native realpath. */
+  const realFs: RunnerFs = {
+    fileExists: p => fsp.access(p).then(() => true, () => false),
+    readFile: p => fsp.readFile(p, "utf8"),
+    realpath: p => fsp.realpath(p),
+    async stat(p) {
+      const s = await fsp.stat(p, { bigint: true });
+      return { isFile: s.isFile(), size: s.size, dev: s.dev, ino: s.ino };
+    },
+    readdir: p => fsp.readdir(p),
+    async unlink(p) {
+      try {
+        await fsp.unlink(p);
+      } catch (err) {
+        if (!(err instanceof Error && "code" in err && err.code === "ENOENT")) throw err;
+      }
+    },
+  };
+  /** git runs for real (capture, materialize, GC, dispose); any other file is recorded, not spawned. */
+  const reruns: { file: string; args: readonly string[]; cwd: string | undefined }[] = [];
+  const argv: ArgvSeam = (file, args, opts) => {
+    if (file !== "git") {
+      reruns.push({ file, args, cwd: opts?.cwd });
+      return Promise.resolve({ code: 1, stdout: "", stderr: "" });
+    }
+    return new Promise(resolve => {
+      const child = spawn(file, [...args], {
+        cwd: opts?.cwd,
+        env: opts?.env ? { ...process.env, ...opts.env } : process.env,
+        windowsHide: true,
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      let stdout = "";
+      let stderr = "";
+      child.stdout.setEncoding("utf8").on("data", (c: string) => void (stdout += c));
+      child.stderr.setEncoding("utf8").on("data", (c: string) => void (stderr += c));
+      child.on("error", e => resolve({ code: -1, stdout, stderr: `${stderr}${String(e)}` }));
+      child.on("close", code => resolve({ code: code ?? 1, stdout, stderr }));
+    });
+  };
+  const git = async (cwd: string, ...args: string[]): Promise<void> => {
+    const r = await argv("git", args, { cwd });
+    if (r.code !== 0) throw new Error(`git ${args.join(" ")} failed: ${r.stderr}`);
+  };
+
+  let longRoot = "";
+  let junction = "";
+  afterEach(async () => {
+    reruns.length = 0;
+    if (junction !== "" && (await fsp.lstat(junction).catch(() => undefined))?.isSymbolicLink()) await fsp.unlink(junction);
+    if (longRoot !== "") await fsp.rm(longRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
+    longRoot = "";
+    junction = "";
+  });
+
+  it("reruns the failing file at the reference with the live runner entry, from an 8.3 plugin directory and tmpdir", async ctx => {
+    if (process.platform !== "win32") return ctx.skip("8.3 short names exist on win32 only");
+    // ASCII-only long names, so cmd's output code page cannot garble the short spelling.
+    longRoot = await fsp.mkdtemp(join(await fsp.realpath(tmpdir()), "omr-e2e2-pipeline-long-"));
+    const longRepo = join(longRoot, "repository-long-name");
+    const longTmp = join(longRoot, "temporary-long-name");
+    const store = join(longRoot, "dependency-store", "node_modules");
+    junction = join(longRepo, "node_modules");
+    await fsp.mkdir(longRepo);
+    await fsp.mkdir(longTmp);
+    const shortRepo = shortPathOf(longRepo);
+    const shortTmp = shortPathOf(longTmp);
+    if (shortRepo === undefined || shortTmp === undefined) {
+      console.warn(`[E2E-2] SKIPPED: 8.3 short names are disabled on the volume of ${longRoot}`);
+      return ctx.skip("8.3 short names are disabled on this volume");
+    }
+    expect(shortRepo).toMatch(/~\d/);
+    await git(longRepo, "init", "-q");
+    for (const [k, v] of [["user.email", "t@example.com"], ["user.name", "t"], ["commit.gpgsign", "false"], ["core.autocrlf", "false"]]) {
+      await git(longRepo, "config", k, v);
+    }
+    await fsp.mkdir(join(longRepo, "test"));
+    await fsp.writeFile(join(longRepo, "package.json"), '{"name":"e2e2","scripts":{"test":"vitest run"}}\n');
+    await fsp.writeFile(join(longRepo, "test", "a.test.js"), "// a failing test file\n");
+    await fsp.writeFile(join(longRepo, ".gitignore"), "node_modules/\n");
+    await git(longRepo, "add", "-A");
+    await git(longRepo, "commit", "-q", "-m", "init");
+    await fsp.mkdir(join(store, "vitest"), { recursive: true });
+    await fsp.writeFile(join(store, "vitest", "package.json"), '{"name":"vitest","version":"3.0.0","bin":{"vitest":"vitest.mjs"}}\n');
+    await fsp.writeFile(join(store, "vitest", "vitest.mjs"), "\n");
+    await fsp.symlink(store, junction, "junction");
+
+    const reference = await captureReference(shortRepo, new AbortController().signal, { argv, fs: nodeReferenceFs, tmpdir: shortTmp });
+    if (!reference) throw new Error("capture from the 8.3 cwd returned undefined");
+    const warn = vi.fn();
+    const release = vi.fn(async (): Promise<void> => {});
+    const materialized: string[] = [];
+    const readResult = vi.fn<RecheckSeams["readResult"]>(async spec => ({
+      failingIds: ["test/a.test.js > fails"],
+      failingFiles: [join(spec.cwd, "test", "a.test.js")],
+      collectionError: false,
+      total: 1,
+      complete: true,
+      source: "report",
+    }));
+    const host = { platform: process.platform, tmpdir: shortTmp };
+    const open = createScopeOpener({
+      argv,
+      exec: async () => ({ code: 0, stdout: "", stderr: "" }),
+      fs: realFs,
+      acquire: async () => ({ release, lost: false }),
+      budget: BUDGET,
+      checkTimeoutMs: 120_000,
+      host,
+      logger: { warn },
+      reference: { tmpdir: shortTmp },
+      recheck: {
+        readResult,
+        materialize: async (...a) => {
+          const m = await realMaterialize(...a);
+          if (m.ok) materialized.push(m.reference.dir);
+          return m;
+        },
+      },
+    });
+    const scope = open({ cwd: shortRepo, command: "npx vitest run" });
+    // The live failing file as the scoped run reports it: the planner's canonical spelling.
+    const failing = join(await fsp.realpath(longRepo), "test", "a.test.js");
+    const out = await scope.rechecker("npx vitest run", shortRepo)(reference, [failing], createDeadline(300_000));
+    await scope.close();
+
+    expect(out).toMatchObject({ kind: "exact", ranFiles: ["test/a.test.js"], absentFiles: [] });
+    expect(materialized).toHaveLength(1);
+    const refDir = materialized[0] ?? "";
+    expect(dirname(refDir)).toBe(await fsp.realpath(shortTmp));
+    // One rerun: node + the LIVE vitest entry, in the reference worktree, on the mapped file.
+    expect(reruns).toHaveLength(1);
+    const rerun = reruns[0];
+    expect(rerun?.cwd).toBe(refDir);
+    expect(rerun?.args[0]).toBe(join(await fsp.realpath(longRepo), "node_modules", "vitest", "vitest.mjs"));
+    expect(rerun?.args).toContain(join(refDir, "test", "a.test.js"));
+    expect(release).toHaveBeenCalledTimes(1);
+    // The reference was disposed without going through the junction (R1).
+    expect(await fsp.readFile(join(store, "vitest", "package.json"), "utf8")).toContain('"vitest"');
+    expect((await fsp.readdir(longTmp)).filter(n => n.startsWith("omr-ref-"))).toEqual([]);
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  it("resolveEntry walks from an 8.3 cwd up to the realpath'd gitRoot detectRunner returns", async ctx => {
+    if (process.platform !== "win32") return ctx.skip("8.3 short names exist on win32 only");
+    longRoot = await fsp.mkdtemp(join(await fsp.realpath(tmpdir()), "omr-e2e2-entry-long-"));
+    const longRepo = join(longRoot, "repository-long-name");
+    await fsp.mkdir(join(longRepo, "node_modules", "vitest"), { recursive: true });
+    await fsp.mkdir(join(longRepo, ".git"));
+    await fsp.writeFile(join(longRepo, "package.json"), '{"name":"e2e2"}\n');
+    await fsp.writeFile(join(longRepo, "node_modules", "vitest", "package.json"), '{"name":"vitest","version":"3.0.0","bin":{"vitest":"vitest.mjs"}}\n');
+    await fsp.writeFile(join(longRepo, "node_modules", "vitest", "vitest.mjs"), "\n");
+    const shortRepo = shortPathOf(longRepo);
+    if (shortRepo === undefined) {
+      console.warn(`[E2E-2] SKIPPED: 8.3 short names are disabled on the volume of ${longRoot}`);
+      return ctx.skip("8.3 short names are disabled on this volume");
+    }
+    const runner = await realDetectRunner("npx vitest run", shortRepo, realFs);
+    if ("unverifiable" in runner) throw new Error(`detectRunner: ${runner.reason}`);
+    expect(runner.gitRoot).toBe(await fsp.realpath(longRepo));
+    const entry = await realResolveEntry(runner, shortRepo, realFs);
+    expect(entry).toMatchObject({ entry: join(await fsp.realpath(longRepo), "node_modules", "vitest", "vitest.mjs"), version: "3.0.0" });
   });
 });
