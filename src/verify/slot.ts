@@ -42,6 +42,10 @@
  * that still acts. Transient antivirus/indexer errors (EBUSY/EPERM/EACCES) are
  * retried, and a failed delete is never reported as success.
  *
+ * Loss. When the heartbeat finds the holder's file gone or owned by another token,
+ * the handle's `lost` becomes true, `onLost` is called and a warning is logged,
+ * once. A failing `utimes` is retried like an unlink.
+ *
  * Residual risk: every check-then-act on a file system has a window between the
  * last check and the syscall. A process frozen exactly there (SIGSTOP, a debugger)
  * for longer than the stale rules allow can still act late. A holder that stops
@@ -69,11 +73,18 @@ export interface SlotOptions {
   waitMs: number;
   signal?: AbortSignal;
   meta: SlotMeta;
+  /**
+   * Called once if the heartbeat finds this holder's lock file gone or owned by
+   * another token (the slot was reclaimed while held: two holders may be running).
+   */
+  onLost?: () => void;
 }
 
 export interface SlotHandle {
   /** Deletes this holder's lock file. Idempotent; never rejects. */
   release(): Promise<void>;
+  /** True once the heartbeat found that another process reclaimed this slot. */
+  readonly lost: boolean;
 }
 
 export type SlotResult = SlotHandle | { busy: true };
@@ -529,6 +540,7 @@ function acquireLocal(opts: SlotOptions, cfg: Cfg): Promise<SlotResult> {
         if (next) next();
         else s.count--;
       },
+      lost: false,
     };
   };
   if (s.count < opts.max) {
@@ -584,7 +596,7 @@ async function tryAcquireOnce(opts: SlotOptions, cfg: Cfg): Promise<SlotHandle |
     for (let attempt = 0; attempt < 3; attempt++) {
       const token = randomUUID();
       const info: LockInfo = { pid: cfg.pid, hostname: cfg.hostname, token, startedAt: cfg.now(), cwd: opts.meta.cwd, command: opts.meta.command };
-      if (await createOwned(path, info, cfg)) return makeFileHandle(path, token, cfg);
+      if (await createOwned(path, info, cfg)) return makeFileHandle(path, token, opts, cfg);
       const cur = await readLock(path, cfg);
       if (cur.kind === "missing") continue; // released meanwhile: create again
       if (cur.kind === "unreadable" || !lockStale(path, cur, cfg)) break;
@@ -597,12 +609,13 @@ async function tryAcquireOnce(opts: SlotOptions, cfg: Cfg): Promise<SlotHandle |
   return undefined;
 }
 
-function makeFileHandle(path: string, token: string, cfg: Cfg): SlotHandle {
+function makeFileHandle(path: string, token: string, opts: SlotOptions, cfg: Cfg): SlotHandle {
   hookExit();
   const entry: Held = { path, token, pid: cfg.pid, hostname: cfg.hostname };
   held.add(entry);
   // held -> releasing (an attempt runs) -> done, or -> deferred (retried on a timer) -> ...
   let phase: "held" | "releasing" | "deferred" | "done" = "held";
+  let lost = false;
   let tick: Promise<void> | undefined;
   let attempt: Promise<void> | undefined;
   let retryTimer: NodeJS.Timeout | undefined;
@@ -618,13 +631,24 @@ function makeFileHandle(path: string, token: string, cfg: Cfg): SlotHandle {
     held.delete(entry);
   };
 
+  /** The file is gone or someone else's. While held, that is a loss; while a release is pending, it is done. */
+  const notOurs = () => {
+    const wasHeld = phase === "held";
+    finish();
+    if (!wasHeld) return;
+    lost = true;
+    warn(cfg, "verification slot lost: another process reclaimed it while it was held", { path });
+    try {
+      opts.onLost?.();
+    } catch (e) {
+      warn(cfg, "verification slot: onLost callback threw", { path, error: String(e) });
+    }
+  };
+
   const beat = async (): Promise<void> => {
     const cur = await readLock(path, cfg);
     if (!beating() || cur.kind === "unreadable") return; // a scanner has it open: next tick
-    if (cur.kind !== "ok" || cur.info.token !== token) {
-      if (phase === "deferred") finish(); // the pending delete happened (or the slot was reaped)
-      return;
-    }
+    if (cur.kind !== "ok" || cur.info.token !== token) return notOurs();
     for (let i = 0; ; i++) {
       if (!beating()) return; // a release began: never touch the file again
       try {
@@ -633,7 +657,11 @@ function makeFileHandle(path: string, token: string, cfg: Cfg): SlotHandle {
         return;
       } catch (e) {
         const code = errCode(e) ?? String(e);
-        if (code === "ENOENT" || !TRANSIENT.has(code) || i >= cfg.unlinkRetries) {
+        if (code === "ENOENT") {
+          if (beating()) notOurs();
+          return;
+        }
+        if (!TRANSIENT.has(code) || i >= cfg.unlinkRetries) {
           if (!beatWarned) warn(cfg, "verification slot: heartbeat failed", { path, code });
           beatWarned = true;
           return;
@@ -696,7 +724,12 @@ function makeFileHandle(path: string, token: string, cfg: Cfg): SlotHandle {
     return attempt;
   };
 
-  return { release };
+  return {
+    release,
+    get lost() {
+      return lost;
+    },
+  };
 }
 
 /**

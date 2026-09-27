@@ -583,6 +583,30 @@ describe("slot: release never fails the caller (QA-1.4-4, QA-1.4-6, QA-1.4-17)",
   });
 });
 
+describe("slot: the holder learns that it lost the slot (QA-1.4-7)", () => {
+  it.each([
+    ["taken over by another token", (p: string) => writeLock(p, { token: "intruder" })],
+    ["deleted", (p: string) => rmSync(p)],
+  ])("lock %s: lost becomes true, onLost runs once, one warning; release leaves the path alone", async (_n, steal) => {
+    const dir = freshDir();
+    const p = join(dir, "slot-0.lock");
+    const warns: string[] = [];
+    let calls = 0;
+    const a = held(
+      await acquireSlot({ max: 1, waitMs: 0, meta, onLost: () => calls++ }, fast(dir, { heartbeatMs: 50, logger: { warn: (m) => warns.push(m) } })),
+    );
+    expect(a.lost).toBe(false);
+    steal(p);
+    const after = tokenAt(p);
+    await waitUntil(() => a.lost);
+    await sleep(200);
+    expect(calls).toBe(1);
+    expect(warns.filter((w) => w.includes("slot lost"))).toHaveLength(1);
+    await a.release();
+    expect(tokenAt(p)).toBe(after);
+  });
+});
+
 describe("slot: waiting", () => {
   it("waitMs=0 returns busy immediately", async () => {
     const dir = freshDir();
