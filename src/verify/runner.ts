@@ -1430,6 +1430,12 @@ export interface RunResult {
   readonly source: "report" | "text";
   /** A stable explanation when complete is false or the report and exit code disagree. */
   readonly note?: string;
+  /**
+   * Tests the report lists per file (S5 attribution, Phase 2.2 P1): id-space file key (cwd-relative,
+   * "/" separators, the prefix of failingIds) -> count. JSON: each suite's assertionResults; junit:
+   * the testcases mapped to an input, without collection pseudo-cases. undefined for the text fallback.
+   */
+  readonly testsByFile?: Readonly<Record<string, number>>;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -4627,6 +4633,7 @@ function finishResult(
   code: number,
   forced: string | undefined,
   exitOk: boolean,
+  testsByFile: Readonly<Record<string, number>>,
 ): RunResult {
   const silent = !exitOk && ids.size === 0 && !collectionError;
   const note = forced ?? (silent ? `runner exited ${code} but its report lists no failure` : undefined);
@@ -4638,7 +4645,13 @@ function finishResult(
     complete: forced === undefined && !silent,
     source: "report",
     ...(note !== undefined ? { note } : {}),
+    testsByFile,
   };
+}
+
+/** P1: add `n` tests to a file key (a null-prototype record, so a key like "__proto__" is safe). */
+function addCount(counts: Record<string, number>, key: string, n: number): void {
+  counts[key] = (counts[key] ?? 0) + n;
 }
 
 /** I step 2: the jest-compatible JSON of vitest and jest. undefined = unusable. */
@@ -4653,11 +4666,13 @@ function parseJestJson(ctx: Ctx, spec: ScopedSpec, text: string, code: number): 
   if (!isRecord(v) || !Array.isArray(v.testResults)) return undefined;
   const ids = new Set<string>();
   const files = new Set<string>();
+  const counts: Record<string, number> = Object.create(null) as Record<string, number>;
   let collectionError = typeof v.numRuntimeErrorTestSuites === "number" && v.numRuntimeErrorTestSuites > 0;
   for (const s of v.testResults.filter(isRecord)) {
     if (typeof s.name !== "string") continue;
     const rel = relSlash(ctx, spec.cwd, s.name);
     const results = Array.isArray(s.assertionResults) ? s.assertionResults.filter(isRecord) : [];
+    addCount(counts, rel, results.length);
     const failed = results.filter((a) => a.status === "failed");
     for (const a of failed) {
       const titles = Array.isArray(a.ancestorTitles) ? a.ancestorTitles.map(String) : [];
@@ -4670,7 +4685,7 @@ function parseJestJson(ctx: Ctx, spec: ScopedSpec, text: string, code: number): 
     if (s.status === "failed" || failed.length > 0) files.add(P.normalize(s.name));
   }
   const total = typeof v.numTotalTests === "number" ? v.numTotalTests : undefined;
-  return finishResult(ids, files, collectionError, total, code, undefined, code === 0);
+  return finishResult(ids, files, collectionError, total, code, undefined, code === 0, counts);
 }
 
 /**
@@ -4773,6 +4788,25 @@ function parseJunit(ctx: Ctx, spec: ScopedSpec, text: string, code: number): Run
   let collectionError = false;
   let total = 0;
   let unmapped: string | undefined;
+  const counts: Record<string, number> = Object.create(null) as Record<string, number>;
+  // P1: raw classname attribute -> the file key it maps to (null when unmapped), decoded once each.
+  const classKeys = new Map<string, string | null>();
+  const countCase = (attrs: string) => {
+    let raw = "";
+    for (const a of attrs.matchAll(/([\w:-]+)="([^"]*)"/g)) {
+      if (a[1] === "classname") {
+        raw = a[2];
+        break;
+      }
+    }
+    let key = classKeys.get(raw);
+    if (key === undefined) {
+      const hit = map(decodeXml(raw));
+      key = hit ? relOf(hit.file) : null;
+      classKeys.set(raw, key);
+    }
+    if (key !== null) addCount(counts, key, 1);
+  };
   const cases = junitCases(text);
   if (!cases) return undefined;
   for (const c of cases) {
@@ -4780,9 +4814,11 @@ function parseJunit(ctx: Ctx, spec: ScopedSpec, text: string, code: number): Run
     // QA-1.3-22: only the collection-failure <error> marks a collection case. pytest also writes
     // classname="" for a test outside its rootdir (-c elsewhere, --rootdir), which is a real test.
     const collection = /<error\b[^>]*\bmessage="collection failure"/.test(body);
-    // QA-1.3-35: a passing case only counts; its attributes are never decoded.
+    // QA-1.3-35: a passing case only counts; its attributes are never decoded (only its classname,
+    // once per distinct value, for the per-file counts).
     if (!collection) {
       total++;
+      countCase(c.attrs);
       if (!/<(?:failure|error)\b/.test(body)) continue;
     }
     const attrs: Record<string, string> = {};
@@ -4819,7 +4855,7 @@ function parseJunit(ctx: Ctx, spec: ScopedSpec, text: string, code: number): Run
         : unmapped !== undefined
           ? `pytest classname not mapped to a test file: ${unmapped}`
           : undefined;
-  return finishResult(ids, files, collectionError, total, code, forced, code === 0 || code === 5);
+  return finishResult(ids, files, collectionError, total, code, forced, code === 0 || code === 5, counts);
 }
 
 /**

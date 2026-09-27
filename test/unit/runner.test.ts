@@ -1269,6 +1269,92 @@ describe("readResult: pytest junit", () => {
   });
 });
 
+describe("readResult: per-file test counts (Phase 2.2 P1)", () => {
+  const sum = (c: Readonly<Record<string, number>> | undefined) => Object.values(c ?? {}).reduce((a, b) => a + b, 0);
+  const pyInputs = ["/root/pytest-proj/tests/test_math.py", "/root/pytest-proj/tests/test_str.py", "/root/pytest-proj/tests/test_broken.py"];
+  const pspec = (over: Partial<ScopedSpec> = {}) =>
+    mkSpec({ runner: "pytest", reportPath: RPT_XML, cwd: "/root/pytest-proj", gitRoot: "/root", inputs: pyInputs, inputsAreTests: true, ...over });
+
+  for (const [name, code] of [["vitest-fail.json", 1], ["vitest-pass.json", 0], ["vitest-none.json", 0], ["vitest-collect-error.json", 1]] as const) {
+    it(`vitest ${name}: keys are cwd-relative and the counts sum to total`, async () => {
+      const r = await read(mkSpec(), { [RPT_JSON]: report(name, "/root") }, code);
+      expect(r.testsByFile).toBeDefined();
+      expect(sum(r.testsByFile)).toBe(r.total);
+      for (const k of Object.keys(r.testsByFile ?? {})) expect(k.startsWith("/") || k.includes("\\")).toBe(false);
+    });
+  }
+
+  it("vitest: the failing file's key is the prefix of its failing ids", async () => {
+    const r = await read(mkSpec(), { [RPT_JSON]: report("vitest-fail.json", "/root") }, 1);
+    expect(r.testsByFile?.["test/str.test.js"]).toBeGreaterThan(0);
+  });
+
+  it("an import-time throw counts 0 tests for its file", async () => {
+    const r = await read(mkSpec(), { [RPT_JSON]: report("vitest-collect-error.json", "/root") }, 1);
+    expect(r.testsByFile?.["test/throws.test.js"]).toBe(0);
+  });
+
+  for (const [name, code] of [["jest-fail.json", 1], ["jest-pass.json", 0], ["jest-none.json", 0]] as const) {
+    it(`jest ${name} (win32 names): "/" keys that sum to total`, async () => {
+      const at = `C:\\Temp\\omr-verify-${UUID}.json`;
+      const sp = mkSpec({ runner: "jest", cwd: "C:\\root\\jest-proj", gitRoot: "C:\\root", reportPath: at });
+      const r = await read(sp, { [at]: report(name, "C:\\root") }, code, { ...WIN_HOST });
+      expect(sum(r.testsByFile)).toBe(r.total);
+      for (const k of Object.keys(r.testsByFile ?? {})) expect(k.includes("\\") || /^[A-Za-z]:/.test(k)).toBe(false);
+    });
+  }
+
+  it("jest-fail: the failing file is keyed like its ids", async () => {
+    const at = `C:\\Temp\\omr-verify-${UUID}.json`;
+    const sp = mkSpec({ runner: "jest", cwd: "C:\\root\\jest-proj", gitRoot: "C:\\root", reportPath: at });
+    const r = await read(sp, { [at]: report("jest-fail.json", "C:\\root") }, 1, { ...WIN_HOST });
+    expect(r.testsByFile?.["test/str.test.js"]).toBeGreaterThan(0);
+  });
+
+  for (const [name, code] of [["pytest-fail.xml", 1], ["pytest-xdist-fail.xml", 1], ["pytest-pass.xml", 0], ["pytest-none.xml", 5]] as const) {
+    it(`pytest ${name}: counts per mapped input sum to total`, async () => {
+      const r = await read(pspec(), { [RPT_XML]: report(name, "/root") }, code);
+      expect(r.testsByFile).toBeDefined();
+      expect(sum(r.testsByFile)).toBe(r.total);
+    });
+  }
+
+  it("pytest: the failing file's key matches its ids", async () => {
+    const r = await read(pspec(), { [RPT_XML]: report("pytest-fail.xml", "/root") }, 1);
+    expect(r.testsByFile?.["tests/test_str.py"]).toBeGreaterThan(0);
+  });
+
+  it("pytest: collection pseudo-cases are not counted", async () => {
+    const r = await read(pspec(), { [RPT_XML]: report("pytest-collect-error.xml", "/root") }, 2);
+    expect(r.total).toBe(0);
+    expect(r.testsByFile).toEqual({});
+  });
+
+  it("pytest: entity-encoded classnames map; unmapped cases are not counted", async () => {
+    const xml =
+      '<?xml version="1.0"?><testsuites><testsuite>' +
+      '<testcase classname="tests.test_math" name="a"/>' +
+      '<testcase name="b" classname="tests.test_math"></testcase>' +
+      '<testcase classname="tests.test_&#115;tr.TestStr" name="c"/>' +
+      '<testcase classname="elsewhere.mod" name="d"/>' +
+      "</testsuite></testsuites>";
+    const r = await read(pspec(), { [RPT_XML]: xml }, 0);
+    expect(r.total).toBe(4);
+    expect(r.testsByFile).toEqual({ "tests/test_math.py": 2, "tests/test_str.py": 1 });
+  });
+
+  it("the zero-test guard keeps the counts; the text fallback has none", async () => {
+    const none = await read(pspec(), { [RPT_XML]: report("pytest-none.xml", "/root") }, 5);
+    expect(none.complete).toBe(false);
+    expect(none.testsByFile).toEqual({});
+    const text = await read(mkSpec(), {}, 1);
+    expect(text.source).toBe("text");
+    expect(text.testsByFile).toBeUndefined();
+    const truncated = await read(mkSpec(), { [RPT_JSON]: report("vitest-fail.json", "/root").slice(0, 200) }, 1);
+    expect(truncated.testsByFile).toBeUndefined();
+  });
+});
+
 // ---------------------------------------------------------------------------------------------
 // planRerun (1.3.2.e)
 // ---------------------------------------------------------------------------------------------
