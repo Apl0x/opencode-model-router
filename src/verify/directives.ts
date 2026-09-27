@@ -13,8 +13,12 @@
  *   after the colon and `VERIFY:maybe,VERIFY:required` → required, like `CAP:abc,CAP:3` → 3 (QA-1.6-19);
  * - prose guard (QA-1.6-18): when the key is NOT written as upper-case `VERIFY`/`VERIFY_WAIT`,
  *   the value counts only if it ends the line (optionally followed by closing quotes, `*`, `_`,
- *   `)`/`]`, a table pipe or punctuation) or is followed by another directive key
- *   (`VERIFY:`/`VERIFY_WAIT:`/`CAP:`, any case; QA-1.6-27). So `verify: required` alone on a line,
+ *   `)`/`]`, a table pipe or punctuation) or is followed on the same line by another directive key
+ *   whose value is validly formatted (`VERIFY:` `required|deferred`, `VERIFY_WAIT:` `<n>ms|s`,
+ *   `CAP:` `none|<n>`, any case; QA-1.6-27, QA-1.6-35). "Valid" means the value's format only, not
+ *   whether the parser would accept that directive: `cap:0` still ends the line; a value on the
+ *   next line does not, and a bare `CAP:` after the value falls back silently (QA-1.6-38).
+ *   So `verify: required` alone on a line,
  *   `verify:required verify_wait:2s` and `| verify:required |` → required (decision), but
  *   `Things to verify: deferred loading works` and `Please verify: "deferred" state…` are prose
  *   and ignored silently; so are `verify: required (per QA)`, `verify: required -- …` and
@@ -94,8 +98,10 @@ const WAIT_VALUE = /(\d+)(ms|s)\b/iy;
 /**
  * After a non-upper-case key the value must end the line (QA-1.6-18), bar closing marks and a
  * table pipe, or be followed by another directive key carrying a valid value for that key
- * (QA-1.6-27, QA-1.6-35). Tested with a sticky regex on
- * the text itself (no slice, no length limit); linear: one character class, then a fixed alternative.
+ * (QA-1.6-27, QA-1.6-35); "valid" means format-valid, see the module header (QA-1.6-38). Tested
+ * with a sticky regex on the text itself (no slice, no length limit); linear: one character class,
+ * then an alternative of line ends and key/value shapes built from bounded-choice pieces, `\d+`
+ * and horizontal-space runs.
  */
 const LINE_TAIL = new RegExp(
   `(?:["'\`*_.,;:!?)\\]|]|[^\\S\\r\\n\\u2028\\u2029])*(?:[\\r\\n\\u2028\\u2029]|$|\\b(?:VERIFY${HWS}:${HWS}["'\`*_]?(?:required|deferred)\\b|VERIFY_WAIT${HWS}:${HWS}["'\`*_]?\\d+(?:ms|s)\\b|CAP${HWS}:${HWS}(?:none|\\d+)\\b))`,
