@@ -667,6 +667,9 @@
 //   Bun docs (oven-sh/bun docs/runtime/index.mdx): "If a built-in bun command has the same name,
 //   the built-in command takes precedence; use the explicit bun run <script>".
 
+import { randomUUID } from "node:crypto";
+import * as os from "node:os";
+import * as nodePath from "node:path";
 import type { ExecResult, FsSeam } from "./types";
 
 // ---------------------------------------------------------------------------------------------
@@ -971,6 +974,922 @@ export function isScopedSpec(x: object): x is ScopedSpec {
 }
 
 // ---------------------------------------------------------------------------------------------
+// Internal helpers (host, paths, reasons)
+// ---------------------------------------------------------------------------------------------
+
+type PathApi = typeof nodePath.posix;
+
+interface Ctx {
+  readonly host: RunnerHost;
+  readonly P: PathApi;
+  readonly win: boolean;
+  key(p: string): string;
+}
+
+function resolveHost(h: Partial<RunnerHost> | undefined): RunnerHost {
+  return {
+    platform: h?.platform ?? process.platform,
+    execPath: h?.execPath ?? process.execPath,
+    tmpdir: h?.tmpdir ?? os.tmpdir(),
+    cores: h?.cores ?? os.availableParallelism(),
+    pathEnv: h?.pathEnv ?? process.env.PATH ?? "",
+    pytestAddopts: h?.pytestAddopts ?? process.env.PYTEST_ADDOPTS ?? "",
+    randomId: h?.randomId ?? randomUUID,
+  };
+}
+
+function makeCtx(h: Partial<RunnerHost> | undefined): Ctx {
+  const host = resolveHost(h);
+  const win = host.platform === "win32";
+  return { host, P: win ? nodePath.win32 : nodePath.posix, win, key: (p: string) => (win ? p.toLowerCase() : p) };
+}
+
+function s6(code: S6Code, reason: string): Unverifiable {
+  return { unverifiable: true, code, reason };
+}
+
+function noAffected(note: string): NoAffected {
+  return { noAffected: true, note };
+}
+
+function isS6(x: object): x is Unverifiable {
+  return isUnverifiable(x);
+}
+
+/** True when `abs` is `root` itself or lies below it (G.4 rules; win32 compares case-insensitively). */
+function isInside(ctx: Ctx, root: string, abs: string): boolean {
+  const rel = ctx.P.relative(root, abs);
+  if (rel === "") return true;
+  if (ctx.P.isAbsolute(rel)) return false;
+  return rel.split(/[\\/]/)[0] !== "..";
+}
+
+/** Directories from `from` up to `root`, inclusive. Empty when `from` is not inside `root`. */
+function ancestors(ctx: Ctx, from: string, root: string): string[] {
+  if (!isInside(ctx, root, from)) return [];
+  const out: string[] = [];
+  let d = ctx.P.resolve(from);
+  for (;;) {
+    out.push(d);
+    if (ctx.key(d) === ctx.key(ctx.P.resolve(root))) break;
+    const parent = ctx.P.dirname(d);
+    if (parent === d) break;
+    d = parent;
+  }
+  return out;
+}
+
+function toSlash(ctx: Ctx, rel: string): string {
+  return ctx.win ? rel.replace(/\\/g, "/") : rel;
+}
+
+async function findGitRoot(ctx: Ctx, cwd: string, fs: FsSeam): Promise<string | undefined> {
+  let d = ctx.P.resolve(cwd);
+  for (;;) {
+    if (await fs.fileExists(ctx.P.join(d, ".git"))) return d;
+    const parent = ctx.P.dirname(d);
+    if (parent === d) return undefined;
+    d = parent;
+  }
+}
+
+async function readJson(fs: FsSeam, path: string): Promise<{ ok: true; value: unknown } | { ok: false }> {
+  try {
+    return { ok: true, value: JSON.parse(await fs.readFile(path)) as unknown };
+  } catch {
+    return { ok: false };
+  }
+}
+
+function isRecord(x: unknown): x is Record<string, unknown> {
+  return typeof x === "object" && x !== null && !Array.isArray(x);
+}
+
+// ---------------------------------------------------------------------------------------------
+// C. Script parsing
+// ---------------------------------------------------------------------------------------------
+
+/** C.1: POSIX-style subset. Returns undefined on an unterminated quote. */
+function tokenize(s: string): string[] | undefined {
+  const out: string[] = [];
+  let cur = "";
+  let has = false;
+  let i = 0;
+  while (i < s.length) {
+    const ch = s[i];
+    if (ch === " " || ch === "\t") {
+      if (has) out.push(cur);
+      cur = "";
+      has = false;
+      i++;
+    } else if (ch === '"') {
+      has = true;
+      i++;
+      let closed = false;
+      while (i < s.length) {
+        if (s[i] === "\\" && s[i + 1] === '"') {
+          cur += '"';
+          i += 2;
+        } else if (s[i] === '"') {
+          closed = true;
+          i++;
+          break;
+        } else {
+          cur += s[i];
+          i++;
+        }
+      }
+      if (!closed) return undefined;
+    } else if (ch === "'") {
+      const end = s.indexOf("'", i + 1);
+      if (end < 0) return undefined;
+      cur += s.slice(i + 1, end);
+      has = true;
+      i = end + 1;
+    } else {
+      cur += ch;
+      has = true;
+      i++;
+    }
+  }
+  if (has) out.push(cur);
+  return out;
+}
+
+const COMPOSITE_MULTI = ["&&", "||", "$("];
+const COMPOSITE_SINGLE = new Set([";", "|", "&", ">", "<", "`", "$"]);
+const PERCENT_VAR_RE = /%[A-Za-z_][A-Za-z0-9_]*%/y;
+
+/** C.2: the first composite construct in the raw text (quotes ignored), or undefined. */
+function findComposite(s: string): string | undefined {
+  for (let i = 0; i < s.length; i++) {
+    const two = s.slice(i, i + 2);
+    if (COMPOSITE_MULTI.includes(two)) return two;
+    const ch = s[i];
+    if (ch === "\r" || ch === "\n") return "newline";
+    if (COMPOSITE_SINGLE.has(ch)) return ch;
+    if (ch === "%") {
+      PERCENT_VAR_RE.lastIndex = i;
+      const m = PERCENT_VAR_RE.exec(s);
+      if (m) return m[0];
+    }
+  }
+  return undefined;
+}
+
+const ASSIGN_RE = /^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/s;
+
+type Invocation =
+  | { readonly type: "direct"; readonly kind: RunnerKind; readonly launcher: Launcher; readonly env: Record<string, string>; readonly args: string[] }
+  | {
+      readonly type: "script";
+      readonly manager: PackageManager;
+      readonly name: string;
+      readonly env: Record<string, string>;
+      readonly extra: string[];
+      readonly notes: string[];
+    };
+
+function unsupported(prefix: string, where: string): Unverifiable {
+  return s6("unsupported-command", `unsupported command "${prefix}" in ${where}`);
+}
+
+/** B step 2 + C.3: classify a token list. `allowScripts` is false inside a package script. */
+function parseInvocation(tokens: readonly string[], where: string, allowScripts: boolean): Invocation | Unverifiable {
+  const env: Record<string, string> = {};
+  let t = tokens;
+  if (t[0] === "cross-env") {
+    let i = 1;
+    for (; i < t.length; i++) {
+      const m = ASSIGN_RE.exec(t[i]);
+      if (!m) break;
+      env[m[1]] = m[2];
+    }
+    if (i >= t.length) return unsupported("cross-env", where);
+    t = t.slice(i);
+  }
+  const h = t[0] ?? "";
+  const inline = ASSIGN_RE.exec(h);
+  if (inline) {
+    return s6("inline-env", `inline environment assignment "${inline[1]}=" in ${where} (only cross-env is supported)`);
+  }
+  const direct = (kind: RunnerKind, launcher: Launcher, args: string[]): Invocation => ({ type: "direct", kind, launcher, env, args });
+  const isJs = (x: string | undefined): x is "vitest" | "jest" => x === "vitest" || x === "jest";
+  if (isJs(h)) return direct(h, "direct", t.slice(1));
+  if (h === "pytest") return direct("pytest", "direct", t.slice(1));
+  if (h === "npx") {
+    const r = t[1];
+    return isJs(r) ? direct(r, "npx", t.slice(2)) : unsupported(`npx ${r ?? ""}`.trim(), where);
+  }
+  if (h === "uv") {
+    if (t[1] === "run" && t[2] === "pytest") return direct("pytest", "uv-run", t.slice(3));
+    return unsupported(t[1] === "run" ? `uv run ${t[2] ?? ""}`.trim() : `uv ${t[1] ?? ""}`.trim(), where);
+  }
+  if (h === "pnpm" && t[1] === "exec") {
+    const r = t[2];
+    return isJs(r) ? direct(r, "pnpm-exec", t.slice(3)) : unsupported(`pnpm exec ${r ?? ""}`.trim(), where);
+  }
+  if (h !== "npm" && h !== "pnpm" && h !== "yarn" && h !== "bun") return unsupported(h, where);
+  if (!allowScripts) return unsupported(h, where);
+
+  const sub = t[1];
+  const script = (name: string | undefined, rest: string[]): Invocation | Unverifiable => {
+    if (name === undefined) return unsupported(`${h} ${sub}`, where);
+    if (h === "npm") {
+      const dd = rest.indexOf("--");
+      const ignored = dd < 0 ? rest : rest.slice(0, dd);
+      const notes = ignored.length > 0 ? [`npm options ignored: ${ignored.join(" ")}`] : [];
+      return { type: "script", manager: "npm", name, env, extra: dd < 0 ? [] : rest.slice(dd + 1), notes };
+    }
+    return { type: "script", manager: h, name, env, extra: rest[0] === "--" ? rest.slice(1) : rest, notes: [] };
+  };
+  if (h === "npm") {
+    if (sub === "test" || sub === "t") return script("test", t.slice(2));
+    if (sub === "run" || sub === "run-script") return script(t[2], t.slice(3));
+  } else if (h === "pnpm") {
+    if (sub === "test" || sub === "t") return script("test", t.slice(2));
+    if (sub === "run") return script(t[2], t.slice(3));
+  } else if (h === "yarn") {
+    if (sub === "test") return script("test", t.slice(2));
+    if (sub === "run") return script(t[2], t.slice(3));
+  } else {
+    if (sub === "test") {
+      return s6("bun-test", `"bun test" runs Bun's built-in test runner, not scripts.test (use "bun run test")`);
+    }
+    if (sub === "run") return script(t[2], t.slice(3));
+  }
+  return unsupported(`${h} ${sub ?? ""}`.trim(), where);
+}
+
+// ---------------------------------------------------------------------------------------------
+// D. User arguments
+// ---------------------------------------------------------------------------------------------
+
+type Arity = "0" | "1" | "?" | "*";
+type ArgAction = "drop" | "cap" | "cap1-keep" | "cap1-drop" | "keep" | "s6";
+interface ArgEntry {
+  readonly names: readonly string[];
+  readonly action: ArgAction;
+  readonly arity: Arity;
+  readonly note?: string;
+}
+
+const COVERAGE_NOTE = "coverage disabled for the scoped run";
+const e = (names: string, action: ArgAction, arity: Arity, note?: string): ArgEntry => ({ names: names.split(" "), action, arity, note });
+
+const VITEST_ARGS: readonly ArgEntry[] = [
+  e("--run --watch -w --no-watch --ui --open --standalone --update -u --passWithNoTests --clearScreen --inspect --inspect-brk", "drop", "0"),
+  e("--coverage", "drop", "0", COVERAGE_NOTE),
+  e("--changed --api --mergeReports", "drop", "?"),
+  e("--coverage.*", "drop", "?", COVERAGE_NOTE),
+  e("--reporter --outputFile --outputFile.* --shard --minWorkers --min-workers --api.*", "drop", "1"),
+  e("--maxWorkers --max-workers", "cap", "1"),
+  e("--no-file-parallelism --fileParallelism=false", "cap1-keep", "0"),
+  e("--config -c --root -r --dir --project --environment --pool --testNamePattern -t --mode --testTimeout --hookTimeout --teardownTimeout --retry --bail --exclude", "keep", "1"),
+  e("--browser --sequence.* --typecheck.* --browser.*", "keep", "?"),
+  e("--globals --dom --isolate --no-isolate --allowOnly --silent --hideSkippedTests --logHeapUsage --color --no-color --expandSnapshotDiff --disableConsoleIntercept --typecheck", "keep", "0"),
+];
+
+const JEST_ARGS: readonly ArgEntry[] = [
+  e("--watch --watchAll --json --findRelatedTests --listTests --onlyChanged -o --lastCommit --changedFilesWithAncestor --updateSnapshot -u --passWithNoTests --runTestsByPath", "drop", "0"),
+  e("--coverage --collectCoverage", "drop", "0", COVERAGE_NOTE),
+  e("--outputFile --changedSince --shard --collectCoverageFrom --coverageDirectory --coverageProvider --coverageThreshold", "drop", "1"),
+  e("--reporters --coverageReporters --coveragePathIgnorePatterns", "drop", "*"),
+  e("--maxWorkers --max-workers -w", "cap", "1"),
+  e("--runInBand -i", "cap1-drop", "0"),
+  e("--config -c --rootDir --testNamePattern -t --testEnvironment --env --testTimeout --testRunner --testSequencer --cacheDirectory --workerIdleMemoryLimit --seed --maxConcurrency --openHandlesTimeout", "keep", "1"),
+  e("--bail -b", "keep", "?"),
+  e("--roots --selectProjects --ignoreProjects --projects --testPathPatterns --testPathPattern --testPathIgnorePatterns --testMatch", "keep", "*"),
+  e("--ci --silent --verbose --detectOpenHandles --detectLeaks --forceExit --cache --no-cache --colors --watchman --no-watchman --errorOnDeprecated --injectGlobals --noStackTrace --useStderr --workerThreads --randomize --showSeed --clearMocks --resetMocks --restoreMocks --expand -e --logHeapUsage", "keep", "0"),
+  e("--showConfig --clearCache --init", "s6", "0"),
+];
+
+const PYTEST_ARGS: readonly ArgEntry[] = [
+  e("-q --quiet --lf --last-failed --ff --failed-first --nf --new-first --sw --stepwise --sw-skip --stepwise-skip --cache-clear --pdb --trace -f --looponfail --cov-append --cov-branch --no-cov --no-cov-on-fail --self-contained-html --json-report", "drop", "0"),
+  e("--cov", "drop", "?"),
+  e("--junitxml --junit-xml --pdbcls --cov-report --cov-config --cov-fail-under --cov-context --html --json-report-file", "drop", "1"),
+  e("-n --numprocesses --maxprocesses", "cap", "1"),
+  e("-k -m -c --config-file --rootdir -o --override-ini -W --pythonwarnings --tb -r --import-mode --basetemp --durations --durations-min --timeout --maxfail --ignore --ignore-glob --deselect --confcutdir --dist --capture --log-level --log-cli-level", "keep", "1"),
+  e("-x --exitfirst -v -vv --verbose -s -l --showlocals --strict-markers --strict-config --disable-warnings --no-header --runxfail", "keep", "0"),
+  e("--co --collect-only --fixtures --fixtures-per-test --markers --setup-plan --setup-only --version -V -h --help", "s6", "0"),
+];
+
+interface ArgMatch {
+  readonly entry: ArgEntry;
+  readonly name: string;
+  /** The value was attached ("--x=v", "-xV"): arity is ignored. */
+  readonly inline: boolean;
+  readonly value?: string;
+}
+
+function matchArg(table: readonly ArgEntry[], t: string): ArgMatch | undefined {
+  for (const entry of table) {
+    for (const name of entry.names) {
+      if (name.endsWith(".*")) {
+        const p = name.slice(0, -1);
+        if (t.startsWith(p) && t.length > p.length) {
+          const eq = t.indexOf("=");
+          return { entry, name, inline: eq >= 0, value: eq >= 0 ? t.slice(eq + 1) : undefined };
+        }
+      } else if (t === name) {
+        return { entry, name, inline: false };
+      } else if (t.startsWith(`${name}=`)) {
+        return { entry, name, inline: true, value: t.slice(name.length + 1) };
+      }
+    }
+  }
+  for (const entry of table) {
+    if (entry.arity !== "1") continue;
+    for (const name of entry.names) {
+      if (/^-[A-Za-z]$/.test(name) && t.startsWith(name) && t.length > 2) {
+        return { entry, name, inline: true, value: t.slice(2) };
+      }
+    }
+  }
+  return undefined;
+}
+
+/** Section E: parse a user worker-cap value for one tool. undefined means invalid. */
+function parseCap(kind: ToolKind, raw: string): UserWorkerCap | undefined {
+  if (/^\d+$/.test(raw)) {
+    const n = Number(raw);
+    if (!Number.isSafeInteger(n)) return undefined;
+    if (n === 0 && kind !== "pytest") return undefined;
+    return { count: n };
+  }
+  const pm = /^(\d{1,3})%$/.exec(raw);
+  if (pm && (kind === "vitest" || kind === "jest")) {
+    const p = Number(pm[1]);
+    return p >= 1 && p <= 100 ? { percent: p } : undefined;
+  }
+  if (kind === "pytest" && (raw === "auto" || raw === "logical")) return { auto: true };
+  if (kind === "eslint" && raw === "auto") return { auto: true };
+  return undefined;
+}
+
+const PY_SCOPE_BAD_RE = /::|[*?[\]{}]/;
+
+interface ArgResult {
+  readonly kept: string[];
+  readonly capRaw: string | undefined;
+  readonly userWorkers: UserWorkerCap | undefined;
+  readonly pathScopes: string[];
+  readonly noXdist: boolean;
+  readonly xdistArg: boolean;
+  readonly notes: string[];
+}
+
+/** D.1 for vitest, jest and pytest. */
+function processArgs(
+  ctx: Ctx,
+  kind: RunnerKind,
+  args: readonly string[],
+  where: string,
+  runnerCwd: string,
+  gitRoot: string,
+): ArgResult | Unverifiable {
+  const table = kind === "vitest" ? VITEST_ARGS : kind === "jest" ? JEST_ARGS : PYTEST_ARGS;
+  const kept: string[] = [];
+  const notes = new Set<string>();
+  const filters: string[] = [];
+  const pathScopes: string[] = [];
+  let capRaw: string | undefined;
+  let noXdist = false;
+  let xdistArg = false;
+  let firstPositional = true;
+  const badArg = (t: string) => s6("unsupported-argument", `unsupported ${kind} argument "${t}" in ${where}`);
+
+  for (let i = 0; i < args.length; i++) {
+    const t = args[i];
+    if (t === "--") return badArg(t);
+    if (kind === "pytest" && t.startsWith("-p") && !t.startsWith("--")) {
+      const attached = t.length > 2;
+      const value = attached ? t.slice(2) : args[i + 1];
+      if (value === "no:cacheprovider") {
+        if (!attached) i++;
+        continue;
+      }
+      if (value === "no:xdist") noXdist = true;
+      kept.push(t);
+      if (!attached && value !== undefined) {
+        kept.push(value);
+        i++;
+      }
+      continue;
+    }
+    const m = matchArg(table, t);
+    if (m) {
+      const values: string[] = [];
+      if (!m.inline) {
+        if (m.entry.arity === "1") {
+          if (i + 1 < args.length) values.push(args[i + 1]);
+        } else if (m.entry.arity === "?") {
+          if (i + 1 < args.length && !args[i + 1].startsWith("-")) values.push(args[i + 1]);
+        } else if (m.entry.arity === "*") {
+          for (let j = i + 1; j < args.length && !args[j].startsWith("-"); j++) values.push(args[j]);
+        }
+      }
+      i += values.length;
+      if (m.entry.note) notes.add(m.entry.note);
+      if (m.name === "--dist") xdistArg = true;
+      switch (m.entry.action) {
+        case "drop":
+          break;
+        case "cap":
+          capRaw = m.inline ? (m.value ?? "") : (values[0] ?? "");
+          xdistArg = true;
+          break;
+        case "cap1-keep":
+          kept.push(t);
+          capRaw = "1";
+          break;
+        case "cap1-drop":
+          capRaw = "1";
+          break;
+        case "keep":
+          kept.push(t, ...values);
+          break;
+        case "s6":
+          return badArg(t);
+      }
+      continue;
+    }
+    if (t.startsWith("-")) {
+      const next = args[i + 1];
+      if (t.includes("=") || next === undefined || next.startsWith("-")) {
+        kept.push(t);
+        continue;
+      }
+      return s6("ambiguous-option", `ambiguous ${kind} option "${t}" in ${where}: cannot tell whether "${next}" is its value`);
+    }
+    // Positional.
+    const first = firstPositional;
+    firstPositional = false;
+    if (kind === "vitest") {
+      if (first && ["run", "watch", "dev", "related"].includes(t)) continue;
+      if (first && ["bench", "list", "init", "typecheck"].includes(t)) {
+        return s6("unsupported-subcommand", `unsupported vitest subcommand "${t}" in ${where}`);
+      }
+      filters.push(t);
+    } else if (kind === "jest") {
+      filters.push(t);
+    } else {
+      const abs = ctx.P.resolve(runnerCwd, t);
+      if (PY_SCOPE_BAD_RE.test(t) || !isInside(ctx, gitRoot, abs)) return badArg(t);
+      pathScopes.push(abs);
+    }
+  }
+  if (filters.length > 0) notes.add(`${kind} filters dropped: ${filters.join(", ")}`);
+  let userWorkers: UserWorkerCap | undefined;
+  if (capRaw !== undefined) {
+    userWorkers = parseCap(kind, capRaw);
+    if (!userWorkers) notes.add(`invalid worker cap "${capRaw}" ignored`);
+  }
+  return { kept, capRaw, userWorkers, pathScopes, noXdist, xdistArg, notes: [...notes] };
+}
+
+const XDIST_RE = /(?:^|[\s"'[,=])(?:-n|--numprocesses|--maxprocesses|--dist)(?=[\s"'=,\]]|\d|$)/m;
+const XDIST_VALUE_RE = /(?:-n|--numprocesses|--maxprocesses)(?:\s*=\s*|\s+|["']\s*,\s*["'])?["']?(\d+|auto|logical)\b/;
+const COV_RE = /(?:^|[\s"'[,=])--cov(?=[=\s"',\]]|$)/m;
+const PYTEST_CONFIG_FILES = ["pytest.ini", "pyproject.toml", "tox.ini", "setup.cfg"];
+
+/** D.4: the pytest config text of the nearest directory holding any config file. */
+async function readPytestConfig(ctx: Ctx, fs: FsSeam, runnerCwd: string, gitRoot: string, notes: string[]): Promise<string> {
+  for (const d of ancestors(ctx, runnerCwd, gitRoot)) {
+    const texts: string[] = [];
+    let found = false;
+    for (const f of PYTEST_CONFIG_FILES) {
+      const p = ctx.P.join(d, f);
+      if (!(await fs.fileExists(p))) continue;
+      found = true;
+      try {
+        texts.push(await fs.readFile(p));
+      } catch {
+        notes.push(`unreadable pytest config ignored: ${p}`);
+      }
+    }
+    if (found) return texts.join("\n");
+  }
+  return "";
+}
+
+// ---------------------------------------------------------------------------------------------
+// B. Detection
+// ---------------------------------------------------------------------------------------------
+
+async function detectImpl(ctx: Ctx, command: string, cwd: string, fs: FsSeam): Promise<DetectedRunner | Unverifiable> {
+  const P = ctx.P;
+  const absCwd = P.resolve(cwd);
+  const gitRoot = await findGitRoot(ctx, absCwd, fs);
+  if (gitRoot === undefined) return s6("no-git-root", `no git repository at or above ${cwd}`);
+
+  const composite = findComposite(command);
+  if (composite !== undefined) return s6("composite", `composite command: "${composite}"`);
+  const tokens = tokenize(command);
+  if (!tokens) return s6("unterminated-quote", "unterminated quote in command");
+  const inv = parseInvocation(tokens, "command", true);
+  if (isS6(inv)) return inv;
+
+  if (inv.type === "direct") {
+    return finishDetection(ctx, fs, inv.kind, inv.launcher, { type: "command" }, gitRoot, absCwd, inv.env, inv.args, "command", []);
+  }
+
+  let pkgPath: string | undefined;
+  for (const d of ancestors(ctx, absCwd, gitRoot)) {
+    const p = P.join(d, "package.json");
+    if (await fs.fileExists(p)) {
+      pkgPath = p;
+      break;
+    }
+  }
+  if (pkgPath === undefined) return s6("no-package-json", `no package.json between ${cwd} and the git root`);
+  const parsed = await readJson(fs, pkgPath);
+  if (!parsed.ok || !isRecord(parsed.value)) return s6("bad-package-json", `unreadable package.json: ${pkgPath}`);
+  const scripts = parsed.value.scripts;
+  const text = isRecord(scripts) ? scripts[inv.name] : undefined;
+  if (typeof text !== "string") return s6("no-script", `package.json has no string scripts.${inv.name}: ${pkgPath}`);
+
+  const where = `scripts.${inv.name}`;
+  const sc = findComposite(text);
+  if (sc !== undefined) return s6("composite", `composite ${where}: "${sc}"`);
+  const st = tokenize(text);
+  if (!st) return s6("unterminated-quote", `unterminated quote in ${where}`);
+  const inner = parseInvocation(st, where, false);
+  if (isS6(inner)) return inner;
+  if (inner.type !== "direct") return unsupported(inv.manager, where);
+
+  const notes = [...inv.notes];
+  for (const hook of [`pre${inv.name}`, `post${inv.name}`]) {
+    if (isRecord(scripts) && scripts[hook] !== undefined) notes.push(`scripts.${hook} is not run by the scoped command`);
+  }
+  const source: CommandSource = { type: "script", manager: inv.manager, name: inv.name, packageJson: pkgPath };
+  return finishDetection(
+    ctx,
+    fs,
+    inner.kind,
+    inner.launcher,
+    source,
+    gitRoot,
+    P.dirname(pkgPath),
+    { ...inv.env, ...inner.env },
+    [...inner.args, ...inv.extra],
+    where,
+    notes,
+  );
+}
+
+async function finishDetection(
+  ctx: Ctx,
+  fs: FsSeam,
+  kind: RunnerKind,
+  launcher: Launcher,
+  source: CommandSource,
+  gitRoot: string,
+  runnerCwd: string,
+  env: Record<string, string>,
+  args: readonly string[],
+  where: string,
+  notes: string[],
+): Promise<DetectedRunner | Unverifiable> {
+  const a = processArgs(ctx, kind, args, where, runnerCwd, gitRoot);
+  if (isS6(a)) return a;
+  const allNotes = [...notes, ...a.notes];
+  let userWorkers = a.userWorkers;
+  let xdist = false;
+  let covInConfig = false;
+  if (kind === "pytest") {
+    const cfg = await readPytestConfig(ctx, fs, runnerCwd, gitRoot, allNotes);
+    const addopts = ctx.host.pytestAddopts;
+    xdist = !a.noXdist && (a.xdistArg || XDIST_RE.test(cfg) || XDIST_RE.test(addopts));
+    covInConfig = COV_RE.test(cfg) || COV_RE.test(addopts);
+    if (a.capRaw === undefined) {
+      const m = XDIST_VALUE_RE.exec(cfg) ?? XDIST_VALUE_RE.exec(addopts);
+      if (m) userWorkers = parseCap("pytest", m[1]);
+    }
+  }
+  return {
+    kind,
+    launcher,
+    source,
+    gitRoot,
+    runnerCwd,
+    env,
+    keptArgs: a.kept,
+    ...(userWorkers ? { userWorkers } : {}),
+    pathScopes: a.pathScopes,
+    xdist,
+    covInConfig,
+    notes: allNotes,
+  };
+}
+
+// ---------------------------------------------------------------------------------------------
+// F. Entry resolution
+// ---------------------------------------------------------------------------------------------
+
+async function resolveEntryImpl(
+  ctx: Ctx,
+  req: EntryRequest,
+  cwd: string,
+  fs: FsSeam,
+): Promise<{ entry: ResolvedEntry; notes: string[] } | Unverifiable> {
+  const P = ctx.P;
+  const exe = (name: string) => (ctx.win ? `${name}.exe` : name);
+  const onPath = async (name: string): Promise<string | undefined> => {
+    for (const dir of ctx.host.pathEnv.split(P.delimiter)) {
+      if (!dir || !P.isAbsolute(dir)) continue;
+      const f = P.join(dir, exe(name));
+      if (await fs.fileExists(f)) return f;
+    }
+    return undefined;
+  };
+
+  if (req.launcher === "uv-run") {
+    const uv = await onPath("uv");
+    if (!uv) return s6("runner-not-installed", "runner not installed: uv");
+    return { entry: { file: uv, prefix: ["run", "pytest"], entry: uv }, notes: [] };
+  }
+  if (req.kind === "pytest") {
+    const found = await onPath("pytest");
+    if (found) return { entry: { file: found, prefix: [], entry: found }, notes: [] };
+    const venvRel = ctx.win ? P.join(".venv", "Scripts", "pytest.exe") : P.join(".venv", "bin", "pytest");
+    for (const d of ancestors(ctx, cwd, req.gitRoot)) {
+      const f = P.join(d, venvRel);
+      if (await fs.fileExists(f)) return { entry: { file: f, prefix: [], entry: f }, notes: [`pytest resolved from ${f}`] };
+    }
+    return s6("runner-not-installed", "runner not installed: pytest");
+  }
+
+  const pkg = req.kind;
+  let pj: string | undefined;
+  for (const d of ancestors(ctx, cwd, req.gitRoot)) {
+    const p = P.join(d, "node_modules", pkg, "package.json");
+    if (await fs.fileExists(p)) {
+      pj = p;
+      break;
+    }
+  }
+  if (pj === undefined) {
+    if (await fs.fileExists(P.join(req.gitRoot, ".pnp.cjs"))) {
+      return s6("yarn-pnp", `yarn Plug'n'Play has no node_modules to resolve ${pkg} from`);
+    }
+    return s6("runner-not-installed", `runner not installed: ${pkg}`);
+  }
+  const badBin = (detail: string) => s6("bad-bin", `invalid bin for ${pkg}: ${detail}`);
+  const parsed = await readJson(fs, pj);
+  if (!parsed.ok || !isRecord(parsed.value)) return badBin(`unreadable package.json ${pj}`);
+  const meta = parsed.value;
+  if (meta.name !== pkg) return badBin(`package name is not "${pkg}"`);
+  const bin = typeof meta.bin === "string" ? meta.bin : isRecord(meta.bin) ? meta.bin[pkg] : undefined;
+  if (typeof bin !== "string") return badBin("no bin entry");
+  const pkgDir = P.dirname(pj);
+  const entry = P.resolve(pkgDir, bin);
+  const rel = P.relative(pkgDir, entry);
+  if (rel === "" || P.isAbsolute(rel) || rel.split(/[\\/]/).includes("..")) return badBin("bin escapes the package directory");
+  if (!/\.(?:js|mjs|cjs)$/.test(entry)) return badBin("bin is not a .js, .mjs or .cjs file");
+  if (!(await fs.fileExists(entry))) return badBin(`bin entry missing: ${entry}`);
+  const version = typeof meta.version === "string" ? meta.version : undefined;
+  return { entry: { file: ctx.host.execPath, prefix: [entry], entry, ...(version !== undefined ? { version } : {}) }, notes: [] };
+}
+
+// ---------------------------------------------------------------------------------------------
+// G + H. Changed files and argv construction
+// ---------------------------------------------------------------------------------------------
+
+const JS_TEST_RE = /\.(test|spec)\.[cm]?[jt]sx?$/;
+const PY_TEST_RE = /^test_.*\.py$|_test\.py$/;
+const NON_INPUT_EXT_RE = /\.(md|mdx|markdown|rst|adoc|txt)$/i;
+const NON_INPUT_NAMES = new Set([
+  "LICENSE", "LICENCE", ".gitignore", ".gitattributes", ".editorconfig", ".npmignore", ".prettierignore",
+  "package-lock.json", "npm-shrinkwrap.json", "pnpm-lock.yaml", "yarn.lock", "bun.lockb", "bun.lock",
+]);
+const TRIGGERS: Record<RunnerKind, RegExp> = {
+  vitest: /^(?:package\.json|vitest\.config\..+|vite\.config\..+|vitest\.workspace\..+|vitest\.projects\..+|tsconfig.*\.json)$/,
+  jest: /^(?:package\.json|jest\.config\..+|babel\.config\..+|\.babelrc|\.babelrc\..+|tsconfig.*\.json)$/,
+  pytest: /^(?:conftest\.py|pyproject\.toml|pytest\.ini|setup\.cfg|tox\.ini)$/,
+};
+const NOTE_NO_CHANGES = "no changed files, no affected tests";
+const NOTE_NO_INPUT = "no affected tests: no changed file is a test input";
+const NOTE_NO_PY_MAP = "no affected tests: no test files map to the changed modules";
+
+interface FileRef {
+  readonly abs: string;
+  readonly rel: string;
+}
+
+function stemOf(ctx: Ctx, abs: string): string {
+  const base = ctx.P.basename(abs);
+  const dot = base.lastIndexOf(".");
+  const stem = dot > 0 ? base.slice(0, dot) : base;
+  return stem === "index" || stem === "__init__" ? ctx.P.basename(ctx.P.dirname(abs)) : stem;
+}
+
+/** G.3-G.5 for one path: canonical absolute path inside gitRoot, or undefined. */
+function canonicalize(ctx: Ctx, cwd: string, gitRoot: string, p: string): FileRef | undefined {
+  const abs = ctx.P.resolve(cwd, p);
+  const rel = ctx.P.relative(gitRoot, abs);
+  if (rel === "" || ctx.P.isAbsolute(rel) || rel.split(/[\\/]/)[0] === "..") return undefined;
+  return { abs: ctx.P.join(gitRoot, rel), rel: toSlash(ctx, rel) };
+}
+
+async function plan(input: StaticScopingInput, search: TestSearchSeam): Promise<ScopingPlan>;
+async function plan(input: StaticScopingInput, search: undefined): Promise<StaticScoping>;
+async function plan(input: StaticScopingInput, search: TestSearchSeam | undefined): Promise<ScopingPlan | StaticScoping> {
+  const ctx = makeCtx(input.host);
+  const P = ctx.P;
+  const fs = input.fs;
+  if (input.changedFiles === "unavailable") return s6("attribution-unavailable", "change attribution unavailable");
+  if (input.changedFiles.length === 0) return noAffected(NOTE_NO_CHANGES);
+
+  const det = await detectImpl(ctx, input.command, input.cwd, fs);
+  if (isS6(det)) return det;
+  const gitRoot = det.gitRoot;
+  const cwd = P.resolve(input.cwd);
+  const notes: string[] = [...det.notes];
+
+  // G.2-G.5: candidates, normalization, dedup, sort.
+  const files = new Map<string, FileRef>();
+  for (const c of input.changedFiles) {
+    for (const cand of [c.path, c.previousPath]) {
+      if (cand === undefined) continue;
+      if (cand.includes("\0")) {
+        notes.push("dropped a path containing a NUL byte");
+        continue;
+      }
+      const ref = canonicalize(ctx, cwd, gitRoot, cand);
+      if (!ref) {
+        notes.push(`dropped outside the git root: ${cand}`);
+        continue;
+      }
+      if (ref.abs.startsWith("-")) {
+        notes.push(`dropped a path starting with "-": ${cand}`);
+        continue;
+      }
+      if (!files.has(ctx.key(ref.abs))) files.set(ctx.key(ref.abs), ref);
+    }
+  }
+  const sorted = [...files.entries()].sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0)).map(([, v]) => v);
+
+  // G.7: config triggers.
+  const sourcePj = det.source.type === "script" ? ctx.key(det.source.packageJson) : undefined;
+  for (const f of sorted) {
+    const base = P.basename(f.abs);
+    if (TRIGGERS[det.kind].test(ctx.win ? base.toLowerCase() : base) || ctx.key(f.abs) === sourcePj) {
+      return s6("config-changed", `config file changed: ${f.rel}`);
+    }
+  }
+
+  // G.8: classification.
+  const inputs = new Map<string, string>();
+  const addInput = (abs: string) => inputs.set(ctx.key(abs), abs);
+  const goneSources: FileRef[] = [];
+  const modules: FileRef[] = [];
+  const goneModules: FileRef[] = [];
+  let skipped = 0;
+  const inScope = (abs: string) =>
+    isInside(ctx, det.runnerCwd, abs) && (det.pathScopes.length === 0 || det.pathScopes.some((s) => isInside(ctx, s, abs)));
+
+  for (const f of sorted) {
+    const base = P.basename(f.abs);
+    const nonInput = NON_INPUT_EXT_RE.test(base) || NON_INPUT_NAMES.has(base) || f.rel.split("/").includes(".github");
+    if (nonInput || (det.kind === "pytest" && !base.endsWith(".py"))) {
+      skipped++;
+      continue;
+    }
+    const exists = await fs.fileExists(f.abs);
+    if (det.kind === "pytest") {
+      const isTest = PY_TEST_RE.test(base);
+      if (exists && isTest) {
+        if (inScope(f.abs)) addInput(f.abs);
+      } else if (exists) modules.push(f);
+      else if (isTest) notes.push(`deleted test file not run: ${f.rel}`);
+      else goneModules.push(f);
+    } else {
+      const isTest = JS_TEST_RE.test(base) || f.rel.split("/").includes("__tests__");
+      if (exists) addInput(f.abs);
+      else if (isTest) notes.push(`deleted test file not run: ${f.rel}`);
+      else goneSources.push(f);
+    }
+  }
+  if (skipped > 0) notes.push(`non-input files skipped: ${skipped}`);
+
+  const pending = det.kind === "pytest" ? modules.length + goneModules.length : goneSources.length;
+  const emptyNote = det.kind === "pytest" && modules.length + goneModules.length > 0 ? NOTE_NO_PY_MAP : NOTE_NO_INPUT;
+
+  if (!search) {
+    if (inputs.size === 0 && pending === 0) return noAffected(emptyNote);
+    const pre = await preflight(ctx, det, fs);
+    if (isS6(pre)) return pre;
+    return { scopable: true, runner: det.kind, pendingSearches: pending, notes: [...notes, ...pre.notes] };
+  }
+
+  // G.9 and the pytest name mapping.
+  const accept = (paths: readonly string[], scoped: boolean): Promise<string[]> =>
+    Promise.all(
+      paths.map(async (p) => {
+        const ref = canonicalize(ctx, gitRoot, gitRoot, p);
+        if (!ref || (scoped && !inScope(ref.abs)) || !(await fs.fileExists(ref.abs))) return undefined;
+        return ref.abs;
+      }),
+    ).then((xs) => xs.filter((x): x is string => x !== undefined));
+  const searchFailed = (f: FileRef) => s6("search-failed", `test search failed for ${f.rel}`);
+  const pyNames = (stem: string) => [`test_${stem}.py`, `${stem}_test.py`];
+
+  for (const f of goneSources) {
+    const stem = stemOf(ctx, f.abs);
+    const hits = await search.findByContent(gitRoot, stem, JS_TEST_GLOBS);
+    if (hits === undefined) return searchFailed(f);
+    if (hits.length === 0) return s6("deleted-no-tests", `deleted source ${f.rel}: no test file references "${stem}"`);
+    if (hits.length > STEM_MATCH_LIMIT) {
+      return s6("stem-too-common", `deleted source ${f.rel}: "${stem}" appears in ${hits.length} test files (limit ${STEM_MATCH_LIMIT})`);
+    }
+    for (const h of await accept(hits, false)) addInput(h);
+  }
+  for (const f of modules) {
+    const hits = await search.findByName(gitRoot, pyNames(stemOf(ctx, f.abs)));
+    if (hits === undefined) return searchFailed(f);
+    const ok = await accept(hits, true);
+    if (ok.length === 0) notes.push(`no tests named for ${f.rel}`);
+    for (const h of ok) addInput(h);
+  }
+  for (const f of goneModules) {
+    const stem = stemOf(ctx, f.abs);
+    const byContent = await search.findByContent(gitRoot, stem, PY_TEST_GLOBS);
+    const byName = await search.findByName(gitRoot, pyNames(stem));
+    if (byContent === undefined || byName === undefined) return searchFailed(f);
+    if (byContent.length > STEM_MATCH_LIMIT) {
+      return s6("stem-too-common", `deleted source ${f.rel}: "${stem}" appears in ${byContent.length} test files (limit ${STEM_MATCH_LIMIT})`);
+    }
+    const ok = await accept([...byContent, ...byName], true);
+    if (ok.length === 0) return s6("deleted-no-tests", `deleted source ${f.rel}: no test file references "${stem}"`);
+    for (const h of ok) addInput(h);
+  }
+
+  if (inputs.size === 0) return noAffected(emptyNote);
+  const pre = await preflight(ctx, det, fs);
+  if (isS6(pre)) return pre;
+  const F = [...inputs.entries()].sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0)).map(([, v]) => v);
+  return buildSpec(ctx, det, pre.entry, F, input.budget, input.cores, [...notes, ...pre.notes]);
+}
+
+/** Checks that need no search: entry resolution and the tmpdir location (F, H, N.4). */
+async function preflight(ctx: Ctx, det: DetectedRunner, fs: FsSeam): Promise<{ entry: ResolvedEntry; notes: string[] } | Unverifiable> {
+  const tmp = ctx.P.resolve(ctx.host.tmpdir);
+  if (isInside(ctx, det.gitRoot, tmp)) return s6("tmpdir-in-repo", `temp dir is inside the repository: ${ctx.host.tmpdir}`);
+  return resolveEntryImpl(ctx, det, det.runnerCwd, fs);
+}
+
+function buildSpec(
+  ctx: Ctx,
+  det: DetectedRunner,
+  entry: ResolvedEntry,
+  F: readonly string[],
+  budget: RunnerBudget,
+  inputCores: number | undefined,
+  notes: string[],
+): ScopedSpec | Unverifiable {
+  const C = inputCores ?? ctx.host.cores;
+  const N = effectiveWorkers(det.userWorkers, budget, C);
+  const E = entry.prefix;
+  const K = det.keptArgs;
+  const R = ctx.P.join(ctx.host.tmpdir, `omr-verify-${ctx.host.randomId()}.${det.kind === "pytest" ? "xml" : "json"}`);
+  const env: Record<string, string> = { ...det.env };
+  let args: string[];
+  let workers: number | null = N;
+  if (det.kind === "vitest") {
+    args = [...E, "related", ...F, ...K, "--run", "--passWithNoTests", `--maxWorkers=${N}`, "--coverage.enabled=false", "--reporter=json", `--outputFile=${R}`];
+  } else if (det.kind === "jest") {
+    args = [...E, ...K, "--findRelatedTests", "--passWithNoTests", `--maxWorkers=${N}`, "--coverage=false", "--json", `--outputFile=${R}`, "--", ...F];
+  } else {
+    args = [
+      ...E, ...K, "-q", "-p", "no:cacheprovider", `--junitxml=${R}`,
+      ...(det.xdist ? ["-n", String(N)] : []),
+      ...(det.covInConfig ? ["--no-cov"] : []),
+      "--", ...F,
+    ];
+    env.PYTEST_XDIST_AUTO_NUM_WORKERS = String(N >= 1 ? N : effectiveWorkers({ auto: true }, budget, C));
+    workers = det.xdist ? N : null;
+  }
+  const chars = args.reduce((n, a) => n + a.length + 1, 0);
+  if (chars > MAX_ARGV_CHARS) return s6("argv-too-long", `too many inputs for one command line: ${F.length} files`);
+  return {
+    runner: det.kind,
+    mode: "related",
+    file: entry.file,
+    args,
+    cwd: det.runnerCwd,
+    env,
+    reportPath: R,
+    gitRoot: det.gitRoot,
+    entry: entry.entry,
+    inputs: F,
+    inputsAreTests: det.kind === "pytest",
+    workers,
+    notes,
+  };
+}
+
+// ---------------------------------------------------------------------------------------------
 // Functions (Task 1.3.2 implements them; the signatures are the contract)
 // ---------------------------------------------------------------------------------------------
 
@@ -981,7 +1900,7 @@ export async function detectRunner(
   fs: FsSeam,
   host?: Partial<RunnerHost>,
 ): Promise<DetectedRunner | Unverifiable> {
-  throw new Error("not implemented: runner.detectRunner (Task 1.3.2.a)");
+  return detectImpl(makeCtx(host), command, cwd, fs);
 }
 
 /** 1.3.2.b: locate the JS bin entry or the native executable (F), walking from cwd up to runner.gitRoot. */
@@ -991,17 +1910,18 @@ export async function resolveEntry(
   fs: FsSeam,
   host?: Partial<RunnerHost>,
 ): Promise<ResolvedEntry | Unverifiable> {
-  throw new Error("not implemented: runner.resolveEntry (Task 1.3.2.b)");
+  const r = await resolveEntryImpl(makeCtx(host), runner, cwd, fs);
+  return isS6(r) ? r : r.entry;
 }
 
 /** 1.3.2.c: the full planner (B through H), including the section 1.5-5 and pytest searches. */
 export async function planScopedRun(input: PlanScopedRunInput): Promise<ScopingPlan> {
-  throw new Error("not implemented: runner.planScopedRun (Task 1.3.2.c)");
+  return plan(input, input.search);
 }
 
 /** 1.3.2.c: the process-free subset of planScopedRun, for the section 1.5-17 risk signal (O.4). */
 export async function planStaticScoping(input: StaticScopingInput): Promise<StaticScoping> {
-  throw new Error("not implemented: runner.planStaticScoping (Task 1.3.2.c)");
+  return plan(input, undefined);
 }
 
 /**
@@ -1037,5 +1957,13 @@ export async function planScopedLint(input: PlanScopedLintInput): Promise<LintSp
 
 /** Section E: the single worker-cap rule shared by every runner. It never exceeds the budget. */
 export function effectiveWorkers(user: UserWorkerCap | undefined, budget: RunnerBudget, cores: number): number {
-  throw new Error("not implemented: runner.effectiveWorkers (Task 1.3.2.c)");
+  const B = Number.isSafeInteger(budget.maxWorkers) && budget.maxWorkers >= 1 ? budget.maxWorkers : 1;
+  const C = Number.isSafeInteger(cores) && cores >= 1 ? cores : 1;
+  if (!user) return B;
+  if ("count" in user) return Number.isSafeInteger(user.count) && user.count >= 0 ? Math.min(user.count, B) : B;
+  if ("percent" in user) {
+    if (!(user.percent >= 1 && user.percent <= 100)) return B;
+    return Math.min(Math.max(1, Math.ceil((user.percent * C) / 100)), B);
+  }
+  return Math.min(C, B);
 }

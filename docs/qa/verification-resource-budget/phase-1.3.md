@@ -393,3 +393,17 @@ file, so runner.ts must read `reportPath` itself. Suite-level collection failure
 `Get-CimInstance Win32_Process … | Where CommandLine -match 'omr-spikeC'` returned nothing after the last
 run (no leftover node/python/pytest processes from the spike). The fixture dir `%TEMP%\omr-spikeC` is left
 in place for re-runs; it is not part of the repo.
+
+## Implementation notes (part 1)
+
+Choices made where the runner.ts design header left room (safer option taken each time):
+
+- Dedup of changed files keeps the first-seen spelling; the canonical path is always gitRoot + relative path, so drive-letter case follows gitRoot.
+- vitest subcommands (run/watch/dev/related, bench/list/init/typecheck) are recognised only as the FIRST positional; later positionals are filters.
+- A deleted pytest module whose content/name hits are all filtered away (missing, outside the root, or outside runnerCwd/path scopes) is S6 deleted-no-tests, not NoAffected.
+- An unreadable pytest config file is ignored with the note `unreadable pytest config ignored: <path>` rather than aborting detection.
+- The pytest config-derived cap also looks at PYTEST_ADDOPTS when the config text has none (can only lower the cap).
+- NoAffected is returned before entry resolution, so a docs-only change passes even when the runner is not installed. planStaticScoping runs the entry and tmpdir-in-repo checks whenever something would be run, so those S6s are visible to the risk signal without a process.
+- Notes not fixed by M: `npm options ignored: <tokens>`, `non-input files skipped: <n>`, `dropped a path containing a NUL byte`, `dropped a path starting with "-": <p>`, bad-bin details (`unreadable package.json <p>`, `package name is not "<pkg>"`, `no bin entry`, `bin escapes the package directory`, `bin is not a .js, .mjs or .cjs file`, `bin entry missing: <p>`).
+- Config-trigger basenames are matched case-insensitively on win32.
+- resolveEntry reports the venv-fallback note only through planScopedRun/planStaticScoping notes (ResolvedEntry has no notes field).
