@@ -300,7 +300,8 @@
 //   7b. Clean-file conversion (section 2e, QA-1.5-13), skipped when a ""
 //      "checkout-conversion" reason (core.autocrlf) is already recorded:
 //      `git ls-files --eol -z` at root and at dir, run concurrently
-//      (the cost of QA-1.5-17; QA-1.5-18: no pathspec limit is sound). A path in both lists, not in ref.tracked and
+//      (the cost of QA-1.5-17; QA-1.5-18: no pathspec limit is sound).
+//      A path in both lists, not in ref.tracked and
 //      not in the drift set of step 7, whose `w/` class differs adds
 //      "checkout-conversion" for it. A path in the drift set but not in
 //      ref.tracked (edited after capture, QA-1.5-16) has unknown dispatch
@@ -1090,14 +1091,6 @@ interface GitRun {
   readonly env?: Record<string, string>;
 }
 
-/**
- * One git run through the seam; undefined on timeout or abort. Every call is
- * `git --no-optional-locks ...` (QA-1.5-2): read-only commands never refresh
- * the user's index, and so never compete with the producer for index.lock.
- * A truncated stdout (QA-1.5-21) comes back as a failed call (code -1): the
- * seam's truncation note in stderr, or a non-empty `-z` output that does not
- * end in NUL. Every caller parses stdout only after `code === 0`.
- */
 /** Overrides for the pathspec environment switches git would otherwise inherit (QA-1.5-18). */
 const PATHSPEC_ENV_RESET: Readonly<Record<string, string>> = {
   GIT_LITERAL_PATHSPECS: "0",
@@ -1109,6 +1102,14 @@ const PATHSPEC_ENV_RESET: Readonly<Record<string, string>> = {
 /** The note the p12 seam appends to stderr when it cut stdout at its maxBuffer (QA-1.5-21). */
 const STDOUT_TRUNCATED = /\[stdout truncated at \d+ chars\]/;
 
+/**
+ * One git run through the seam; undefined on timeout or abort. Every call is
+ * `git --no-optional-locks ...` (QA-1.5-2): read-only commands never refresh
+ * the user's index, and so never compete with the producer for index.lock.
+ * A truncated stdout (QA-1.5-21) comes back as a failed call (code -1): the
+ * seam's truncation note in stderr, or a non-empty `-z` output that does not
+ * end in NUL. Every caller parses stdout only after `code === 0`.
+ */
 async function runGit(argv: ArgvSeam, args: readonly string[], run: GitRun): Promise<ExecResult | undefined> {
   if (run.timeoutMs <= 0 || run.signal?.aborted) return undefined;
   const opts: ExecOptions = { cwd: run.cwd, timeoutMs: run.timeoutMs };
@@ -1823,8 +1824,9 @@ export async function materialize(
         });
         return listed && listed.code === 0 ? parseEolList(listed.stdout) : undefined;
       };
-      // QA-1.5-17: both listings run concurrently to bound the cost.
-      // A truncated listing is a failed call (QA-1.5-21), so it takes the "" fallback.
+      // QA-1.5-17: both listings run concurrently, which halves the wall time; the bound
+      // itself is budget.remaining() plus the "" fallback. A truncated listing is a failed
+      // call (QA-1.5-21), so it also takes the "" fallback.
       const [liveEol, refEol] = await Promise.all([eolClasses(root), eolClasses(dir)]);
       if (signal.aborted) return await abandon("aborted", "aborted during the eol comparison");
       if (!liveEol || !refEol) {

@@ -372,6 +372,28 @@ describe("captureReference", { timeout: 60_000 }, () => {
     expect(Buffer.compare(await fsp.readFile(userIndex), indexBefore)).toBe(0);
   });
 
+  it("QA-1.5-18/22: every git call resets the four pathspec env switches to \"0\"; caller keys still arrive", async () => {
+    const envs: Array<Record<string, string> | undefined> = [];
+    const recording: CaptureDeps["argv"] = (file, args, opts) => {
+      envs.push(opts?.env);
+      return argv(file, args, opts);
+    };
+    const ref = await captureReference(repo, new AbortController().signal, captureDeps({ argv: recording }));
+    expect(ref).toBeDefined();
+    if (!ref) return;
+    const handle = await mat(ref, { argv: recording });
+    await handle.dispose();
+    expect(envs.length).toBeGreaterThan(5);
+    for (const env of envs) {
+      expect(env).toMatchObject({
+        GIT_LITERAL_PATHSPECS: "0",
+        GIT_GLOB_PATHSPECS: "0",
+        GIT_NOGLOB_PATHSPECS: "0",
+        GIT_ICASE_PATHSPECS: "0",
+      });
+    }
+    expect(envs.some((env) => typeof env?.GIT_INDEX_FILE === "string" && env.GIT_INDEX_FILE !== "")).toBe(true);
+  });
 });
 
 describe("materialize / dispose", { timeout: 60_000 }, () => {
