@@ -912,3 +912,106 @@ All three are implemented; nothing was deferred to a residual except the estimat
 - The other wiring consumers pass 224/224: `annotate-plan`, `deterministic`, `dod`, `wiring`,
   `enforcement-defaults`, `modeA-e2e`, `modeB-e2e` and `reference-gc-start`.
 - `npm run typecheck` is clean. The full suite was not run (§0.6.7).
+
+## QA re-review (2.2.3 wiring, round 2)
+
+Adversarial review of `git diff 798735f..HEAD` on `vrb/p22` (9ed2abb, 8f0f936, 0b6e61e, 2cb8bd5,
+36b471f, f81eaa6). Code that earlier rounds cleared was re-read only where these commits touch it
+or where a new path reaches it. This is the final round: under the owner's rule only major and
+critical findings get fixed after it. Priority was false passes, and cases where a batched gate
+ends weaker than the same gate with `batchWindowMs: 0`. By default the gate accepts an
+unverifiable verdict (`strictUnverifiable` off), so a batched V where the direct path gives F is a
+weakening: the introduced failure is accepted.
+
+**Test run** (once, as dispatched): `npx vitest run --maxWorkers=2 test/unit/batch.test.ts
+test/integration/batch-wiring.test.ts test/integration/batch-plugin-hookup.test.ts
+test/unit/baseline-wiring.test.ts test/unit/tests-pass-pipeline.test.ts
+test/integration/layer2-wiring.test.ts test/integration/delegate-timeout.test.ts
+test/integration/session-lifecycle.test.ts` → Test Files 8 passed (8), Tests 425 passed (425),
+29.01 s. `npm run typecheck` is clean.
+
+**Method.** All scratch work ran in `%TEMP%\opencode\qa22r2`: a copy of `src/`, `test/` and the
+root config files, with a junction to `node_modules`. The worktree was not edited, and the copy
+was deleted afterwards.
+
+- **Repros.** A scratch test file uses `batch-wiring.test.ts`'s harness. The wiring, planner,
+  scope, `readResult`, judge and gate are real; the `exec`, `slot` and `reference` seams are fake.
+  It adds three things:
+  - a FIFO slot with a capacity;
+  - runs whose time scales with their inputs;
+  - an external slot holder, standing in for another gate's check.
+- **Runtimes.** Each repro ran under node 24.21.0 (vitest) and under Bun 1.3.14 (vitest under
+  `bun --bun`). A test in the same run logged `process.versions.bun = 1.3.14`. Verdicts were the
+  same on both runtimes. The times quoted below are node's.
+- **Mutants.** Each mutant was an in-place change in the copy, restored after its run. They ran
+  against `batch.test.ts`, `batch-wiring.test.ts` and `batch-plugin-hookup.test.ts` (181 tests;
+  the unmutated control passes 181/181).
+
+### Round-1 wiring findings: verdicts
+
+| id | verdict | evidence |
+| --- | --- | --- |
+| QA-2.2-17 (major) | **partially fixed** | **R6** (one gate, 12 s left, 1 s runs, default config): batched `fail`, `accepted: false`, 2020 ms; alone the same, 2027 ms. **R5** (c 30 ms late, one FIFO slot): batched c `fail`; runs are the 4-input union at 10 ms, c's run at 1016 ms and its reference run at 2035 ms; alone the same. Both hold on node and Bun. W7, W3 and B5.2a work for the shapes they were built for. Three weakenings of the same class remain. **QA-2.2-23** is introduced by the fix itself: a solo or split-first member poisons the batch's slot. **QA-2.2-24**: W3 keeps each member's own reserve, but not what the batch then spends on them one after another. **QA-2.2-25**: B5.2a prices the union at one own run. |
+| QA-2.2-18 (minor) | **fixed** | **R1** (lone gate, default config, 0 ms runs): batched 23 ms, alone 6 ms (Bun: 101 ms vs 72 ms), same verdict. Mutant M1 (W7 off) fails 7 tests. A lone gate still waits while another request is planning or another batch runs (W7's signal). That wait is bounded by the window and W3; its cost is QA-2.2-24. |
+| QA-2.2-19 (minor) | **fixed** | **R3/R4**: `sweep()` returns 0, then 1 after the clock moves 61 s. Releases stay at 0 while the seam hangs. With a 20 ms grace, `disposeVerification()` returns in 31 ms (Bun: 28 ms) and logs "dispose stopped waiting for scope closes…". Releases become 1 once the seam exits. The eviction warning now matches the behaviour. Mutants M18 (closes awaited without the grace) and M19 (dispose returns at once) are killed, 2 and 7. |
+| QA-2.2-20 (minor) | **fixed** | R2 re-run: `failureRecheck: false` at the gate, with a captured exact reference, gives batched = alone for all 3 gates and 0 materializations. `batch-plugin-hookup.test.ts` passes 1/1. The resolution's MW3/MB3/MW6-MW9 table was not re-run in this round. |
+| QA-2.2-21 (nit) | **fixed** | `effectiveBatchWindowMs` = min(`batchWindowMs`, ⌊`gateBudgetMs`/10⌋). The edge cases fail safe: a `gateBudgetMs` below 10 gives 0, which means the direct hook, and a NaN budget gives NaN, which fails `> 0` and also means the direct hook. The cap uses the configured budget; W3 handles the gate's live deadline. Mutants M21 (no cap) and M22 (divisor 2) are each killed by 1 test. |
+| QA-2.2-22 (nit) | **fixed** | `runGate` holds every run from index 2 on until the first gate settles, so a's early verdict with the hold still live is forced. The test passed in the dispatched run and in every mutant run that did not target it. |
+
+### New findings (2.2.3 wiring, round 2)
+
+| id | severity | evidence | fix |
+| --- | --- | --- | --- |
+| QA-2.2-23 | **major** | **A solo or split-first member takes the batch's slot under its own short deadline, and when that wait is cut, every other member of the batch gets slot-busy. The members with ample budget are then unverifiable and accepted, where alone they are rejected.** 2.1's scope memoizes its first hold attempt: `holdP ??= acquireHold(deadline)` with `waitMs: deadline.bound(budget.slotWaitMs)`, and `if (!hold.ok) return hold.outcome` for every later execute and recheck (deterministic.ts L940-973; P4: "Later calls on a busy scope return the same outcome at once"). Before 9ed2abb, a batch's first execute was the union under D, the batch's longest deadline. Now it is a solo member's own run (B5.2a, `drain(b, scope, true)` before step 4), or, in B5.2a's split, the member with the least time left (EDF). That member is chosen because it is short on budget. **N1** (e = 1 s measured by a lone gate f; one FIFO slot held by another check for 6 s). c has 4 s and no reference, so its floor is 1 s and it is solo: 4 < 1 + 1·(1+3). a and b have 60 s and a captured exact reference, and a has an introduced failure. **Batched:** c's run waits for the slot and is cut at 4 s. The union then returns slot-busy at once, and a and b are **`unverifiable`, `accepted: true`**, "gate budget exhausted waiting for the verification slot". Only f's run spawns. **Alone:** a's run starts at 7024 ms and its reference run at 8030 ms, so a is **`fail`, `accepted: false`**, and b passes. **N1b** (c 4 s, a 60 s): pooled = 1, so the batch splits ("split into own runs"). c runs first, is cut, and a is `unverifiable`, `accepted: true`; alone a is `fail`. N1 and N1b give the same verdicts on node and Bun. **Reach:** one FIFO slot is the default below 16 cores (`max(1, ⌊cores/8⌋)`). Another gate's check or another key's batch often holds it when a batch starts. A member close to its deadline is always the tightest (W3 closes its window on arrival), so a busy slot then poisons every other member of its batch. The step-6 split after an inconsistent union plan also runs the tightest member first (EDF, since 94dec74). That sibling is pre-existing, and 9ed2abb makes this ordering the normal one under deadline pressure. | Take the batch's hold under D, never under a member's deadline. In batch.ts, the local option: when an own or solo run returns `slot-busy` with `deadlineCut` while D is still live, settle that member and close the scope, which never took the slot, so the close is immediate. Then open a fresh scope for the remaining members. The option in 2.1: in the scope, memoize only a granted hold, or a busy outcome that is not a caller's deadline cut. Add N1 and N1b as wiring tests. |
+| QA-2.2-24 | **major** | **W3 reserves floor + e for each member separately, but the batch that follows serializes them. A window held open while the slot is free therefore spends the recheck of the second tight member.** `fitWindow` (L1099-1113) takes the minimum over members of `remaining − floor − e`. When the window closes, B5.2a finds every tight member short and splits (or runs them solo), one own run and recheck after another. **N2** (one FIFO slot; e = 1 s). Another gate's planning is still in flight, so W7 does not fire. c (14.0 s) and d (14.1 s) both have introduced failures and an exact reference. W3's close is 14 − 11 − 1 = 2 s, the same as the timer. **Batched:** the batch splits. c runs at 1998 ms, c's reference run at 3018 ms and d's run at 4034 ms; then d's recheck is skipped, so d is **`unverifiable`, `accepted: true`**, "gate budget exhausted before recheck". **Alone:** c runs at 5 ms and its reference run at 1020 ms; d runs at 2032 ms and its reference run at 3037 ms, so d is **`fail`, `accepted: false`**. The direct path is serial here too (one slot), so the declared "serial runs under one hold" residual does not explain this; the 2 s window wait does. **N2b** covers the dispatch's case of a gate that arrives just after a lone gate went direct. It uses 2 FIFO slots, the default at 16 cores. A lone gate g runs at 4 ms (W7) with a run and a recheck. c and d arrive 100 ms later and wait for g's batch (`running.size > 0`), then split at about 2 s: d is `unverifiable`, `accepted: true`. Alone, c runs at 113 ms beside g, and d rechecks and is `fail`. N2 and N2b give the same verdicts on node and Bun. **Reach:** a window stays open while the slot is free whenever any request is planning (of any key; planning's git searches have a 10 s bound), whenever another batch is in union planning, or whenever a batch runs while `maxConcurrentVerifications` ≥ 2. | Make W3 reserve the schedule the batch will run, not one run. Either close the window as soon as closing later would move a member out of the pool (apply B5.2a's rule in `fitWindow`), or reserve floor + e·(2k + 1) for the member at deadline position k (the split schedule). Add N2 as a wiring test. |
+| QA-2.2-25 | **major** | **B5.2a prices the union at e, the key's last measured run, which is usually one member's own run. It prices union planning at the 1 s margin. The union's run grows with the number of pooled members, so on the mode-B path a member the check pooled loses its recheck.** In `soloForDeadline` (L1320-1331) the union is `e` in `e·(1 + p + i)`. `execute` records every run (L1631), so after a mode-B batch or a lone gate, e is a single member's run. **N3** (runs take 1 s per 2 inputs, which models `maxWorkers` 2, the default; one FIFO slot; e = 1 s from a lone gate; exact shared reference; introduced failures in c and e). Budgets are c 17.3 s, a 18.3, b 19.3, d 20.3 and e 21.3. B5.2a's thresholds are 17, 18, 19, 20 and 21 s, so every member is pooled. **Batched:** the 5-input union runs 71-3071 ms (priced at 1 s). The own runs follow at 3083-8131 ms, and c's outcome is held until e's own run reproduces e's failure (B5.7). c's recheck is then skipped at about 9.2 s left, so c is **`unverifiable`, `accepted: true`**. **Alone:** c is first in the FIFO: its run starts at 4 ms and its reference run at 1017 ms, so c is **`fail`, `accepted: false`**. The other members give the same verdicts both ways. Node and Bun agree. The declared B15 residual ("a run slower than the last one") reads as an occasional error. This is a systematic underestimate in every mode-B batch, and it grows with run time × (p / workers − 1): about 2 s here, and about 10 s with 5 s files. That contradicts the resolution's "a lone gate, or any earlier batch of the key, measures e first". | Keep a separate per-key estimate for union runs (the last union's duration per input, times the pooled inputs), with e as its floor. Repeat the B5.2a check after `planUnion`, which is unmeasured, and split if a pooled member became short. Add N3 (input-scaled run times) as a wiring test. |
+| QA-2.2-26 | minor | **Mutation survivors in the new logic.** **M10:** solo members' rechecks are deferred until after the union and the pooled own runs, because the solo phase no longer releases held members. This is exactly the weakening B5.2a exists to prevent, and it survives all 181 tests. **M4:** W3 ignores e (`const e = 0` in `fitWindow`) and survives. **M12:** B5.2a drops the recheck-queue term (`+ i`) and survives. **M14:** a new measurement does not refit the open window and survives. Killed: M1 (7), M2 (11), M3 (1), M5 (3), M6 (3), M7 (4), M8 (1), M9 (1), M11 (1), M13 (3), M15 (2), M16 (1), M17 (2), M18 (2), M19 (7), M21 (1), M22 (1). M20 (`closeAt < t` instead of `<=`) survives, and is equivalent in practice. | Test-only. When fixing QA-2.2-23 to QA-2.2-25, add cases that kill M10 (a solo member whose recheck must precede the union), M4, M12 and M14. |
+| QA-2.2-27 | nit | **Abort wording for the new phases.** A solo member aborted while it waits for its turn (phase `own-wait`, L1241) gets `BATCH_REASONS.attribution`, "…during batch attribution", although it is never attributed. A pooled member aborted during the solo phase is still in phase `run` and gets `BATCH_REASONS.run`, "…during the scoped run", while other members' runs execute. Alone, the direct path would give slot-busy or aborted before the run. Every outcome is V. | Record in B9, or give the solo phase its own reason. |
+
+### Verified without a finding
+
+- **Pulled-out members and taint accounting.** A solo run never enters `reproduced` (`!m.solo` in
+  `runOwn`; M9 is killed). `attribute` covers the pooled members only (M16 is killed), and the
+  union is planned over them only (M17 is killed). Solo members settle before the union runs,
+  while `b.unionIds` is still empty, so `settleLate` cannot taint them, and `taint` skips them.
+  No path lets a solo run explain a union failure. A solo recheck recorded in `b.rechecked` may be
+  reused by a pooled member at the same reference, which is correct under B8.6.
+- **The split when fewer than 2 pooled members remain.** `pooled.length <= 1` splits (M8 is
+  killed), with the cause "the members' budgets cannot cover a batched run". Every member runs
+  its own spec in EDF order. The split's weakness is its first execute: see QA-2.2-23.
+- **The early-close signal (W7).** `planning` is incremented before `runtime.plan` and
+  decremented on every exit from planning. `closeIdle` runs on join, on every planning outcome
+  without a spec, on an aborted request, at a batch's end and at eviction. Two lone gates planning
+  together meet in one window; gates of different keys close their windows together and contend
+  for the slot as the direct path does. Races between a lone gate and a second arrival are
+  QA-2.2-24.
+  - Minor gap, not a verdict issue: if `batchKey` throws in `join`, or a plan is not an object,
+    the hook's catch returns an error without calling `closeIdle`. Other windows then run to
+    their timers.
+- **Clock.** `createDeadline` uses `Date.now` (deterministic.ts L733-734), as does the
+  coordinator's default `now`. So `t + remaining()` in `fitWindow` is the absolute deadline on
+  one clock, and a wall-clock step moves both sides equally. A step during a run skews e: a
+  backward step is clamped to 0, and a forward step gives a large e, which means more splits and
+  more QA-2.2-23 exposure. Rare, so not raised.
+- **The cold and stale estimate.** e = 0 before a key's first run is the declared residual. It
+  covers more than "the first multi-gate window": W3 then keeps only the floor for any window
+  held open (QA-2.2-24's triggers). A large e (a `timed-out` run, or a first run that includes a
+  slot wait) only closes windows early and splits batches. That costs batching, and with
+  QA-2.2-23 it can also cost verdicts.
+- **The dispose grace.** One timer bounds both waits and is cleared in `finally`. A second
+  concurrent `dispose()` arms its own grace, and both return within one grace. `evict` during
+  dispose is harmless (the windows are already cleared).
+- **The test-only `idleClose` option** cannot be reached from production config. index.ts
+  (L355-360) calls `createVerificationWiring` without `batch`. config.ts has no such key.
+  `createVerificationWiring`'s `batch` parameter (`Omit<BatchCoordinatorOptions, "logger">`) is
+  the only route, and only tests use it.
+
+**Round verdict (2.2.3 wiring, round 2).** QA-2.2-18 to QA-2.2-22 are fixed. QA-2.2-17 is
+partially fixed: R5 and R6 no longer reproduce on node or Bun, but the same class of weakening,
+F turned into an accepted V, reproduces through three paths. QA-2.2-23 (**major**) is introduced
+by 9ed2abb's solo-first and B5.2a split: one tight member poisons the slot for every member of
+its batch, including members with 60 s left. QA-2.2-24 (**major**) and QA-2.2-25 (**major**) are
+the gaps in W3 and B5.2a's estimates. All three reproduce on node and Bun with scratch wiring
+tests, whose shapes are given above for the regression tests. Under the owner's rule, QA-2.2-23,
+QA-2.2-24 and QA-2.2-25 get fixed. QA-2.2-26 (minor, test-only) and QA-2.2-27 (nit) are
+recorded and not fixed.
