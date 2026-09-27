@@ -33,7 +33,7 @@ export function createMutexRegistry(): MutexRegistry {
 
 export const DEFAULT_ALLOWLIST = [
   "npm", "npx", "pnpm", "yarn", "bun", "node",
-  "tsc", "tsx", "vitest", "jest", "eslint", "prettier",
+  "tsc", "tsx", "vitest", "jest", "eslint", "prettier", "pytest",
 ];
 
 // Any shell-chaining / redirection / substitution metacharacter.
@@ -55,6 +55,11 @@ export function isCommandAllowed(command: string, allowlist: string[]): boolean 
   const firstToken = tokens[0];
   const parts = firstToken.split(/[/\\]/);
   const basename = parts[parts.length - 1];
+  // `uv` is never allowlisted as such: only `uv run pytest ...` passes, and only when pytest is
+  // allowed. This runs before the generic check so a user allowlist containing "uv" cannot widen it.
+  if (basename.replace(/\.(exe|cmd|bat)$/i, "") === "uv") {
+    return allowlist.includes("pytest") && tokens[1] === "run" && tokens[2] === "pytest";
+  }
   if (!allowlist.includes(basename)) return false;
   // Strip a Windows executable suffix before the interpreter check.
   const interpreterBase = basename.replace(/\.(exe|cmd|bat)$/i, "");

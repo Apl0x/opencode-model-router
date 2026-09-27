@@ -282,6 +282,25 @@ describe("isCommandAllowed + allowlist gate", () => {
   it("blocks python3 -c with extended allowlist", () => {
     expect(isCommandAllowed(`python3 -c "x"`, [...DEFAULT_ALLOWLIST, "python3"])).toBe(false);
   });
+
+  it("allows pytest", () => {
+    expect(DEFAULT_ALLOWLIST).toContain("pytest");
+    expect(DEFAULT_ALLOWLIST).not.toContain("uv");
+    expect(isCommandAllowed("pytest -q tests", DEFAULT_ALLOWLIST)).toBe(true);
+  });
+
+  it("allows only `uv run pytest ...` for uv", () => {
+    expect(isCommandAllowed("uv run pytest -q", DEFAULT_ALLOWLIST)).toBe(true);
+    expect(isCommandAllowed("C:\\tools\\uv.exe run pytest", DEFAULT_ALLOWLIST)).toBe(true);
+    expect(isCommandAllowed(`uv run python -c "x"`, DEFAULT_ALLOWLIST)).toBe(false);
+    expect(isCommandAllowed("uv run --with x pytest", DEFAULT_ALLOWLIST)).toBe(false);
+    expect(isCommandAllowed("uv pip install x", DEFAULT_ALLOWLIST)).toBe(false);
+    expect(isCommandAllowed("uvx pytest", DEFAULT_ALLOWLIST)).toBe(false);
+    // A user allowlist containing "uv" does not widen the special case.
+    expect(isCommandAllowed("uv run python x.py", [...DEFAULT_ALLOWLIST, "uv"])).toBe(false);
+    // Without pytest on the allowlist, uv run pytest is refused too.
+    expect(isCommandAllowed("uv run pytest", ["npm", "uv"])).toBe(false);
+  });
 });
 
 // ---------------------------------------------------------------------------
