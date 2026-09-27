@@ -8,10 +8,63 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { acceptance, createE2EPlugin } from "./harness";
-import { descendantsOf, startSampler, type Snapshot } from "./sampler";
+import { ancestorsOf, descendantsOf, startSampler, type ProcSample, type Snapshot } from "./sampler";
 
 const enabled = process.env.RUN_VERIFY_E2E === "1";
 const suite = enabled ? describe : describe.skip;
+
+// Always runs (pure): the process-tree helpers against the Windows pid-reuse shape of CI round 1.
+describe("e2e sampler helpers: process tree under Windows pid reuse", () => {
+  const proc = (pid: number, ppid: number, createdMs: number | undefined, args: string): ProcSample => ({
+    pid,
+    ppid,
+    priority: 8,
+    lowPriority: false,
+    args,
+    ...(createdMs === undefined ? {} : { createdMs }),
+  });
+  // CI round 1: npx's parent (pid 2620) had exited; a git child of the test process then got pid
+  // 2620, and npx -> cmd -> vitest main (the test process's own ancestors) looked like its children.
+  const T = 1_000_000;
+  const win: Snapshot = {
+    t: T + 10_000,
+    procs: [
+      proc(5448, 2620, T, "node npx-cli.js vitest run --coverage"),
+      proc(5288, 5448, T + 10, "cmd.exe /d /s /c vitest run --coverage"),
+      proc(5336, 5288, T + 20, "node vitest.mjs run --coverage"),
+      proc(1000, 5336, T + 30, "node vitest/dist/workers/forks.js"),
+      proc(2620, 1000, T + 9_000, "git status --porcelain"),
+      proc(2700, 2620, T + 9_010, "git.exe credential helper"),
+    ],
+  };
+
+  it("does not follow a stale ppid to an older, unrelated process", () => {
+    expect(descendantsOf(win, 1000, []).map(p => p.pid)).toEqual([2620, 2700]);
+    // What the ppid alone would have said: the test process's own ancestors as its descendants.
+    const unguarded = win.procs.map(p => ({ ...p, createdMs: undefined }));
+    expect(descendantsOf({ ...win, procs: unguarded }, 1000, []).map(p => p.pid)).toEqual([2620, 5448, 2700, 5288, 5336]);
+  });
+
+  it("finds the ancestors and stops at the reused pid", () => {
+    expect(ancestorsOf(win, 1000).map(p => p.pid)).toEqual([5336, 5288, 5448]);
+  });
+
+  it("follows the ppid as is when creation times are unknown (POSIX samples reparent orphans)", () => {
+    const posix: Snapshot = {
+      t: T,
+      procs: [
+        proc(1, 0, undefined, "init"),
+        proc(5448, 1, undefined, "node npx-cli.js vitest run"),
+        proc(5336, 5448, undefined, "node vitest.mjs run"),
+        proc(1000, 5336, undefined, "node vitest/dist/workers/forks.js"),
+        proc(3000, 1000, undefined, "git status --porcelain"),
+        proc(3001, 3000, undefined, "git credential helper"),
+      ],
+    };
+    expect(ancestorsOf(posix, 1000).map(p => p.pid)).toEqual([5336, 5448, 1]);
+    expect(descendantsOf(posix, 1000, []).map(p => p.pid)).toEqual([3000, 3001]);
+  });
+});
 
 function git(cwd: string, ...args: string[]): void {
   execFileSync("git", args, { cwd, stdio: "ignore" });

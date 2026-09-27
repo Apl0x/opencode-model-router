@@ -24,7 +24,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { e2eEnabled, prepareFixtureRepo, type FixtureRepo } from "./e2e/fixture-repo";
 import { acceptance, createE2EPlugin, type E2EPlugin, type E2ETaskResult } from "./e2e/harness";
-import { descendantsOf, peak, priorityViolations, seen, startSampler, type ProcSample, type Snapshot } from "./e2e/sampler";
+import { ancestorsOf, descendantsOf, peak, priorityViolations, seen, startSampler, type ProcSample, type Snapshot } from "./e2e/sampler";
 import type { ChildConfig, ChildSummary } from "./e2e/child-instance";
 
 const suite = e2eEnabled() ? describe.sequential : describe.skip;
@@ -534,16 +534,24 @@ suite("verify resource budget: machine-wide bound (3.1.2.b-e)", () => {
       attributable,
     );
     const late = snapshots.filter(s => s.t >= res.returnedAt + 3000);
+    // This process's own ancestors (the vitest main, and in CI npx and cmd) outlive the gate by
+    // design; they are never a gate orphan (CI round 1).
+    const ancestors = new Set(snapshots.flatMap(s => ancestorsOf(s, process.pid)).map(p => p.pid));
+    /** Created by this dispatch or later (creation times are known on win32 only). */
+    const sinceDispatch = (p: ProcSample): boolean => p.createdMs === undefined || p.createdMs >= dispatchedAt;
     // Descendants still attached to this process, and (Windows does not reparent) any process on
-    // the machine that is one of the tracked pids (same creation time) or names our paths.
-    const tracked = new Map(trackedDuring.map(p => [p.pid, p.createdMs]));
+    // the machine created since the dispatch that is one of the tracked pids (same creation time)
+    // or names our paths.
+    const tracked = new Map(trackedDuring.filter(sinceDispatch).map(p => [p.pid, p.createdMs]));
     const lateDesc = late.flatMap(s => descendantsOf(s, process.pid, excl).filter(attributable).map(p => ({ t: s.t, p })));
     const lateMachine = late.flatMap(s =>
       s.procs
-        .filter(p => p.pid !== sampler.pid && p.pid !== process.pid)
+        .filter(p => p.pid !== sampler.pid && p.pid !== process.pid && !ancestors.has(p.pid) && sinceDispatch(p))
         .filter(p => (tracked.has(p.pid) && tracked.get(p.pid) === p.createdMs) || mentionsAny(p.args, spellings))
         .map(p => ({ t: s.t, p })),
     );
+    const describeProc = (x: { t: number; p: ProcSample }): string =>
+      `+${x.t - res.returnedAt}ms pid=${x.p.pid} ppid=${x.p.ppid} created=${x.p.createdMs === undefined ? "?" : `${x.p.createdMs - dispatchedAt}ms after dispatch`} ${x.p.args.slice(0, 300)}`;
     // Direct check, after the sampler stopped: signal 0 on every pid seen.
     const directAlive: number[] = [];
     for (const pid of tracked.keys()) {
@@ -563,10 +571,10 @@ suite("verify resource budget: machine-wide bound (3.1.2.b-e)", () => {
         `[3.1.2.d] gateBudgetMs=${GATE_BUDGET_MS} beforeMs=${res.beforeMs.toFixed(0)} afterMs(gate)=${res.afterMs.toFixed(0)}`,
         `[3.1.2.d] dispatch->return=${res.returnedAt - dispatchedAt}ms deadline->gate return=${deadlineToReturn.toFixed(0)}ms`,
         `[3.1.2.d] sampler snapshots=${snapshots.length} interval ${intervalStats(snapshots)}; snapshots >= return+3s=${late.length} (first at +${late.length > 0 ? late[0].t - res.returnedAt : -1}ms, last at +${late.length > 0 ? late[late.length - 1].t - res.returnedAt : -1}ms)`,
-        `[3.1.2.d] runner processes seen during the run=${runDuring.length} attributable descendants seen=${trackedDuring.length}`,
-        ...trackedDuring.map(p => `  seen ${p.pid} ppid=${p.ppid} ${p.args.slice(0, 200)}`),
+        `[3.1.2.d] runner processes seen during the run=${runDuring.length} attributable descendants seen=${trackedDuring.length} (created since the dispatch=${tracked.size}); own ancestors=[${[...ancestors].join(",")}]`,
+        ...trackedDuring.map(p => `  seen ${p.pid} ppid=${p.ppid} created=${p.createdMs === undefined ? "?" : `${p.createdMs - dispatchedAt}ms after dispatch`} ${p.args.slice(0, 200)}`),
         `[3.1.2.d] alive >= 3 s after return: descendants=${lateDesc.length} machine-wide=${lateMachine.length} direct kill(0) at +${directAliveAt}ms=${directAlive.length} [${directAlive.join(",")}]`,
-        ...[...lateDesc, ...lateMachine].map(x => `  alive at +${x.t - res.returnedAt}ms ${x.p.pid} ppid=${x.p.ppid} ${x.p.args.slice(0, 200)}`),
+        ...[...lateDesc, ...lateMachine].map(x => `  alive at ${describeProc(x)}`),
         `[3.1.2.d] output:\n${res.output}`,
       ].join("\n"),
     );
@@ -583,8 +591,8 @@ suite("verify resource budget: machine-wide bound (3.1.2.b-e)", () => {
     expect(/timed out|budget|deadline/i.test(out), out).toBe(true);
     expect(DEFERRED_FOOTER.test(out), out).toBe(false);
     // No orphans 3 s after return.
-    expect(lateDesc.map(x => `${x.p.pid} ${x.p.args}`)).toEqual([]);
-    expect(lateMachine.map(x => `${x.p.pid} ${x.p.args}`)).toEqual([]);
+    expect(lateDesc.map(describeProc)).toEqual([]);
+    expect(lateMachine.map(describeProc)).toEqual([]);
     expect(directAlive).toEqual([]);
   }, TEST_TIMEOUT_MS);
 

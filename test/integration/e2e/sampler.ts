@@ -251,11 +251,27 @@ export function startSampler(opts?: {
 // Pure helpers
 // ---------------------------------------------------------------------------------------------
 
+/**
+ * Whether `child`, whose ppid names `parent`'s pid, is really `parent`'s child. Windows never
+ * reparents: a process whose parent exited keeps the dead parent's pid as its ppid, and once that
+ * pid is reused by a newer process the stale ppid points at an unrelated one. A process cannot be
+ * created before its parent, so a child older than the process holding its ppid is not its child
+ * (CI round 1: the CI job's own `npx` -> `cmd` -> `vitest` chain showed up as descendants of the
+ * test process once a short-lived plugin child reused the pid of npx's exited parent). Without
+ * creation times (POSIX samples, where orphans are reparented) the ppid is taken as is.
+ */
+export function isChildOf(child: ProcSample, parent: ProcSample | undefined): boolean {
+  if (parent === undefined || child.createdMs === undefined || parent.createdMs === undefined) return true;
+  return child.createdMs >= parent.createdMs;
+}
+
 /** Every transitive descendant of rootPid within one snapshot (via ppid), minus excludePids and their subtrees. */
 export function descendantsOf(snapshot: Snapshot, rootPid: number, excludePids: number[]): ProcSample[] {
   const exclude = new Set(excludePids);
+  const byPid = new Map<number, ProcSample>();
   const byParent = new Map<number, ProcSample[]>();
   for (const p of snapshot.procs) {
+    byPid.set(p.pid, p);
     const list = byParent.get(p.ppid);
     if (list === undefined) byParent.set(p.ppid, [p]);
     else list.push(p);
@@ -268,10 +284,28 @@ export function descendantsOf(snapshot: Snapshot, rootPid: number, excludePids: 
     for (const child of byParent.get(parent) ?? []) {
       // pid reuse can make a ppid chain cyclic; visit each pid once.
       if (visited.has(child.pid) || exclude.has(child.pid)) continue;
+      // ... and on Windows a stale ppid can name a newer, unrelated process.
+      if (!isChildOf(child, byPid.get(parent))) continue;
       visited.add(child.pid);
       out.push(child);
       queue.push(child.pid);
     }
+  }
+  return out;
+}
+
+/** rootPid's own ancestors in one snapshot (parent first), following ppid while isChildOf holds. */
+export function ancestorsOf(snapshot: Snapshot, rootPid: number): ProcSample[] {
+  const byPid = new Map(snapshot.procs.map(p => [p.pid, p] as const));
+  const out: ProcSample[] = [];
+  const visited = new Set<number>([rootPid]);
+  let current = byPid.get(rootPid);
+  while (current !== undefined) {
+    const parent = byPid.get(current.ppid);
+    if (parent === undefined || visited.has(parent.pid) || !isChildOf(current, parent)) break;
+    visited.add(parent.pid);
+    out.push(parent);
+    current = parent;
   }
   return out;
 }
