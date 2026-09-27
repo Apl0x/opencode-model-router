@@ -54,11 +54,12 @@ Cleanup: all spike processes exited on their own (≤ 4 s lifetimes); a
 `Get-CimInstance Win32_Process | ? CommandLine -like '*omr-spikeA*'` afterwards matched only the
 query itself.
 
-## Spike B (POSIX nice)
+## POSIX low-priority mechanism (note)
 
-Handled by a separate agent. Implementation prepends `nice -n 10` to argv (`runArgv`) and runs
-`nice -n 10 /bin/sh -c <command>` for `runShell` — the same `/bin/sh -c` that `shell: true`
-spawns, so shell semantics are unchanged and the command is never re-quoted.
+The Spike B results are in the next section. The implementation prepends `nice -n 10` to argv
+(`runArgv`) and runs `nice -n 10 /bin/sh -c <command>` for `runShell`. That is the same
+`/bin/sh -c` that `shell: true` spawns, so the command keeps its shell semantics and is never
+re-quoted.
 
 ## Pre-flight / Spike B (POSIX)
 
@@ -87,3 +88,283 @@ these came from the spike script's cleanup, not from exec.ts.
 The POSIX tree-kill tests passed: "kills the whole process tree on timeout, not just the shell",
 "kills the whole process tree on abort" (×2), and "kills the whole process tree on timeout".
 No failures.
+
+## QA findings
+
+Reviewer: heavy QA, adversarial review of `754296c..0b1fb45` against plan §1.3 S4, §1.5, Phase 1.2
+and G4.
+
+**Baseline.** On Windows 11 with node v24.21.0:
+- `npx vitest run --maxWorkers=2 test/unit/exec.test.ts` passed 19 of 19 tests (Duration 11.00s).
+- `npm run typecheck` is clean.
+
+**Repro setup.** The repro scripts lived in `%TEMP%\omr-qa12` and were removed afterwards; no
+leftover processes remained. `repro.mjs` imported `src/verify/exec.ts` directly (Node 24 type
+stripping). Each fixture's lifetime was 8 s or less. Deadline cases used `timeoutMs: 1500`, or an
+abort after 1500 ms. Each case checked whether the descendant was alive at t = 3.5 s (the deadline
+plus the "no orphans after" margin) and whether the promise had resolved.
+
+**Result.** 2 major, 5 minor and 4 nit findings. Two more items are deferred by plan. The DoD
+(zero open findings) is **not met**: QA-1.2-1 and QA-1.2-2 need a fix round.
+
+### QA-1.2-1 — major — Windows: a deadline after the direct child exited kills nothing, and descendants outlive it
+
+- **Where:** `src/verify/exec.ts:109` (`if (exited && isWin) return;`), with `:121` and `:123`.
+- **Spec:**
+  - Phase 1.2 Goal: "It kills the whole tree".
+  - G4: "Its expiry kills the whole process tree; no orphans after 3 s. Proven by 1.2".
+- **Evidence.** Fixture `early-exit`: the direct child (node) spawns a grandchild with
+  `stdio: inherit, detached: true`. `detached` keeps it out of libuv's job, the same as a child of
+  cmd.exe, python or a native launcher. The direct child exits 0 at 300 ms; the grandchild lives 8 s.
+  ```
+  [early-exit/timeout] t=3519ms pids={"child":49192,"grandchild":47476} grandchildAlive=true resolved=NO
+    taskkill /T on exited parent 49192: exit 128: ERRO: o processo "49192" não foi encontrado.
+    CIM ParentProcessId=49192: 47476 node.exe created=21:52:59.636
+    result after 8140ms: {"code":1,"timedOut":true,"stderr":""}
+  [early-exit/abort] t=3527ms pids={"child":32688,"grandchild":33932} grandchildAlive=true resolved=NO
+    result after 8159ms: {"code":1,"timedOut":true,"stderr":""}
+  ```
+  - At the deadline nothing is killed, and the grandchild is alive 2 s past it.
+  - The result arrives only when the grandchild ends by itself. It says `timedOut: true, code: 1`,
+    although the direct child exited 0 and nothing was killed.
+  - The same window also means an abort after the natural `exit` but before `close` is not a
+    no-op on the result (plan: "Abort after natural exit is a no-op").
+- **Mitigation observed.** In the same fixture without `detached` (`early-exit-plain`), the
+  grandchild died when its Node parent exited (libuv's kill-on-close job object) and the run
+  resolved at 398 ms with `code 0`. So vitest and jest workers forked by a live Node runner are
+  covered. The exposure is descendants of non-libuv parents (cmd.exe `start /b`, pytest-xdist or
+  multiprocessing, native launchers) and `detached` descendants.
+- **PID-reuse judgement.** The guard itself is correct. `taskkill /T` on the dead PID cannot help
+  (exit 128, "not found", above), and a recycled PID must not be targeted. What is missing is a
+  PID-reuse-safe way to reach the orphans.
+- **Fix (recommended):** a creation-time-bounded descendant kill.
+  1. Record `spawnedAt = Date.now()` after `spawn` and `exitedAt` in the `exit` handler.
+  2. In `kill()`, when `exited && isWin`, query the processes with `powershell.exe -NoProfile -c
+     "Get-CimInstance Win32_Process -Filter 'ParentProcessId=<pid>'"`. Use `powershell.exe`
+     because it is built in; pwsh 7 is not guaranteed and wmic is removed on current Windows 11.
+  3. Keep only the roots whose `CreationDate` lies in `[spawnedAt − 1 s, exitedAt]`. A process
+     that reuses the PID, and all of its children, are created after `exitedAt`, so the filter
+     excludes them. The repro shows that the query finds the orphan together with its
+     `CreationDate`.
+  4. Run `taskkill /pid <root> /T /F` on each root. A live PID cannot be recycled.
+
+  Report the real exit code when nothing was killed. Add a regression test: the `early-exit`
+  fixture with a `detached` grandchild, where the grandchild must be dead within 3 s of the
+  deadline.
+- **Alternative (acceptable only together with QA-1.2-2):** accept the residual explicitly in the
+  plan risk table and in G4's wording ("descendants of an already-exited direct child on Windows
+  are not killed"). Justification: libuv jobs cover Node-forked workers, and QA-1.2-2 bounds the
+  run and the slot.
+
+### QA-1.2-2 — major — the result waits for `close`, so a descendant that holds a pipe and survives the kill keeps the run (and the S3 slot) past the deadline
+
+- **Where:** `src/verify/exec.ts:125` (`child.on("close", …)` is the only success path).
+- **Spec:** G4: "No slot wait, run, recheck or batch step outlives it". S4 replaces a "gate timeout
+  that abandons the command without killing it".
+- **Evidence (the kill path, not QA-1.2-1's exited path).** Fixture `broken-tree`: the direct
+  child stays alive. A middle process spawns a `detached` great-grandchild that inherits the pipes,
+  then exits, so the great-grandchild's parent is dead. At the deadline, `taskkill /pid <child> /T`
+  kills the child but cannot walk to the re-parented process.
+  ```
+  [broken-tree/timeout] t=3525ms pids={"middle":49716,"grandchild":25988} grandchildAlive=true resolved=NO
+    result after 8302ms: {"code":1,"timedOut":true,"stderr":""}
+  ```
+  The deadline was 1500 ms; the promise resolved at 8302 ms. The POSIX analogue (a descendant that
+  calls `setsid`, so `kill(-pgid)` misses it and it keeps stdout open) follows from Node's `close`
+  semantics. It was not reproduced here, because the host is Windows.
+- **Impact:** Phase 2 wraps runs in `slot.acquire` (S3), so the machine-wide slot is held for the
+  whole lifetime of the stray process, not for `gateBudgetMs`.
+- **Fix:**
+  1. In `kill()`, including the branch that returns early for `exited && isWin`, arm one grace
+     timer (for example 2000 ms, `unref()`'d).
+  2. When the timer fires, call `child.stdout?.destroy()` and `child.stderr?.destroy()`.
+  3. Then call `finish(exitCode ?? 1)`, using the code captured on `exit`, and append
+     `[output streams force-closed <n> ms after kill: a descendant still held them]` to stderr.
+  4. Clear the timer in `finish`.
+
+  Add a test with the `broken-tree` fixture: it resolves within the deadline plus the grace period,
+  with `timedOut: true`.
+
+### QA-1.2-3 — minor — Windows env merge is case-sensitive, so an override whose key has a different case is silently dropped
+
+- **Where:** `src/verify/exec.ts:70` (`{ ...process.env, ...opts.env }`).
+- **Spec:** 1.2.2 / types.ts: "Merged over process.env; never replaces it". §1.5-4 puts `cross-env`
+  assignments into the spec's `env`.
+- **Evidence.** Node's spawn on win32 de-duplicates keys case-insensitively and keeps the first
+  key in sorted order:
+  ```
+  [env] override {"PATH":"OVERRIDE"} -> child sees {"PATH":"OVERRIDE","TEMP":"C:\\Users\\MAR"}
+  [env] override {"path":"OVERRIDE"} -> child sees {"Path":"C:\\Program F","TEMP":"C:\\Users\\MAR"}
+  [env] override {"Temp":"OVERRIDE"} -> child sees {"Path":"C:\\Program F","TEMP":"C:\\Users\\MAR"}
+  ```
+  Whether an override wins depends on how its key sorts against the existing key, not on
+  precedence.
+- **Fix:** on win32, before assigning each override key, delete every inherited key whose
+  `toUpperCase()` equals the override key's `toUpperCase()`. Add a Windows test: `env: { path: "X" }`
+  → the child sees `X`, and no second Path/PATH entry exists.
+
+### QA-1.2-4 — minor — POSIX `lowPriority` breaks the spawn-error contract (`nice` exits 127 instead of an ENOENT `error`)
+
+- **Where:** `src/verify/exec.ts:38` and `src/verify/exec.ts:49`.
+- **Spec:** "A spawn error (non-existent executable) resolves `{code:1, timedOut:false}` with the
+  error in `stderr`".
+- **Evidence (from the spec; not reproduced, because the host is Windows).** With the `nice` prefix,
+  Node spawns `nice` successfully. `nice` then fails to exec the target and exits 127 (not found) or
+  126 (not executable) with its own message. Node emits no ENOENT `error`. The Linux spawn-error
+  test (`exec.test.ts:153`) does not set `lowPriority`, so CI cannot see this. Production runs with
+  `lowPriority: true` by default (§1.4), so the 1.3 adapter would see 127, not 1.
+- **Fix:** when `run` wrapped the target in `nice`, map exit 126/127 whose stderr starts with
+  `nice:` to `{code: 1, stderr: "exec failed: …"}`. Pass `--` before the target
+  (`nice -n 10 -- file …`). Run the spawn-error test on both platforms with and without
+  `lowPriority`.
+
+### QA-1.2-5 — minor — `timeoutMs` ≥ 2^31 (or `Infinity`) kills the command immediately
+
+- **Where:** `src/verify/exec.ts:112`.
+- **Spec:** §1.4 allows any "integer ≥ 1" for `gateBudgetMs` and `recheckTimeoutMs`, and §1.5-13
+  passes `min(budget, remaining)` down.
+- **Evidence:**
+  ```
+  TimeoutOverflowWarning: 2147483648 does not fit into a 32-bit signed integer. Timeout duration was set to 1.
+  [timeoutMs=2^31] resolved in 466ms: code=1 timedOut=true
+  ```
+  A user who sets a large `gateBudgetMs` would get every verification reported as timed out.
+- **Fix:** do not arm the timer when `!Number.isFinite(timeoutMs)`. Otherwise clamp with
+  `Math.min(Math.max(timeoutMs, 0), 2 ** 31 - 1)`. Add a test for `2 ** 31`: the command completes
+  normally.
+
+### QA-1.2-6 — minor — POSIX `detached` (new session) trees survive opencode exit; there is no exit cleanup
+
+- **Where:** `src/verify/exec.ts:74` (`detached: !isWin`). `rg "process\.on\(|process\.once\(" src`
+  returns no matches.
+- **Spec:** QA focus: "`detached` side effects on POSIX (a detached child that survives opencode
+  exit)". G4.
+- **Evidence (from Node's documented behaviour; not reproduced, because the host is Windows).**
+  `detached: true` makes the child "the leader of a new process group and session". A terminal
+  hang-up (SIGHUP) or a tty Ctrl-C does not reach it. When opencode exits mid-run, the tree keeps
+  running at nice 10 until the suite ends by itself, and indefinitely when no deadline was passed
+  (QA-1.2-7).
+- **Contrast on Windows:** non-detached children sit in libuv's kill-on-close job, so opencode exit
+  kills them (see the `early-exit-plain` observation in QA-1.2-1).
+- **Status:** the `detached` flag predates this phase (it is in the `754296c` context lines), but
+  the plan puts this case in this phase's QA focus.
+- **Fix:**
+  1. Keep a module-level `Set<number>` of live POSIX group ids: add after spawn, delete in `finish`.
+  2. Lazily install one `process.once("exit", …)` handler that runs `process.kill(-pgid, "SIGKILL")`
+     for each id in a try/catch. `process.kill` is synchronous, so it is allowed in `exit`.
+  3. Document that death by an unhandled signal (the host's SIGTERM/SIGHUP policy) remains
+     opencode's concern.
+
+### QA-1.2-7 — nit — a run with neither `timeoutMs` nor `signal` has no deadline
+
+- **Where:** `src/verify/exec.ts:33`, `:48` (`opts = {}`) and `:112`.
+- **Spec:** 1.2.2 makes `timeoutMs?` optional in the seam, so the type is as specified. G4:
+  "Nothing outlives its budget".
+- **Evidence:** today's only caller (`src/verify/wiring.ts:110-112`) always passes a
+  `cwd ?? directory` and a `timeoutMs ?? 120000` default, so nothing is unbounded yet. `cwd` also
+  silently defaults to opencode's own `process.cwd()`.
+- **Fix:** document on `ExecOptions` that callers must bound every run with `timeoutMs` or
+  `signal`. Optionally apply a defensive 120000 ms default when both are absent (the same default as
+  `DeterministicDeps.timeoutMs`). Phase 3.2 should re-check that every 1.3/1.5/2.x call site passes
+  a deadline.
+
+### QA-1.2-8 — minor — multi-byte UTF-8 characters split across chunks become U+FFFD (pre-existing)
+
+- **Where:** `src/verify/exec.ts:100-101` (`String(chunk)` per Buffer chunk).
+- **Evidence:** 65535 × `a` followed by `é`/`日本` produced damaged characters:
+  ```
+  [utf8] code=0 length=145543 replacementChars=7
+  ```
+  This damages non-ASCII test names in the text-parsing fallback (`observeTests`, §1.5-2) and in
+  failure evidence.
+- **Fix:** call `child.stdout?.setEncoding("utf8")` and `child.stderr?.setEncoding("utf8")`, which
+  use a StringDecoder, then concatenate the strings.
+
+### QA-1.2-9 — nit — `maxBuffer` is not a cap, and truncation leaves no marker
+
+- **Where:** `src/verify/exec.ts:100-101`; the JSDoc at `:26` says "Per-stream cap in characters;
+  output past it is dropped".
+- **Evidence:**
+  ```
+  [maxBuffer=1000] stdout.length=65536 stderr="" (no truncation marker)
+  ```
+  The cap is exceeded by up to one pipe chunk (64 KiB here, 65 times the cap), and a truncated
+  stream cannot be told apart from a complete one. The test (`exec.test.ts:145-151`) only asserts
+  `< 5 MiB`.
+- **Fix:** append `s.slice(0, limit - stdout.length)` and record `truncated` for each stream. Put a
+  marker (`[stdout truncated at <limit> chars]`) on stderr or a `truncated?: boolean` field on the
+  result. The test should assert `stdout.length <= maxBuffer` and the marker.
+
+### QA-1.2-10 — nit — the "abort after natural exit" test does not cover the window the Windows guard exists for
+
+- **Where:** `test/unit/exec.test.ts:176-182`.
+- **Spec:** "Abort after natural exit is a no-op (no `taskkill` of a recycled PID: a `settled`
+  guard)".
+- **Evidence:** the test aborts only after the promise has settled, when the listener has already
+  been removed, so it cannot fail. The `exited && isWin` branch (`exec.ts:109`) is not tested at all.
+  QA-1.2-1's `early-exit/abort` repro shows that this window changes the result (`code 1,
+  timedOut: true` for a child that exited 0).
+- **Fix:** add the `early-exit` fixture case with the abort fired between `exit` and `close`. Assert
+  no kill of the direct PID, plus the behaviour chosen in QA-1.2-1.
+
+### QA-1.2-11 — nit — the Windows priority test depends on PowerShell 7
+
+- **Where:** `test/unit/exec.test.ts:91` (`execFileSync("pwsh", …)`).
+- **Evidence:** `pwsh` is not installed by default on Windows (GitHub's Windows runners have it;
+  developer machines may not), and this test would fail with ENOENT there.
+- **Fix:** use `powershell.exe` (Windows PowerShell 5.1, always present), with the same
+  `Get-CimInstance` query.
+
+### QA-1.2-12 — deferred by plan (3.2) — the `rg child_process src` acceptance check lists `src/index.ts`
+
+- **Evidence:** `rg -n child_process src` lists:
+  - `src/index.ts:74 import { exec as nodeExec } from "node:child_process";`
+  - `src/verify/exec.ts`
+  - `src/verify/tree.ts`
+  - `src/verify/wiring.ts:7` (a comment only)
+
+  `git show 754296c:src/index.ts | rg child_process` → `74:import { exec as nodeExec } …`, so the
+  import predates this phase. `rg nodeExec src/index.ts` matches only that import line: it is a dead
+  import that spawns nothing.
+- **Status:** the acceptance intent holds (no new spawn path). Phase 3.2's re-check should delete
+  the unused import and update the acceptance wording.
+
+### QA-1.2-13 — deferred by plan (2.1) — production callers do not pass `lowPriority` or `env` yet
+
+- **Where:** `src/verify/wiring.ts:106-114`. The `execSeam` adapter narrows `opts` to
+  `{ cwd, timeoutMs, signal }`, so verification still runs at normal priority.
+- **Status:** plan 2.1.2.b wires low priority, the slot and the deadline into every check kind.
+  Phase 2.1 QA should confirm that `lowPriority` (default `true`, §1.4) reaches `runShell` and
+  `runArgv`.
+
+### Checked, no finding
+
+- **Priority race (Windows).** `setPriority` runs right after `spawn`, and anything spawned before
+  it runs at normal priority. This is accepted by the plan rule ("If neither does both, use (a) and
+  document the startup race in the code comment"); the comment is at `exec.ts:86-89`. Spike A
+  observed P6 grandchildren in both the argv chain and the `shell: true` + `.cmd` chain. BELOW_NORMAL
+  is inherited by `CreateProcess` children. The window length ("few microseconds") is not measured.
+  POSIX has no race, because `nice` execs its target.
+- **PID reuse.**
+  - Windows: the direct child's PID is pinned while libuv holds its handle, until `exit`, and the
+    `exited` guard stops `taskkill` after that.
+  - POSIX: a group id cannot be reused while the group has members, and an empty group gives ESRCH,
+    so `child.kill` is a no-op.
+  - The gap is coverage, not safety: see QA-1.2-1.
+- **Abort-listener leak.** Listeners use `{ once: true }` and are removed in `finish`. The
+  pre-aborted and synchronous-throw paths return before adding one. The test with 25 runs sharing
+  one signal leaves 0 listeners.
+- **setPriority failure text on stderr.** `deterministic.ts:151,226` and `baseline.ts:17` parse
+  `stdout + "\n" + stderr`. The `[low priority not applied: …]` line has no summary or identity
+  tokens, and stdout is untouched.
+- **Windows `.cmd` quoting.** The `runShell` `shell: true` path is unchanged from `754296c`
+  (`cmd.exe /d /s /c "<command>"`). A quoted `.cmd` path with `lowPriority` keeps exit 3, and
+  `npm.cmd --version` exits 0 (test passes). `runArgv` resolves a `.cmd` as EINVAL through the
+  synchronous `try/catch` and never rejects.
+- **ENOENT and EINVAL never reject.** ENOENT goes through `error` → `finish(1, err)`, and EINVAL
+  through the `try/catch`. Both are covered by tests.
+- **types.ts contract.** `ExecOptions` is exactly `{ cwd?, timeoutMs?, signal?, lowPriority?, env? }`
+  and `ArgvSeam` is `(file, args, opts?) => Promise<ExecResult>`, as in 1.2.2. It was committed first
+  (`31043d9`).
+- **Required tests.** All of plan 1.2.3's cases are present. Coverage gaps are QA-1.2-9 and
+  QA-1.2-10.
