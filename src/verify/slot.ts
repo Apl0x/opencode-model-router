@@ -899,6 +899,16 @@ function makeFileHandle(path: string, token: string, opts: SlotOptions, cfg: Cfg
 }
 
 /**
+ * Delay before wake-up `attempt` (0-based): exponential from `minMs` to `maxMs`,
+ * with upward-only jitter (x1 to x1.5) capped at `maxMs`, so never below `minMs`
+ * (plan 1.4.1.d: 250 ms -> 2 s).
+ */
+export function nextBackoffMs(attempt: number, random: number, minMs: number, maxMs: number): number {
+  const base = Math.min(maxMs, minMs * 2 ** Math.min(attempt, 30));
+  return Math.max(1, Math.round(Math.min(maxMs, base * (1 + random * 0.5))));
+}
+
+/**
  * Acquire one of `max` machine-wide verification slots, waiting up to `waitMs`
  * with exponential backoff and jitter. Resolves `{busy:true}` on timeout or
  * abort; never rejects for contention.
@@ -933,10 +943,9 @@ export async function acquireSlot(opts: SlotOptions, deps?: SlotDeps): Promise<S
       }
       const remaining = deadline - cfg.mono();
       if (remaining <= 0 || opts.signal?.aborted) return { busy: true };
-      const base = Math.min(cfg.backoffMaxMs, cfg.backoffMinMs * 2 ** k);
-      const jittered = Math.max(1, Math.round(base * (0.5 + cfg.random() * 0.5)));
-      // Observations need a wake-up at least every 2 heartbeats to stay unbroken.
-      const delay = Math.min(remaining, cfg.heartbeatMs, jittered);
+      // Observations need a wake-up at least every 2 heartbeats to stay unbroken;
+      // the last wait is cut to the deadline.
+      const delay = Math.min(remaining, cfg.heartbeatMs, nextBackoffMs(k, cfg.random(), cfg.backoffMinMs, cfg.backoffMaxMs));
       const aborted = await new Promise<boolean>((resolve) => {
         const onAbort = () => {
           clearTimeout(t);

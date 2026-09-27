@@ -9,7 +9,9 @@ import {
   acquireSlot,
   exitReleaseFailures,
   isPidAlive,
+  nextBackoffMs,
   reapClaimPath,
+  SLOT_DEFAULTS,
   releaseAllSlotsSync,
   withSlot,
   type FileSnapshot,
@@ -326,18 +328,29 @@ describe("slot: clock changes and suspend/resume (QA-1.4-1, QA-1.4-8)", () => {
 });
 
 describe("slot: release", () => {
-  it("release is idempotent and stops the heartbeat", async () => {
+  it("release is idempotent and stops the heartbeat: the released handle's own lock is never touched again (QA-1.4-10)", async () => {
     const dir = freshDir();
     const p = join(dir, "slot-0.lock");
-    const a = held(await acquireSlot({ max: 1, waitMs: 0, meta }, fast(dir, { heartbeatMs: 30 })));
+    let touches = 0;
+    const utimes = async (path: string, t: Date) => {
+      if (path === p) touches++;
+      await fsUtimes(path, t, t);
+    };
+    const a = held(await acquireSlot({ max: 1, waitMs: 0, meta }, fast(dir, { heartbeatMs: 30, utimes })));
+    await waitUntil(() => touches >= 2); // the heartbeat does run
+    const own = readFileSync(p, "utf8");
     await a.release();
     await a.release();
     expect(existsSync(p)).toBe(false);
-    // Plant a lock with the same path; a still-running heartbeat would touch it.
-    writeLock(p, { token: "someone" }, 10_000);
+    // Put the released handle's *own* lock back, aged: a heartbeat still running would refresh it.
+    writeFileSync(p, own);
+    setAge(p, 10_000);
     const before = statSync(p).mtimeMs;
-    await new Promise((r) => setTimeout(r, 150));
+    const count = touches;
+    await sleep(250); // more than 3 heartbeats
     expect(statSync(p).mtimeMs).toBe(before);
+    expect(touches).toBe(count);
+    rmSync(p);
   });
 
   it("release after the slot was reclaimed as stale does not delete the new owner's file", async () => {
@@ -685,6 +698,29 @@ describe("slot: waiting", () => {
     expect(r).toEqual({ busy: true });
     expect(wakes).toBeGreaterThan(2);
     expect(wakes).toBeLessThan(20);
+  });
+
+  it("the production constants are the plan values: heartbeat 5 s, stale 30 s, backoff 250 ms -> 2 s (QA-1.4-15)", () => {
+    expect(SLOT_DEFAULTS).toMatchObject({ heartbeatMs: 5_000, staleMs: 30_000, backoffMinMs: 250, backoffMaxMs: 2_000 });
+  });
+
+  it("backoff jitter never goes below the floor nor above the cap (QA-1.4-16)", async () => {
+    const { backoffMinMs: lo, backoffMaxMs: hi } = SLOT_DEFAULTS;
+    for (let k = 0; k < 12; k++) {
+      for (const r of [0, 0.25, 0.5, 0.75, 0.999999]) {
+        const d = nextBackoffMs(k, r, lo, hi);
+        expect(d).toBeGreaterThanOrEqual(lo);
+        expect(d).toBeLessThanOrEqual(hi);
+      }
+    }
+    expect([nextBackoffMs(0, 0, lo, hi), nextBackoffMs(0, 0.999999, lo, hi), nextBackoffMs(1, 0, lo, hi), nextBackoffMs(3, 0, lo, hi)]).toEqual([250, 375, 500, 2_000]);
+    // The wait loop uses it: with random = 0 the first wake-up is not earlier than backoffMinMs.
+    const dir = freshDir();
+    held(await acquireSlot({ max: 1, waitMs: 0, meta }, fast(dir, { heartbeatMs: 1_000_000 })));
+    const stamps: number[] = [];
+    await acquireSlot({ max: 1, waitMs: 300, meta }, { dir, backoffMinMs: 100, backoffMaxMs: 800, random: () => 0, onAttempt: () => stamps.push(performance.now()) });
+    expect(stamps.length).toBeGreaterThanOrEqual(2);
+    expect(stamps[1]! - stamps[0]!).toBeGreaterThanOrEqual(95);
   });
 });
 
