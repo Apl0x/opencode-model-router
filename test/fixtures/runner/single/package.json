@@ -1,0 +1,1 @@
+{ "name": "single", "scripts": { "pretest": "echo hi", "test": "vitest run --coverage", "unit": "jest --ci -w 4", "bad": "vitest run && eslint .", "seq": "npm run a; npm run b", "dot": "dotenv -- vitest run", "xenv": "cross-env X=1 Y=\"a b\" vitest run", "xenvc": "cross-env X=1 vitest run && eslint .", "nested": "npm run test", "quote": "vitest \"run", "num": 5 } }

@@ -1,0 +1,1 @@
+{ "name": "no-runner", "scripts": { "test": "jest" } }
