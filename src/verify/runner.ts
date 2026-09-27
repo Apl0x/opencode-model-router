@@ -12,7 +12,7 @@
 // child_process. It turns (check command, cwd, changed files, budget) into one of three results:
 // an argv spec, a "nothing to run" note, or an S6 `unverifiable` reason. After a run, it turns the
 // result into failing test identities. It reaches the outside world only through injected seams:
-// FsSeam/RunnerFs for the filesystem, TestSearchSeam for test-file searches (the caller runs git)
+// FsSeam/PlannerFs/RunnerFs for the filesystem, TestSearchSeam for test-file searches (the caller runs git)
 // and RunnerHost for platform, execPath, tmpdir, core count, PATH and ids.
 //
 // Sections: B detection, C script parsing, D user arguments, E worker cap, F entry resolution,
@@ -286,9 +286,21 @@
 //   2. The candidates are each c.path, plus c.previousPath when present (the source of a rename).
 //   3. abs = P.resolve(cwd, candidate). This resolves "..", "." and mixed separators, and an
 //      absolute input keeps its drive. A path containing "\0" is dropped, with a note.
+//   3a. Canonical spelling (QA-1.3-1, QA-1.3-7). win32 first strips the \\?\, \\.\ and \\?\UNC\
+//      prefixes. Then abs goes through realOf: fs.realpath (PlannerFs), which resolves symlinks,
+//      junctions and 8.3 short names. A missing file keeps its lexical tail below the realpath of
+//      its nearest existing ancestor. cwd (hence gitRoot, the package.json and runnerCwd), path
+//      scopes, rerun test files and the tmpdir are canonicalized the same way, so every path in a
+//      spec is a real path. Reason: jest realpaths rootDir and then matched none of the lexical
+//      --findRelatedTests paths (0 tests, exit 0 under --passWithNoTests) for an 8.3 or junction
+//      cwd. Without fs.realpath the paths stay lexical and the spec carries lexicalPaths (I 2a).
+//      The trigger check (7) also looks at the lexical basename, so a symlink named
+//      vitest.config.ts still triggers.
 //   4. rel = P.relative(gitRoot, abs). The file is outside the root when rel === "", rel starts
 //      with a ".." segment, or P.isAbsolute(rel) (another drive). Outside files are dropped with
 //      the note `dropped outside the git root: <candidate>`.
+//   4a. A non-empty change set in which EVERY candidate was dropped (outside, NUL) -> S6
+//      attribution-unavailable (lint: Unscoped), never NoAffected (QA-1.3-7).
 //        "src/../../x" is outside -> dropped.
 //        "packages/a/../b/x.ts" is inside -> kept as packages/b/x.ts (see O.9).
 //        win32 P.relative compares case-insensitively, so "c:\repo\a.ts" is inside a gitRoot of
@@ -377,10 +389,14 @@
 //     workers = xdist ? N : null.
 //   env = the cross-env assignments, then the adapter's own entries. The ArgvSeam merges env
 //   over process.env.
-//   reportPath = P.join(host.tmpdir, `omr-verify-${host.randomId()}.json`); pytest uses ".xml".
-//   The tmpdir being inside gitRoot -> S6 tmpdir-in-repo.
-//   The sum of (arg.length + 1) over args must not exceed MAX_ARGV_CHARS; otherwise -> S6
-//   argv-too-long.
+//   reportPath = P.join(P.resolve(host.tmpdir), `omr-verify-${host.randomId()}.json`); pytest
+//   uses ".xml". A relative host.tmpdir -> S6 tmpdir-in-repo "temp dir is not an absolute path"
+//   (the runner would resolve it against spec.cwd, inside the repo: QA-1.3-11). The tmpdir inside
+//   gitRoot, lexically or after realpath -> S6 tmpdir-in-repo.
+//   The command line must not exceed MAX_ARGV_CHARS; otherwise -> S6 argv-too-long. It is
+//   counted as CreateProcess receives it (QA-1.3-14): file plus args, one separator each, and on
+//   win32 each argument quoted the way libuv quotes it (+2 for a space, tab or quote, 2n+1
+//   backslashes before a quote, doubled trailing backslashes, "" for an empty argument).
 //
 // ------------------------------------------------------------------------------------------------
 // I. RESULTS AND IDENTITIES (readResult; plan 1.3.2.f)
@@ -407,9 +423,20 @@
 //     complete = true. Exception: exit != 0 with no failing id and no collection error ->
 //     complete = false, note `runner exited <code> but its report lists no failure` (vitest
 //     unhandled errors, coverage thresholds).
+//   Step 2a (QA-1.3-1) Zero-test guard, for JSON and junit alike. A complete report with total 0,
+//     no failing id and no collection error becomes complete = false when
+//       - mode is "rerun" (every input is an existing test file), note `rerun ran no tests
+//         although every input is a test file`;
+//       - jest related was given a JS test file (G.8 rule), note `jest ran no tests although a
+//         test file was passed`;
+//       - jest ran from a spec with lexicalPaths, note `jest ran no tests and the paths were not
+//         canonicalized (no realpath seam)`.
+//     A parser exception is an unusable report: step 4 with the note `report could not be
+//     parsed: <message>` (QA-1.3-12). readResult never rejects.
 //   Step 3  pytest junit XML, parsed at regex level (no XML library).
 //     - Read each <testcase .../> and <testcase ...>...</testcase>, with its classname and name
-//       attributes. Decode &amp; &lt; &gt; &quot; &apos; &#N; and &#xN;.
+//       attributes. Decode &amp; &lt; &gt; &quot; &apos; &#N; and &#xN;. A numeric reference
+//       outside 0..0xD7FF and 0xE000..0x10FFFF stays literal text (QA-1.3-12).
 //     - A <failure> child marks a failing test.
 //     - An <error message="collection failure"> child, or classname="", marks a collection
 //       error. Any other <error> (fixture setup or teardown) marks a failing test.
@@ -508,6 +535,8 @@
 //
 //   M.1 S6 reasons, as code -> template:
 //     attribution-unavailable  change attribution unavailable
+//                              change attribution unavailable: no changed path lies inside the
+//                              git root   (G.4a)
 //     no-git-root              no git repository at or above <cwd>
 //     no-package-json          no package.json between <cwd> and the git root
 //     bad-package-json         unreadable package.json: <path>
@@ -531,6 +560,7 @@
 //     stem-too-common          deleted source <rel>: "<stem>" appears in <n> test files (limit 20)
 //     search-failed            test search failed for <rel>
 //     tmpdir-in-repo           temp dir is inside the repository: <tmpdir>
+//                              temp dir is not an absolute path: <tmpdir>   (H)
 //     argv-too-long            too many inputs for one command line: <n> files
 //   M.2 NoAffected notes:
 //     "no changed files, no affected tests"                          (section 1.5-6, exactly)
@@ -557,9 +587,10 @@
 //   3. No input list is ever empty. "vitest related" with no files runs nothing and exits 0 (R),
 //      while "vitest run" and "pytest" with no files run the WHOLE suite. An empty list becomes
 //      NoAffected.
-//   4. reportPath lives in host.tmpdir and randomId is a UUID. A tmpdir inside gitRoot -> S6.
-//      readResult reads and unlinks only a path whose dirname equals host.tmpdir
-//      (case-insensitive on win32) and whose basename matches REPORT_NAME_RE.
+//   4. reportPath lives in host.tmpdir and randomId is a UUID. A relative tmpdir, or one inside
+//      gitRoot (lexically or after realpath) -> S6. readResult reads and unlinks only an
+//      absolute path whose dirname equals the absolute host.tmpdir (case-insensitive on win32)
+//      and whose basename matches REPORT_NAME_RE.
 //   5. A JS entry resolves inside <dir>/node_modules/<pkg>/, for some dir from runnerCwd up to
 //      gitRoot. The package name must match, and bin must stay inside the package dir with a
 //      .js/.mjs/.cjs extension.
@@ -574,7 +605,7 @@
 //      cap, reporter, outputFile, passWithNoTests, run, the coverage switch, junitxml and
 //      -p no:cacheprovider.
 //   9. The argv-length cap (H) exists so that a failed spawn (Windows' limit is 32767 chars)
-//      never masquerades as a test failure.
+//      never masquerades as a test failure. It counts the program path and win32 quoting.
 //
 // ------------------------------------------------------------------------------------------------
 // O. DEVIATIONS FROM PLAN (evidence wins, and each one is deliberate)
@@ -633,7 +664,9 @@
 //         readResult(spec, result, fs), even after a timeout or abort, because it deletes the
 //         report.
 //       Green means !timedOut && complete && !collectionError && failingIds is empty. total === 0
-//       means green with the note "no affected tests ran".
+//       means green with the note "no affected tests ran" (I step 2a already turned the
+//       untrustworthy zeros into complete = false). The fs passed to the planners must be a
+//       PlannerFs with the native realpath (G.3a).
 //       S2: map failingFiles into the reference worktree (gitRoot-relative), call
 //       planRerun(runner, mapped, refRunnerCwd, budget, {fs, entry}), and compare failingIds.
 //       testScope "full" is outside this module, except that its recheck uses planRerun.
@@ -783,8 +816,20 @@ export interface RunnerHost {
   readonly randomId: () => string;
 }
 
+/**
+ * The planners' filesystem seam (G.3a, QA-1.3-1). `realpath` must be the NATIVE realpath
+ * (fs.promises.realpath or fs.realpathSync.native): it resolves symlinks, junctions and win32
+ * 8.3 short names, and it rejects for a missing path. The JS fs.realpathSync does not expand 8.3
+ * names and must not be used. `fileExists` must accept directories as well as files (B step 0).
+ * Without `realpath`, paths stay lexical, every spec carries `lexicalPaths: true`, and readResult
+ * never trusts a jest run that reports 0 tests.
+ */
+export interface PlannerFs extends FsSeam {
+  realpath?(path: string): Promise<string>;
+}
+
 /** Filesystem seam extended with the one mutation readResult needs. */
-export interface RunnerFs extends FsSeam {
+export interface RunnerFs extends PlannerFs {
   /** Delete a file. It must resolve, not reject, when the file is already gone. */
   unlink(path: string): Promise<void>;
 }
@@ -876,6 +921,12 @@ export interface ScopedSpec {
   /** The worker cap emitted. null when no cap flag applies (pytest without xdist). */
   readonly workers: number | null;
   readonly notes: readonly string[];
+  /**
+   * Set when the fs seam had no realpath, so cwd and inputs may not be the canonical spelling
+   * (G.3a). jest matches files against its realpath'd rootDir, so readResult treats a jest run
+   * reporting 0 tests as incomplete.
+   */
+  readonly lexicalPaths?: true;
 }
 
 /** An executable scoped eslint run (section K). Pass or fail comes from the exit code. */
@@ -918,7 +969,7 @@ export interface PlanScopedRunInput {
   readonly budget: RunnerBudget;
   /** Injected core count (percent and auto caps). Default: host.cores. */
   readonly cores?: number;
-  readonly fs: FsSeam;
+  readonly fs: PlannerFs;
   readonly search: TestSearchSeam;
   readonly host?: Partial<RunnerHost>;
 }
@@ -930,7 +981,7 @@ export type StaticScopingInput = Omit<PlanScopedRunInput, "search">;
 export type PlanScopedLintInput = Omit<PlanScopedRunInput, "search">;
 
 export interface RerunDeps {
-  readonly fs: FsSeam;
+  readonly fs: PlannerFs;
   /** Reuse an entry resolved elsewhere, such as the current tree for a reference worktree. Default: resolveEntry(runner, cwd). */
   readonly entry?: ResolvedEntry;
   readonly cores?: number;
@@ -1052,6 +1103,42 @@ async function findGitRoot(ctx: Ctx, cwd: string, fs: FsSeam): Promise<string | 
     if (parent === d) return undefined;
     d = parent;
   }
+}
+
+/** G.3a: drop the win32 `\\?\`, `\\.\` and `\\?\UNC\` prefixes (QA-1.3-7). Other platforms: unchanged. */
+function stripWinPrefix(ctx: Ctx, p: string): string {
+  if (!ctx.win) return p;
+  if (/^[\\/]{2}[?.][\\/]UNC[\\/]/i.test(p)) return `\\\\${p.slice(8)}`;
+  if (/^[\\/]{2}[?.][\\/]/.test(p)) return p.slice(4);
+  return p;
+}
+
+/**
+ * G.3a (QA-1.3-1): the canonical spelling of the absolute path `p`, with symlinks, junctions and
+ * 8.3 names resolved. A missing tail (a deleted file) is kept lexically below its nearest
+ * existing ancestor. Without fs.realpath the result is `p` itself.
+ */
+async function realOf(ctx: Ctx, fs: PlannerFs, p: string): Promise<string> {
+  const rp = fs.realpath;
+  if (!rp) return p;
+  const tail: string[] = [];
+  let head = p;
+  for (;;) {
+    const real = await rp.call(fs, head).then(
+      (x) => stripWinPrefix(ctx, x),
+      () => undefined,
+    );
+    if (real !== undefined) return tail.length === 0 ? real : ctx.P.join(real, ...tail.reverse());
+    const up = ctx.P.dirname(head);
+    if (up === head) return p;
+    tail.push(ctx.P.basename(head));
+    head = up;
+  }
+}
+
+/** An absolute, canonical directory for a caller-supplied cwd. */
+async function canonicalCwd(ctx: Ctx, fs: PlannerFs, cwd: string): Promise<string> {
+  return realOf(ctx, fs, ctx.P.resolve(stripWinPrefix(ctx, cwd)));
 }
 
 async function readJson(fs: FsSeam, path: string): Promise<{ ok: true; value: unknown } | { ok: false }> {
@@ -1518,11 +1605,11 @@ async function detectImpl<K extends ToolKind>(
   ctx: Ctx,
   command: string,
   cwd: string,
-  fs: FsSeam,
+  fs: PlannerFs,
   heads: Heads<K>,
 ): Promise<Detected<K> | Unverifiable> {
   const P = ctx.P;
-  const absCwd = P.resolve(cwd);
+  const absCwd = await canonicalCwd(ctx, fs, cwd);
   const gitRoot = await findGitRoot(ctx, absCwd, fs);
   if (gitRoot === undefined) return s6("no-git-root", `no git repository at or above ${cwd}`);
 
@@ -1720,6 +1807,8 @@ const NOTE_NO_RERUN = "no rerun: none of the test files exist in this tree";
 interface FileRef {
   readonly abs: string;
   readonly rel: string;
+  /** The basename as the producer spelled it, before realpath (a trigger reached through a symlink). */
+  readonly lexBase?: string;
 }
 
 function stemOf(ctx: Ctx, abs: string): string {
@@ -1749,23 +1838,39 @@ async function plan(input: StaticScopingInput, search: TestSearchSeam | undefine
   const det = await detectImpl(ctx, input.command, input.cwd, fs, TEST_HEADS);
   if (isS6(det)) return det;
   const gitRoot = det.gitRoot;
-  const cwd = P.resolve(input.cwd);
+  const cwd = await canonicalCwd(ctx, fs, input.cwd);
   const notes: string[] = [...det.notes];
-  const sorted = collectChanged(ctx, cwd, gitRoot, input.changedFiles, notes);
+  const sorted = await collectChanged(ctx, fs, cwd, gitRoot, input.changedFiles, notes);
+  if (sorted.length === 0) return s6("attribution-unavailable", NO_PATH_KEPT);
 
   // G.7: config triggers.
   const sourcePj = det.source.type === "script" ? ctx.key(det.source.packageJson) : undefined;
   for (const f of sorted) {
-    const base = P.basename(f.abs);
-    if (TRIGGERS[det.kind].test(ctx.win ? base.toLowerCase() : base) || ctx.key(f.abs) === sourcePj) {
+    if (namesOf(ctx, f).some((b) => TRIGGERS[det.kind].test(b)) || ctx.key(f.abs) === sourcePj) {
       return s6("config-changed", `config file changed: ${f.rel}`);
     }
   }
   return classify(ctx, input, det, sorted, notes, search);
 }
 
-/** G.2-G.5: candidates, normalization, dedup, sort. */
-function collectChanged(ctx: Ctx, cwd: string, gitRoot: string, changed: readonly ChangedPath[], notes: string[]): FileRef[] {
+/** Change attribution that names only paths the planner cannot use (G.4a). */
+const NO_PATH_KEPT = "change attribution unavailable: no changed path lies inside the git root";
+
+/** The basenames a trigger is matched against (G.7): real and lexical, lower-cased on win32. */
+function namesOf(ctx: Ctx, f: FileRef): string[] {
+  const names = [ctx.P.basename(f.abs), ...(f.lexBase !== undefined ? [f.lexBase] : [])];
+  return names.map((b) => (ctx.win ? b.toLowerCase() : b));
+}
+
+/** G.2-G.5: candidates, normalization, dedup, sort. Empty when every candidate was dropped (G.4a). */
+async function collectChanged(
+  ctx: Ctx,
+  fs: PlannerFs,
+  cwd: string,
+  gitRoot: string,
+  changed: readonly ChangedPath[],
+  notes: string[],
+): Promise<FileRef[]> {
   const files = new Map<string, FileRef>();
   for (const c of changed) {
     for (const cand of [c.path, c.previousPath]) {
@@ -1774,7 +1879,8 @@ function collectChanged(ctx: Ctx, cwd: string, gitRoot: string, changed: readonl
         notes.push("dropped a path containing a NUL byte");
         continue;
       }
-      const ref = canonicalize(ctx, cwd, gitRoot, cand);
+      const lexical = ctx.P.resolve(cwd, stripWinPrefix(ctx, cand));
+      const ref = canonicalize(ctx, gitRoot, gitRoot, await realOf(ctx, fs, lexical));
       if (!ref) {
         notes.push(`dropped outside the git root: ${cand}`);
         continue;
@@ -1783,7 +1889,9 @@ function collectChanged(ctx: Ctx, cwd: string, gitRoot: string, changed: readonl
         notes.push(`dropped a path starting with "-": ${cand}`);
         continue;
       }
-      if (!files.has(ctx.key(ref.abs))) files.set(ctx.key(ref.abs), ref);
+      const lexBase = ctx.P.basename(lexical);
+      const full = lexBase === ctx.P.basename(ref.abs) ? ref : { ...ref, lexBase };
+      if (!files.has(ctx.key(ref.abs))) files.set(ctx.key(ref.abs), full);
     }
   }
   return [...files.entries()].sort(byKey).map(([, v]) => v);
@@ -1894,14 +2002,48 @@ async function classify(
   const pre = await preflight(ctx, det, fs);
   if (isS6(pre)) return pre;
   const F = [...inputs.entries()].sort(byKey).map(([, v]) => v);
-  return buildSpec(ctx, det, pre.entry, F, input.budget, input.cores, [...notes, ...pre.notes], "related", det.runnerCwd, gitRoot);
+  const allNotes = [...notes, ...pre.notes];
+  return buildSpec(ctx, det, pre.entry, F, input.budget, input.cores, allNotes, "related", det.runnerCwd, gitRoot, !fs.realpath);
+}
+
+/** H, N.4 (QA-1.3-11): the tmpdir must be absolute and must not be inside gitRoot, lexically or after realpath. */
+async function tmpdirCheck(ctx: Ctx, fs: PlannerFs, gitRoot: string): Promise<Unverifiable | undefined> {
+  const t = ctx.host.tmpdir;
+  if (!ctx.P.isAbsolute(t)) return s6("tmpdir-in-repo", `temp dir is not an absolute path: ${t}`);
+  const lexical = ctx.P.resolve(t);
+  if (isInside(ctx, gitRoot, lexical) || isInside(ctx, gitRoot, await realOf(ctx, fs, lexical))) {
+    return s6("tmpdir-in-repo", `temp dir is inside the repository: ${t}`);
+  }
+  return undefined;
 }
 
 /** Checks that need no search: entry resolution and the tmpdir location (F, H, N.4). */
-async function preflight(ctx: Ctx, det: DetectedRunner, fs: FsSeam): Promise<{ entry: ResolvedEntry; notes: string[] } | Unverifiable> {
-  const tmp = ctx.P.resolve(ctx.host.tmpdir);
-  if (isInside(ctx, det.gitRoot, tmp)) return s6("tmpdir-in-repo", `temp dir is inside the repository: ${ctx.host.tmpdir}`);
+async function preflight(ctx: Ctx, det: DetectedRunner, fs: PlannerFs): Promise<{ entry: ResolvedEntry; notes: string[] } | Unverifiable> {
+  const bad = await tmpdirCheck(ctx, fs, det.gitRoot);
+  if (bad) return bad;
   return resolveEntryImpl(ctx, det, det.runnerCwd, fs);
+}
+
+/** N.9 (QA-1.3-14): the command line CreateProcess receives, quoted as libuv quotes it on win32. */
+function commandLineLength(ctx: Ctx, file: string, args: readonly string[]): number {
+  return [file, ...args].reduce((n, a) => n + (ctx.win ? winQuotedLength(a) : a.length) + 1, 0);
+}
+
+/** The length of one argument after libuv's quote_cmd_arg (CommandLineToArgvW rules). */
+function winQuotedLength(a: string): number {
+  if (a === "") return 2;
+  if (!/[ \t"]/.test(a)) return a.length;
+  let n = 2;
+  let slashes = 0;
+  for (const ch of a) {
+    if (ch === "\\") {
+      slashes++;
+      continue;
+    }
+    n += ch === '"' ? 2 * slashes + 2 : slashes + ch.length;
+    slashes = 0;
+  }
+  return n + 2 * slashes;
 }
 
 function buildSpec(
@@ -1915,12 +2057,13 @@ function buildSpec(
   mode: "related" | "rerun",
   cwd: string,
   gitRoot: string,
+  lexical: boolean,
 ): ScopedSpec | Unverifiable {
   const C = inputCores ?? ctx.host.cores;
   const N = effectiveWorkers(det.userWorkers, budget, C);
   const E = entry.prefix;
   const K = det.keptArgs;
-  const R = ctx.P.join(ctx.host.tmpdir, `omr-verify-${ctx.host.randomId()}.${det.kind === "pytest" ? "xml" : "json"}`);
+  const R = ctx.P.join(ctx.P.resolve(ctx.host.tmpdir), `omr-verify-${ctx.host.randomId()}.${det.kind === "pytest" ? "xml" : "json"}`);
   const env: Record<string, string> = { ...det.env };
   let args: string[];
   let workers: number | null = N;
@@ -1940,8 +2083,9 @@ function buildSpec(
     env.PYTEST_XDIST_AUTO_NUM_WORKERS = String(N >= 1 ? N : effectiveWorkers({ auto: true }, budget, C));
     workers = det.xdist ? N : null;
   }
-  const chars = args.reduce((n, a) => n + a.length + 1, 0);
-  if (chars > MAX_ARGV_CHARS) return s6("argv-too-long", `too many inputs for one command line: ${F.length} files`);
+  if (commandLineLength(ctx, entry.file, args) > MAX_ARGV_CHARS) {
+    return s6("argv-too-long", `too many inputs for one command line: ${F.length} files`);
+  }
   return {
     runner: det.kind,
     mode,
@@ -1956,6 +2100,7 @@ function buildSpec(
     inputsAreTests: mode === "rerun" || det.kind === "pytest",
     workers,
     notes,
+    ...(lexical ? { lexicalPaths: true as const } : {}),
   };
 }
 
@@ -1967,7 +2112,7 @@ function buildSpec(
 export async function detectRunner(
   command: string,
   cwd: string,
-  fs: FsSeam,
+  fs: PlannerFs,
   host?: Partial<RunnerHost>,
 ): Promise<DetectedRunner | Unverifiable> {
   return detectImpl(makeCtx(host), command, cwd, fs, TEST_HEADS);
@@ -2009,13 +2154,15 @@ export async function planRerun(
 ): Promise<ScopedSpec | NoAffected | Unverifiable> {
   const ctx = makeCtx(deps.host);
   const P = ctx.P;
-  const absCwd = P.resolve(cwd);
+  const absCwd = await canonicalCwd(ctx, deps.fs, cwd);
   const gitRoot = await findGitRoot(ctx, absCwd, deps.fs);
   if (gitRoot === undefined) return s6("no-git-root", `no git repository at or above ${cwd}`);
   const notes: string[] = [];
   const inputs = new Map<string, string>();
   for (const f of testFiles) {
-    const ref = P.isAbsolute(f) && !f.includes("\0") ? canonicalize(ctx, gitRoot, gitRoot, f) : undefined;
+    const lexical = stripWinPrefix(ctx, f);
+    const usable = P.isAbsolute(lexical) && !f.includes("\0");
+    const ref = usable ? canonicalize(ctx, gitRoot, gitRoot, await realOf(ctx, deps.fs, P.resolve(lexical))) : undefined;
     if (!ref) {
       notes.push(`rerun file dropped (relative or outside the git root): ${f}`);
     } else if (!(await deps.fs.fileExists(ref.abs))) {
@@ -2025,9 +2172,8 @@ export async function planRerun(
     }
   }
   if (inputs.size === 0) return noAffected(NOTE_NO_RERUN);
-  if (isInside(ctx, gitRoot, P.resolve(ctx.host.tmpdir))) {
-    return s6("tmpdir-in-repo", `temp dir is inside the repository: ${ctx.host.tmpdir}`);
-  }
+  const badTmp = await tmpdirCheck(ctx, deps.fs, gitRoot);
+  if (badTmp) return badTmp;
   let entry = deps.entry;
   if (!entry) {
     const r = await resolveEntryImpl(ctx, { kind: runner.kind, launcher: runner.launcher, gitRoot }, absCwd, deps.fs);
@@ -2036,7 +2182,7 @@ export async function planRerun(
     notes.push(...r.notes);
   }
   const F = [...inputs.entries()].sort(byKey).map(([, v]) => v);
-  return buildSpec(ctx, runner, entry, F, budget, deps.cores, notes, "rerun", absCwd, gitRoot);
+  return buildSpec(ctx, runner, entry, F, budget, deps.cores, notes, "rerun", absCwd, gitRoot, !deps.fs.realpath);
 }
 
 /** 1.3.2.f: parse the report (or fall back to observeTests) and always delete the report file (I, N.4). */
@@ -2049,6 +2195,8 @@ export async function readResult(
   const ctx = makeCtx(host);
   const P = ctx.P;
   const allowed =
+    P.isAbsolute(ctx.host.tmpdir) &&
+    P.isAbsolute(spec.reportPath) &&
     ctx.key(P.dirname(P.resolve(spec.reportPath))) === ctx.key(P.resolve(ctx.host.tmpdir)) &&
     REPORT_NAME_RE.test(P.basename(spec.reportPath));
   try {
@@ -2059,9 +2207,15 @@ export async function readResult(
     } catch {
       text = undefined; // Missing or unreadable: step 4.
     }
-    const parsed =
-      text === undefined ? undefined : spec.runner === "pytest" ? parseJunit(ctx, spec, text, execResult.code) : parseJestJson(ctx, spec, text, execResult.code);
-    return parsed ?? textResult(ctx, spec, execResult, undefined);
+    if (text === undefined) return textResult(ctx, spec, execResult, undefined);
+    let parsed: RunResult | undefined;
+    try {
+      parsed = spec.runner === "pytest" ? parseJunit(ctx, spec, text, execResult.code) : parseJestJson(ctx, spec, text, execResult.code);
+    } catch (err) {
+      // I step 1 (QA-1.3-12): a parser failure is an unusable report, never a rejection.
+      return textResult(ctx, spec, execResult, `report could not be parsed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+    return parsed ? zeroTestsGuard(spec, parsed) : textResult(ctx, spec, execResult, undefined);
   } finally {
     if (allowed) {
       try {
@@ -2083,10 +2237,10 @@ export async function planScopedLint(input: PlanScopedLintInput): Promise<LintSp
   const det = await detectImpl(ctx, input.command, input.cwd, fs, LINT_HEADS);
   if (isS6(det)) return unscoped(det.reason);
   const notes = [...det.notes];
-  const sorted = collectChanged(ctx, P.resolve(input.cwd), det.gitRoot, input.changedFiles, notes);
+  const sorted = await collectChanged(ctx, fs, await canonicalCwd(ctx, fs, input.cwd), det.gitRoot, input.changedFiles, notes);
+  if (sorted.length === 0) return unscoped(NO_PATH_KEPT);
   for (const f of sorted) {
-    const base = P.basename(f.abs);
-    if (ESLINT_TRIGGER_RE.test(ctx.win ? base.toLowerCase() : base)) return unscoped(`eslint config changed: ${f.rel}`);
+    if (namesOf(ctx, f).some((b) => ESLINT_TRIGGER_RE.test(b))) return unscoped(`eslint config changed: ${f.rel}`);
   }
   const exts = lintExtensions(det.keptArgs);
   const F: string[] = [];
@@ -2109,7 +2263,7 @@ export async function planScopedLint(input: PlanScopedLintInput): Promise<LintSp
     ...(v9 ? ["--no-warn-ignored"] : []),
     ...F,
   ];
-  if (args.reduce((n, a) => n + a.length + 1, 0) > MAX_ARGV_CHARS) return unscoped(`too many inputs for one command line: ${F.length} files`);
+  if (commandLineLength(ctx, r.entry.file, args) > MAX_ARGV_CHARS) return unscoped(`too many inputs for one command line: ${F.length} files`);
   return {
     runner: "eslint",
     file: r.entry.file,
@@ -2201,12 +2355,44 @@ function parseJestJson(ctx: Ctx, spec: ScopedSpec, text: string, code: number): 
   return finishResult(ids, files, collectionError, total, code, undefined, code === 0);
 }
 
+/** A test path by the G.8 JS rule: a .test/.spec file or a file under __tests__. */
+function isJsTestPath(p: string): boolean {
+  return JS_TEST_RE.test(p.split(/[\\/]/).pop() ?? "") || p.split(/[\\/]/).includes("__tests__");
+}
+
+/**
+ * I step 2a (QA-1.3-1): a report that lists no test at all is not trusted when the inputs say
+ * tests must have run: every rerun (inputs are test files), a jest related run given a test file,
+ * and any jest run planned without realpath (jest silently matches nothing when cwd is not the
+ * realpath).
+ */
+function zeroTestsGuard(spec: ScopedSpec, r: RunResult): RunResult {
+  if (r.total !== 0 || !r.complete || r.failingIds.length > 0 || r.collectionError) return r;
+  const note =
+    spec.mode === "rerun"
+      ? "rerun ran no tests although every input is a test file"
+      : spec.runner === "jest" && spec.inputs.some(isJsTestPath)
+        ? "jest ran no tests although a test file was passed"
+        : spec.runner === "jest" && spec.lexicalPaths === true
+          ? "jest ran no tests and the paths were not canonicalized (no realpath seam)"
+          : undefined;
+  return note === undefined ? r : { ...r, complete: false, note };
+}
+
 const XML_ENTITIES: Record<string, string> = { amp: "&", lt: "<", gt: ">", quot: '"', apos: "'" };
 
+/** A code point String.fromCodePoint accepts and XML allows to be a character reference. */
+function isXmlCodePoint(n: number): boolean {
+  return Number.isSafeInteger(n) && ((n >= 0 && n <= 0xd7ff) || (n >= 0xe000 && n <= 0x10ffff));
+}
+
+/** I step 3 (QA-1.3-12): out-of-range numeric references stay literal text instead of throwing. */
 function decodeXml(s: string): string {
-  return s.replace(/&(#x[0-9a-fA-F]+|#\d+|amp|lt|gt|quot|apos);/g, (_m, g: string) =>
-    g.startsWith("#x") ? String.fromCodePoint(Number.parseInt(g.slice(2), 16)) : g.startsWith("#") ? String.fromCodePoint(Number(g.slice(1))) : XML_ENTITIES[g],
-  );
+  return s.replace(/&(#x[0-9a-fA-F]+|#\d+|amp|lt|gt|quot|apos);/g, (m, g: string) => {
+    if (!g.startsWith("#")) return XML_ENTITIES[g];
+    const n = g.startsWith("#x") ? Number.parseInt(g.slice(2), 16) : Number(g.slice(1));
+    return isXmlCodePoint(n) ? String.fromCodePoint(n) : m;
+  });
 }
 
 /** I step 3: pytest junit XML at regex level. undefined = unusable (truncated). */

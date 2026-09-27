@@ -1,5 +1,6 @@
-import { describe, it, expect, vi } from "vitest";
-import { existsSync, readFileSync } from "node:fs";
+import { afterAll, describe, it, expect, vi } from "vitest";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { realpath as fsRealpath } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import {
@@ -29,6 +30,7 @@ import {
   planScopedLint,
   readResult,
   type LintSpec,
+  type PlannerFs,
   type RunnerFs,
   type RunResult,
 } from "../../src/verify/runner";
@@ -738,8 +740,12 @@ describe("planScopedRun: changed-file normalization", () => {
     ]));
   });
 
-  it("everything dropped -> NoAffected", async () => {
-    expect(isNoAffected(await planScopedRun(input({ changedFiles: changed("../x.ts") })))).toBe(true);
+  it("everything dropped -> S6 attribution-unavailable, never NoAffected (QA-1.3-7)", async () => {
+    expectS6(
+      await planScopedRun(input({ changedFiles: changed("../x.ts", "bad\0.ts") })),
+      "attribution-unavailable",
+      "change attribution unavailable: no changed path lies inside the git root",
+    );
   });
 
   it("win32: drive-letter case, separators and other drives", async () => {
@@ -1431,5 +1437,289 @@ describe("planScopedLint", () => {
       names.push(n);
     }
     expectUnscoped(await lint("eslint", changed(...names), lintRepo("9.1.0", {}, extra)), "too many inputs for one command line: 300 files");
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// QA round 1 (docs/qa/verification-resource-budget/phase-1.3.md, QA-1.3-1..15)
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * memFs plus a native-like realpath: `aliases` maps an alias prefix (an 8.3 name, a junction, a
+ * symlink) to its target. Directories exist when a file lies below them. On win32 the realpath
+ * result carries a \\?\ prefix, which the planner must strip.
+ */
+function aliasFs(files: Record<string, string>, win: boolean, aliases: Record<string, string>): PlannerFs {
+  const P = win ? path.win32 : path.posix;
+  const k = (p: string) => (win ? p.toLowerCase() : p);
+  const known = new Map(Object.entries(files).map(([p, c]) => [k(P.normalize(p)), c]));
+  const real = (p: string) => {
+    const q = P.normalize(p);
+    for (const [from, to] of Object.entries(aliases)) {
+      if (k(q) === k(from) || k(q).startsWith(k(from) + P.sep)) return to + q.slice(from.length);
+    }
+    return q;
+  };
+  const exists = (p: string) => known.has(k(p)) || [...known.keys()].some((f) => f.startsWith(k(p) + P.sep));
+  return {
+    fileExists: async (p) => exists(real(p)),
+    readFile: async (p) => {
+      const v = known.get(k(real(p)));
+      if (v === undefined) throw new Error(`ENOENT ${p}`);
+      return v;
+    },
+    realpath: async (p) => {
+      const r = real(p);
+      if (!exists(r)) throw new Error(`ENOENT ${p}`);
+      return win ? `\\\\?\\${r}` : r;
+    },
+  };
+}
+
+function jsonReport(numTotalTests: number): string {
+  return JSON.stringify({ numTotalTests, numRuntimeErrorTestSuites: 0, testResults: [] });
+}
+
+describe("QA-1.3-1: canonical paths through the realpath seam", () => {
+  const REAL = "/real/r";
+  const files = jsRepo({}, { [`${REAL}/src/a.js`]: "", [`${REAL}/test/a.test.js`]: "" }, REAL);
+
+  it("a symlinked or junction cwd plans on the real paths, so jest's realpath'd rootDir matches", async () => {
+    const fs = aliasFs(files, false, { "/link": REAL });
+    const d = (await detectRunner("jest", "/link", fs, POSIX_HOST)) as DetectedRunner;
+    expect(d).toMatchObject({ gitRoot: REAL, runnerCwd: REAL });
+    const s = spec(await planScopedRun(input({ command: "jest", cwd: "/link", fs, changedFiles: changed("/link/src/a.js", "test/a.test.js") })));
+    expect(s).toMatchObject({ cwd: REAL, gitRoot: REAL, inputs: [`${REAL}/src/a.js`, `${REAL}/test/a.test.js`] });
+    expect(s.lexicalPaths).toBeUndefined();
+    expect(s.args.slice(-3)).toEqual(["--", `${REAL}/src/a.js`, `${REAL}/test/a.test.js`]);
+  });
+
+  it("win32 8.3 short names and \\\\?\\ results canonicalize to the long spelling", async () => {
+    const LONG = "C:\\Users\\Marquinho\\p";
+    const w = {
+      [`${LONG}\\.git`]: "",
+      [`${LONG}\\node_modules\\jest\\package.json`]: JEST_PKG,
+      [`${LONG}\\node_modules\\jest\\bin\\jest.js`]: "",
+      [`${LONG}\\src\\a.js`]: "",
+    };
+    const fs = aliasFs(w, true, { "C:\\Users\\MARQUI~1": "C:\\Users\\Marquinho" });
+    const s = spec(await planScopedRun(input({ win: true, command: "jest", cwd: "C:\\Users\\MARQUI~1\\p", fs, changedFiles: changed("src\\a.js") })));
+    expect(s).toMatchObject({ cwd: LONG, gitRoot: LONG, inputs: [`${LONG}\\src\\a.js`] });
+  });
+
+  it("a deleted file keeps its lexical tail below the nearest real ancestor", async () => {
+    const fs = aliasFs(files, false, { "/link": REAL });
+    const search = stubSearch({ gone: [`${REAL}/test/a.test.js`] });
+    const s = spec(await planScopedRun(input({ command: "jest", cwd: "/link", fs, search, changedFiles: changed("/link/src/deep/gone.js") })));
+    expect(s.inputs).toEqual([`${REAL}/test/a.test.js`]);
+  });
+
+  it("a path whose every ancestor is missing stays lexical", async () => {
+    const fs = aliasFs({}, false, {});
+    expectS6(await detectRunner("jest", "/nowhere", fs, POSIX_HOST), "no-git-root", "no git repository at or above /nowhere");
+  });
+
+  it("planRerun canonicalizes cwd and test files", async () => {
+    const fs = aliasFs(files, false, { "/link": REAL });
+    const det = await detect("jest", files, POSIX_HOST, REAL);
+    const r = spec(await planRerun(det, ["/link/test/a.test.js"], "/link", { maxWorkers: 2 }, { fs, host: POSIX_HOST }));
+    expect(r).toMatchObject({ cwd: REAL, gitRoot: REAL, inputs: [`${REAL}/test/a.test.js`] });
+  });
+
+  it("without realpath the spec is marked lexical", async () => {
+    const s = spec(await planScopedRun(input({ command: "jest", files, cwd: REAL, changedFiles: changed("src/a.js") })));
+    expect(s.lexicalPaths).toBe(true);
+    const r = spec(await planRerun(await detect("jest", files, POSIX_HOST, REAL), [`${REAL}/test/a.test.js`], REAL, { maxWorkers: 2 }, { fs: memFs(files), host: POSIX_HOST }));
+    expect(r.lexicalPaths).toBe(true);
+  });
+
+  describe("readResult: a total of 0 is never a vacuous pass", () => {
+    const at = RPT_JSON;
+    const run = (over: Partial<ScopedSpec>, total = 0, code = 0) => read(mkSpec({ runner: "jest", ...over }), { [at]: jsonReport(total) }, code);
+
+    it.each<[string, Partial<ScopedSpec>, string]>([
+      ["rerun", { mode: "rerun", inputs: ["/root/vitest-proj/test/a.test.js"], inputsAreTests: true }, "rerun ran no tests although every input is a test file"],
+      ["rerun (vitest)", { runner: "vitest", mode: "rerun", inputs: ["/root/vitest-proj/test/a.test.js"] }, "rerun ran no tests although every input is a test file"],
+      ["jest related given a test file", { inputs: ["/root/vitest-proj/src/a.js", "/root/vitest-proj/test/a.test.js"] }, "jest ran no tests although a test file was passed"],
+      ["jest related given a __tests__ file", { inputs: ["/root/vitest-proj/src/__tests__/a.js"] }, "jest ran no tests although a test file was passed"],
+      ["jest planned without realpath", { inputs: ["/root/vitest-proj/src/a.js"], lexicalPaths: true }, "jest ran no tests and the paths were not canonicalized (no realpath seam)"],
+    ])("%s -> complete false", async (_name, over, note) => {
+      expect(await run(over)).toMatchObject({ total: 0, complete: false, note });
+    });
+
+    it("jest related over sources only, canonical paths, vitest related: 0 stays a complete result", async () => {
+      expect(await run({ inputs: ["/root/vitest-proj/src/a.js"] })).toMatchObject({ total: 0, complete: true });
+      expect(await run({ runner: "vitest", inputs: ["/root/vitest-proj/test/a.test.js"], lexicalPaths: true })).toMatchObject({ total: 0, complete: true });
+    });
+
+    it("the guard never touches a run with tests, failures or a collection error", async () => {
+      expect(await run({ mode: "rerun" }, 2)).toMatchObject({ total: 2, complete: true });
+      const withError = JSON.stringify({ numTotalTests: 0, numRuntimeErrorTestSuites: 1, testResults: [] });
+      expect(await read(mkSpec({ runner: "jest", mode: "rerun" }), { [at]: withError }, 1)).toMatchObject({ complete: true, collectionError: true });
+      const failed = JSON.stringify({ numTotalTests: 0, testResults: [{ name: "/root/vitest-proj/a.test.js", status: "failed", assertionResults: [] }] });
+      expect(await read(mkSpec({ runner: "jest", mode: "rerun" }), { [at]: failed }, 1)).toMatchObject({ complete: true, failingIds: ["a.test.js"] });
+    });
+
+    it("pytest rerun with exit 5 (nothing collected) is incomplete", async () => {
+      const sp = mkSpec({ runner: "pytest", mode: "rerun", reportPath: RPT_XML, inputs: ["/root/vitest-proj/tests/test_a.py"] });
+      expect(await read(sp, { [RPT_XML]: report("pytest-none.xml", "/root") }, 5)).toMatchObject({ total: 0, complete: false });
+    });
+  });
+
+  describe("real filesystem: a junction (win32) or symlink to the repo", () => {
+    const base = mkdtempSync(path.join(tmpdir(), "omr-qa131-"));
+    afterAll(() => rmSync(base, { recursive: true, force: true }));
+    const repo = path.join(base, "repo");
+    for (const [rel, body] of Object.entries({
+      ".git": "gitdir: elsewhere",
+      "package.json": JSON.stringify({ name: "x", scripts: { test: "jest" } }),
+      "node_modules/jest/package.json": JEST_PKG,
+      "node_modules/jest/bin/jest.js": "",
+      "src/str.js": "",
+    })) {
+      mkdirSync(path.dirname(path.join(repo, rel)), { recursive: true });
+      writeFileSync(path.join(repo, rel), body);
+    }
+    const link = path.join(base, "link");
+    symlinkSync(repo, link, "junction");
+    const realFs: PlannerFs = {
+      fileExists: async (p) => existsSync(p),
+      readFile: async (p) => readFileSync(p, "utf8"),
+      realpath: (p) => fsRealpath(p),
+    };
+
+    it("plans with the native realpath, whatever spelling tmpdir() and the link use", async () => {
+      const canonical = realpathSync.native(repo);
+      const host = { ...POSIX_HOST, platform: process.platform, tmpdir: path.parse(base).root + "omr-no-such-tmp" };
+      const s = spec(
+        await planScopedRun({ command: "npm test", cwd: link, changedFiles: changed(path.join(link, "src", "str.js")), budget: { maxWorkers: 2 }, fs: realFs, search: stubSearch(), host }),
+      );
+      expect(s.cwd).toBe(canonical);
+      expect(s.gitRoot).toBe(canonical);
+      expect(s.inputs).toEqual([path.join(canonical, "src", "str.js")]);
+      expect(s.lexicalPaths).toBeUndefined();
+    });
+  });
+});
+
+describe("QA-1.3-7: win32 path spellings and fully dropped change sets", () => {
+  const W = {
+    "C:\\repo\\.git": "",
+    "C:\\repo\\node_modules\\vitest\\package.json": VITEST_PKG,
+    "C:\\repo\\node_modules\\vitest\\vitest.mjs": "",
+    "C:\\repo\\src\\a.ts": "",
+  };
+
+  it.each(["\\\\?\\C:\\repo\\vitest.config.mjs", "\\\\.\\C:\\repo\\vitest.config.mjs", "//?/C:/repo/vitest.config.mjs"])("%s is a config trigger", async (p) => {
+    expectS6(await planScopedRun(input({ win: true, files: W, cwd: "C:\\repo", changedFiles: changed(p) })), "config-changed", "config file changed: vitest.config.mjs");
+  });
+
+  it("\\\\?\\UNC\\ becomes \\\\server\\share", async () => {
+    const u = { "\\\\srv\\share\\repo\\.git": "", "\\\\srv\\share\\repo\\conftest.py": "" };
+    const r = await planScopedRun(input({ win: true, command: "pytest", files: u, cwd: "\\\\srv\\share\\repo", changedFiles: changed("\\\\?\\UNC\\srv\\share\\repo\\conftest.py") }));
+    expectS6(r, "config-changed", "config file changed: conftest.py");
+  });
+
+  it("a symlink named like a trigger is a trigger even when its target is not", async () => {
+    const fs = aliasFs(jsRepo({}, { "/r/cfg/base.ts": "" }), false, { "/r/vitest.config.ts": "/r/cfg/base.ts" });
+    expectS6(await planScopedRun(input({ fs, changedFiles: changed("vitest.config.ts") })), "config-changed", "config file changed: cfg/base.ts");
+  });
+
+  it("the prefix is only stripped on win32", async () => {
+    const r = await planScopedRun(input({ changedFiles: changed("//?/r/vitest.config.ts") }));
+    expectS6(r, "attribution-unavailable");
+  });
+
+  it("static scoping and lint: every path outside -> S6 / Unscoped", async () => {
+    const { search: _s, ...rest } = input({ changedFiles: changed("/elsewhere/a.ts") });
+    expectS6(await planStaticScoping(rest), "attribution-unavailable", "change attribution unavailable: no changed path lies inside the git root");
+    expectUnscoped(await lint("eslint", changed("/elsewhere/a.ts")), "change attribution unavailable: no changed path lies inside the git root");
+  });
+});
+
+describe("QA-1.3-11: the tmpdir must be absolute and outside the repo", () => {
+  const files = jsRepo({}, { "/r/src/a.ts": "", "/r/test/a.test.ts": "", "/r/tmp/keep": "" });
+
+  it("a relative tmpdir -> S6 tmpdir-in-repo (scoped, static, rerun)", async () => {
+    const host = { ...POSIX_HOST, tmpdir: "tmp" };
+    const why = "temp dir is not an absolute path: tmp";
+    expectS6(await planScopedRun(input({ files, host, changedFiles: changed("src/a.ts") })), "tmpdir-in-repo", why);
+    const { search: _s, ...rest } = input({ files, host, changedFiles: changed("src/a.ts") });
+    expectS6(await planStaticScoping(rest), "tmpdir-in-repo", why);
+    expectS6(await planRerun(await detect("vitest", files), ["/r/test/a.test.ts"], "/r", { maxWorkers: 2 }, { fs: memFs(files), host }), "tmpdir-in-repo", why);
+  });
+
+  it("a tmpdir that is a link into the repo -> S6", async () => {
+    const fs = aliasFs(files, false, { "/tmpx": "/r/tmp" });
+    const host = { ...POSIX_HOST, tmpdir: "/tmpx" };
+    expectS6(await planScopedRun(input({ fs, host, changedFiles: changed("src/a.ts") })), "tmpdir-in-repo", "temp dir is inside the repository: /tmpx");
+  });
+
+  it("readResult never touches a report when the tmpdir or the report path is relative", async () => {
+    for (const [tmp, rp] of [["tmp", `tmp/omr-verify-${UUID}.json`], ["/tmp", `omr-verify-${UUID}.json`]]) {
+      const fs = resultFs({ [rp]: jsonReport(1) });
+      const r = await readResult(mkSpec({ reportPath: rp }), exec(0), fs, { ...POSIX_HOST, tmpdir: tmp });
+      expect(r).toMatchObject({ source: "text", complete: false, note: `report path rejected: ${rp}` });
+      expect(fs.reads).toEqual([]);
+      expect(fs.unlinked).toEqual([]);
+    }
+  });
+});
+
+describe("QA-1.3-12: malformed junit never rejects", () => {
+  const pspec = () => mkSpec({ runner: "pytest", reportPath: RPT_XML, cwd: "/root/p", gitRoot: "/root", inputs: ["/root/p/tests/test_math.py"], inputsAreTests: true });
+  const xml = (name: string) =>
+    `<?xml version="1.0"?><testsuites><testsuite><testcase classname="tests.test_math" name="${name}"><failure/></testcase></testsuite></testsuites>`;
+
+  it.each([
+    ["&#x110000;", "&#x110000;"],
+    ["&#1114112;", "&#1114112;"],
+    ["&#xD800;", "&#xD800;"],
+    ["&#99999999999999999999999;", "&#99999999999999999999999;"],
+    ["&#x10FFFF;&#xE000;&#55295;", "\u{10FFFF}\uE000\uD7FF"],
+  ])("%s decodes to %j", async (raw, decoded) => {
+    const r = await read(pspec(), { [RPT_XML]: xml(`t[${raw}]`) }, 1);
+    expect(r.failingIds).toEqual([`tests/test_math.py::t[${decoded}]`]);
+    expect(r.source).toBe("report");
+  });
+
+  it("a parser exception falls back to text and still deletes the report", async () => {
+    const base = mkSpec();
+    const hostile: ScopedSpec = {
+      ...base,
+      get cwd(): string {
+        throw new Error("boom");
+      },
+    };
+    const fs = resultFs({ [RPT_JSON]: report("vitest-fail.json", "/root") });
+    const r = await readResult(hostile, exec(1), fs, POSIX_HOST);
+    expect(r).toMatchObject({ source: "text", complete: false, collectionError: true, note: "report could not be parsed: boom" });
+    expect(fs.unlinked).toEqual([RPT_JSON]);
+    const odd = { ...base, get cwd(): string { throw "str"; } };
+    expect((await readResult(odd, exec(1), resultFs({ [RPT_JSON]: report("vitest-fail.json", "/root") }), POSIX_HOST)).note).toBe("report could not be parsed: str");
+  });
+});
+
+describe("QA-1.3-14: argv length counts win32 quoting and the program path", () => {
+  const W = (extra: Record<string, string>) => ({
+    "C:\\repo\\.git": "",
+    "C:\\repo\\node_modules\\vitest\\package.json": VITEST_PKG,
+    "C:\\repo\\node_modules\\vitest\\vitest.mjs": "",
+    ...extra,
+  });
+
+  it("paths with spaces that fit unquoted but not quoted -> S6", async () => {
+    const names = Array.from({ length: 296 }, (_, i) => `src\\${String(i).padStart(3, "0")} ${"x".repeat(80)}.ts`);
+    const files = W(Object.fromEntries(names.map((n) => [`C:\\repo\\${n}`, ""])));
+    const plain = names.reduce((n, f) => n + `C:\\repo\\${f}`.length + 1, 0);
+    expect(plain).toBeLessThan(30000 - 300);
+    expectS6(await planScopedRun(input({ win: true, files, cwd: "C:\\repo", changedFiles: changed(...names) })), "argv-too-long", "too many inputs for one command line: 296 files");
+  });
+
+  it("quotes, trailing backslashes and empty arguments are counted without failing a normal plan", async () => {
+    const files = W({ 'C:\\repo\\src\\q"u o.ts': "" });
+    const s = spec(await planScopedRun(input({ win: true, files, cwd: "C:\\repo", command: `vitest -t "" --dir 'C:\\a b\\'`, changedFiles: changed('src\\q"u o.ts') })));
+    expect(s.args).toContain('C:\\repo\\src\\q"u o.ts');
+    expect(s.args).toContain("C:\\a b\\");
   });
 });
