@@ -67,7 +67,7 @@ function run(file: string, args: string[], shell: boolean, opts: RunOptions): Pr
     try {
       child = spawn(file, args, {
         cwd: opts.cwd,
-        env: opts.env ? { ...process.env, ...opts.env } : process.env,
+        env: mergeEnv(opts.env),
         shell,
         windowsHide: true,
         // Its own process group on POSIX, so the whole tree can be signalled at once.
@@ -124,6 +124,25 @@ function run(file: string, args: string[], shell: boolean, opts: RunOptions): Pr
     child.on("error", (err) => finish(1, err));
     child.on("close", (code) => finish(code));
   });
+}
+
+/**
+ * Overrides merged over process.env. Windows environment names are
+ * case-insensitive and Node keeps only one of two keys that differ in case
+ * (the first in sort order, not the override), so an inherited key that
+ * matches an override case-insensitively is dropped first.
+ */
+function mergeEnv(overrides: Record<string, string> | undefined): NodeJS.ProcessEnv {
+  if (!overrides) return process.env;
+  const env: NodeJS.ProcessEnv = { ...process.env };
+  for (const [key, value] of Object.entries(overrides)) {
+    if (isWin) {
+      const upper = key.toUpperCase();
+      for (const existing of Object.keys(env)) if (existing.toUpperCase() === upper) delete env[existing];
+    }
+    env[key] = value;
+  }
+  return env;
 }
 
 function killTree(child: ChildProcess): void {

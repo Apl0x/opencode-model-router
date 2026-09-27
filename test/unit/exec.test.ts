@@ -88,7 +88,8 @@ function scratch(): string {
 /** OS scheduling priority of a live process: Windows base priority (normal = 8) or POSIX niceness. */
 function priorityOf(pid: number): number {
   if (isWin) {
-    return Number(execFileSync("pwsh", ["-NoProfile", "-c", `(Get-CimInstance Win32_Process -Filter "ProcessId=${pid}").Priority`], { timeout: 30000 }).toString().trim());
+    // Windows PowerShell 5.1 is always installed; pwsh 7 is not (QA-1.2-11).
+    return Number(execFileSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", `(Get-CimInstance Win32_Process -Filter 'ProcessId=${pid}').Priority`], { timeout: 30000, windowsHide: true }).toString().trim());
   }
   return Number(execFileSync("ps", ["-o", "ni=", "-p", String(pid)]).toString().trim());
 }
@@ -140,6 +141,14 @@ describe("runArgv", () => {
       cwd: tmpdir(), timeoutMs: 20000, env: { OMR_EXEC_X: "yes" },
     });
     expect(JSON.parse(r.stdout)).toEqual({ x: "yes", path: true });
+  }, 20000);
+
+  it.runIf(isWin)("lets an env override win whatever the case of the inherited key (Windows-only: its environment names are case-insensitive)", async () => {
+    const probe = "const keys = Object.keys(process.env).map(k => k.toUpperCase());"
+      + "process.stdout.write(JSON.stringify({ path: process.env.PATH, temp: process.env.TEMP, paths: keys.filter(k => k === 'PATH').length, temps: keys.filter(k => k === 'TEMP').length }))";
+    const r = await runArgv(process.execPath, ["-e", probe], { cwd: tmpdir(), timeoutMs: 20000, env: { path: "OMR-X", Temp: "C:\\omr-temp-override" } });
+    expect(r.code).toBe(0);
+    expect(JSON.parse(r.stdout)).toEqual({ path: "OMR-X", temp: "C:\\omr-temp-override", paths: 1, temps: 1 });
   }, 20000);
 
   it("truncates output over maxBuffer without hanging", async () => {
