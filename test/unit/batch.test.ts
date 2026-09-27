@@ -1,8 +1,12 @@
-import { describe, expect, it, vi } from "vitest";
+import { posix } from "node:path";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  BATCH_REASONS,
+  BATCH_STALE_GRACE_MS,
   argvTemplate,
   attributeUnion,
   batchKey,
+  createBatchCoordinator,
   createBatchDeadline,
   deriveSharedRecheck,
   envSignature,
@@ -12,9 +16,18 @@ import {
   taintUnreproduced,
   unionChangedFiles,
 } from "../../src/verify/batch";
+import type { BatchPlanInput, BatchPlanner, BatchRuntime } from "../../src/verify/batch";
 import type { DispatchReference } from "../../src/verify/reference";
-import type { RunResult, ScopedSpec } from "../../src/verify/runner";
-import type { Deadline, RecheckOutcome } from "../../src/verify/types";
+import type { RunResult, RunnerKind, ScopedSpec, ScopingPlan } from "../../src/verify/runner";
+import type {
+  Deadline,
+  OpenVerificationScope,
+  RecheckOutcome,
+  ScopedOutcome,
+  TestsPassHook,
+  TestsPassRequest,
+  TestsPassRun,
+} from "../../src/verify/types";
 
 const REPORT = "/tmp/omr-verify-00000000-0000-0000-0000-000000000000.json";
 
@@ -544,5 +557,790 @@ describe("createBatchDeadline", () => {
     const d = createBatchDeadline([a]);
     expect(d.signal.aborted).toBe(true);
     expect(a.listeners.size).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// createBatchCoordinator: fakes (fake timers; a model repository behind fake planner and scope seams)
+// ---------------------------------------------------------------------------------------------
+
+const WINDOW = 100;
+const ROOT = "/r";
+
+interface TestDeadline extends Deadline {
+  abort(): void;
+}
+
+/** A gate deadline on the (fake) clock. It has no timer: the owner aborts it, as withTimeout does. */
+function liveDeadline(budgetMs = 60_000): TestDeadline {
+  const ctl = new AbortController();
+  const start = Date.now();
+  const remaining = () => (ctl.signal.aborted ? 0 : Math.max(0, budgetMs - (Date.now() - start)));
+  return { budgetMs, remaining, bound: (ms) => Math.min(ms, remaining()), signal: ctl.signal, abort: () => ctl.abort() };
+}
+
+const REF: DispatchReference = {
+  root: ROOT,
+  head: "h1",
+  commit: "c1",
+  untracked: new Map(),
+  tracked: new Map(),
+  captureReasons: [],
+  capturedAt: 0,
+};
+
+interface TestRequest extends TestsPassRequest {
+  readonly deadline: TestDeadline;
+}
+
+function req(files: readonly string[], over: Partial<TestRequest> = {}): TestRequest {
+  return {
+    command: "npx vitest run",
+    cwd: ROOT,
+    testScope: "affected",
+    changedFiles: files.map((path) => ({ path, status: "M" })),
+    reference: { kind: "captured", reference: REF },
+    deadline: liveDeadline(),
+    ...over,
+  };
+}
+
+/** The model repository: which test files relate to which source, and what fails now and at the reference. */
+interface Model {
+  /** Source key (cwd-relative) -> its related test files. A test file relates to itself. */
+  readonly related?: Readonly<Record<string, readonly string[]>>;
+  /** Test file -> its number of tests (default 2). */
+  readonly tests?: Readonly<Record<string, number>>;
+  /** Test file -> the names failing in the live tree. */
+  readonly failing?: Readonly<Record<string, readonly string[]>>;
+  /** Test file -> the names failing at the reference; a file missing here is absent there. */
+  readonly atRef?: Readonly<Record<string, readonly string[]>>;
+  /** false: reports carry no per-file counts (P1 absent). */
+  readonly counts?: boolean;
+}
+
+const MODEL: Model = {
+  related: Object.fromEntries([..."abcdefgh"].map((x) => [`src/${x}.ts`, [`test/${x}.test.ts`]])),
+};
+
+const isTestKey = (k: string) => /\.test\.ts$|(^|\/)test_[^/]*\.py$/.test(k);
+const idOf = (runner: RunnerKind, file: string, name: string) => (runner === "pytest" ? `${file}::${name}` : `${file} > ${name}`);
+const keyOfId = (id: string) => id.split(/ > |::/)[0] ?? id;
+
+/** readResult over the model, with its zero-test guard and per-file counts. */
+function runModel(model: Model, spec: ScopedSpec): RunResult {
+  const files = new Set<string>();
+  for (const abs of spec.inputs) {
+    const k = posix.relative(spec.cwd, abs);
+    if (spec.inputsAreTests || isTestKey(k)) files.add(k);
+    for (const t of model.related?.[k] ?? []) files.add(t);
+  }
+  const keys = [...files].sort();
+  const failingIds = keys.flatMap((k) => (model.failing?.[k] ?? []).map((n) => idOf(spec.runner, k, n))).sort();
+  const failingFiles = [...new Set(failingIds.map(keyOfId))].map((k) => posix.join(spec.cwd, k)).sort();
+  const testsByFile: Record<string, number> = Object.fromEntries(keys.map((k) => [k, model.tests?.[k] ?? 2]));
+  const total = keys.reduce((n, k) => n + (testsByFile[k] ?? 0), 0);
+  const guard = total === 0 && (spec.inputsAreTests || spec.inputs.some((f) => isTestKey(posix.relative(spec.cwd, f))));
+  return {
+    failingIds,
+    failingFiles,
+    collectionError: false,
+    total,
+    complete: !guard,
+    source: "report",
+    ...(guard ? { note: `${spec.runner} ran no tests although a test file was passed` } : {}),
+    ...(model.counts === false ? {} : { testsByFile }),
+  };
+}
+
+function ranModel(model: Model, spec: ScopedSpec): ScopedOutcome {
+  const result = runModel(model, spec);
+  return { kind: "ran", result, exitCode: result.failingIds.length > 0 ? 1 : 0, spec, notes: spec.notes };
+}
+
+/** 2.1's Rechecker over the model: pytest is runner-unsupported; vitest reruns the files present at the reference. */
+function recheckModel(model: Model, command: string, cwd: string, files: readonly string[]): RecheckOutcome {
+  if (command.split(" ").includes("pytest")) return { kind: "unusable", cause: "runner-unsupported", reason: "pytest imports the live tree" };
+  const keys = [...new Set(files.map((f) => posix.relative(cwd, f)))].sort();
+  const ranFiles = keys.filter((k) => model.atRef?.[k] !== undefined);
+  const absentFiles = keys.filter((k) => model.atRef?.[k] === undefined);
+  if (ranFiles.length === 0) return { kind: "exact", result: undefined, ranFiles, absentFiles, notes: [] };
+  const failingIds = ranFiles.flatMap((k) => (model.atRef?.[k] ?? []).map((n) => idOf("vitest", k, n))).sort();
+  const testsByFile: Record<string, number> = Object.fromEntries(ranFiles.map((k) => [k, model.tests?.[k] ?? 2]));
+  const result: RunResult = {
+    failingIds,
+    failingFiles: [...new Set(failingIds.map(keyOfId))].map((k) => `/tmp/omr-ref/${k}`),
+    collectionError: false,
+    total: ranFiles.reduce((n, k) => n + (testsByFile[k] ?? 0), 0),
+    complete: true,
+    source: "report",
+    ...(model.counts === false ? {} : { testsByFile }),
+  };
+  return { kind: "exact", result, ranFiles, absentFiles, notes: ["rechecked at the reference"] };
+}
+
+/** planScopedRun over the model. The command's words after the subcommand are kept options (B3). */
+function planModel(input: BatchPlanInput, report = 0, argvCap = Number.POSITIVE_INFINITY): ScopingPlan {
+  if (input.changedFiles === "unavailable") return { unverifiable: true, code: "attribution-unavailable", reason: "no change attribution" };
+  const inputs = [...new Set(input.changedFiles.map((c) => posix.resolve(input.cwd, c.path)))].sort();
+  if (inputs.length === 0) return { noAffected: true, note: "no affected tests" };
+  if (inputs.some((f) => f.includes("untestable"))) return { unverifiable: true, code: "config-changed", reason: "a config file changed" };
+  if (inputs.length > argvCap) return { unverifiable: true, code: "argv-too-long", reason: "argv too long" };
+  const words = input.command.split(" ");
+  const runner: RunnerKind = words.includes("pytest") ? "pytest" : words.includes("jest") ? "jest" : "vitest";
+  const reportPath = `/tmp/omr-report-${report}.${runner === "pytest" ? "xml" : "json"}`;
+  const entry = `${input.cwd}/node_modules/${runner}/bin.js`;
+  const options = words.slice(runner === "vitest" ? 3 : 2);
+  return {
+    runner,
+    mode: "related",
+    file: runner === "pytest" ? "/usr/bin/pytest" : "/usr/bin/node",
+    args:
+      runner === "pytest"
+        ? [`--junitxml=${reportPath}`, ...options, ...inputs]
+        : [entry, "related", "--run", ...options, `--outputFile=${reportPath}`, ...inputs],
+    cwd: input.cwd,
+    env: { CI: "1" },
+    reportPath,
+    gitRoot: input.cwd,
+    entry,
+    inputs,
+    inputsAreTests: runner === "pytest",
+    workers: runner === "pytest" ? null : 2,
+    notes: [`planned ${inputs.length} input(s)`],
+  };
+}
+
+interface Calls {
+  readonly events: string[];
+  readonly plans: BatchPlanInput[];
+  readonly planned: ScopingPlan[];
+  readonly opens: { readonly cwd: string; readonly command: string }[];
+  readonly executes: { readonly scope: number; readonly spec: ScopedSpec; readonly deadline: Deadline; readonly at: number }[];
+  readonly rechecks: {
+    readonly scope: number;
+    readonly command: string;
+    readonly reference: DispatchReference;
+    readonly files: readonly string[];
+    readonly deadline: Deadline;
+  }[];
+  readonly closes: number[];
+  readonly direct: TestsPassRequest[];
+}
+
+interface HarnessOptions {
+  /** Replaces the model run; `n` is the index of the execute call. */
+  readonly execute?: (spec: ScopedSpec, deadline: Deadline, n: number) => ScopedOutcome | Promise<ScopedOutcome>;
+  /** Replaces the model recheck; `n` is the index of the recheck call. */
+  readonly rechecker?: (
+    reference: DispatchReference,
+    files: readonly string[],
+    deadline: Deadline,
+    n: number,
+  ) => RecheckOutcome | Promise<RecheckOutcome>;
+  readonly plan?: BatchPlanner;
+  readonly argvCap?: number;
+  readonly runtime?: Partial<BatchRuntime>;
+}
+
+/** The runtime seams, each counting its calls. A scope throws when used after its close. */
+function harness(model: Model = MODEL, o: HarnessOptions = {}) {
+  const calls: Calls = { events: [], plans: [], planned: [], opens: [], executes: [], rechecks: [], closes: [], direct: [] };
+  let reports = 0;
+  const plan: BatchPlanner = async (input, deadline) => {
+    calls.plans.push(input);
+    const out = o.plan !== undefined ? await o.plan(input, deadline) : planModel(input, reports++, o.argvCap);
+    calls.planned.push(out);
+    return out;
+  };
+  const openScope: OpenVerificationScope = (meta) => {
+    const id = calls.opens.length;
+    calls.opens.push(meta);
+    calls.events.push(`open ${id}`);
+    let closed = false;
+    const use = (what: string) => {
+      if (closed) throw new Error(`${what} after close`);
+      calls.events.push(`${what} ${id}`);
+    };
+    return {
+      execute: async (spec, deadline) => {
+        use("execute");
+        const n = calls.executes.push({ scope: id, spec, deadline, at: Date.now() }) - 1;
+        if (deadline.signal.aborted) return { kind: "aborted", reason: "aborted before the spawn" };
+        return o.execute !== undefined ? o.execute(spec, deadline, n) : ranModel(model, spec);
+      },
+      rechecker: (command, cwd) => async (reference, files, deadline) => {
+        use("recheck");
+        const n = calls.rechecks.push({ scope: id, command, reference, files, deadline }) - 1;
+        return o.rechecker !== undefined ? o.rechecker(reference, files, deadline, n) : recheckModel(model, command, cwd, files);
+      },
+      close: async () => {
+        if (closed) return;
+        closed = true;
+        calls.closes.push(id);
+        calls.events.push(`close ${id}`);
+      },
+    };
+  };
+  const direct: TestsPassHook = async (request) => {
+    calls.direct.push(request);
+    return { scoped: { kind: "no-affected", note: "direct" }, recheck: undefined };
+  };
+  const runtime: BatchRuntime = { direct, plan, openScope, batchWindowMs: WINDOW, recheckMinRemainingMs: 1_000, ...o.runtime };
+  return { calls, runtime };
+}
+
+function deferred<T>() {
+  let resolve: (value: T) => void = () => undefined;
+  const promise = new Promise<T>((r) => {
+    resolve = r;
+  });
+  return { promise, resolve };
+}
+
+/** An executor that runs until its signal aborts, as a killed tree reports. */
+function untilAborted(_spec: ScopedSpec, deadline: Deadline): Promise<ScopedOutcome> {
+  return new Promise((resolve) => {
+    deadline.signal.addEventListener("abort", () => resolve({ kind: "aborted", reason: "tree killed" }), { once: true });
+  });
+}
+
+const flush = () => vi.advanceTimersByTimeAsync(0);
+const at = (k: string, cwd = ROOT) => posix.join(cwd, k);
+const aborted = (reason: string): TestsPassRun => ({ scoped: { kind: "aborted", reason }, recheck: undefined });
+
+function ran(run: TestsPassRun): Extract<ScopedOutcome, { kind: "ran" }> {
+  if (run.scoped.kind !== "ran") throw new Error(`expected a ran outcome, got ${JSON.stringify(run.scoped)}`);
+  return run.scoped;
+}
+
+// ---------------------------------------------------------------------------------------------
+// createBatchCoordinator: B2 bypasses, B4 windows, B5 union run, B9 deadlines, B11 disposal
+// ---------------------------------------------------------------------------------------------
+
+describe("createBatchCoordinator: windows and the union run", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("five requests in one window: exactly one union run under one scope, five outcomes", async () => {
+    const { calls, runtime } = harness();
+    const c = createBatchCoordinator({ platform: "linux" });
+    const hook = c.hook(runtime);
+    const names = [..."abcde"];
+    const outs = names.map((x) => hook(req([`src/${x}.ts`])));
+    await flush();
+    expect(c.stats()).toMatchObject({ openWindows: 1, pendingRequests: 5, runningBatches: 0 });
+    expect(calls.executes).toHaveLength(0);
+
+    await vi.advanceTimersByTimeAsync(WINDOW);
+    const runs = await Promise.all(outs);
+    expect(calls.opens).toEqual([{ cwd: ROOT, command: "npx vitest run" }]);
+    expect(calls.executes).toHaveLength(1);
+    expect(calls.executes[0]?.spec.inputs).toEqual(names.map((x) => at(`src/${x}.ts`)));
+    runs.forEach((run, i) => {
+      expect(run.recheck).toBeUndefined();
+      const s = ran(run);
+      expect(s).toMatchObject({ exitCode: 0, result: { failingIds: [], complete: true, total: 10 } });
+      expect(s.spec?.inputs).toEqual([at(`src/${names[i]}.ts`)]);
+      expect(s.notes).toEqual(["planned 1 input(s)", "batched: 1 run for 5 requests"]);
+    });
+    expect(c.stats()).toEqual({
+      openWindows: 0,
+      runningBatches: 0,
+      pendingRequests: 0,
+      unionRuns: 1,
+      ownRuns: 0,
+      rechecks: 0,
+      splits: 0,
+      taints: 0,
+    });
+    await c.dispose();
+    expect(calls.closes).toEqual([0]);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("different roots, runners or kept options form separate batches, each with its own scope", async () => {
+    const { calls, runtime } = harness();
+    const c = createBatchCoordinator({ platform: "linux" });
+    const hook = c.hook(runtime);
+    const outs = [
+      hook(req(["src/a.ts"])),
+      hook(req(["src/b.ts"])),
+      hook(req(["src/a.ts"], { cwd: "/s" })),
+      hook(req(["src/a.ts"], { command: "npx jest" })),
+      hook(req(["src/c.ts"], { command: "npx vitest run -t smoke" })),
+    ];
+    await vi.advanceTimersByTimeAsync(WINDOW);
+    const runs = await Promise.all(outs);
+    expect(runs.map((r) => r.scoped.kind)).toEqual(["ran", "ran", "ran", "ran", "ran"]);
+    expect(calls.opens).toHaveLength(4);
+    const batches = calls.executes.map((e) => JSON.stringify([e.spec.runner, e.spec.cwd, e.spec.args.includes("smoke"), e.spec.inputs.length]));
+    expect(batches.sort()).toEqual(
+      [
+        ["jest", ROOT, false, 1],
+        ["vitest", "/s", false, 1],
+        ["vitest", ROOT, false, 2],
+        ["vitest", ROOT, true, 1],
+      ]
+        .map((x) => JSON.stringify(x))
+        .sort(),
+    );
+    expect(new Set(calls.executes.map((e) => e.scope)).size).toBe(4);
+    expect(c.stats()).toMatchObject({ unionRuns: 1, ownRuns: 3 });
+    await c.dispose();
+  });
+
+  it("batchWindowMs <= 0 and testScope full use runtime.direct", async () => {
+    const { calls, runtime } = harness(MODEL, { runtime: { batchWindowMs: 0 } });
+    const c = createBatchCoordinator({ platform: "linux" });
+    const direct = { scoped: { kind: "no-affected", note: "direct" }, recheck: undefined };
+    expect(await c.hook(runtime)(req(["src/a.ts"]))).toEqual(direct);
+    expect(await c.hook({ ...runtime, batchWindowMs: -1 })(req(["src/b.ts"]))).toEqual(direct);
+    expect(await c.hook({ ...runtime, batchWindowMs: Number.NaN })(req(["src/b.ts"]))).toEqual(direct);
+    expect(await c.hook({ ...runtime, batchWindowMs: WINDOW })(req(["src/c.ts"], { testScope: "full" }))).toEqual(direct);
+    expect(calls.direct).toHaveLength(4);
+    expect(calls.plans).toHaveLength(0);
+    expect(calls.opens).toHaveLength(0);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("planning outcomes and an exhausted deadline settle at once, without a window or the slot", async () => {
+    const late = req(["src/b.ts"]);
+    const { calls, runtime } = harness(MODEL, {
+      plan: async (input) => {
+        if (input.changedFiles !== "unavailable" && input.changedFiles.some((f) => f.path === "src/b.ts")) late.deadline.abort();
+        return planModel(input);
+      },
+    });
+    const c = createBatchCoordinator({ platform: "linux" });
+    const hook = c.hook(runtime);
+    expect(await hook(req([]))).toEqual({ scoped: { kind: "no-affected", note: "no affected tests" }, recheck: undefined });
+    expect(await hook(req(["vitest.untestable.ts"]))).toEqual({
+      scoped: { kind: "unverifiable", code: "config-changed", reason: "a config file changed" },
+      recheck: undefined,
+    });
+    expect(await hook(req(["src/a.ts"], { changedFiles: "unavailable" }))).toMatchObject({
+      scoped: { kind: "unverifiable", code: "attribution-unavailable" },
+    });
+    const gone = req(["src/a.ts"]);
+    gone.deadline.abort();
+    expect(await hook(gone)).toEqual(aborted(BATCH_REASONS.beforeRun));
+    expect(await hook(late)).toEqual(aborted(BATCH_REASONS.beforeRun));
+    expect(calls.plans).toHaveLength(4);
+    expect(calls.opens).toHaveLength(0);
+    expect(c.stats()).toMatchObject({ openWindows: 0, pendingRequests: 0 });
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("an arrival during a running batch joins the next window, never the running union", async () => {
+    const gate = deferred<void>();
+    const { calls, runtime } = harness(MODEL, {
+      execute: async (spec, _d, n) => {
+        if (n === 0) await gate.promise;
+        return ranModel(MODEL, spec);
+      },
+    });
+    const c = createBatchCoordinator({ platform: "linux" });
+    const hook = c.hook(runtime);
+    const first = [hook(req(["src/a.ts"])), hook(req(["src/b.ts"]))];
+    await vi.advanceTimersByTimeAsync(WINDOW);
+    expect(calls.executes).toHaveLength(1);
+
+    const late = hook(req(["src/c.ts"]));
+    await flush();
+    expect(c.stats()).toMatchObject({ openWindows: 1, runningBatches: 1, pendingRequests: 3 });
+    await vi.advanceTimersByTimeAsync(WINDOW);
+    expect(ran(await late).spec?.inputs).toEqual([at("src/c.ts")]);
+    expect(calls.executes.map((e) => [e.scope, e.spec.inputs])).toEqual([
+      [0, [at("src/a.ts"), at("src/b.ts")]],
+      [1, [at("src/c.ts")]],
+    ]);
+
+    gate.resolve();
+    expect((await Promise.all(first)).map((r) => ran(r).exitCode)).toEqual([0, 0]);
+    await c.dispose();
+    expect([...calls.closes].sort()).toEqual([0, 1]);
+  });
+
+  it("the maximum size closes a window early, and so does a joiner that could not outlive the wait (W2, W3)", async () => {
+    const { calls, runtime } = harness();
+    const c = createBatchCoordinator({ platform: "linux", maxBatchSize: 3 });
+    const hook = c.hook(runtime);
+    const outs = [..."abcd"].map((x) => hook(req([`src/${x}.ts`])));
+    await flush();
+    expect(calls.executes.map((e) => e.spec.inputs.length)).toEqual([3]);
+    expect(c.stats().openWindows).toBe(1);
+    await Promise.all(outs.slice(0, 3));
+    await vi.advanceTimersByTimeAsync(WINDOW);
+    await outs[3];
+    expect(calls.executes.map((e) => e.spec.inputs.length)).toEqual([3, 1]);
+
+    // W3: 60 ms left in the window, and a joiner with exactly 60 ms left.
+    const w3 = harness();
+    const c3 = createBatchCoordinator({ platform: "linux" });
+    const hook3 = c3.hook(w3.runtime);
+    const long = hook3(req(["src/a.ts"]));
+    await vi.advanceTimersByTimeAsync(40);
+    const short = hook3(req(["src/b.ts"], { deadline: liveDeadline(60) }));
+    await flush();
+    expect(w3.calls.executes.map((e) => e.spec.inputs)).toEqual([[at("src/a.ts"), at("src/b.ts")]]);
+    expect(vi.getTimerCount()).toBe(0);
+    await Promise.all([long, short]);
+    await Promise.all([c.dispose(), c3.dispose()]);
+  });
+
+  it("a maximum size that is not a safe integer >= 1 means no batching", async () => {
+    for (const maxBatchSize of [0, 1.5, Number.NaN]) {
+      const { calls, runtime } = harness();
+      const c = createBatchCoordinator({ platform: "linux", maxBatchSize });
+      const hook = c.hook(runtime);
+      await Promise.all([hook(req(["src/a.ts"])), hook(req(["src/b.ts"]))]);
+      expect(calls.opens).toHaveLength(2);
+      expect(calls.executes.map((e) => e.spec.inputs.length)).toEqual([1, 1]);
+      expect(vi.getTimerCount()).toBe(0);
+      await c.dispose();
+    }
+  });
+
+  it("an abort while waiting in the window settles at once; a window left empty clears its timer", async () => {
+    const { calls, runtime } = harness();
+    const c = createBatchCoordinator({ platform: "linux" });
+    const hook = c.hook(runtime);
+    const a = req(["src/a.ts"]);
+    const pa = hook(a);
+    const pb = hook(req(["src/b.ts"]));
+    await flush();
+    a.deadline.abort();
+    expect(await pa).toEqual(aborted(BATCH_REASONS.window));
+    expect(c.stats().pendingRequests).toBe(1);
+    await vi.advanceTimersByTimeAsync(WINDOW);
+    expect(ran(await pb).exitCode).toBe(0);
+    expect(calls.executes.map((e) => e.spec.inputs)).toEqual([[at("src/b.ts")]]);
+
+    const x = req(["src/c.ts"]);
+    const px = hook(x);
+    await flush();
+    expect(vi.getTimerCount()).toBe(1);
+    x.deadline.abort();
+    expect(await px).toEqual(aborted(BATCH_REASONS.window));
+    expect(vi.getTimerCount()).toBe(0);
+    expect(c.stats()).toMatchObject({ openWindows: 0, pendingRequests: 0 });
+    await c.dispose();
+  });
+
+  it("a requester whose deadline expires mid-batch gets aborted labelled with the phase; the batch continues", async () => {
+    const gate = deferred<void>();
+    const { calls, runtime } = harness(MODEL, {
+      execute: async (spec) => {
+        await gate.promise;
+        return ranModel(MODEL, spec);
+      },
+    });
+    const c = createBatchCoordinator({ platform: "linux" });
+    const hook = c.hook(runtime);
+    const a = req(["src/a.ts"], { deadline: liveDeadline(1_000) });
+    const b = req(["src/b.ts"], { deadline: liveDeadline(9_000) });
+    const pa = hook(a);
+    const pb = hook(b);
+    await vi.advanceTimersByTimeAsync(WINDOW);
+    const union = calls.executes[0];
+    expect(union?.deadline.remaining()).toBe(8_900);
+
+    await vi.advanceTimersByTimeAsync(900);
+    expect(a.deadline.remaining()).toBe(0);
+    a.deadline.abort();
+    expect(await pa).toEqual(aborted(BATCH_REASONS.run));
+    expect(union?.deadline.signal.aborted).toBe(false);
+    expect(union?.deadline.remaining()).toBe(8_000);
+
+    gate.resolve();
+    expect(ran(await pb)).toMatchObject({ exitCode: 0, spec: { inputs: [at("src/b.ts")] } });
+    expect(calls.executes).toHaveLength(1);
+    await c.dispose();
+  });
+
+  it("when every member aborts, the union's signal aborts (the tree is killed) and nothing is spawned afterwards", async () => {
+    const { calls, runtime } = harness(MODEL, { execute: untilAborted });
+    const c = createBatchCoordinator({ platform: "linux" });
+    const hook = c.hook(runtime);
+    const a = req(["src/a.ts"]);
+    const b = req(["src/b.ts"]);
+    const outs = [hook(a), hook(b)];
+    await vi.advanceTimersByTimeAsync(WINDOW);
+    a.deadline.abort();
+    expect(calls.executes[0]?.deadline.signal.aborted).toBe(false);
+    b.deadline.abort();
+    expect(calls.executes[0]?.deadline.signal.aborted).toBe(true);
+    expect(await Promise.all(outs)).toEqual([aborted(BATCH_REASONS.run), aborted(BATCH_REASONS.run)]);
+    await flush();
+    expect(calls.executes).toHaveLength(1);
+    expect(calls.closes).toEqual([0]);
+    expect(c.stats()).toMatchObject({ runningBatches: 0, pendingRequests: 0, ownRuns: 0 });
+  });
+
+  it("dispose settles waiting and running members, kills the runs, leaves no timer and is idempotent", async () => {
+    const { calls, runtime } = harness(MODEL, { execute: untilAborted });
+    const c = createBatchCoordinator({ platform: "linux" });
+    const hook = c.hook(runtime);
+    const running = [hook(req(["src/a.ts"])), hook(req(["src/b.ts"]))];
+    await vi.advanceTimersByTimeAsync(WINDOW);
+    const waiting = hook(req(["src/c.ts"]));
+    const alone = hook(req(["src/d.ts"], { command: "npx jest" }));
+    await vi.advanceTimersByTimeAsync(WINDOW / 2);
+    const single = hook(req(["src/e.ts"], { command: "npx jest -i" }));
+    await flush();
+    expect(c.stats()).toMatchObject({ openWindows: 3, runningBatches: 1, pendingRequests: 5 });
+
+    await c.dispose();
+    const gone = aborted(BATCH_REASONS.disposed);
+    expect(await Promise.all([...running, waiting, alone, single])).toEqual([gone, gone, gone, gone, gone]);
+    expect(calls.executes[0]?.deadline.signal.aborted).toBe(true);
+    expect(vi.getTimerCount()).toBe(0);
+    expect(calls.closes).toEqual([0]);
+    await flush();
+    expect(c.stats()).toMatchObject({ openWindows: 0, runningBatches: 0, pendingRequests: 0 });
+    expect(await hook(req(["src/f.ts"]))).toEqual(gone);
+    await c.dispose();
+    expect(calls.executes).toHaveLength(1);
+  });
+
+  it("dispose kills a batch of one that runs under the member's own deadline", async () => {
+    const { calls, runtime } = harness(MODEL, { execute: untilAborted });
+    const c = createBatchCoordinator({ platform: "linux" });
+    const out = c.hook(runtime)(req(["src/a.ts"]));
+    await vi.advanceTimersByTimeAsync(WINDOW);
+    expect(calls.executes[0]?.deadline.signal.aborted).toBe(false);
+    await c.dispose();
+    expect(await out).toEqual(aborted(BATCH_REASONS.disposed));
+    expect(calls.executes[0]?.deadline.signal.aborted).toBe(true);
+    expect(calls.executes[0]?.deadline.remaining()).toBe(0);
+  });
+
+  it("the starvation bound: a steady stream cannot keep a window open past its fixed close", async () => {
+    const { calls, runtime } = harness();
+    const c = createBatchCoordinator({ platform: "linux" });
+    const hook = c.hook(runtime);
+    const t0 = Date.now();
+    const outs: Promise<TestsPassRun>[] = [];
+    for (const x of "abcdef") {
+      outs.push(hook(req([`src/${x}.ts`])));
+      await vi.advanceTimersByTimeAsync(30);
+    }
+    await vi.advanceTimersByTimeAsync(WINDOW);
+    await Promise.all(outs);
+    // a..d arrived at 0, 30, 60, 90: closed at 100. e opened the next window at 120; f joined at 150.
+    expect(calls.executes.map((e) => [e.at - t0, e.spec.inputs.length])).toEqual([
+      [100, 4],
+      [220, 2],
+    ]);
+    await c.dispose();
+  });
+
+  it("a batch holds one scope: opened once, every run and recheck inside it, closed after the last", async () => {
+    const model: Model = { ...MODEL, failing: { "test/b.test.ts": ["fails"] }, atRef: { "test/b.test.ts": [] } };
+    const { calls, runtime } = harness(model);
+    const c = createBatchCoordinator({ platform: "linux" });
+    const hook = c.hook(runtime);
+    const outs = [..."abc"].map((x) => hook(req([`src/${x}.ts`])));
+    await vi.advanceTimersByTimeAsync(WINDOW);
+    await Promise.all(outs);
+    await flush();
+    expect(calls.events).toEqual(["open 0", "execute 0", "execute 0", "execute 0", "execute 0", "recheck 0", "close 0"]);
+    await c.dispose();
+  });
+
+  it("a batch of one runs the member's own spec under the member's own deadline (the direct path)", async () => {
+    const { calls, runtime } = harness();
+    const c = createBatchCoordinator({ platform: "linux" });
+    const a = req(["src/a.ts"], { deadline: liveDeadline(5_000) });
+    const out = c.hook(runtime)(a);
+    await vi.advanceTimersByTimeAsync(WINDOW);
+    const run = await out;
+    expect(calls.plans).toHaveLength(1);
+    expect(calls.executes[0]?.spec).toBe(calls.planned[0]);
+    expect(calls.executes[0]?.deadline.remaining()).toBe(a.deadline.remaining());
+    expect(calls.executes[0]?.deadline.bound(100)).toBe(100);
+    expect(run).toEqual({ scoped: ranModel(MODEL, calls.executes[0]?.spec ?? spec()), recheck: undefined });
+    expect(c.stats()).toMatchObject({ unionRuns: 0, ownRuns: 1 });
+    await c.dispose();
+  });
+
+  it("an inconsistent union plan splits the batch into own runs, logged once", async () => {
+    const union = (input: BatchPlanInput) => input.changedFiles !== "unavailable" && input.changedFiles.length > 1;
+    const cases: [string, HarnessOptions][] = [
+      ["a union-only S6", { argvCap: 1 }],
+      [
+        "a rejected union plan",
+        {
+          plan: async (input) => {
+            if (union(input)) throw new Error("search failed");
+            return planModel(input);
+          },
+        },
+      ],
+      ["a union with nothing to run", { plan: async (input) => (union(input) ? { noAffected: true, note: "none" } : planModel(input)) }],
+      [
+        "a union with other options",
+        { plan: async (input) => planModel(union(input) ? { ...input, command: "npx vitest run --bail" } : input) },
+      ],
+      [
+        "a union with other inputs",
+        {
+          plan: async (input) =>
+            planModel(union(input) && input.changedFiles !== "unavailable" ? { ...input, changedFiles: input.changedFiles.slice(1) } : input),
+        },
+      ],
+    ];
+    for (const [what, o] of cases) {
+      const { calls, runtime } = harness(MODEL, o);
+      const warn = vi.fn();
+      const c = createBatchCoordinator({ platform: "linux", logger: { warn } });
+      const hook = c.hook(runtime);
+      const outs = [hook(req(["src/a.ts"])), hook(req(["src/b.ts"]))];
+      await vi.advanceTimersByTimeAsync(WINDOW);
+      const runs = await Promise.all(outs);
+      expect(runs.map((r) => ran(r).spec?.inputs), what).toEqual([[at("src/a.ts")], [at("src/b.ts")]]);
+      expect(runs.map((r) => ran(r).notes), what).toEqual([["planned 1 input(s)"], ["planned 1 input(s)"]]);
+      expect(calls.opens, what).toHaveLength(1);
+      expect(c.stats(), what).toMatchObject({ unionRuns: 0, ownRuns: 2, splits: 1 });
+      expect(warn, what).toHaveBeenCalledTimes(1);
+      expect(warn.mock.calls[0]?.[0], what).toContain("split");
+      await c.dispose();
+    }
+  });
+
+  it("a busy slot reaches every member; a timed-out or failed union falls back to own runs", async () => {
+    const busy: ScopedOutcome = { kind: "slot-busy", waitedMs: 30_000, deadlineCut: false };
+    const b1 = harness(MODEL, { execute: () => busy });
+    const c1 = createBatchCoordinator({ platform: "linux" });
+    const outs1 = [c1.hook(b1.runtime)(req(["src/a.ts"])), c1.hook(b1.runtime)(req(["src/b.ts"]))];
+    await vi.advanceTimersByTimeAsync(WINDOW);
+    expect(await Promise.all(outs1)).toEqual([
+      { scoped: busy, recheck: undefined },
+      { scoped: busy, recheck: undefined },
+    ]);
+    expect(b1.calls.executes).toHaveLength(1);
+
+    for (const first of [{ kind: "timed-out", boundMs: 120_000 }, { kind: "error", reason: "spawn failed" }] as const) {
+      const h = harness(MODEL, { execute: (spec, _d, n) => (n === 0 ? first : ranModel(MODEL, spec)) });
+      const c = createBatchCoordinator({ platform: "linux" });
+      const outs = [c.hook(h.runtime)(req(["src/a.ts"])), c.hook(h.runtime)(req(["src/b.ts"]))];
+      await vi.advanceTimersByTimeAsync(WINDOW);
+      const runs = await Promise.all(outs);
+      expect(runs.map((r) => ran(r).spec?.inputs)).toEqual([[at("src/a.ts")], [at("src/b.ts")]]);
+      expect(h.calls.executes).toHaveLength(3);
+      expect(c.stats()).toMatchObject({ unionRuns: 1, ownRuns: 2 });
+      await c.dispose();
+    }
+    await c1.dispose();
+  });
+
+  it("the union plan deduplicates overlapping change sets", async () => {
+    const { calls, runtime } = harness();
+    const c = createBatchCoordinator({ platform: "linux" });
+    const hook = c.hook(runtime);
+    const outs = [hook(req(["src/a.ts", "src/shared.ts"])), hook(req([at("src/shared.ts"), "src/b.ts"]))];
+    await vi.advanceTimersByTimeAsync(WINDOW);
+    await Promise.all(outs);
+    expect(calls.plans[2]?.changedFiles).toEqual([
+      { path: at("src/a.ts"), status: "M" },
+      { path: at("src/shared.ts"), status: "M" },
+      { path: at("src/b.ts"), status: "M" },
+    ]);
+    expect(calls.executes.map((e) => e.spec.inputs)).toEqual([[at("src/a.ts"), at("src/b.ts"), at("src/shared.ts")]]);
+    await c.dispose();
+  });
+
+  it("the hook never rejects when a seam throws", async () => {
+    const boom = () => {
+      throw new Error("boom");
+    };
+    const warn = vi.fn();
+    const c = createBatchCoordinator({ platform: "linux", logger: { warn } });
+
+    const planning = harness(MODEL, { plan: async () => boom() });
+    expect(await c.hook(planning.runtime)(req(["src/a.ts"]))).toEqual({
+      scoped: { kind: "error", reason: "scoped run planning failed: boom" },
+      recheck: undefined,
+    });
+
+    const direct = harness(MODEL, { runtime: { batchWindowMs: 0, direct: async () => boom() } });
+    expect(await c.hook(direct.runtime)(req(["src/a.ts"]))).toEqual({
+      scoped: { kind: "error", reason: "verification coordinator failed: boom" },
+      recheck: undefined,
+    });
+
+    const opening = harness(MODEL, { runtime: { openScope: boom } });
+    const opened = [c.hook(opening.runtime)(req(["src/a.ts"])), c.hook(opening.runtime)(req(["src/b.ts"]))];
+    await vi.advanceTimersByTimeAsync(WINDOW);
+    const failed = { scoped: { kind: "error", reason: "verification batch failed: boom" }, recheck: undefined };
+    expect(await Promise.all(opened)).toEqual([failed, failed]);
+
+    const executing = harness(MODEL, { execute: boom });
+    const executed = [c.hook(executing.runtime)(req(["src/a.ts"])), c.hook(executing.runtime)(req(["src/b.ts"]))];
+    await vi.advanceTimersByTimeAsync(WINDOW);
+    const spawnFailed = { scoped: { kind: "error", reason: "scoped run failed: boom" }, recheck: undefined };
+    expect(await Promise.all(executed)).toEqual([spawnFailed, spawnFailed]);
+    expect(executing.calls.executes).toHaveLength(3);
+
+    const failing: Model = { ...MODEL, failing: { "test/a.test.ts": ["x"] } };
+    const rechecking = harness(failing, { rechecker: boom });
+    const rechecked = c.hook(rechecking.runtime)(req(["src/a.ts"]));
+    await vi.advanceTimersByTimeAsync(WINDOW);
+    expect((await rechecked).recheck).toEqual({ kind: "unusable", cause: "error", reason: "recheck failed: boom" });
+
+    const inner = harness();
+    const closing = harness(MODEL, { runtime: { openScope: (meta) => ({ ...inner.runtime.openScope(meta), close: async () => boom() }) } });
+    const closed = c.hook(closing.runtime)(req(["src/a.ts"]));
+    await vi.advanceTimersByTimeAsync(WINDOW);
+    expect(ran(await closed).exitCode).toBe(0);
+    await c.dispose();
+    expect(warn).toHaveBeenCalledWith("verify batch: scope close failed", { error: "boom" });
+  });
+
+  it("sweep evicts a batch whose seam never returned once the grace period has passed", async () => {
+    const { calls, runtime } = harness(MODEL, { execute: () => new Promise<ScopedOutcome>(() => undefined) });
+    const warn = vi.fn();
+    const c = createBatchCoordinator({ platform: "linux", logger: { warn } });
+    const hook = c.hook(runtime);
+    const a = req(["src/a.ts"]);
+    const b = req(["src/b.ts"]);
+    const outs = [hook(a), hook(b)];
+    await vi.advanceTimersByTimeAsync(WINDOW);
+    a.deadline.abort();
+    b.deadline.abort();
+    expect(await Promise.all(outs)).toEqual([aborted(BATCH_REASONS.run), aborted(BATCH_REASONS.run)]);
+    expect(c.stats().runningBatches).toBe(1);
+    expect(c.sweep()).toBe(0);
+    await vi.advanceTimersByTimeAsync(BATCH_STALE_GRACE_MS + 1);
+    expect(c.sweep()).toBe(1);
+    expect(c.stats().runningBatches).toBe(0);
+    expect(warn).toHaveBeenCalledWith("verify batch: evicted a batch whose seam never returned", expect.objectContaining({ members: 2 }));
+    await c.dispose();
+    expect(calls.closes).toEqual([0]);
+  });
+
+  it("uses the injected timers and clock", async () => {
+    let t = 1_000;
+    const handles: (() => void)[] = [];
+    const timers = {
+      setTimeout: vi.fn((callback: () => void) => handles.push(callback)),
+      clearTimeout: vi.fn(),
+    };
+    const { calls, runtime } = harness();
+    const c = createBatchCoordinator({ platform: "linux", timers, now: () => t });
+    const out = c.hook(runtime)(req(["src/a.ts"]));
+    await flush();
+    expect(timers.setTimeout).toHaveBeenCalledWith(expect.any(Function), WINDOW);
+    t += WINDOW;
+    handles[0]?.();
+    expect(ran(await out).exitCode).toBe(0);
+    expect(timers.clearTimeout).toHaveBeenCalledWith(1);
+    expect(calls.executes).toHaveLength(1);
+    await c.dispose();
   });
 });

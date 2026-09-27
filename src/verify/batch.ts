@@ -1,6 +1,6 @@
 // src/verify/batch.ts
-// S5 batching coordinator (plan Phase 2.2). This file is the design of task 2.2.1: the header
-// below and the exported contract. Every body throws "not implemented" until task 2.2.2.
+// S5 batching coordinator (plan Phase 2.2). The header below is the design of task 2.2.1; the
+// pure helpers (2.2.2.b) and createBatchCoordinator (2.2.2.c, 2.2.2.d) implement it.
 //
 // ===============================================================================================
 // BATCHING COORDINATOR: design (plan Phase 2.2, task 2.2.1)
@@ -492,7 +492,16 @@ import { posix, win32 } from "node:path";
 import type { PluginLogger } from "../router/logger";
 import type { DispatchReference } from "./reference";
 import type { ChangedPath, RunResult, ScopedSpec, ScopingPlan } from "./runner";
-import type { Deadline, OpenVerificationScope, RecheckOutcome, TestsPassHook, TestsPassRequest } from "./types";
+import type {
+  Deadline,
+  OpenVerificationScope,
+  RecheckOutcome,
+  ScopedOutcome,
+  TestsPassHook,
+  TestsPassRequest,
+  TestsPassRun,
+  VerificationScope,
+} from "./types";
 
 // ---------------------------------------------------------------------------------------------
 // Constants
@@ -582,10 +591,607 @@ export interface BatchCoordinator {
   dispose(): Promise<void>;
 }
 
+// ---------------------------------------------------------------------------------------------
+// Coordinator (tasks 2.2.2.c and 2.2.2.d)
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * Where a member stands; B9's table maps each phase to what an abort settles it with.
+ *   window   waiting in a window (W5);
+ *   run      union planning or the union run (B5 steps 2-4);
+ *   queued   waiting for its own run, or holding its outcome until the flaky taint (B5 steps 5-7);
+ *   own-run  its own run is running: the executor kills it and reports (B9);
+ *   recheck  waiting for its recheck (B8).
+ */
+type MemberPhase = "window" | "run" | "queued" | "own-run" | "recheck";
+
+type RanOutcome = Extract<ScopedOutcome, { readonly kind: "ran" }>;
+
+interface Member {
+  readonly request: TestsPassRequest;
+  /** The member's own planScopedRun spec. */
+  readonly spec: ScopedSpec;
+  /** Arrival order: the tie-break of every deadline ordering. */
+  readonly seq: number;
+  phase: MemberPhase;
+  settled: boolean;
+  window: BatchWindow | undefined;
+  batch: Batch | undefined;
+  /** The member's scoped outcome once known (B5 steps 4-7). */
+  scoped: ScopedOutcome | undefined;
+  /** B9: its remaining() when its recheck started, reported if it aborts while waiting for it. */
+  recheckBoundMs: number;
+  readonly resolve: (run: TestsPassRun) => void;
+  readonly onAbort: () => void;
+}
+
+interface BatchWindow {
+  readonly key: string;
+  /** The opener's runtime (W1, D6). */
+  readonly runtime: BatchRuntime;
+  /** Fixed at opening (W1, W2). */
+  readonly closeAt: number;
+  readonly members: Member[];
+  timer: unknown;
+  closed: boolean;
+}
+
+interface Batch {
+  readonly key: string;
+  readonly runtime: BatchRuntime;
+  /** Fixed at close, in arrival order (W4). */
+  readonly members: readonly Member[];
+  /** D (B9). */
+  readonly deadline: BatchDeadline;
+  /** Rg of the shared recheck in flight (B8.5). */
+  group: BatchDeadline | undefined;
+  scope: VerificationScope | undefined;
+  closing: Promise<void> | undefined;
+  /** When the last member settled (B11 sweep). */
+  settledAt: number | undefined;
+}
+
+function message(e: unknown): string {
+  return e instanceof Error ? e.message : String(e);
+}
+
+function abortedRun(reason: string): TestsPassRun {
+  return { scoped: { kind: "aborted", reason }, recheck: undefined };
+}
+
+function errorRun(reason: string): TestsPassRun {
+  return { scoped: { kind: "error", reason }, recheck: undefined };
+}
+
+/** 2.1-T2 P7: a recheck is attempted for a "ran" outcome with >= 1 failing id and >= 1 failing file. */
+function needsRecheck(scoped: ScopedOutcome): scoped is RanOutcome {
+  return scoped.kind === "ran" && scoped.result.failingIds.length > 0 && scoped.result.failingFiles.length > 0;
+}
+
+/** Deadline order (B5.5, B8.3): the least remaining first, then arrival order. */
+function byDeadline(a: Member, b: Member): number {
+  return a.request.deadline.remaining() - b.request.deadline.remaining() || a.seq - b.seq;
+}
+
+/**
+ * A member's own deadline that also aborts with `kill` (the batch deadline D, which aborts at
+ * dispose or when every member is gone), so that dispose() kills own runs and single rechecks too
+ * (B11.4). While the member is attached to D, D aborts only at dispose or after the member's own
+ * signal, so the result bounds exactly as the member's deadline alone.
+ */
+function linkDeadline(base: Deadline, kill: AbortSignal): { readonly deadline: Deadline; unlink(): void } {
+  const controller = new AbortController();
+  const onAbort = () => {
+    unlink();
+    controller.abort();
+  };
+  const unlink = () => {
+    base.signal.removeEventListener("abort", onAbort);
+    kill.removeEventListener("abort", onAbort);
+  };
+  if (base.signal.aborted || kill.aborted) controller.abort();
+  else {
+    base.signal.addEventListener("abort", onAbort, { once: true });
+    kill.addEventListener("abort", onAbort, { once: true });
+  }
+  const remaining = () => (controller.signal.aborted ? 0 : base.remaining());
+  return {
+    deadline: { budgetMs: base.budgetMs, remaining, bound: (ownBudgetMs) => Math.min(ownBudgetMs, remaining()), signal: controller.signal },
+    unlink,
+  };
+}
+
+/** B11: the global timers, each handle unref'd so that an open window never keeps the process alive. */
+const defaultTimers: BatchTimers = {
+  setTimeout(callback, ms) {
+    const handle = setTimeout(callback, ms);
+    handle.unref();
+    return handle;
+  },
+  clearTimeout(handle) {
+    clearTimeout(handle as Parameters<typeof clearTimeout>[0]);
+  },
+};
+
 /** One coordinator per plugin instance (2.2.3). */
 export function createBatchCoordinator(options: BatchCoordinatorOptions = {}): BatchCoordinator {
-  void options;
-  throw notImplemented("createBatchCoordinator");
+  const requestedSize = options.maxBatchSize ?? BATCH_MAX_REQUESTS;
+  const maxBatchSize = Number.isSafeInteger(requestedSize) && requestedSize >= 1 ? requestedSize : 1;
+  const platform = options.platform ?? process.platform;
+  const now = options.now ?? (() => Date.now());
+  const timers = options.timers ?? defaultTimers;
+  const logger = options.logger;
+
+  const windows = new Map<string, BatchWindow>();
+  const running = new Set<Batch>();
+  const closing = new Set<Promise<void>>();
+  const counters = { unionRuns: 0, ownRuns: 0, rechecks: 0, splits: 0, taints: 0 };
+  let disposed = false;
+  let pending = 0;
+  let arrivals = 0;
+
+  const warn = (text: string, extra?: Record<string, unknown>) => logger?.warn(text, extra);
+  const live = (b: Batch) => b.members.filter((m) => !m.settled);
+
+  // -- settlement ------------------------------------------------------------------------------
+
+  function settle(m: Member, run: TestsPassRun): void {
+    if (m.settled) return;
+    m.settled = true;
+    pending--;
+    m.request.deadline.signal.removeEventListener("abort", m.onAbort);
+    const b = m.batch;
+    if (b !== undefined) {
+      // B9: a settled member no longer keeps the batch alive. Two members may share one Deadline
+      // (one router_verify call naming several handles): it is released with the last of them.
+      const deadline = m.request.deadline;
+      if (!b.members.some((x) => !x.settled && x.request.deadline === deadline)) {
+        b.group?.release(deadline);
+        b.deadline.release(deadline);
+      }
+      if (b.members.every((x) => x.settled)) b.settledAt = now();
+    }
+    m.resolve(run);
+  }
+
+  /** B9's table. */
+  function onAbort(m: Member): void {
+    if (m.settled) return;
+    switch (m.phase) {
+      case "window":
+        leaveWindow(m);
+        settle(m, abortedRun(BATCH_REASONS.window));
+        return;
+      case "run":
+        settle(m, abortedRun(BATCH_REASONS.run));
+        return;
+      case "queued":
+        settle(m, abortedRun(BATCH_REASONS.attribution));
+        return;
+      case "own-run":
+        // The executor kills the run on the member's signal and reports it (runOwn settles).
+        return;
+      case "recheck":
+        settle(
+          m,
+          m.scoped === undefined
+            ? abortedRun(BATCH_REASONS.attribution)
+            : { scoped: m.scoped, recheck: { kind: "timed-out", boundMs: m.recheckBoundMs } },
+        );
+        return;
+    }
+  }
+
+  // -- windows (B4) ----------------------------------------------------------------------------
+
+  function leaveWindow(m: Member): void {
+    const w = m.window;
+    if (w === undefined) return;
+    m.window = undefined;
+    const i = w.members.indexOf(m);
+    if (i >= 0) w.members.splice(i, 1);
+    // W5: a window left empty clears its timer and is deleted.
+    if (w.members.length === 0 && !w.closed) {
+      w.closed = true;
+      timers.clearTimeout(w.timer);
+      if (windows.get(w.key) === w) windows.delete(w.key);
+    }
+  }
+
+  function join(runtime: BatchRuntime, request: TestsPassRequest, spec: ScopedSpec): Promise<TestsPassRun> {
+    const key = batchKey(spec, platform);
+    return new Promise<TestsPassRun>((resolve) => {
+      const member: Member = {
+        request,
+        spec,
+        seq: arrivals++,
+        phase: "window",
+        settled: false,
+        window: undefined,
+        batch: undefined,
+        scoped: undefined,
+        recheckBoundMs: 0,
+        resolve,
+        onAbort: () => onAbort(member),
+      };
+      let w = windows.get(key);
+      if (w === undefined) {
+        // W1: the close time is fixed now, with the opener's window length.
+        const opened: BatchWindow = { key, runtime, closeAt: now() + runtime.batchWindowMs, members: [], timer: undefined, closed: false };
+        opened.timer = timers.setTimeout(() => closeWindow(opened), runtime.batchWindowMs);
+        windows.set(key, opened);
+        w = opened;
+      }
+      member.window = w;
+      w.members.push(member);
+      pending++;
+      request.deadline.signal.addEventListener("abort", member.onAbort, { once: true });
+      // W2 (size) and W3 (a joiner that could not outlive the wait).
+      if (w.members.length >= maxBatchSize || request.deadline.remaining() <= w.closeAt - now()) closeWindow(w);
+    });
+  }
+
+  /** W2, W4: close, leave the key map before anything asynchronous, and start the batch. */
+  function closeWindow(w: BatchWindow): void {
+    if (w.closed) return;
+    w.closed = true;
+    timers.clearTimeout(w.timer);
+    if (windows.get(w.key) === w) windows.delete(w.key);
+    const members = w.members.filter((m) => !m.settled);
+    if (members.length === 0) return;
+    const b: Batch = {
+      key: w.key,
+      runtime: w.runtime,
+      members,
+      deadline: createBatchDeadline(members.map((m) => m.request.deadline)),
+      group: undefined,
+      scope: undefined,
+      closing: undefined,
+      settledAt: undefined,
+    };
+    for (const m of members) {
+      m.window = undefined;
+      m.batch = b;
+      // B5.1: a batch of one runs the member's own spec at once.
+      m.phase = members.length === 1 ? "own-run" : "run";
+    }
+    running.add(b);
+    void runBatch(b);
+  }
+
+  // -- the batch (B5) --------------------------------------------------------------------------
+
+  async function runBatch(b: Batch): Promise<void> {
+    try {
+      await runSteps(b);
+    } catch (e) {
+      // B-G5: fail closed for every member the failure affects.
+      warn("verify batch: internal failure", { error: message(e) });
+      for (const m of b.members) settle(m, errorRun(`verification batch failed: ${message(e)}`));
+    } finally {
+      for (const m of b.members) settle(m, errorRun("verification batch ended without an outcome"));
+      running.delete(b);
+      b.group?.dispose();
+      b.deadline.dispose();
+      void closeScope(b);
+    }
+  }
+
+  async function runSteps(b: Batch): Promise<void> {
+    const first = b.members[0];
+    let own: Member[] = [];
+    let unionSpec: ScopedSpec | undefined;
+    if (b.members.length === 1) {
+      own = [first];
+    } else {
+      // Step 2.
+      const planned = await planUnion(b);
+      if (b.deadline.signal.aborted) return;
+      if (typeof planned === "string") {
+        // Step 6.
+        counters.splits++;
+        warn("verify batch: split into own runs", { members: b.members.length, cause: planned });
+        own = queue(live(b));
+      } else {
+        unionSpec = planned;
+      }
+    }
+    // Everyone is gone, or the coordinator was disposed: open nothing.
+    if (b.deadline.signal.aborted) return;
+
+    // Step 3.
+    const scope = b.runtime.openScope({ cwd: first.request.cwd, command: first.request.command });
+    b.scope = scope;
+
+    // Step 4.
+    if (unionSpec !== undefined) {
+      counters.unionRuns++;
+      const union = await execute(scope, unionSpec, b.deadline);
+      switch (union.kind) {
+        case "ran":
+          own = attribute(b, union);
+          break;
+        case "slot-busy":
+        case "aborted":
+          for (const m of live(b)) settle(m, { scoped: union, recheck: undefined });
+          return;
+        default:
+          own = queue(live(b));
+      }
+    }
+
+    // Step 5.
+    for (const m of [...own].sort(byDeadline)) {
+      if (!m.settled) await runOwn(b, scope, m);
+    }
+
+    // Steps 8 and 9.
+    await rechecks(b, scope);
+  }
+
+  function queue(members: Member[]): Member[] {
+    for (const m of members) m.phase = "queued";
+    return members;
+  }
+
+  /** B6 and the step-2 consistency checks. Returns the union spec, or the cause of a split. */
+  async function planUnion(b: Batch): Promise<ScopedSpec | string> {
+    const changes: BatchMemberChanges[] = [];
+    for (const m of b.members) {
+      const changedFiles = m.request.changedFiles;
+      if (changedFiles === "unavailable") return "a member's change set is unavailable";
+      changes.push({ cwd: m.request.cwd, changedFiles });
+    }
+    const first = b.members[0];
+    let plan: ScopingPlan;
+    try {
+      plan = await b.runtime.plan(
+        { command: first.request.command, cwd: first.request.cwd, changedFiles: unionChangedFiles(changes, platform) },
+        b.deadline,
+      );
+    } catch (e) {
+      return `union planning failed: ${message(e)}`;
+    }
+    if ("noAffected" in plan) return "the union plan found nothing to run";
+    if ("unverifiable" in plan) return `the union cannot be scoped (${plan.code})`;
+    if (batchKey(plan, platform) !== b.key) return "the union plan runs a different command";
+    const want = new Set(b.members.flatMap((m) => m.spec.inputs.map((f) => fold(f, platform))));
+    const got = new Set(plan.inputs.map((f) => fold(f, platform)));
+    if (want.size !== got.size || [...want].some((k) => !got.has(k))) return "the union plan's inputs differ from the members' inputs";
+    return plan;
+  }
+
+  /**
+   * B7 for every live member after a "ran" union. A derived member of a green union settles at
+   * once (B5.8); every other member runs its own spec (B5.5).
+   */
+  function attribute(b: Batch, union: RanOutcome): Member[] {
+    const own: Member[] = [];
+    const n = b.members.length;
+    for (const m of live(b)) {
+      // Per-file counts and the failing-union attribution land with task 2.2.2.d.
+      const a = union.result.failingIds.length === 0 ? attributeUnion(union.result, undefined, m.spec, platform) : undefined;
+      if (a?.kind === "derived") {
+        const scoped: RanOutcome = {
+          kind: "ran",
+          result: a.result,
+          exitCode: a.exitCode,
+          spec: m.spec,
+          notes: [...m.spec.notes, `batched: 1 run for ${n} requests`],
+        };
+        m.scoped = scoped;
+        settle(m, { scoped, recheck: undefined });
+      } else {
+        m.phase = "queued";
+        own.push(m);
+      }
+    }
+    return own;
+  }
+
+  /** B5.5: the member's own spec under its own deadline; the outcome is its scoped outcome, verbatim. */
+  async function runOwn(b: Batch, scope: VerificationScope, m: Member): Promise<void> {
+    m.phase = "own-run";
+    counters.ownRuns++;
+    const link = linkDeadline(m.request.deadline, b.deadline.signal);
+    const out = await execute(scope, m.spec, link.deadline);
+    link.unlink();
+    if (m.settled) return;
+    m.scoped = out;
+    if (out.kind !== "ran") {
+      settle(m, { scoped: out, recheck: undefined });
+    } else if (m.request.deadline.signal.aborted) {
+      // Its deadline ended during its own run: it waits for nothing more, as alone (B-G4).
+      settle(m, { scoped: out, recheck: needsRecheck(out) ? lateRecheck(m) : undefined });
+    } else {
+      m.phase = "queued";
+    }
+  }
+
+  // -- rechecks (B8) ---------------------------------------------------------------------------
+
+  /** B8.1: the no-spawn decisions of 2.1-T4, or the captured reference to recheck at. */
+  function referenceDecision(m: Member): { readonly decided: RecheckOutcome } | { readonly reference: DispatchReference } {
+    const state = m.request.reference;
+    switch (state.kind) {
+      case "disabled":
+        return { decided: { kind: "disabled" } };
+      case "none":
+        return { decided: { kind: "unusable", cause: "no-reference", reason: state.reason } };
+      case "captured":
+        return { reference: state.reference };
+    }
+  }
+
+  /** The recheck of a member whose deadline already ended: its reference decision, else skipped-deadline. */
+  function lateRecheck(m: Member): RecheckOutcome {
+    const decision = referenceDecision(m);
+    return "decided" in decision ? decision.decided : { kind: "skipped-deadline", remainingMs: m.request.deadline.remaining() };
+  }
+
+  /** B8.3: below the threshold a member gets skipped-deadline and nothing is spawned for it. */
+  function skippedForDeadline(b: Batch, m: Member, scoped: RanOutcome): boolean {
+    const remainingMs = m.request.deadline.remaining();
+    if (remainingMs >= b.runtime.recheckMinRemainingMs) return false;
+    settle(m, { scoped, recheck: { kind: "skipped-deadline", remainingMs } });
+    return true;
+  }
+
+  async function rechecks(b: Batch, scope: VerificationScope): Promise<void> {
+    const candidates: { readonly m: Member; readonly scoped: RanOutcome; readonly reference: DispatchReference }[] = [];
+    for (const m of live(b)) {
+      const scoped = m.scoped;
+      if (scoped === undefined) {
+        settle(m, errorRun("verification batch produced no outcome"));
+        continue;
+      }
+      if (!needsRecheck(scoped)) {
+        settle(m, { scoped, recheck: undefined });
+        continue;
+      }
+      const decision = referenceDecision(m);
+      if ("decided" in decision) {
+        settle(m, { scoped, recheck: decision.decided });
+        continue;
+      }
+      m.phase = "recheck";
+      m.recheckBoundMs = m.request.deadline.remaining();
+      candidates.push({ m, scoped, reference: decision.reference });
+    }
+    // Shared rechecks per reference land with task 2.2.2.d: each member rechecks alone.
+    for (const c of candidates.sort((x, y) => byDeadline(x.m, y.m))) {
+      await recheckOne(b, scope, c.m, c.scoped, c.reference);
+    }
+  }
+
+  /** B8.4: the direct path, under the member's own deadline. */
+  async function recheckOne(b: Batch, scope: VerificationScope, m: Member, scoped: RanOutcome, reference: DispatchReference): Promise<void> {
+    if (m.settled || skippedForDeadline(b, m, scoped)) return;
+    m.recheckBoundMs = m.request.deadline.remaining();
+    counters.rechecks++;
+    const link = linkDeadline(m.request.deadline, b.deadline.signal);
+    const out = await recheck(scope, m.request, reference, scoped.result.failingFiles, link.deadline);
+    link.unlink();
+    settle(m, { scoped, recheck: out });
+  }
+
+  // -- seams (B-G5: a throwing seam becomes a fail-closed outcome) ------------------------------
+
+  async function execute(scope: VerificationScope, spec: ScopedSpec, deadline: Deadline): Promise<ScopedOutcome> {
+    try {
+      return await scope.execute(spec, deadline);
+    } catch (e) {
+      return { kind: "error", reason: `scoped run failed: ${message(e)}` };
+    }
+  }
+
+  async function recheck(
+    scope: VerificationScope,
+    request: TestsPassRequest,
+    reference: DispatchReference,
+    files: readonly string[],
+    deadline: Deadline,
+  ): Promise<RecheckOutcome> {
+    try {
+      return await scope.rechecker(request.command, request.cwd)(reference, files, deadline);
+    } catch (e) {
+      return { kind: "unusable", cause: "error", reason: `recheck failed: ${message(e)}` };
+    }
+  }
+
+  /** B5.9: close once; requesters never wait for it, dispose() does. */
+  function closeScope(b: Batch): Promise<void> {
+    if (b.closing === undefined) {
+      const scope = b.scope;
+      const p =
+        scope === undefined
+          ? Promise.resolve()
+          : Promise.resolve()
+              .then(() => scope.close())
+              .catch((e: unknown) => warn("verify batch: scope close failed", { error: message(e) }));
+      b.closing = p;
+      closing.add(p);
+      void p.then(() => closing.delete(p));
+    }
+    return b.closing;
+  }
+
+  // -- arrival (B2) ----------------------------------------------------------------------------
+
+  async function submit(runtime: BatchRuntime, request: TestsPassRequest): Promise<TestsPassRun> {
+    if (disposed) return abortedRun(BATCH_REASONS.disposed);
+    if (request.testScope === "full" || !(runtime.batchWindowMs > 0)) return await runtime.direct(request);
+    if (request.deadline.signal.aborted) return abortedRun(BATCH_REASONS.beforeRun);
+    let plan: ScopingPlan;
+    try {
+      plan = await runtime.plan({ command: request.command, cwd: request.cwd, changedFiles: request.changedFiles }, request.deadline);
+    } catch (e) {
+      return errorRun(`scoped run planning failed: ${message(e)}`);
+    }
+    if ("noAffected" in plan) return { scoped: { kind: "no-affected", note: plan.note }, recheck: undefined };
+    if ("unverifiable" in plan) return { scoped: { kind: "unverifiable", code: plan.code, reason: plan.reason }, recheck: undefined };
+    if (disposed) return abortedRun(BATCH_REASONS.disposed);
+    if (request.deadline.signal.aborted) return abortedRun(BATCH_REASONS.beforeRun);
+    return join(runtime, request, plan);
+  }
+
+  return {
+    hook(runtime: BatchRuntime): TestsPassHook {
+      return async (request) => {
+        try {
+          return await submit(runtime, request);
+        } catch (e) {
+          return errorRun(`verification coordinator failed: ${message(e)}`);
+        }
+      };
+    },
+
+    sweep(): number {
+      let evicted = 0;
+      for (const [key, w] of windows) {
+        if (w.members.some((m) => !m.settled)) continue;
+        w.closed = true;
+        timers.clearTimeout(w.timer);
+        windows.delete(key);
+        evicted++;
+        warn("verify batch: evicted a window with no live member", { key });
+      }
+      const t = now();
+      for (const b of running) {
+        if (b.settledAt === undefined || t - b.settledAt <= BATCH_STALE_GRACE_MS) continue;
+        running.delete(b);
+        b.group?.dispose();
+        b.deadline.dispose();
+        void closeScope(b);
+        evicted++;
+        warn("verify batch: evicted a batch whose seam never returned", { key: b.key, members: b.members.length });
+      }
+      return evicted;
+    },
+
+    stats(): BatchStats {
+      return { openWindows: windows.size, runningBatches: running.size, pendingRequests: pending, ...counters };
+    },
+
+    async dispose(): Promise<void> {
+      if (!disposed) {
+        disposed = true;
+        for (const w of windows.values()) {
+          w.closed = true;
+          timers.clearTimeout(w.timer);
+          for (const m of [...w.members]) settle(m, abortedRun(BATCH_REASONS.disposed));
+        }
+        windows.clear();
+        for (const b of running) {
+          for (const m of b.members) settle(m, abortedRun(BATCH_REASONS.disposed));
+          b.group?.dispose();
+          b.deadline.dispose();
+          void closeScope(b);
+        }
+      }
+      await Promise.all([...closing]);
+    },
+  };
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -943,6 +1549,3 @@ export function createBatchDeadline(members: readonly Deadline[]): BatchDeadline
   };
 }
 
-function notImplemented(name: string): Error {
-  return new Error(`not implemented: batch.${name} (Task 2.2.2)`);
-}
