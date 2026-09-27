@@ -21,6 +21,11 @@ export interface Verdict {
   evidence?: string;
   /** true when nothing was actually verified (SKIPPED != PASS) */
   skipped?: boolean;
+  /**
+   * testsPass attribution (deterministic.ts header, T5): the ids every exact-recheck judgement of
+   * this verdict classified, concatenated across testsPass checks. Absent when no check classified.
+   */
+  failures?: FailureClassification;
 }
 
 export interface ExecResult {
@@ -61,8 +66,32 @@ export interface MutexRegistry {
 }
 
 export interface DeterministicDeps {
-  /** Bound to the original dispatch, not looked up using the after-state diff. */
-  testBaseline?: (command: string) => Promise<import("./baseline").TestBaseline | undefined>;
+  /**
+   * S5 (deterministic.ts header, T2 P2-P7): plans, runs and rechecks one testsPass request. Called
+   * outside `mutex`. Absent -> testsPass is unverifiable, never a run (G5).
+   */
+  testsPass?: TestsPassHook;
+  /** S3/S4 per-check scopes (T8): one slot hold per check, low priority, deadline-bound. */
+  openScope?: import("./deterministic").OpenCheckScope;
+  /** Shell-free process seam (git searches, scoped specs). */
+  argv?: ArgvSeam;
+  /**
+   * The producer's changed files with tree-snapshot statuses and rename sources, or "unavailable"
+   * without a change baseline (section 1.5-6). Default "unavailable".
+   */
+  changedFiles?: readonly ChangedPath[] | "unavailable";
+  /**
+   * The settled dispatch reference (T2 P0). Default: "disabled" when `budget.failureRecheck` is
+   * off, else none ("the dispatch was not tracked").
+   */
+  reference?: ReferenceState;
+  /** The validated budget (resolveVerifyBudget). Absent: testScope "affected", failureRecheck on. */
+  budget?: import("../router/config").VerifyBudget;
+  /**
+   * The gate's deadline (T3). Absent: each testsPass check runs under its own deadline of
+   * `budget.gateBudgetMs` (else `timeoutMs`), disposed when the check ends.
+   */
+  deadline?: Deadline;
   /** Preserve completed failures if an outer gate budget expires later. */
   onFailure?: (reason: string) => void;
   exec: ExecSeam;

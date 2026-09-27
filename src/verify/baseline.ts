@@ -12,10 +12,18 @@ export interface TestObservation {
   complete: boolean;
 }
 
-export interface TestBaseline {
-  observation: TestObservation;
-  dirty: boolean;
-}
+/**
+ * T7 u4: the stable ReferenceState "none" reasons. The store (dispatch.ts) produces all but
+ * `untracked`, which is also runDeterministic's default when a gate carries no reference.
+ */
+export const REFERENCE_NONE = {
+  failed: "the dispatch-time capture failed or timed out",
+  contaminated: "an edit was observed in an overlapping directory before the capture resolved",
+  untracked: "the dispatch was not tracked",
+  gateBudget: "the capture had not resolved within the gate budget",
+  /** The dispatch's DoD had no allowlisted testsPass check (or verify.require was "never"). */
+  notRequested: "no testsPass check was declared at dispatch",
+} as const;
 
 export function observeTests(result: ExecResult): TestObservation {
   const text = (result.stdout + "\n" + result.stderr).replace(/\x1b\[[0-9;]*m/g, "");
@@ -185,26 +193,3 @@ export const judgeScoped: JudgeScoped = (scoped: ScopedOutcome, recheck: Recheck
   }
   return unverifiable(`testsPass: the scoped failure inventory is incomplete (${c.note ?? "collection error"}); known failures predate dispatch, others may not${observed}`, failures);
 };
-
-export function compareTests(after: TestObservation, baseline?: TestBaseline): {
-  ok: boolean; unverifiable?: boolean; reason?: string; evidence?: string; note?: string;
-} {
-  const observed = `observed failures: ${after.failures.join(", ") || "(identities unavailable)"}; count=${after.count ?? "unknown"}; exit=${after.code}`;
-  const unavailable = (why: string) => ({ ok: false, unverifiable: true, reason: `testsPass: ${why}; ${observed}` });
-  if (!baseline) return unavailable("no usable dispatch-time baseline");
-  const before = baseline.observation;
-  if (after.code === 0) return { ok: true, evidence: "testsPass: suite is green (exit 0)" };
-  const added = after.failures.filter(id => !before.failures.includes(id));
-  if (before.code === 0 || (before.complete && added.length > 0) ||
-      (before.count !== undefined && after.count !== undefined && after.count > before.count)) {
-    const named = before.code === 0 || before.complete ? added : [];
-    return { ok: false, reason: `testsPass: introduced failures: ${named.join(", ") || `failure count ${before.count ?? 0} -> ${after.count ?? "unknown"}, exit ${after.code}`}` };
-  }
-  if (before.complete && after.complete && added.length === 0) {
-    const note = `testsPass: no worse than before; pre-existing failures: ${after.failures.join(", ")}; suite is NOT green; baseline tree was ${baseline.dirty ? "dirty" : "clean"}`;
-    return { ok: true, evidence: note, note };
-  }
-  // Equal counts or equal non-zero exits cannot prove that the identities are
-  // unchanged. Under-excuse rather than silently replace an old failure by a new one.
-  return unavailable(`baseline exit=${before.code}, count=${before.count ?? "unknown"}; cannot prove failures predate dispatch`);
-}

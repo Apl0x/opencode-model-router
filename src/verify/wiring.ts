@@ -13,19 +13,36 @@
  * settings that were active when the plugin loaded, and `/preset` would
  * silently stop applying to graded work.
  */
-import { access, readFile as fsReadFile } from "node:fs/promises";
+import { access, readdir, readFile as fsReadFile, realpath, stat, unlink } from "node:fs/promises";
 import { isAbsolute, join, resolve } from "node:path";
-import { createMutexRegistry, DEFAULT_ALLOWLIST, isCommandAllowed, resolveRepoCommand } from "./deterministic";
-import { tierModel, type createChangedFileStore } from "./dispatch";
-import { runShell } from "./exec";
+import {
+  createDirectTestsPassHook,
+  createMutexRegistry,
+  createScopeOpener,
+  DEFAULT_ALLOWLIST,
+  isCommandAllowed,
+  resolveRepoCommand,
+} from "./deterministic";
+import {
+  tierModel,
+  type ChangedFile,
+  type createChangedFileStore,
+  type DispatchCaptureDeps,
+  type TreeSnapshot,
+} from "./dispatch";
+import { runArgv, runShell } from "./exec";
 import { snapshotTree } from "./tree";
+import { captureReference, DEFAULT_CAPTURE_TIMEOUT_MS, nodeReferenceFs } from "./reference";
+import { REFERENCE_NONE } from "./baseline";
+import { scrubText } from "../guard/scrub";
 import type { DoD } from "./dod";
-import type { DeterministicDeps } from "./types";
+import type { ArgvSeam, Deadline, ExecOptions, ExecResult as SeamResult, ExecSeam, ReferenceState } from "./types";
+import type { RunnerFs, TestSearchSeam } from "./runner";
 import {
   graderTimeoutMs,
   withTimeout,
 } from "./timeout";
-import type { RouterConfig } from "../router/config";
+import { resolveVerifyBudget, type RouterConfig, type VerifyBudget } from "../router/config";
 import type { GateDeps } from "./gate";
 // The grader request shape is owned by checker.ts, which builds it. Re-exported
 // here because this module is where it is consumed, and because keeping a
@@ -62,13 +79,42 @@ export function extractAssistantText(res: any): string {
     .join("\n");
 }
 
+/** P0 (deterministic.ts header, T2): what a gate needs from its dispatch. */
+export interface PreparedVerification {
+  /**
+   * The producer's changed files: tool-observed paths plus paths the current snapshot added since
+   * dispatch, each with the snapshot's status letters and rename source when the snapshot lists it.
+   */
+  changedFiles: ChangedFile[];
+  changeBaseline: "available" | "unavailable";
+  /** Settled: the dispatch reference, or why there is none. */
+  reference: ReferenceState;
+  /** The current tree snapshot (materialize's drift check); undefined when unavailable. */
+  snapshot: TreeSnapshot | undefined;
+}
+
+/** How long the gate-time tree snapshot may take (bounded further by a gate deadline). */
+export const GRADE_SNAPSHOT_TIMEOUT_MS = 10_000;
+/** T3: each git test search, bounded further by a gate deadline. */
+export const TEST_SEARCH_TIMEOUT_MS = 10_000;
+/** P5: the per-check timeout (DeterministicDeps.timeoutMs default). */
+const CHECK_TIMEOUT_MS = 120_000;
+
 export interface VerificationWiring {
-  beginVerification(store: ReturnType<typeof createChangedFileStore>, id: string, cwd: string | undefined, dod: DoD): void;
-  prepareVerification(store: ReturnType<typeof createChangedFileStore>, id: string, childID: string, cwd?: string): Promise<{
-    changedFiles: { path: string; status: string }[];
-    changeBaseline: "available" | "unavailable";
-    testBaseline: NonNullable<DeterministicDeps["testBaseline"]>;
-  }>;
+  /**
+   * Starts the dispatch's background work: the tree snapshot and, only for a DoD with an
+   * allowlisted testsPass check and failureRecheck on, a git-only reference capture bounded by
+   * baselineTimeoutMs. Resolves when both settled; never rejects. No test command runs (G6).
+   */
+  beginVerification(store: ReturnType<typeof createChangedFileStore>, id: string, cwd: string | undefined, dod: DoD): Promise<void>;
+  /** P0: the snapshot, the changed files and the settled reference, each bounded by `deadline` when given. */
+  prepareVerification(
+    store: ReturnType<typeof createChangedFileStore>,
+    id: string,
+    childID: string,
+    cwd?: string,
+    deadline?: Deadline,
+  ): Promise<PreparedVerification>;
   /** Session ids currently running a grader prompt, so hooks can skip them. */
   graderSessions: Set<string>;
   /** Abort then delete a plugin-created child session. Never throws. */
@@ -87,8 +133,20 @@ export interface VerificationWiring {
    * grader finishes. A caller enforcing a gate budget aborts THAT set — never
    * the wiring-global one, which belongs to every concurrent delegation at
    * once.
+   *
+   * `prepared` supplies the testsPass inputs (changed files, reference, current tree); without it
+   * the changed files are "unavailable" and the reference is the untracked default. `deadline`
+   * bounds every testsPass step (T3); without it each testsPass check owns one of gateBudgetMs.
    */
-  buildGateDeps(parentSessionID?: string, inFlight?: Set<string>): GateDeps;
+  buildGateDeps(parentSessionID?: string, inFlight?: Set<string>, prepared?: PreparedVerification, deadline?: Deadline): GateDeps;
+}
+
+function splitZ(out: string): string[] {
+  return out.split("\0").filter(s => s.length > 0);
+}
+
+function errorText(err: unknown): string {
+  return scrubText(err instanceof Error ? err.message : String(err));
 }
 
 export function createVerificationWiring(deps: {
@@ -103,28 +161,86 @@ export function createVerificationWiring(deps: {
   const disposed = new Set<string>();
   const mutex = createMutexRegistry();
 
-  const execSeam = (
-    command: string,
-    opts?: { cwd?: string; timeoutMs?: number; signal?: AbortSignal },
-  ): Promise<ExecResult> =>
+  const abs = (p: string): string => (isAbsolute(p) ? p : join(directory, p));
+
+  // QA-1.2-13: lowPriority and env reach the process; no per-call maxBuffer (QA-1.5-25).
+  const execSeam: ExecSeam = (command: string, opts?: ExecOptions): Promise<ExecResult> =>
     runShell(command, {
       cwd: opts?.cwd ?? directory,
-      timeoutMs: opts?.timeoutMs ?? 120000,
+      timeoutMs: opts?.timeoutMs ?? CHECK_TIMEOUT_MS,
       signal: opts?.signal,
+      lowPriority: opts?.lowPriority,
+      env: opts?.env,
     });
 
-  const fsSeam = {
+  const argvSeam: ArgvSeam = (file, args, opts) =>
+    runArgv(file, args, {
+      cwd: opts?.cwd ?? directory,
+      timeoutMs: opts?.timeoutMs ?? CHECK_TIMEOUT_MS,
+      signal: opts?.signal,
+      lowPriority: opts?.lowPriority,
+      env: opts?.env,
+    });
+
+  // T9 1.3: PlannerFs + unlink over fs.promises. realpath is the native one; fileExists accepts
+  // directories (access does).
+  const fsSeam: RunnerFs = {
     async fileExists(p: string): Promise<boolean> {
       try {
-        await access(isAbsolute(p) ? p : join(directory, p));
+        await access(abs(p));
         return true;
       } catch {
         return false;
       }
     },
     async readFile(p: string): Promise<string> {
-      return await fsReadFile(isAbsolute(p) ? p : join(directory, p), "utf-8");
+      return await fsReadFile(abs(p), "utf-8");
     },
+    realpath: p => realpath(abs(p)),
+    async stat(p) {
+      const s = await stat(abs(p), { bigint: true });
+      return { isFile: s.isFile(), size: s.size, dev: s.dev, ino: s.ino };
+    },
+    readdir: p => readdir(abs(p)),
+    async unlink(p) {
+      try {
+        await unlink(abs(p));
+      } catch (err) {
+        // Already gone resolves (RunnerFs contract); anything else is the caller's to report.
+        if (!(err instanceof Error && "code" in err && err.code === "ENOENT")) throw err;
+      }
+    },
+  };
+
+  /** T9 1.3: the planners' git searches through the argv seam; no shell, no optional locks. */
+  const testSearch = (budget: VerifyBudget, deadline: Deadline | undefined): TestSearchSeam => {
+    const git = async (root: string, args: readonly string[]): Promise<SeamResult | undefined> => {
+      const timeoutMs = deadline ? deadline.bound(TEST_SEARCH_TIMEOUT_MS) : TEST_SEARCH_TIMEOUT_MS;
+      if (timeoutMs <= 0 || deadline?.signal.aborted) return undefined;
+      try {
+        const r = await argvSeam("git", ["--no-optional-locks", "-C", root, ...args], {
+          cwd: root,
+          timeoutMs,
+          lowPriority: budget.lowPriority,
+          ...(deadline ? { signal: deadline.signal } : {}),
+        });
+        return r.timedOut === true ? undefined : r;
+      } catch {
+        return undefined; // The search could not run: never the same as "no match".
+      }
+    };
+    return {
+      async findByName(gitRoot, names) {
+        const r = await git(gitRoot, ["ls-files", "-z", "--cached", "--others", "--exclude-standard", "--", ...names.map(n => `:(glob)**/${n}`)]);
+        return r && r.code === 0 ? splitZ(r.stdout).map(rel => resolve(gitRoot, rel)) : undefined;
+      },
+      async findByContent(gitRoot, needle, globs) {
+        const r = await git(gitRoot, ["grep", "-l", "-z", "-F", "--untracked", "-e", needle, "--", ...globs]);
+        if (!r) return undefined;
+        if (r.code === 1) return [];
+        return r.code === 0 ? splitZ(r.stdout).map(rel => resolve(gitRoot, rel)) : undefined;
+      },
+    };
   };
 
   // Best-effort disposal of a plugin-created child session: abort any in-flight
@@ -219,17 +335,56 @@ export function createVerificationWiring(deps: {
     }
   };
 
+  /** What beginDispatch captures for `dod` under the current config (T9 1.1: resolveVerifyBudget). */
+  const captureDepsFor = (dod: DoD): DispatchCaptureDeps => {
+    const cfg = getConfig();
+    const budget = resolveVerifyBudget(cfg);
+    // Only a dispatch that will be judged by testsPass captures a reference (G6: a git-only
+    // capture, never a test run). Read-only fan-outs capture nothing.
+    const judgedByTests = cfg.enforcement?.verify?.require !== "never" && dod.checks.some(
+      c => c.kind === "testsPass" && isCommandAllowed(resolveRepoCommand(c, "testsPass", undefined), DEFAULT_ALLOWLIST),
+    );
+    const base = { snapshot: snapshotTree, timeoutMs: budget.baselineTimeoutMs };
+    if (!judgedByTests) return { ...base, uncaptured: { kind: "none", reason: REFERENCE_NONE.notRequested } };
+    if (!budget.failureRecheck) return { ...base, uncaptured: { kind: "disabled" } };
+    // QA-1.2-13: the capture's git processes run at the configured priority too.
+    const argv: ArgvSeam = (file, args, opts) => argvSeam(file, args, { ...opts, lowPriority: budget.lowPriority });
+    return {
+      ...base,
+      capture: (at, signal) => captureReference(at, signal, { argv, fs: nodeReferenceFs, timeoutMs: budget.baselineTimeoutMs }),
+    };
+  };
+
   const buildGateDeps = (
     parentSessionID?: string,
     inFlight?: Set<string>,
+    prepared?: PreparedVerification,
+    deadline?: Deadline,
   ): GateDeps => {
     const cfg = getConfig();
+    const budget = resolveVerifyBudget(cfg);
+    const openScope = createScopeOpener({ argv: argvSeam, exec: execSeam, fs: fsSeam, budget, checkTimeoutMs: CHECK_TIMEOUT_MS });
+    const testsPass = createDirectTestsPassHook({
+      openScope,
+      plannerFs: fsSeam,
+      search: testSearch(budget, deadline),
+      budget,
+      ...(prepared?.snapshot !== undefined ? { currentTree: prepared.snapshot } : {}),
+    });
     return {
       deterministic: {
         exec: execSeam,
         fs: fsSeam,
         cwd: directory,
         mutex,
+        argv: argvSeam,
+        budget,
+        openScope,
+        testsPass,
+        // Section 1.5-6: without a change baseline, shell edits are unattributed.
+        changedFiles: prepared?.changeBaseline === "available" ? prepared.changedFiles : "unavailable",
+        ...(prepared !== undefined ? { reference: prepared.reference } : {}),
+        ...(deadline !== undefined ? { deadline } : {}),
       },
       checker: {
         dispatchGrader: (req: GraderRequest) =>
@@ -243,39 +398,39 @@ export function createVerificationWiring(deps: {
   };
 
   return {
-    beginVerification(store, id, cwd, dod) {
-      const verify = getConfig().enforcement?.verify;
-      const base = resolve(directory, cwd || ".");
-      // Only a dispatch that will be judged by testsPass captures a baseline. Warming
-      // the cache from read-only dispatches ran the full suite on every exploration
-      // fan-out, and the capture was almost always discarded anyway: any shell or
-      // edit tool in the directory contaminates it.
-      const commands = dod.checks
-        .filter(c => c.kind === "testsPass")
-        .map(c => resolveRepoCommand(c, "testsPass", undefined))
-        .filter(c => isCommandAllowed(c, DEFAULT_ALLOWLIST));
-      const budget = verify?.baselineTimeoutMs ?? 60000;
-      store.beginDispatch(id, base, verify?.testBaseline === false || verify?.require === "never" ? [] : commands, {
-        snapshot: snapshotTree,
-        run: (command, cwd, signal) => execSeam(command, { cwd, timeoutMs: budget, signal }),
-        timeoutMs: budget,
-      });
-    },
-    async prepareVerification(store, id, childID, cwd) {
-      const controller = new AbortController();
-      let current;
+    async beginVerification(store, id, cwd, dod) {
+      let deps: DispatchCaptureDeps;
       try {
-        current = await withTimeout(snapshotTree(resolve(directory, cwd || "."), controller.signal), 10000, "grade fingerprint");
+        deps = captureDepsFor(dod);
+      } catch (err) {
+        // Never blocks or fails the dispatch: snapshot only, and no reference.
+        deps = {
+          snapshot: snapshotTree,
+          timeoutMs: DEFAULT_CAPTURE_TIMEOUT_MS,
+          uncaptured: { kind: "none", reason: `${REFERENCE_NONE.failed} (${errorText(err)})` },
+        };
+      }
+      await store.beginDispatch(id, resolve(directory, cwd || "."), deps);
+    },
+    async prepareVerification(store, id, childID, cwd, deadline) {
+      const base = resolve(directory, cwd || ".");
+      const controller = new AbortController();
+      const onAbort = (): void => controller.abort();
+      deadline?.signal.addEventListener("abort", onAbort, { once: true });
+      let snapshot: TreeSnapshot | undefined;
+      try {
+        const bound = deadline ? deadline.bound(GRADE_SNAPSHOT_TIMEOUT_MS) : GRADE_SNAPSHOT_TIMEOUT_MS;
+        snapshot = bound > 0 && !controller.signal.aborted
+          ? await withTimeout(snapshotTree(base, controller.signal), bound, "grade fingerprint")
+          : undefined;
       } catch {
-        current = undefined; // Explicit unavailable disclaimer, never a raw tree.
+        snapshot = undefined; // Explicit unavailable disclaimer, never a raw tree.
       } finally {
+        deadline?.signal.removeEventListener("abort", onAbort);
         controller.abort();
       }
-      return {
-        ...store.delta(id, childID, current, resolve(directory, cwd || ".")),
-        testBaseline: command => getConfig().enforcement?.verify?.testBaseline === false
-          ? Promise.resolve(undefined) : store.baseline(id, command, current?.head),
-      };
+      const reference = await store.reference(id, deadline?.signal);
+      return { ...store.delta(id, childID, snapshot, base), reference, snapshot };
     },
     graderSessions,
     disposeChildSession,

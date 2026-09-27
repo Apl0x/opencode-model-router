@@ -11,8 +11,9 @@ import { parseDoDFromDispatch, inferDoD } from "./dod";
 import type { DoD, InferHints } from "./dod";
 import { DEFAULT_IDLE_TTL_MS } from "../router/idle-sweep";
 import { resolve } from "node:path";
-import type { ExecResult } from "./types";
-import { observeTests, type TestBaseline } from "./baseline";
+import type { ReferenceState } from "./types";
+import type { DispatchReference } from "./reference";
+import { REFERENCE_NONE } from "./baseline";
 import { withTimeout } from "./timeout";
 
 export interface TreeSnapshot {
@@ -25,10 +26,23 @@ export interface TreeSnapshot {
   files: ChangedFile[];
 }
 
-export interface BaselineCaptureDeps {
+/** What beginDispatch runs in the background for one dispatch (never a test command, G6). */
+export interface DispatchCaptureDeps {
+  /** The change baseline: the tree snapshot `delta` compares against. */
   snapshot(cwd: string, signal: AbortSignal): Promise<TreeSnapshot | undefined>;
-  run(command: string, cwd: string, signal: AbortSignal): Promise<ExecResult>;
+  /**
+   * The git-only dispatch reference (reference.ts captureReference); undefined = no reference.
+   * Absent: nothing is captured and the dispatch's reference is `uncaptured`.
+   */
+  capture?: (cwd: string, signal: AbortSignal) => Promise<DispatchReference | undefined>;
+  /** The reference when `capture` is absent. Default: none (REFERENCE_NONE.notRequested). */
+  uncaptured?: ReferenceState;
+  /** Bounds the snapshot and the capture, each (baselineTimeoutMs). */
   timeoutMs: number;
+}
+
+function none(reason: string): ReferenceState {
+  return { kind: "none", reason };
 }
 
 function pathKey(path: string): string {
@@ -71,6 +85,25 @@ export function extractChangedFile(tool: string, args: unknown): ChangedFile | n
   return { path, status };
 }
 
+/** One tracked dispatch: its change baseline and its reference (T2 P0). */
+interface DispatchRecord {
+  cwd: string;
+  snapshotPending: boolean;
+  /** An overlapping edit was observed while the snapshot was in flight: the snapshot is discarded. */
+  snapshotContaminated: boolean;
+  snapshot?: TreeSnapshot;
+  capturePending: boolean;
+  /** An overlapping edit was observed while the capture was in flight: the reference is none. */
+  captureContaminated: boolean;
+  captureController: AbortController;
+  /** Settles once; never rejects. */
+  reference: Promise<ReferenceState>;
+  /** The snapshot settled. */
+  ready: Promise<void>;
+  /** The snapshot and the reference settled. */
+  settled: Promise<void>;
+}
+
 /**
  * Per-session changed-file tracker. We attribute changed files to a delegation
  * by observing that session's own edit/write tool calls (ADR 0002 D3 — NOT a
@@ -80,24 +113,22 @@ export function createChangedFileStore(options: ChangedFileStoreOptions = {}) {
   const now = options.now ?? Date.now;
   const bySession = new Map<string, Map<string, string>>();
   const lastTouch = new Map<string, number>();
-  const dispatches = new Map<string, {
-    cwd: string; pending: boolean; contaminated: boolean;
-    snapshot?: TreeSnapshot;
-    ready: Promise<void>;
-    baselines: Map<string, Promise<TestBaseline | undefined>>;
-  }>();
-  const cache = new Map<string, {
-    cwd: string; command: string; pending: boolean; contaminated: boolean; stamp: number;
-    controller: AbortController; result: Promise<TestBaseline | undefined>;
-  }>();
+  const dispatches = new Map<string, DispatchRecord>();
 
   function observeEdit(tool: string, cwd?: string): void {
     if (!MAY_WRITE_TOOLS.has(tool.toLowerCase())) return;
     // Unknown directory is conservatively treated as overlapping every capture.
     const overlaps = (other: string) => !cwd || pathKey(cwd) === pathKey(other)
       || pathKey(cwd).startsWith(pathKey(other) + "/") || pathKey(other).startsWith(pathKey(cwd) + "/");
-    for (const d of dispatches.values()) if (d.pending && overlaps(d.cwd)) d.contaminated = true;
-    for (const c of cache.values()) if (c.pending && overlaps(c.cwd)) c.contaminated = true;
+    for (const d of dispatches.values()) {
+      if (!overlaps(d.cwd)) continue;
+      if (d.snapshotPending) d.snapshotContaminated = true;
+      // The capture would describe a tree that already holds the edit: discard it, and stop it.
+      if (d.capturePending && !d.captureContaminated) {
+        d.captureContaminated = true;
+        d.captureController.abort();
+      }
+    }
   }
 
   function touch(sessionID: string): void {
@@ -107,77 +138,94 @@ export function createChangedFileStore(options: ChangedFileStoreOptions = {}) {
   function evict(sessionID: string): void {
     bySession.delete(sessionID);
     lastTouch.delete(sessionID);
+    dispatches.get(sessionID)?.captureController.abort();
     dispatches.delete(sessionID);
   }
 
   return {
-    /** Non-blocking: fingerprint and test run are bounded background work. */
-    beginDispatch(id: string, cwd: string, commands: string[], deps: BaselineCaptureDeps): void {
+    /**
+     * Starts the bounded background work of one dispatch: the tree snapshot (change baseline) and,
+     * when `deps.capture` is given, the git-only reference. Resolves once both settled; never
+     * rejects. A dispatch id that is already tracked keeps its ORIGINAL snapshot and reference, so
+     * a retry never turns a failed attempt into its own reference.
+     */
+    beginDispatch(id: string, cwd: string, deps: DispatchCaptureDeps): Promise<void> {
       touch(id);
+      const existing = dispatches.get(id);
+      if (existing) return existing.settled;
       bySession.delete(id);
-      const controller = new AbortController();
-      const d = {
-        cwd, pending: true, contaminated: false, snapshot: undefined as TreeSnapshot | undefined,
-        ready: Promise.resolve(), baselines: new Map<string, Promise<TestBaseline | undefined>>(),
+      const d: DispatchRecord = {
+        cwd, snapshotPending: true, snapshotContaminated: false,
+        capturePending: deps.capture !== undefined, captureContaminated: false,
+        captureController: new AbortController(),
+        reference: Promise.resolve(deps.uncaptured ?? none(REFERENCE_NONE.notRequested)),
+        ready: Promise.resolve(), settled: Promise.resolve(),
       };
       dispatches.set(id, d);
-      d.ready = withTimeout(deps.snapshot(cwd, controller.signal), deps.timeoutMs, "dispatch fingerprint")
-        .then(snapshot => {
-          if (!snapshot || d.contaminated || dispatches.get(id) !== d) return;
-          d.snapshot = snapshot;
-          for (const command of new Set(commands)) {
-            const key = JSON.stringify([pathKey(snapshot.cwd), snapshot.head, snapshot.fingerprint, command]);
-            let entry = cache.get(key);
-            // A suite already running in this directory is not started again under a new
-            // fingerprint: concurrent full suites saturate every core, and the dispatch
-            // falls back to the same "no baseline" path as a contaminated capture.
-            if (!entry && [...cache.values()].some(c => c.pending && c.command === command && pathKey(c.cwd) === pathKey(cwd))) continue;
-            if (!entry) {
-              const capture = {
-                cwd, command, pending: true, contaminated: false, stamp: now(),
-                controller: new AbortController(), result: Promise.resolve<TestBaseline | undefined>(undefined),
-              };
-              cache.set(key, capture);
-              capture.result = withTimeout((async () => {
-                const result = await deps.run(command, cwd, capture.controller.signal);
-                if (result.timedOut || capture.contaminated) return undefined;
-                const end = await deps.snapshot(cwd, capture.controller.signal);
-                if (!end || capture.contaminated || end.head !== snapshot.head || end.fingerprint !== snapshot.fingerprint) return undefined;
-                return { observation: observeTests(result), dirty: snapshot.dirty };
-              })(), deps.timeoutMs, "test baseline")
-                .catch(() => undefined)
-                .then(result => {
-                  capture.pending = false;
-                  capture.controller.abort();
-                  if (!result && cache.get(key) === capture) cache.delete(key);
-                  return result;
-                });
-              entry = capture;
-            }
-            entry.stamp = now();
-            d.baselines.set(command, entry.result);
+      d.ready = (async (): Promise<void> => {
+        const controller = new AbortController();
+        let snapshot: TreeSnapshot | undefined;
+        try {
+          snapshot = await withTimeout(deps.snapshot(cwd, controller.signal), deps.timeoutMs, "dispatch fingerprint");
+        } catch {
+          snapshot = undefined; // Fingerprinting unavailable: keep the explicit missing-snapshot state.
+        } finally {
+          d.snapshotPending = false;
+          controller.abort();
+        }
+        if (snapshot && !d.snapshotContaminated && dispatches.get(id) === d) d.snapshot = snapshot;
+      })();
+      const capture = deps.capture;
+      if (capture !== undefined) {
+        d.reference = (async (): Promise<ReferenceState> => {
+          let captured: DispatchReference | undefined;
+          try {
+            captured = await withTimeout(capture(cwd, d.captureController.signal), deps.timeoutMs, "dispatch reference");
+          } catch {
+            captured = undefined; // Timed out or failed: "no reference", never a blocked dispatch.
+          } finally {
+            d.capturePending = false;
+            d.captureController.abort();
           }
-        })
-        .catch(() => { /* Fingerprinting unavailable: retain explicit missing-snapshot state. */ })
-        .finally(() => { d.pending = false; controller.abort(); });
+          if (d.captureContaminated) return none(REFERENCE_NONE.contaminated);
+          return captured ? { kind: "captured", reference: captured } : none(REFERENCE_NONE.failed);
+        })();
+      }
+      d.settled = Promise.all([d.ready, d.reference]).then(() => undefined);
+      return d.settled;
     },
     observeEdit,
-    async baseline(id: string, command: string, currentHead?: string): Promise<TestBaseline | undefined> {
+    /**
+     * The dispatch's ReferenceState. An untracked (or swept) dispatch has none. `signal` bounds the
+     * wait for a capture still in flight: once it aborts, the reference is none (gate budget).
+     */
+    reference(id: string, signal?: AbortSignal): Promise<ReferenceState> {
       const d = dispatches.get(id);
-      if (!d) return undefined;
+      if (!d) return Promise.resolve(none(REFERENCE_NONE.untracked));
       touch(id);
-      await d.ready;
-      if (!currentHead || d.snapshot?.head !== currentHead) return undefined;
-      return d.baselines.get(command);
+      if (!signal || !d.capturePending) return d.reference;
+      if (signal.aborted) return Promise.resolve(none(REFERENCE_NONE.gateBudget));
+      return new Promise<ReferenceState>(settle => {
+        const onAbort = (): void => settle(none(REFERENCE_NONE.gateBudget));
+        signal.addEventListener("abort", onAbort, { once: true });
+        void d.reference.then(state => {
+          signal.removeEventListener("abort", onAbort);
+          settle(state);
+        });
+      });
     },
     delta(id: string, childID: string, current?: TreeSnapshot, fallbackCwd?: string): { changedFiles: ChangedFile[]; changeBaseline: "available" | "unavailable" } {
       const d = dispatches.get(id);
       const snapshot = d?.snapshot;
       const files = new Map<string, ChangedFile>();
+      const listed = new Map((current?.files ?? []).map(f => [pathKey(f.path), f] as const));
       for (const [path, status] of bySession.get(childID) ?? []) {
         const base = d?.cwd ?? current?.cwd ?? fallbackCwd;
         const absolute = base ? resolve(base, path) : path;
-        files.set(base ? pathKey(absolute) : path, { path: absolute, status });
+        const key = base ? pathKey(absolute) : path;
+        // Tool-observed paths never carry deletions or rename sources: when the current snapshot
+        // lists the path, its status letters and previousPath win.
+        files.set(key, (base ? listed.get(key) : undefined) ?? { path: absolute, status });
       }
       const available = !!snapshot && !!current;
       if (available) {
@@ -217,14 +265,9 @@ export function createChangedFileStore(options: ChangedFileStoreOptions = {}) {
     },
     /** Evict every session idle for >= ttlMs. Future stamps are never evicted. */
     sweep(nowMs: number = now(), ttlMs: number = DEFAULT_IDLE_TTL_MS): void {
+      // A dispatch's reference lives on its record, so it follows the same TTL.
       for (const [sessionID, stamp] of [...lastTouch.entries()]) {
         if (nowMs - stamp >= ttlMs) evict(sessionID);
-      }
-      for (const [key, entry] of cache) {
-        if (nowMs - entry.stamp >= ttlMs) {
-          entry.controller.abort();
-          cache.delete(key);
-        }
       }
     },
   };

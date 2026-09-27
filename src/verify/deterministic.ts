@@ -13,13 +13,16 @@ import type {
   ArgvSeam,
   ExecOptions,
   ExecSeam,
+  FailureClassification,
   OpenVerificationScope,
   RecheckOutcome,
+  ReferenceState,
   RecheckUnusableCause,
   Rechecker,
   ScopedExecutor,
   ScopedOutcome,
   TestsPassHook,
+  TestsPassJudgement,
   TestsPassRequest,
   TestsPassRun,
   VerificationScope,
@@ -40,7 +43,7 @@ import type { PluginLogger } from "../router/logger";
 import { scrubText } from "../guard/scrub";
 import { resolveAgainst } from "./paths";
 import { isAbsolute, posix as pathPosix, win32 as pathWin32 } from "node:path";
-import { compareTests, observeTests } from "./baseline";
+import { judgeScoped, observeTests, REFERENCE_NONE } from "./baseline";
 import { detectRunner, isNoAffected, isUnverifiable, planRerun, planScopedRun, readResult, resolveEntry } from "./runner";
 import { fileKeyOfId } from "./baseline";
 import { DEFAULT_MATERIALIZE_TIMEOUT_MS, gcStaleReferences, materialize, nodeReferenceFs } from "./reference";
@@ -151,6 +154,8 @@ interface CheckResult {
   unverifiable?: boolean;
   reason?: string;
   evidence?: string;
+  /** testsPass only: judgeScoped's attribution against an exact recheck. */
+  failures?: FailureClassification;
 }
 
 // ---------------------------------------------------------------------------
@@ -549,7 +554,7 @@ export function resolveRepoCommand(
 //           platform), fileKeyOfId(id). Tests: test/unit/tests-pass-pipeline.test.ts (new),
 //           fake timers: bound/remaining/abort/dispose, derive never exceeds the parent.
 //   2.1.4   baseline.ts: export judgeScoped: JudgeScoped per T5/T6/T7. Keep observeTests;
-//           compareTests stays until the cut-over deletes it. Tests: a table-driven block in
+//           the legacy comparator stays until the cut-over deletes it. Tests: a table-driven block in
 //           test/unit/baseline.test.ts with one case per T6 cell, T5 classification edge cases
 //           (bare ids, text source, absent files, id-level vs file-level) and the <ids> cap.
 //   2.1.2.2 deterministic.ts: export createScopeOpener(deps: { argv: ArgvSeam; exec: ExecSeam;
@@ -573,7 +578,7 @@ export function resolveRepoCommand(
 //           show-toplevel). dispatch.ts: TreeSnapshot gains root; ChangedFile gains
 //           previousPath?. Additive. Tests: extend test/unit/baseline-wiring.test.ts snapshot cases.
 //   2.1.3b  CUT-OVER, one commit: DeterministicDeps (types.ts, outside the 2.1.1 block) drops
-//           testBaseline and gains testsPass?: TestsPassHook, openScope?, argv?, changedFiles?,
+//           the dispatch-time baseline hook and gains testsPass?: TestsPassHook, openScope?, argv?, changedFiles?,
 //           reference?, budget?, deadline? (a missing hook -> testsPass unverifiable, G5).
 //           runCommandCheck's testsPass branch calls deps.testsPass, then judgeScoped, outside
 //           the mutex. dispatch.ts: the store keeps bySession/delta/record/observeEdit/sweep,
@@ -583,8 +588,9 @@ export function resolveRepoCommand(
 //           on); prepareVerification(store, id, childID, cwd, deadline) returns { changedFiles:
 //           ChangedPath[], changeBaseline, reference: ReferenceState, snapshot }; buildGateDeps
 //           takes the deadline and wires the hook, the scope opener, the PlannerFs and the
-//           TestSearchSeam. index.ts: only the two `.testBaseline =` lines change. Delete
-//           compareTests and TestBaseline. Update baseline(-wiring).test.ts for the removed APIs.
+//           TestSearchSeam. index.ts: only the two lines that set the dispatch-time baseline
+//           change. Delete the legacy comparator and its baseline type. Update
+//           baseline(-wiring).test.ts for the removed APIs.
 //   2.1.2.5 deterministic.ts: buildPasses, lintClean (planScopedLint) and run through per-check
 //           scopes (T8). Tests: the slot is taken once per check, never nested; lint scoping.
 //   2.1.5a  index.ts: a Deadline + AbortController per gate in both sites; the native task
@@ -1261,6 +1267,50 @@ export function createDirectTestsPassHook(deps: DirectTestsPassHookDeps): TestsP
   };
 }
 
+/** G5: testsPass with no TestsPassHook in the deps is unverifiable, never a run. */
+export const NO_TESTS_PASS_HOOK = "testsPass: not run: no scoped test pipeline is wired for this verification";
+
+/** P8: a TestsPassJudgement as the check's CheckResult, carrying the attribution (2.4 lineage). */
+function fromJudgement(j: TestsPassJudgement): CheckResult {
+  return {
+    ok: j.ok,
+    ...(j.unverifiable ? { unverifiable: true } : {}),
+    ...(j.reason !== undefined ? { reason: j.reason } : {}),
+    ...(j.note !== undefined ? { note: j.note } : {}),
+    ...(j.evidence !== undefined ? { evidence: j.evidence } : {}),
+    ...(j.failures !== undefined ? { failures: j.failures } : {}),
+  };
+}
+
+function defaultReference(deps: DeterministicDeps): ReferenceState {
+  return deps.budget?.failureRecheck === false ? { kind: "disabled" } : { kind: "none", reason: REFERENCE_NONE.untracked };
+}
+
+/** P0-P8 for one testsPass check whose command already passed the allowlist (P1). Never rejects. */
+async function runTestsPass(command: string, deps: DeterministicDeps, timeoutMs: number): Promise<CheckResult> {
+  if (!deps.testsPass) return { ok: false, unverifiable: true, reason: `${NO_TESTS_PASS_HOOK}: ${command}` };
+  if (!deps.cwd || !isAbsolute(deps.cwd)) {
+    return { ok: false, unverifiable: true, reason: `testsPass cannot run without an absolute working directory: ${command}` };
+  }
+  let owned: OwnedDeadline | undefined;
+  const deadline: Deadline = deps.deadline ?? (owned = createDeadline(deps.budget?.gateBudgetMs ?? timeoutMs));
+  try {
+    const run = await deps.testsPass({
+      command,
+      cwd: deps.cwd,
+      testScope: deps.budget?.testScope ?? "affected",
+      changedFiles: deps.changedFiles ?? "unavailable",
+      reference: deps.reference ?? defaultReference(deps),
+      deadline,
+    });
+    return fromJudgement(judgeScoped(run.scoped, run.recheck));
+  } catch (err) {
+    return { ok: false, unverifiable: true, reason: `testsPass check errored: ${scrubText(String(err))}` };
+  } finally {
+    owned?.dispose();
+  }
+}
+
 async function runCommandCheck(
   check: Check,
   kind: "testsPass" | "buildPasses" | "lintClean",
@@ -1288,21 +1338,24 @@ async function runCommandCheck(
     }
   }
 
+  if (kind === "testsPass") {
+    // P1: not allowlisted -> unverifiable, as today. P2-P8 run outside deps.mutex: that per-cwd
+    // lock would serialize exactly the concurrent gates that 2.2 must batch.
+    if (!isCommandAllowed(command, allowlist)) {
+      return { ok: false, unverifiable: true, reason: `command not allowlisted: ${command}` };
+    }
+    return runTestsPass(command, deps, timeoutMs);
+  }
+
   const fn = async (): Promise<CheckResult> => {
     try {
       if (!isCommandAllowed(command, allowlist)) {
         return { ok: false, unverifiable: true, reason: `command not allowlisted: ${command}` };
       }
-      const baseline = kind === "testsPass" ? await deps.testBaseline?.(command) : undefined;
       const r: ExecResult = await deps.exec(command, { cwd: deps.cwd, timeoutMs });
       if (r.timedOut) {
-        if (kind === "testsPass") {
-          const observed = compareTests(observeTests(r));
-          return { ...observed, reason: `${kind} timed out after ${timeoutMs}ms: ${command}; ${observed.reason}` };
-        }
         return { ok: false, reason: `${kind} timed out after ${timeoutMs}ms: ${command}` };
       }
-      if (kind === "testsPass") return compareTests(observeTests(r), baseline);
       const out = r.stdout + "\n" + r.stderr;
       const ok = r.code === 0;
       if (!ok) {
@@ -1314,7 +1367,7 @@ async function runCommandCheck(
       }
       return { ok: true, evidence: `exit 0: ${command}` };
     } catch (err) {
-      return { ok: false, ...(kind === "testsPass" ? { unverifiable: true } : {}), reason: `${kind} check errored: ${scrubText(String(err))}` };
+      return { ok: false, reason: `${kind} check errored: ${scrubText(String(err))}` };
     }
   };
 
@@ -1434,6 +1487,14 @@ export async function runDeterministic(dod: DoD, deps: DeterministicDeps): Promi
   const evidenceParts = results.map(r => r.evidence ?? "").filter(e => e.length > 0);
   const rawEvidence = evidenceParts.length > 0 ? evidenceParts.join("\n---\n") : undefined;
   const evidence = rawEvidence !== undefined ? scrubText(rawEvidence) : undefined;
+  const classified = results.flatMap(r => (r.failures ? [r.failures] : []));
+  const failures: FailureClassification | undefined = classified.length
+    ? {
+        introduced: classified.flatMap(f => f.introduced),
+        preexisting: classified.flatMap(f => f.preexisting),
+        unknown: classified.flatMap(f => f.unknown),
+      }
+    : undefined;
 
   return {
     pass: allPass,
@@ -1443,5 +1504,6 @@ export async function runDeterministic(dod: DoD, deps: DeterministicDeps): Promi
     method: "deterministic",
     reasons,
     ...(evidence !== undefined ? { evidence } : {}),
+    ...(failures !== undefined ? { failures } : {}),
   };
 }

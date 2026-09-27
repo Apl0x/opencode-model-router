@@ -10,8 +10,10 @@ import {
   isCommandAllowed,
   shapeMismatch,
 } from "../../src/verify/deterministic";
+import { NO_TESTS_PASS_HOOK } from "../../src/verify/deterministic";
+import { resolveVerifyBudget } from "../../src/router/config";
 import type { DoD, Check } from "../../src/verify/dod";
-import type { DeterministicDeps, ExecResult } from "../../src/verify/types";
+import type { DeterministicDeps, ExecResult, TestsPassHook, TestsPassRequest, TestsPassRun } from "../../src/verify/types";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -39,6 +41,19 @@ function okExec(stdout = "", stderr = ""): DeterministicDeps["exec"] {
 
 function failExec(code = 1, stdout = "", stderr = ""): DeterministicDeps["exec"] {
   return async (_cmd, _opts) => ({ code, stdout, stderr });
+}
+
+/** A TestsPassHook that records each request and returns `run` (default: a green scoped run). */
+function testsPassHook(run: TestsPassRun = {
+  scoped: { kind: "ran", exitCode: 0, notes: [], result: { failingIds: [], failingFiles: [], collectionError: false, total: 1, complete: true, source: "report" } },
+  recheck: undefined,
+}): { fn: TestsPassHook; requests: TestsPassRequest[]; commands: string[] } {
+  const requests: TestsPassRequest[] = [];
+  return {
+    fn: async req => { requests.push(req); return run; },
+    requests,
+    get commands() { return requests.map(r => r.command); },
+  };
 }
 
 function timedOutExec(): DeterministicDeps["exec"] {
@@ -309,12 +324,9 @@ describe("isCommandAllowed + allowlist gate", () => {
 
 describe("runDeterministic — repo-command defaults", () => {
   it("testsPass uses default 'npm test' when command absent", async () => {
-    let capturedCmd = "";
-    const deps = makeDeps({
-      exec: async (cmd, _opts) => { capturedCmd = cmd; return { code: 0, stdout: "", stderr: "" }; },
-    });
-    await runDeterministic(makeDoD([{ kind: "testsPass" }]), deps);
-    expect(capturedCmd).toBe("npm test");
+    const hook = testsPassHook();
+    await runDeterministic(makeDoD([{ kind: "testsPass" }]), makeDeps({ testsPass: hook.fn }));
+    expect(hook.commands).toEqual(["npm test"]);
   });
 
   it("buildPasses uses 'npm run build' when a build script exists", async () => {
@@ -337,32 +349,62 @@ describe("runDeterministic — repo-command defaults", () => {
   });
 
   it("testsPass uses deps.defaults.testCommand when check.command absent", async () => {
-    let capturedCmd = "";
-    const deps = makeDeps({
-      defaults: { testCommand: "pnpm test" },
-      exec: async (cmd, _opts) => { capturedCmd = cmd; return { code: 0, stdout: "", stderr: "" }; },
-    });
-    await runDeterministic(makeDoD([{ kind: "testsPass" }]), deps);
-    expect(capturedCmd).toBe("pnpm test");
+    const hook = testsPassHook();
+    await runDeterministic(makeDoD([{ kind: "testsPass" }]), makeDeps({ defaults: { testCommand: "pnpm test" }, testsPass: hook.fn }));
+    expect(hook.commands).toEqual(["pnpm test"]);
   });
 
   it("testsPass check.command takes precedence over defaults", async () => {
-    let capturedCmd = "";
-    const deps = makeDeps({
-      defaults: { testCommand: "pnpm test" },
-      exec: async (cmd, _opts) => { capturedCmd = cmd; return { code: 0, stdout: "", stderr: "" }; },
-    });
-    await runDeterministic(makeDoD([{ kind: "testsPass", command: "npx vitest run" }]), deps);
-    expect(capturedCmd).toBe("npx vitest run");
+    const hook = testsPassHook();
+    await runDeterministic(
+      makeDoD([{ kind: "testsPass", command: "npx vitest run" }]),
+      makeDeps({ defaults: { testCommand: "pnpm test" }, testsPass: hook.fn }),
+    );
+    expect(hook.commands).toEqual(["npx vitest run"]);
   });
 
-  it("testsPass: timedOut => fail with 'timed out' in reason", async () => {
+  it("testsPass: a timed-out scoped run is unverifiable with 'timed out' in the reason", async () => {
+    const hook = testsPassHook({ scoped: { kind: "timed-out", boundMs: 5000 }, recheck: undefined });
+    const verdict = await runDeterministic(makeDoD([{ kind: "testsPass", command: "npm test" }]), makeDeps({ testsPass: hook.fn }));
+    expect(verdict.pass).toBe(false);
+    expect(verdict.outcome).toBe("unverifiable");
+    expect(verdict.reasons[0]).toContain("timed out");
+  });
+
+  it("testsPass never runs its command through deps.exec; without a hook it is unverifiable (G5)", async () => {
+    let execCalls = 0;
     const verdict = await runDeterministic(
       makeDoD([{ kind: "testsPass", command: "npm test" }]),
-      makeDeps({ exec: timedOutExec() }),
+      makeDeps({ exec: async () => { execCalls++; return { code: 0, stdout: "", stderr: "" }; } }),
     );
-    expect(verdict.pass).toBe(false);
-    expect(verdict.reasons[0]).toContain("timed out");
+    expect(execCalls).toBe(0);
+    expect(verdict.outcome).toBe("unverifiable");
+    expect(verdict.caveats?.[0]).toContain(NO_TESTS_PASS_HOOK);
+  });
+
+  it("testsPass: not allowlisted -> unverifiable, the hook is never called (P1)", async () => {
+    const hook = testsPassHook();
+    const verdict = await runDeterministic(makeDoD([{ kind: "testsPass", command: "npm test && evil" }]), makeDeps({ testsPass: hook.fn }));
+    expect(hook.commands).toEqual([]);
+    expect(verdict.caveats?.[0]).toBe("command not allowlisted: npm test && evil");
+  });
+
+  it("testsPass forwards the request inputs and carries an introduced failure onto the verdict", async () => {
+    const reference = { kind: "none", reason: "the dispatch-time capture failed or timed out" } as const;
+    const changedFiles = [{ path: "/fake/cwd/src/a.ts", status: " M" }];
+    const hook = testsPassHook({
+      scoped: { kind: "ran", exitCode: 1, notes: [], result: { failingIds: ["a.test.ts > t"], failingFiles: ["/fake/cwd/a.test.ts"], collectionError: false, total: 1, complete: true, source: "report" } },
+      recheck: { kind: "exact", result: undefined, ranFiles: [], absentFiles: ["a.test.ts"], notes: [] },
+    });
+    const failures: string[] = [];
+    const verdict = await runDeterministic(
+      makeDoD([{ kind: "testsPass" }]),
+      makeDeps({ testsPass: hook.fn, changedFiles, reference, budget: resolveVerifyBudget(undefined, { cores: 8 }), onFailure: r => failures.push(r) }),
+    );
+    expect(hook.requests[0]).toMatchObject({ cwd: "/fake/cwd", testScope: "affected", changedFiles, reference });
+    expect(verdict.outcome).toBe("fail");
+    expect(verdict.failures).toEqual({ introduced: ["a.test.ts > t"], preexisting: [], unknown: [] });
+    expect(failures).toEqual(["testsPass: introduced failures: a.test.ts > t; observed failures: a.test.ts > t"]);
   });
 
   it("buildPasses: non-zero exit => fail", async () => {
@@ -374,7 +416,7 @@ describe("runDeterministic — repo-command defaults", () => {
     expect(verdict.reasons[0]).toContain("exited 2");
   });
 
-  it("uses mutex when provided", async () => {
+  it("uses mutex when provided, except for testsPass (P1: 2.2 must batch concurrent gates)", async () => {
     let mutexUsed = false;
     const fakeMutex = {
       runExclusive: async <T>(_key: string, fn: () => Promise<T>): Promise<T> => {
@@ -385,8 +427,11 @@ describe("runDeterministic — repo-command defaults", () => {
     const deps = makeDeps({
       mutex: fakeMutex,
       exec: async (_cmd, _opts) => ({ code: 0, stdout: "", stderr: "" }),
+      testsPass: testsPassHook().fn,
     });
     await runDeterministic(makeDoD([{ kind: "testsPass" }]), deps);
+    expect(mutexUsed).toBe(false);
+    await runDeterministic(makeDoD([{ kind: "lintClean" }]), deps);
     expect(mutexUsed).toBe(true);
   });
 });

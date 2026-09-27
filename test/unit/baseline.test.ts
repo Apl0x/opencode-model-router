@@ -1,24 +1,40 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { resolve } from "node:path";
-import { observeTests, compareTests, type TestBaseline } from "../../src/verify/baseline";
-import { createChangedFileStore, buildAcceptedSuffix, type TreeSnapshot, type BaselineCaptureDeps } from "../../src/verify/dispatch";
+import { observeTests, REFERENCE_NONE } from "../../src/verify/baseline";
+import { createChangedFileStore, buildAcceptedSuffix, type TreeSnapshot, type DispatchCaptureDeps } from "../../src/verify/dispatch";
 import { accept, type Artefact } from "../../src/verify/gate";
 import { buildGradingPrompt } from "../../src/verify/checker";
 import { validateConfig } from "../../src/router/config";
 import { nextAction, newLadderState } from "../../src/escalate/ladder";
-import type { ExecResult, RecheckOutcome, ScopedOutcome } from "../../src/verify/types";
+import type { RecheckOutcome, ScopedOutcome, TestsPassRequest, TestsPassRun } from "../../src/verify/types";
 import { judgeScoped, formatIds } from "../../src/verify/baseline";
 import type { RunResult } from "../../src/verify/runner";
+import type { DispatchReference } from "../../src/verify/reference";
+import { NO_TESTS_PASS_HOOK } from "../../src/verify/deterministic";
 
 const cwd = resolve("baseline-workspace");
-const green: ExecResult = { code: 0, stdout: "", stderr: "" };
-const failed = (...ids: string[]): ExecResult => ({ code: 1, stdout: ids.map(id => `FAILED ${id} - assertion`).join("\n") + `\n=== ${ids.length} failed ===`, stderr: "" });
-const baseline = (result: ExecResult, dirty = false): TestBaseline => ({ observation: observeTests(result), dirty });
 const tree = (over: Partial<TreeSnapshot> = {}): TreeSnapshot => ({ cwd, head: "head1", fingerprint: "diff1", dirty: false, files: [], ...over });
 const artefact: Artefact = { changedFiles: [], declaredOutputs: [], finalReturnText: "done", producerTier: "medium", producerSessionID: "child" };
-async function grade(after: ExecResult, before?: TestBaseline) {
+const FILE = "a.test.ts";
+const id = (name: string): string => `${FILE} > ${name}`;
+const result = (failingIds: string[], o: Partial<RunResult> = {}): RunResult => ({
+  failingIds, failingFiles: failingIds.length ? [resolve(cwd, FILE)] : [], collectionError: false, total: 4, complete: true, source: "report", ...o,
+});
+const scopedRun = (r: RunResult, exitCode = r.failingIds.length ? 1 : 0): ScopedOutcome => ({ kind: "ran", result: r, exitCode, notes: [] });
+/** An exact recheck in which FILE ran at the dispatch reference with `refIds` failing. */
+const atReference = (refIds: string[]): RecheckOutcome => ({ kind: "exact", result: result(refIds), ranFiles: [FILE], absentFiles: [], notes: [] });
+const REF: DispatchReference = { root: cwd, head: "head1", commit: "head1", untracked: new Map(), tracked: new Map(), captureReasons: [], capturedAt: 0 };
+const captured = { kind: "captured", reference: REF };
+
+/** Runs the gate with a testsPass hook that returns `run` (no hook when undefined); the test command itself must never run. */
+async function grade(run: TestsPassRun | undefined, seen: TestsPassRequest[] = []) {
   return accept({ dod: { kind: "deterministic", checks: [{ kind: "testsPass" }], criteria: [], deliverable: null, source: "explicit" } }, artefact, {
-    deterministic: { cwd, exec: async () => after, fs: { fileExists: async () => false, readFile: async () => "" }, testBaseline: async () => before },
+    deterministic: {
+      cwd,
+      exec: async () => { throw new Error("testsPass must never run its command through deps.exec"); },
+      fs: { fileExists: async () => false, readFile: async () => "" },
+      ...(run ? { testsPass: async (req: TestsPassRequest) => { seen.push(req); return run; } } : {}),
+    },
     checker: { dispatchGrader: async () => ({ sessionID: "grader", text: "" }) },
   });
 }
@@ -29,55 +45,71 @@ function deferred<T>() {
 }
 afterEach(() => vi.useRealTimers());
 
-describe("baseline-aware testsPass", () => {
-  it("rejects and escalates a producer failure against a green baseline", async () => {
-    const r = await grade(failed("new-test"), baseline(green));
+describe("reference-aware testsPass", () => {
+  it("rejects and escalates a producer failure that passes at the dispatch reference", async () => {
+    const r = await grade({ scoped: scopedRun(result([id("new-test")])), recheck: atReference([]) });
     expect(r.accepted).toBe(false);
     expect(r.verdict.outcome).toBe("fail");
     expect(r.verdict.reasons[0]).toContain("new-test");
+    // 2.4 lineage: the gate result exposes the introduced ids.
+    expect(r.verdict.failures).toEqual({ introduced: [id("new-test")], preexisting: [], unknown: [] });
     const policy = { ladder: ["medium", "heavy"], maxAttemptsPerTier: 0, maxTotalAttempts: 4 };
     expect(nextAction(newLadderState("medium", policy), r.verdict, policy).action).toBe("escalate");
   });
   it("accepts unchanged pre-existing failures with an explicit no-worse note", async () => {
-    const r = await grade(failed("old-test"), baseline(failed("old-test"), true));
+    const r = await grade({ scoped: scopedRun(result([id("old-test")])), recheck: atReference([id("old-test")]) });
     expect(r.accepted).toBe(true);
     expect(r.verdict.outcome).toBe("pass");
+    expect(r.verdict.failures).toEqual({ introduced: [], preexisting: [id("old-test")], unknown: [] });
     const output = buildAcceptedSuffix(r.verdict.method, r.verdict.caveats, r.verdict.notes);
     expect(output).toContain("no worse than before");
     expect(output).toContain("NOT green");
-    expect(output).toContain("dirty");
+    expect(output).toContain("exact dispatch reference");
   });
   it("rejects only the additional failure, never blaming the old one", async () => {
-    const r = await grade(failed("old-test", "new-test"), baseline(failed("old-test")));
+    const r = await grade({ scoped: scopedRun(result([id("new-test"), id("old-test")])), recheck: atReference([id("old-test")]) });
     expect(r.accepted).toBe(false);
-    expect(r.verdict.reasons.join()).toContain("new-test");
-    expect(r.verdict.reasons.join()).not.toContain("old-test");
+    expect(r.verdict.reasons.join()).toContain(`introduced failures: ${id("new-test")};`);
+    expect(r.verdict.failures?.introduced).toEqual([id("new-test")]);
+    expect(r.verdict.failures?.preexisting).toEqual([id("old-test")]);
+    const policy = { ladder: ["medium", "heavy"], maxAttemptsPerTier: 0, maxTotalAttempts: 4 };
+    expect(nextAction(newLadderState("medium", policy), r.verdict, policy).action).toBe("escalate");
   });
   it("detects a replacement failure even when counts are equal", async () => {
-    expect((await grade(failed("new"), baseline(failed("old")))).accepted).toBe(false);
+    expect((await grade({ scoped: scopedRun(result([id("new")])), recheck: atReference([id("old")]) })).accepted).toBe(false);
   });
-  it("accepts missing baseline as unverifiable with observed failures and a caveat", async () => {
-    const r = await grade(failed("observed-test"));
+  it("accepts a failure without a reference as unverifiable with observed failures and a caveat", async () => {
+    const r = await grade({ scoped: scopedRun(result([id("observed-test")])), recheck: { kind: "unusable", cause: "no-reference", reason: REFERENCE_NONE.failed } });
     expect(r.accepted).toBe(true);
     expect(r.verdict.pass).toBe(false);
     expect(r.verdict.outcome).toBe("unverifiable");
     expect(r.verdict.caveats?.join()).toContain("observed-test");
+    expect(r.verdict.caveats?.join()).toContain("no reference");
   });
-  it("does not fabricate a baseline even for an observed green run", async () => {
-    expect((await grade(green)).verdict.outcome).toBe("unverifiable");
-    expect((await grade(green, baseline(failed("old")))).verdict.outcome).toBe("pass");
+  it("passes a green scoped run without a recheck, and never runs tests without a pipeline (G5)", async () => {
+    const seen: TestsPassRequest[] = [];
+    expect((await grade({ scoped: scopedRun(result([])), recheck: undefined }, seen)).verdict.outcome).toBe("pass");
+    expect(seen).toHaveLength(1);
+    expect(seen[0]).toMatchObject({
+      command: "npm test", cwd, testScope: "affected", changedFiles: "unavailable",
+      reference: { kind: "none", reason: REFERENCE_NONE.untracked },
+    });
+    const bare = await grade(undefined);
+    expect(bare.verdict.outcome).toBe("unverifiable");
+    expect(bare.verdict.caveats?.join()).toContain(NO_TESTS_PASS_HOOK);
   });
-  it("unknown output uses the exit-code floor; equal broken exits cannot excuse identities", async () => {
+  it("an opaque failing run without identities is unverifiable, never a pass or a rejection (G2)", async () => {
     const opaque = { code: 2, stdout: "custom runner broke", stderr: "" };
-    expect((await grade(opaque, baseline(green))).accepted).toBe(false);
-    expect((await grade(opaque, baseline(opaque))).verdict.outcome).toBe("unverifiable");
     expect(observeTests(opaque)).toMatchObject({ code: 2, failures: [], complete: false });
+    for (const recheck of [atReference([]), undefined]) {
+      const r = await grade({ scoped: scopedRun(result([], { complete: false, source: "text", note: "custom runner broke" }), 2), recheck });
+      expect(r.verdict.outcome).toBe("unverifiable");
+      expect(r.accepted).toBe(true);
+    }
   });
-  it("count-only output detects increases but cannot prove equal failures predate dispatch", () => {
-    const before = baseline({ code: 1, stdout: "2 failing", stderr: "" });
-    expect(compareTests(observeTests({ code: 1, stdout: "3 failing", stderr: "" }), before).ok).toBe(false);
-    expect(compareTests(observeTests({ code: 1, stdout: "3 failing", stderr: "" }), before).unverifiable).toBeUndefined();
-    expect(compareTests(before.observation, before).unverifiable).toBe(true);
+  it("count-only output yields no identities, so it can neither excuse nor reject", () => {
+    expect(observeTests({ code: 1, stdout: "3 failing", stderr: "" })).toMatchObject({ failures: [], count: 3, complete: false });
+    expect(judgeScoped(scopedRun(result([], { complete: false, source: "text" }), 1), atReference([]))).toMatchObject({ ok: false, unverifiable: true });
   });
   it("parses multiple runner formats opportunistically without counting failing suites as tests", () => {
     expect(observeTests({ code: 1, stdout: " FAIL test/a.ts > suite > test\n Tests  1 failed | 2 passed", stderr: "" })).toMatchObject({ failures: ["test/a.ts > suite > test"], count: 1, complete: true });
@@ -87,108 +119,104 @@ describe("baseline-aware testsPass", () => {
   });
 });
 
-describe("conservative capture and shared cache in changed-file store", () => {
+describe("dispatch reference capture in the changed-file store", () => {
   function harness() {
     let snapshot = tree();
     let now = 0;
     const store = createChangedFileStore({ now: () => now });
-    const run = vi.fn(async () => green);
-    const deps: BaselineCaptureDeps = { snapshot: async () => snapshot, run, timeoutMs: 50 };
-    const start = (id: string) => store.beginDispatch(id, cwd, ["custom tests"], deps);
-    const get = (id: string, head = snapshot.head) => store.baseline(id, "custom tests", head);
-    return { store, deps, run, start, get, setTree: (s: TreeSnapshot) => { snapshot = s; }, tick: (n: number) => { now = n; } };
+    const capture = vi.fn(async (_cwd: string, _signal: AbortSignal): Promise<DispatchReference | undefined> => REF);
+    const deps: DispatchCaptureDeps = { snapshot: async () => snapshot, capture, timeoutMs: 50 };
+    const start = (dispatch: string) => store.beginDispatch(dispatch, cwd, deps);
+    const get = (dispatch: string) => store.reference(dispatch);
+    return { store, deps, capture, start, get, setTree: (s: TreeSnapshot) => { snapshot = s; }, tick: (n: number) => { now = n; } };
   }
-  it("starts without blocking and caches across dispatches after the first session is cleared", async () => {
+  it("captures in the background and resolves once the capture settled", async () => {
     const h = harness();
-    expect(h.start("first")).toBeUndefined();
-    expect(await h.get("first")).toEqual(baseline(green));
+    const started = h.start("first");
+    expect(started).toBeInstanceOf(Promise);
+    await started;
+    expect(await h.get("first")).toEqual(captured);
     h.store.clear("first");
-    h.start("second");
-    expect(await h.get("second")).toEqual(baseline(green));
-    expect(h.run).toHaveBeenCalledTimes(1);
+    expect(await h.get("first")).toEqual({ kind: "none", reason: REFERENCE_NONE.untracked });
+    await h.start("second");
+    expect(await h.get("second")).toEqual(captured);
+    expect(h.capture).toHaveBeenCalledTimes(2);
   });
-  it.each(["head", "fingerprint"] as const)("does not reuse cache when %s changes", async key => {
+  it("a retry keeps the original dispatch's reference", async () => {
     const h = harness();
-    h.start("first"); await h.get("first");
-    h.setTree(tree({ [key]: "changed" }));
-    h.start("second"); await h.get("second");
-    expect(h.run).toHaveBeenCalledTimes(2);
-    if (key === "head") expect(await h.get("first", "changed")).toBeUndefined();
+    await h.start("first");
+    h.capture.mockResolvedValue({ ...REF, commit: "after-the-failed-attempt" });
+    await h.start("first");
+    expect(await h.get("first")).toEqual(captured);
+    expect(h.capture).toHaveBeenCalledTimes(1);
   });
-  it("keys by command and directory too", async () => {
+  it("without a capture the dispatch keeps its uncaptured state and still snapshots", async () => {
     const h = harness();
-    h.start("first"); await h.get("first");
-    h.store.beginDispatch("other-command", cwd, ["another command"], h.deps);
-    await h.store.baseline("other-command", "another command", "head1");
-    h.setTree(tree({ cwd: resolve("another-workspace") }));
-    h.store.beginDispatch("other-dir", resolve("another-workspace"), ["custom tests"], h.deps);
-    await h.get("other-dir");
-    expect(h.run).toHaveBeenCalledTimes(3);
+    await h.store.beginDispatch("off", cwd, { snapshot: h.deps.snapshot, timeoutMs: 50, uncaptured: { kind: "disabled" } });
+    await h.store.beginDispatch("readonly", cwd, { snapshot: h.deps.snapshot, timeoutMs: 50 });
+    expect(await h.get("off")).toEqual({ kind: "disabled" });
+    expect(await h.get("readonly")).toEqual({ kind: "none", reason: REFERENCE_NONE.notRequested });
+    expect(h.capture).not.toHaveBeenCalled();
+    expect(h.store.delta("off", "child", tree()).changeBaseline).toBe("available");
   });
-  it("runs at most one capture per directory and command, whatever the fingerprint", async () => {
-    const h = harness(); const held = deferred<ExecResult>(); const started = deferred<void>();
-    h.run.mockImplementationOnce(async () => { started.resolve(); return held.promise; });
-    h.start("first"); await started.promise;
-    h.setTree(tree({ fingerprint: "changed" }));
-    h.start("second");
-    expect(await h.get("second")).toBeUndefined();
-    expect(h.run).toHaveBeenCalledTimes(1);
-    held.resolve(green);
-    h.setTree(tree());
-    expect(await h.get("first")).toEqual(baseline(green));
-    h.setTree(tree({ fingerprint: "changed" }));
-    h.start("third"); await h.get("third");
-    expect(h.run).toHaveBeenCalledTimes(2);
-  });
-  it.each(["fingerprint", "edit", "patch", "bash"])("discards a baseline contaminated by %s mid-capture", async cause => {
-    const h = harness();
-    const held = deferred<ExecResult>();
-    const started = deferred<void>();
-    h.deps.run = async () => { started.resolve(); return held.promise; };
-    h.start("child");
-    await started.promise;
-    if (cause === "fingerprint") h.setTree(tree({ fingerprint: "changed" }));
-    else h.store.observeEdit(cause === "patch" ? "apply_patch" : cause, cwd);
-    held.resolve(green);
-    expect(await h.get("child")).toBeUndefined();
-    const r = await grade(failed("observed"), await h.get("child"));
+  it.each(["edit", "patch", "bash"])("discards a reference contaminated by %s mid-capture", async cause => {
+    const h = harness(); const held = deferred<DispatchReference | undefined>(); let signal: AbortSignal | undefined;
+    h.capture.mockImplementationOnce(async (_c, s) => { signal = s; return held.promise; });
+    const settled = h.start("child");
+    await vi.waitFor(() => expect(signal).toBeDefined());
+    h.store.observeEdit(cause === "patch" ? "apply_patch" : cause, cwd);
+    expect(signal?.aborted).toBe(true);
+    held.resolve(REF);
+    await settled;
+    expect(await h.get("child")).toEqual({ kind: "none", reason: REFERENCE_NONE.contaminated });
+    const r = await grade({ scoped: scopedRun(result([id("observed")])), recheck: { kind: "unusable", cause: "no-reference", reason: REFERENCE_NONE.contaminated } });
     expect(r.verdict.outcome).toBe("unverifiable");
     expect(r.accepted).toBe(true);
   });
   it("an edit during initial fingerprinting also discards the snapshot", async () => {
     const h = harness(); const held = deferred<TreeSnapshot>();
     h.deps.snapshot = () => held.promise;
-    h.start("child"); h.store.observeEdit("edit", cwd); held.resolve(tree());
-    expect(await h.get("child")).toBeUndefined();
+    const settled = h.start("child"); h.store.observeEdit("edit", cwd); held.resolve(tree());
+    await settled;
     expect(h.store.delta("child", "child", tree()).changeBaseline).toBe("unavailable");
-    expect(h.run).not.toHaveBeenCalled();
+    expect(await h.get("child")).toEqual({ kind: "none", reason: REFERENCE_NONE.contaminated });
   });
   it("editing a different known directory does not contaminate capture", async () => {
-    const h = harness(); const held = deferred<ExecResult>(); const started = deferred<void>();
-    h.deps.run = async () => { started.resolve(); return held.promise; };
-    h.start("child"); await started.promise;
-    h.store.observeEdit("edit", resolve("unrelated-workspace")); held.resolve(green);
-    expect(await h.get("child")).toEqual(baseline(green));
+    const h = harness(); const held = deferred<DispatchReference | undefined>();
+    h.capture.mockImplementationOnce(() => held.promise);
+    const settled = h.start("child");
+    h.store.observeEdit("edit", resolve("unrelated-workspace")); held.resolve(REF);
+    await settled;
+    expect(await h.get("child")).toEqual(captured);
   });
-  it("baseline timeout is bounded, aborts capture, and yields accepted unverifiable", async () => {
+  it("the capture is bounded, aborted at its timeout, and yields no reference", async () => {
     vi.useFakeTimers(); const h = harness(); let signal: AbortSignal | undefined;
-    h.deps.run = async (_c, _d, s) => { signal = s; return new Promise<ExecResult>(() => {}); };
-    h.start("child"); const pending = h.get("child");
+    h.capture.mockImplementationOnce(async (_c, s) => { signal = s; return new Promise<undefined>(() => {}); });
+    void h.start("child"); const pending = h.get("child");
     await vi.advanceTimersByTimeAsync(100);
-    expect(await pending).toBeUndefined(); expect(signal?.aborted).toBe(true);
-    expect((await grade(failed("observed"), await pending)).verdict.outcome).toBe("unverifiable");
+    expect(await pending).toEqual({ kind: "none", reason: REFERENCE_NONE.failed }); expect(signal?.aborted).toBe(true);
   });
-  it("TTL sweeps both dispatch references and cross-dispatch cache", async () => {
-    const h = harness(); h.start("first"); await h.get("first");
+  it("a gate signal bounds the wait for a capture still in flight", async () => {
+    const h = harness(); const held = deferred<DispatchReference | undefined>();
+    h.capture.mockImplementationOnce(() => held.promise);
+    const settled = h.start("child"); const gate = new AbortController();
+    const waiting = h.store.reference("child", gate.signal); gate.abort();
+    expect(await waiting).toEqual({ kind: "none", reason: REFERENCE_NONE.gateBudget });
+    held.resolve(REF);
+    await settled;
+    expect(await h.get("child")).toEqual(captured);
+  });
+  it("TTL sweeps dispatch references with their dispatch", async () => {
+    const h = harness(); await h.start("first");
     h.tick(100); h.store.sweep(100, 100);
-    expect(await h.get("first")).toBeUndefined();
-    h.start("second"); await h.get("second");
-    expect(h.run).toHaveBeenCalledTimes(2);
+    expect(await h.get("first")).toEqual({ kind: "none", reason: REFERENCE_NONE.untracked });
+    await h.start("second");
+    expect(h.capture).toHaveBeenCalledTimes(2);
   });
   it("grader receives child edits union new changed paths, not unrelated pre-existing dirt", async () => {
     const h = harness(); const old = resolve(cwd, "old.ts"); const edited = resolve(cwd, "edited.ts"); const added = resolve(cwd, "new.ts");
     const before = tree({ dirty: true, files: [{ path: old, status: " M" }, { path: edited, status: " M" }] });
-    h.setTree(before); h.start("dispatch"); await h.get("dispatch");
+    h.setTree(before); await h.start("dispatch");
     h.store.record("child", "edit", { filePath: edited });
     const delta = h.store.delta("dispatch", "child", { ...before, files: [...before.files, { path: added, status: "??" }] });
     expect(delta.changedFiles.map(f => f.path).sort()).toEqual([edited, added].sort());
@@ -196,6 +224,16 @@ describe("conservative capture and shared cache in changed-file store", () => {
     expect(prompt).toContain("Producer delta only"); expect(prompt).toContain("predate the dispatch");
     expect(prompt).not.toContain(old);
     expect(prompt).toContain(edited); expect(prompt).toContain(added);
+  });
+  it("tool-observed paths take the snapshot's status letters and rename source", async () => {
+    const h = harness(); await h.start("dispatch");
+    const gone = resolve(cwd, "gone.ts"); const old = resolve(cwd, "old.ts"); const moved = resolve(cwd, "moved.ts");
+    h.store.record("child", "apply_patch", { patchText: "*** Begin Patch\n*** Delete File: gone.ts\n*** Update File: old.ts\n*** Move to: moved.ts\n*** End Patch" });
+    const current = tree({ files: [{ path: gone, status: " D" }, { path: moved, status: "R ", previousPath: old }] });
+    const { changedFiles } = h.store.delta("dispatch", "child", current);
+    expect(changedFiles).toContainEqual({ path: gone, status: " D" });
+    expect(changedFiles).toContainEqual({ path: moved, status: "R ", previousPath: old });
+    expect(changedFiles).toContainEqual({ path: old, status: "modified" });
   });
   it("missing snapshot never substitutes a raw dirty tree and explicitly disclaims attribution", () => {
     const h = harness(); const old = resolve(cwd, "old.ts");

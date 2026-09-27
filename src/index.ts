@@ -597,8 +597,7 @@ const ModelRouterPlugin: Plugin = async (ctx: PluginInput) => {
               // Grader sessions opened by THIS accept() call, and only those.
               const gateGraderSessions = new Set<string>();
               const completedFailures: string[] = [];
-              const gateDeps = buildGateDeps(toolCtx?.sessionID, gateGraderSessions);
-              gateDeps.deterministic.testBaseline = verification.testBaseline;
+              const gateDeps = buildGateDeps(toolCtx?.sessionID, gateGraderSessions, verification);
               gateDeps.deterministic.onFailure = reason => completedFailures.push(reason);
               let gateRes;
               try {
@@ -1111,8 +1110,7 @@ const ModelRouterPlugin: Plugin = async (ctx: PluginInput) => {
               return;
             }
 
-            const gateDeps = buildGateDeps();
-            gateDeps.deterministic.testBaseline = verification.testBaseline;
+            const gateDeps = buildGateDeps(undefined, undefined, verification);
             const res = await accept(
               {
                 dod,

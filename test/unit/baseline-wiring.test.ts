@@ -6,25 +6,40 @@ import { tmpdir } from "node:os";
 import { createVerificationWiring } from "../../src/verify/wiring";
 import { createChangedFileStore, type TreeSnapshot } from "../../src/verify/dispatch";
 import { accept } from "../../src/verify/gate";
+import { REFERENCE_NONE } from "../../src/verify/baseline";
 import type { RouterConfig } from "../../src/router/config";
 import type { DoD } from "../../src/verify/dod";
+import type { DispatchReference } from "../../src/verify/reference";
+import type { TestsPassRequest } from "../../src/verify/types";
 
 const state = vi.hoisted(() => ({
   snapshot: undefined as TreeSnapshot | undefined,
-  code: 0, stdout: "", commands: [] as string[], budgets: [] as number[],
+  commands: [] as string[],
+  captures: [] as { cwd: string; timeoutMs: number | undefined }[],
+  captureResult: undefined as unknown,
   held: false, finish: undefined as (() => void) | undefined,
 }));
 vi.mock("../../src/verify/tree", () => ({ snapshotTree: async () => state.snapshot }));
+// G6: no process may run at dispatch time; any shell or argv spawn is recorded and fails the assertion.
 vi.mock("../../src/verify/exec", () => ({
-  runShell: (command: string, opts: { timeoutMs: number }) => new Promise(resolve => {
-    state.commands.push(command); state.budgets.push(opts.timeoutMs);
-    const finish = () => resolve({ code: state.code, stdout: state.stdout, stderr: "", timedOut: false });
+  runShell: async (command: string) => { state.commands.push(command); return { code: 0, stdout: "", stderr: "", timedOut: false }; },
+  runArgv: async (file: string, args: readonly string[]) => { state.commands.push([file, ...args].join(" ")); return { code: 0, stdout: "", stderr: "", timedOut: false }; },
+}));
+vi.mock("../../src/verify/reference", async importOriginal => ({
+  ...(await importOriginal<typeof import("../../src/verify/reference")>()),
+  captureReference: (at: string, _signal: AbortSignal, deps: { timeoutMs?: number }) => new Promise(resolve => {
+    state.captures.push({ cwd: at, timeoutMs: deps.timeoutMs });
+    const finish = () => resolve(state.captureResult);
     if (state.held) state.finish = finish; else finish();
   }),
 }));
 const cwd = resolve("baseline-wiring-project");
 const dod: DoD = { kind: "deterministic", source: "explicit", criteria: [], deliverable: null, checks: [{ kind: "testsPass", command: "pnpm test" }] };
-beforeEach(() => Object.assign(state, { snapshot: { cwd, head: "HEAD", fingerprint: "before", dirty: true, files: [{ path: resolve(cwd, "old.ts"), status: " M" }] }, code: 0, stdout: "", commands: [], budgets: [], held: false, finish: undefined }));
+const REF: DispatchReference = { root: cwd, head: "HEAD", commit: "HEAD", untracked: new Map(), tracked: new Map(), captureReasons: [], capturedAt: 0 };
+beforeEach(() => Object.assign(state, {
+  snapshot: { cwd, head: "HEAD", fingerprint: "before", dirty: true, files: [{ path: resolve(cwd, "old.ts"), status: " M" }] },
+  commands: [], captures: [], captureResult: REF, held: false, finish: undefined,
+}));
 function harness() {
   const cfg: RouterConfig = { activePreset: "a", presets: { a: { medium: { model: "p/m" } } }, defaultTier: "medium", rules: [], enforcement: { verify: { baselineTimeoutMs: 1234 } } };
   const wiring = createVerificationWiring({ client: {}, directory: cwd, getConfig: () => cfg });
@@ -74,40 +89,75 @@ describe("tree snapshot against a real git repository", () => {
   });
 });
 
-describe("baseline wiring", () => {
-  it("does not await capture and consumes the original reference after the producer changes the tree", async () => {
+describe("dispatch reference wiring", () => {
+  it("captures a git-only reference (no test command) and the gate judges against it after the producer changed the tree", async () => {
     const { wiring, store } = harness(); state.held = true;
-    expect(wiring.beginVerification(store, "dispatch", undefined, dod)).toBeUndefined();
+    const begun = wiring.beginVerification(store, "dispatch", undefined, dod);
+    expect(begun).toBeInstanceOf(Promise);
     await vi.waitFor(() => expect(state.finish).toBeDefined());
-    expect(state.commands).toEqual(["pnpm test"]);
+    expect(state.captures).toEqual([{ cwd, timeoutMs: 1234 }]);
     state.finish?.();
-    expect(await store.baseline("dispatch", "pnpm test", "HEAD")).toBeDefined();
-    state.held = false; state.code = 1; state.stdout = "FAILED new-test - assertion\n=== 1 failed ===";
+    await begun;
     state.snapshot = { ...state.snapshot!, fingerprint: "after", files: [...state.snapshot!.files, { path: resolve(cwd, "new.ts"), status: "??" }] };
     const prepared = await wiring.prepareVerification(store, "dispatch", "child");
     expect(prepared.changedFiles.map(f => f.path)).toEqual([resolve(cwd, "new.ts")]);
-    const deps = wiring.buildGateDeps(); deps.deterministic.testBaseline = prepared.testBaseline;
+    expect(prepared.reference).toEqual({ kind: "captured", reference: REF });
+    expect(prepared.snapshot?.fingerprint).toBe("after");
+    const deps = wiring.buildGateDeps(undefined, undefined, prepared);
+    const seen: TestsPassRequest[] = [];
+    deps.deterministic.testsPass = async req => {
+      seen.push(req);
+      return {
+        scoped: { kind: "ran", exitCode: 1, notes: [], result: { failingIds: ["new.test.ts > new-test"], failingFiles: [resolve(cwd, "new.test.ts")], collectionError: false, total: 1, complete: true, source: "report" } },
+        recheck: { kind: "exact", result: undefined, ranFiles: [], absentFiles: ["new.test.ts"], notes: [] },
+      };
+    };
     const result = await accept({ dod }, { ...prepared, finalReturnText: "done", declaredOutputs: [], producerSessionID: "child", producerTier: "medium" }, deps);
     expect(result.accepted).toBe(false); expect(result.verdict.reasons[0]).toContain("new-test");
-    expect(state.budgets[0]).toBe(1234);
-  });
-  it("disabled capture still snapshots changed files and disabled consumption ignores a cached baseline", async () => {
-    const { cfg, wiring, store } = harness();
-    wiring.beginVerification(store, "warm", undefined, dod);
-    await store.baseline("warm", "pnpm test", "HEAD");
-    cfg.enforcement!.verify!.testBaseline = false;
-    wiring.beginVerification(store, "disabled", undefined, dod);
-    await store.baseline("disabled", "pnpm test", "HEAD");
-    expect(state.commands).toEqual(["pnpm test"]);
-    expect((await wiring.prepareVerification(store, "disabled", "child")).changeBaseline).toBe("available");
-    expect(await (await wiring.prepareVerification(store, "warm", "child")).testBaseline("pnpm test")).toBeUndefined();
-  });
-  it("read-only dispatches run no tests and forbidden commands never execute", async () => {
-    const { wiring, store } = harness();
-    wiring.beginVerification(store, "readonly", undefined, { ...dod, kind: "checker", checks: [], criteria: ["investigate"] });
-    expect(await store.baseline("readonly", "npm test", "HEAD")).toBeUndefined();
-    wiring.beginVerification(store, "blocked", undefined, { ...dod, checks: [{ kind: "testsPass", command: "npm test && evil" }] });
-    expect(await store.baseline("blocked", "npm test && evil", "HEAD")).toBeUndefined();
+    expect(result.verdict.failures?.introduced).toEqual(["new.test.ts > new-test"]);
+    expect(seen[0]).toMatchObject({ command: "pnpm test", cwd, reference: { kind: "captured" }, changedFiles: [{ path: resolve(cwd, "new.ts"), status: "??" }] });
+    // G6: the dispatch and the gate (whose hook is faked) spawned nothing.
     expect(state.commands).toEqual([]);
+  });
+  it("failureRecheck off (deprecated testBaseline false) captures nothing but still snapshots changed files", async () => {
+    const { cfg, wiring, store } = harness();
+    cfg.enforcement!.verify!.testBaseline = false;
+    await wiring.beginVerification(store, "disabled", undefined, dod);
+    cfg.enforcement!.verify = { failureRecheck: false };
+    await wiring.beginVerification(store, "off", undefined, dod);
+    expect(state.captures).toEqual([]);
+    const prepared = await wiring.prepareVerification(store, "disabled", "child");
+    expect(prepared.changeBaseline).toBe("available");
+    expect(prepared.reference).toEqual({ kind: "disabled" });
+    expect((await wiring.prepareVerification(store, "off", "child")).reference).toEqual({ kind: "disabled" });
+  });
+  it("read-only dispatches and forbidden commands capture nothing and run nothing", async () => {
+    const { wiring, store } = harness();
+    await wiring.beginVerification(store, "readonly", undefined, { ...dod, kind: "checker", checks: [], criteria: ["investigate"] });
+    await wiring.beginVerification(store, "blocked", undefined, { ...dod, checks: [{ kind: "testsPass", command: "npm test && evil" }] });
+    for (const id of ["readonly", "blocked"]) {
+      expect((await wiring.prepareVerification(store, id, "child")).reference).toEqual({ kind: "none", reason: REFERENCE_NONE.notRequested });
+    }
+    expect(state.captures).toEqual([]);
+    expect(state.commands).toEqual([]);
+  });
+  it("a retry keeps the first reference, and an untracked dispatch has none", async () => {
+    const { wiring, store } = harness();
+    await wiring.beginVerification(store, "dispatch", undefined, dod);
+    state.captureResult = { ...REF, commit: "after-the-failed-attempt" };
+    await wiring.beginVerification(store, "dispatch", undefined, dod);
+    expect(state.captures).toHaveLength(1);
+    expect((await wiring.prepareVerification(store, "dispatch", "retry")).reference).toEqual({ kind: "captured", reference: REF });
+    expect((await wiring.prepareVerification(store, "never-begun", "child")).reference).toEqual({ kind: "none", reason: REFERENCE_NONE.untracked });
+  });
+  it("an overlapping edit before the capture resolves discards the reference", async () => {
+    const { wiring, store } = harness(); state.held = true;
+    const begun = wiring.beginVerification(store, "dispatch", undefined, dod);
+    await vi.waitFor(() => expect(state.finish).toBeDefined());
+    store.observeEdit("bash", cwd);
+    state.finish?.();
+    await begun;
+    expect((await wiring.prepareVerification(store, "dispatch", "child")).reference)
+      .toEqual({ kind: "none", reason: REFERENCE_NONE.contaminated });
   });
 });
