@@ -99,7 +99,10 @@ function harness() {
   const store = createChangedFileStore();
   return { cfg, wiring, store };
 }
-describe("tree snapshot against a real git repository", () => {
+// Real git on a loaded Windows runner outlasts the 5 s default.
+const REAL_GIT_TIMEOUT_MS = 60_000;
+
+describe("tree snapshot against a real git repository", { timeout: REAL_GIT_TIMEOUT_MS }, () => {
   const withRepo = async (body: (repo: string) => Promise<void>) => {
     const repo = mkdtempSync(join(tmpdir(), "omr-tree-"));
     const git = (...args: string[]) => execFileSync("git", args, { cwd: repo, windowsHide: true });
@@ -142,7 +145,7 @@ describe("tree snapshot against a real git repository", () => {
   });
 });
 
-describe("shell edits to files already dirty at dispatch, against a real git repository (QA-2.1-2)", () => {
+describe("shell edits to files already dirty at dispatch, against a real git repository (QA-2.1-2)", { timeout: REAL_GIT_TIMEOUT_MS }, () => {
   const real = () => vi.importActual<typeof import("../../src/verify/tree")>("../../src/verify/tree");
   const sha = (text: string) => `file:${createHash("sha256").update(text).digest("hex")}`;
   const key = (p: string) => resolve(p).toLowerCase();
@@ -259,10 +262,10 @@ describe("shell edits to files already dirty at dispatch, against a real git rep
       expect(scoped).toHaveLength(1);
       expect(scoped[0]).toContain(join(repo, "src", "a.js"));
     });
-  });
+  }); // Real git over 501 untracked files: the describe's REAL_GIT_TIMEOUT_MS.
 });
 
-describe("commits made since dispatch, against a real git repository (QA-2.1-12)", () => {
+describe("commits made since dispatch, against a real git repository (QA-2.1-12)", { timeout: REAL_GIT_TIMEOUT_MS }, () => {
   const real = () => vi.importActual<typeof import("../../src/verify/tree")>("../../src/verify/tree");
   const key = (p: string) => resolve(p).toLowerCase();
   /** A clean repository: src/a.js and src/b.js committed. */
@@ -307,8 +310,11 @@ describe("commits made since dispatch, against a real git repository (QA-2.1-12)
       expect(prepared.changeBaseline).toBe("available");
       expect(prepared.changedFiles.map(f => ({ ...f, path: key(f.path) }))).toEqual([{ path: key(join(repo, "src", "b.js")), status: "M" }]);
       // One git diff, through the argv seam, at low priority, bounded, rooted at the repository.
-      expect(state.commands).toEqual([`git --no-optional-locks -C ${repo} diff --name-status -z -M ${head} HEAD`]);
-      expect(state.execOpts[0]).toMatchObject({ cwd: repo, timeoutMs: COMMIT_DIFF_TIMEOUT_MS, lowPriority: resolveVerifyBudget(harness().cfg).lowPriority });
+      // Only the spawns rooted at this test's repository: a timed-out earlier test's gate can still
+      // record into the shared state after beforeEach reset it.
+      const ours = state.commands.map((command, i) => ({ command, opts: state.execOpts[i] })).filter(c => c.opts?.cwd === repo);
+      expect(ours.map(c => c.command)).toEqual([`git --no-optional-locks -C ${repo} diff --name-status -z -M ${head} HEAD`]);
+      expect(ours[0].opts).toMatchObject({ cwd: repo, timeoutMs: COMMIT_DIFF_TIMEOUT_MS, lowPriority: resolveVerifyBudget(harness().cfg).lowPriority });
     });
   });
 
