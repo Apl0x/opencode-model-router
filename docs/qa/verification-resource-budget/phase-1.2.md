@@ -734,3 +734,110 @@ Also align 3.1.2.d ("3 s later no descendant is alive") to "no attributable desc
   reaches `runShell` and `runArgv`.
 - **deferred by plan (3.1):** 3.1.2.d's run under normal-priority load (QA-1.2-14), and the §4.2
   coverage gate that QA-1.2-16 feeds into.
+
+## QA re-review (round 3)
+
+Reviewer: heavy QA, adversarial re-review of `git diff 347200e..7be5c34` on `vrb/p12`
+(`src/verify/exec.ts`, `test/unit/exec.test.ts`), plus a new angle: opencode runs the plugin
+under **Bun 1.3.14**, not Node.
+
+**Setup.**
+- Host: Windows 11, 16 logical cores, node v24.21.0, bun 1.3.14. Other agents were running tests
+  on the same machine, so machine-wide process counts were filtered to this review's own PIDs.
+- `npx vitest run --maxWorkers=2 test/unit/exec.test.ts` (node): **35 passed, 2 skipped** (the
+  POSIX-only cases), 37 in total, 32.62 s.
+- The repro scripts lived in `%TEMP%\omr-qa12r3` and have been removed. No fixture, burner or
+  sweeper process was left running.
+  - `repro.mjs` imported `src/verify/exec.ts` directly. It ran unchanged under `node` (type
+    stripping) and `bun`. The fixtures always ran on node.exe (`OMR_NODE`), because under Bun
+    `process.execPath` is `bun.exe`.
+  - `exitprobe.mjs` ended the host process while runs were in flight, under both runtimes.
+  - `hang.exe` was a stand-in for a hung sweeper. It is a `bun build --compile` binary that
+    ignores its arguments and stdin and lives 60 s. It was installed through
+    `setSweeperExecutableForTests`.
+  - `load.mjs` ran on node only. It wrapped `child_process.spawn` through
+    `syncBuiltinESMExports`, so it could time the sweeper and read its output, and for the CLM
+    case prefix its script. Its fixture was a copy of `tree.cjs` with a 60 s holder cap, so a late
+    kill cannot be mistaken for the holder's own 20 s exit.
+
+**Result.**
+- QA-1.2-14, -15 and -16 are verified.
+- Bun behaves like Node in every exec.ts path measured except one: `runArgv` on a `.cmd` path
+  (QA-1.2-17). Bun spawns through libuv (its ENOENT text names `uv_spawn`), which accounts for
+  the parity elsewhere.
+- There are 4 new findings: 1 major, 2 minor (one of them owned by 1.5) and 1 nit.
+- The DoD (zero open findings) is **not met**.
+
+### Round-2 findings
+
+| Finding | Status | Evidence |
+|---|---|---|
+| QA-1.2-14 | verified | **Code.**<br>• `SWEEP_TIMEOUT_MS = 30_000` (`exec.ts:72`), with `limit.unref()` (`:544`).<br>• The live-child `taskkill` keeps its own `TASKKILL_TIMEOUT_MS = 5000` (`:74`, `:361`).<br>• The sweeper is still a non-detached `spawn` (`:500-503`).<br>**Still kills under saturation.** 16 normal-priority node busy loops ran on 16 cores. The holder died in 7 of 7 runs, so no run was "never":<br>• cold: +4406, +3834, +3237 and +3565 ms after the abort;<br>• pre-armed: +2899, +3255 and +3133 ms.<br>Each sweeper printed `pinned 1` and the root PID, and closed with code 0 at +3342 to +4847 ms, far below the 30 s limit. Each run itself resolved at +2021 to +2052 ms, `timedOut: true`, with the force-closed note. Six of the seven kills missed 3 s, which is G4 limit (c).<br>**Not orphaned.** The hung `hang.exe` sweeper was alive at the host's `process.exit(0)`, 1 s after the result. One second later it was gone, under node and under bun (libuv job).<br>**The limit fires.** When the host is left to exit on its own, `hang.exe` is dead by the time the host exits, at abort+30040 ms (node) and +30060 ms (bun). That same measurement is QA-1.2-19. |
+| QA-1.2-15 | verified | **FullLanguage check** (`exec.ts:474`). The CLM case prefixed the sweeper's `-Command` with `$ExecutionContext.SessionState.LanguageMode = 'ConstrainedLanguage'; `. (`__PSLockdownPolicy=4` does not force CLM on this host: `powershell.exe` still reports `FullLanguage`.) The sweeper exited with **code 3** and printed nothing.<br>• Cold: the result arrived at abort+2009 ms with stderr `[orphan sweep unavailable: exit 3]` then `[output streams force-closed 2000 ms after the kill: …]`.<br>• Pre-armed: the sweeper had already exited 3 at abort−281 ms. The same two notes arrived at +2002 ms.<br>• The holder was alive in both cases, as expected: the sweep could not run.<br>**The marker.** `pinned 1` was on the sweeper's stdout in all 7 load runs.<br>**The note appears only while the run is pending.**<br>• In the load runs the sweep finished after the grace had settled the run. The result carries only the force-closed note, and no stale or misleading line.<br>• With the hung `hang.exe`, the result at +2005 to +2022 ms has only the force-closed note. The `timed out after 30000 ms` reason arrives 28 s after the run settled and is dropped, as the `armSweeper` comment says.<br>**The test hook is not reachable from production.**<br>• `rg setSweeperExecutableForTests src` matches only its definition (`exec.ts:429`).<br>• The plugin entry `src/index.ts` exports only types (`:106-110`) and `default` (`:1548`).<br>• The only production importer of `exec.ts` is `wiring.ts:20`, and it imports `runShell` alone.<br>Both hook tests pass. |
+| QA-1.2-16 | verified | `deadlineOf` is exported (`exec.ts:299`).<br>• The pure test covers `{}` → 120000, `NaN` → 120000, signal only → `undefined`, and signal with `500` → 500.<br>• The `vi.spyOn(globalThis, "setTimeout")` test sees a 120000 ms timer for a bare `runArgv`, and none when only a signal is passed.<br>Together with the earlier `Infinity`, `2 ** 31` and `-5` tests, every branch of `deadlineOf` runs. Both tests pass. |
+
+### Bun compatibility (Windows 11; the same script under both runtimes)
+
+| Aspect | node v24.21.0 | bun 1.3.14 | Verdict |
+|---|---|---|---|
+| Exit codes. `runShell` `exit 0`, `exit 3` and `exit 3` with `lowPriority`; `runArgv` node `exit(3)`, and `ok`/`exit(3)` with `lowPriority` | 0, 3, 3, 3, 0 (`ok`), 3 | the same | same |
+| Spawn error (a missing executable, with and without `lowPriority`) | code 1, `Error: spawn omr-no-such-exe-qa12r3 ENOENT` | code 1, `Error: ENOENT: no such file or directory, uv_spawn 'omr-no-such-exe-qa12r3'` | The contract holds (code 1, error on stderr); only the text differs |
+| `lowPriority` → `os.setPriority` on the child PID, inherited by descendants | argv chain: child P6, grandchild P6. `runShell` of a quoted `.cmd`: `cmd.exe` P6, node P6, grandchild P6. `.cmd` exit 3 kept | the same | same |
+| Tree kill: deadline 1500 ms, and abort at 1500 ms. Target: `runArgv` or `runShell` of node, whose grandchild is **detached**, so only `taskkill /T` reaches it | child and grandchild dead at t = 1839–1894 ms; resolved at 1838–1873 ms, `code 1, timedOut: true` | dead at 1852–1895 ms; resolved at 1856–1879 ms | same |
+| Exited-child sweep (`tree.cjs early-exit`, abort) | holder dead: cold +1352/+1196 ms, pre-armed +625/+657 ms; `[killed 1 process tree(s) …]` | cold +1230/+1291 ms, pre-armed +519/+653 ms; the same note | same |
+| Armed sweeper when nothing is killed (the holder releases the pipes) | this run's sweeper: 1 alive while the pipes were held, 0 at 300 ms after the result; `code 0, timedOut: false` | the same | same |
+| Kill grace (`broken-tree`, abort) | +2002 ms, force-closed note, holder alive (the documented residual) | +2013 ms, the same | same |
+| Env merge on win32: `{path, Temp, omr_x}`, `{PATH:"X1", Path:"Y2"}` and `{Path:"Y2", PATH:"X1"}` | `path=OMR-X`, `Temp=C:\omr-temp-override`, `omr_x=1`; `[["Path","Y2"]]`; `[["PATH","X1"]]`; exactly one key each | the same | same |
+| `maxBuffer: 1000` | stdout.length 1000; stderr ends with `[stdout truncated at 1000 chars]` and `[stderr truncated at 1000 chars]` | the same | same |
+| `setEncoding("utf8")`: 200000 × `aé日本😀` on both streams | byte-exact, 0 U+FFFD | the same | same |
+| Abort listeners after 25 runs sharing one signal (`getEventListeners`) | 0 | 0 | same |
+| `timeoutMs` of `2 ** 31`, `-5`, and a pre-aborted signal | 408 ms `code 0`; 513 ms `timedOut: true`; `timedOut: true` | 393 ms; 353 ms; the same | same |
+| `runShell` of a quoted `.cmd` path with a space and `lowPriority`; `npm.cmd --version`; `npm.cmd run <missing>` | 3 with `cmdout 3`; 0 with `12.0.2`; 1 with `Missing script` | the same | same |
+| **`runArgv` on a `.cmd` path** | code 1, `exec failed: Error: spawn EINVAL` | **Runs it through cmd.exe.** `t.cmd 3` → code 3, `cmdout 3`. `probe.cmd` with the argument `"&echo INJECTED&"` → stdout `probe-ran\r\nINJECTED\r\n`, and cmd.exe complains on stderr that `'\"'` is not a command | **differs: QA-1.2-17** |
+| `runArgv` of a batch file by bare name (`npm`; `probe` with `probe.cmd` in the cwd) | ENOENT | ENOENT (`uv_spawn`) | same: only an explicit `.cmd`/`.bat` path is exposed |
+| Host `process.exit(0)` with a `runShell` and a `runArgv` run in flight (15 s node targets) | the argv run's node child is gone. The shell run's `cmd.exe` is gone, but **its node child is alive** 1.5 s later, re-parented to the dead `cmd.exe` | the same | same in both: **QA-1.2-18** |
+| Hung sweeper at host `process.exit(0)` | killed | killed | same (QA-1.2-14: not orphaned) |
+| Hung sweeper, host left to exit on its own | exits at abort+30040 ms; the result came at +2009 ms | +30060 ms; the result came at +2014 ms | same in both: **QA-1.2-19** |
+| `process.on("exit")` on a natural exit | fires | fires | same. The POSIX group hook (`process.once("exit")`, `process.kill(-pgid)`) and `nice` cannot be run on this host: 3.1 |
+| `process.execPath` | `…\nodejs-lts\current\node.exe` | `C:\Users\Marquinho\.bun\bin\bun.exe` | **differs: QA-1.2-20** (1.5) |
+| `windowsHide` (a `GetConsoleWindow()` probe through `runArgv`) | 0 | 0 | Not observable here: the control spawn without `windowsHide` also reports 0, because the host process has no console |
+
+### New findings
+
+| ID | Severity | Where | Evidence | Fix |
+|---|---|---|---|---|
+| QA-1.2-17 | major | `exec.ts:92-101` (`runArgv`; the JSDoc says a `.cmd` "resolves as a spawn error") | **Under Bun, the production runtime, `runArgv` runs a batch file through cmd.exe, and cmd.exe re-parses its arguments.** This breaks the seam's "arguments reach the child byte-for-byte" contract, and it is the CVE-2024-27980 (BatBadBut) injection class that Node's EINVAL guards against.<br>• `runArgv("<tmp>\probe.cmd", ['"&echo INJECTED&"'])` → code 1 and stdout `probe-ran\r\nINJECTED\r\n`: cmd.exe ran `echo INJECTED`.<br>• `runArgv("<tmp>\dir with space\t.cmd", ["3"])` → code 3, `cmdout 3`.<br>• Node gives `code 1, exec failed: Error: spawn EINVAL` for both.<br>• Bare names (`npm`, `probe`) are ENOENT in both runtimes, so the exposure is an explicit `.cmd`/`.bat` path, such as `node_modules\.bin\vitest.cmd` or a user-configured path.<br>**Impact.** There is no production `runArgv` caller yet (`rg runArgv src` finds only `exec.ts`). §1.5-1's argv adapters are the consumers, and on Windows their arguments (test names, file filters) can contain `&`, `"` or `%`. | 1. In `runArgv`, on win32, refuse a batch target before spawning, whatever the runtime. For example, when `/\.(cmd\|bat)[. ]*$/i` matches `file`, resolve `{ code: 1, stdout: "", stderr: "exec failed: spawn EINVAL (batch files must run through runShell)", timedOut: false }`. That is the result Node gives today.<br>2. Keep the JSDoc as it is: it is then true on both runtimes.<br>3. Add a Windows test: `runArgv(<a .cmd>, ['"&echo X&"'])` → code 1 with EINVAL and no `X` on stdout.<br>4. The 3.1 Bun smoke should run it under bun. |
+| QA-1.2-18 | minor | the `exec.ts:27` header ("On Windows, non-detached children sit in libuv's kill-on-close job"), and QA-1.2-6's Windows contrast | **Ending the host kills only the direct child. The tree below `cmd.exe` keeps running, under node and under bun.** Measured 1.5 s after `process.exit(0)` with two runs in flight:<br>• the `runArgv` node child was gone;<br>• the `runShell` `cmd.exe` was gone, but its node child was alive (`51608<45608 node.exe` under node, `25772<13668 node.exe` under bun).<br>**Cause (from libuv's source, not re-read here).** libuv's job allows silent breakaway, so only the processes libuv spawns itself are in the job. Node children (such as vitest workers) die with their node parent, because each node has its own job. Children of `cmd.exe`, npm's shell and native launchers survive.<br>**Impact.** `runShell` is the only production path (`wiring.ts:20`). Quitting opencode mid-verification on Windows leaves `npm test` and the tree below it running until the suite ends. Nothing ends that tree, and it runs at normal priority until 2.1 wires `lowPriority`. POSIX has the exit hook for this case (QA-1.2-6); Windows has nothing. | 1. Extend the lazy exit hook to Windows. Track the PID of each direct child that has not exited yet: add it after `spawn`, delete it at `exit` and on settle.<br>2. In the hook, run `spawnSync("taskkill", ["/pid", pid, "/T", "/F"], { windowsHide: true, stdio: "ignore", timeout: 2000 })` for each PID. `spawnSync` is allowed in `exit`. The PID cannot be recycled, because libuv still holds the child's handle.<br>3. Correct the `:27` comment.<br>4. Add a Windows test that mirrors the POSIX hook test: call the hook mid-run, and the shell fixture's grandchild must be dead.<br>5. Children that already exited stay under the known residual, because the sweep needs PowerShell. |
+| QA-1.2-19 | nit | `exec.ts:542-545` (the comment "A settled run must not keep opencode alive for a hung sweeper") | **The unref'd limit timer does not stop a hung sweeper from keeping the host alive.** The sweeper's `ChildProcess` handle and stdio pipes stay ref'd, so a host that exits by draining its event loop waits for the 30 s limit. Measured with `hang.exe` and the holder released after the result:<br>• node: the result came at abort+2009 ms, and the process exited at +30040 ms (wall time 30885 ms);<br>• bun: +2014 ms and +30060 ms (wall time 31620 ms).<br>Before 98ae488, this wait was bounded at 5 s. Whether opencode ever exits by draining its event loop, rather than by an explicit exit, is not verified. | Once the run has settled with a sweep still pending, call `ps.unref()` and unref the sweeper's stdin and stdout sockets (`.unref?.()`). Otherwise, reword the comment to say that a hung sweeper can keep the host alive for up to `SWEEP_TIMEOUT_MS`. |
+| QA-1.2-20 | minor (owned by 1.5) | plan §1.5-1, as quoted in the round-2 record: argv adapters run `process.execPath <runner entry>` | **Under Bun, `process.execPath` is not node.**<br>• Measured: `bun.exe` under bun 1.3.14.<br>• Not verified: inside opencode's compiled binary it is presumably the opencode executable itself.<br>So an adapter that launches `process.execPath <vitest entry>` would run the runner under Bun, or hand the arguments to opencode's CLI, instead of under the project's node. exec.ts itself does not use `process.execPath`, and neither does anything else in `src`. | 1.5's argv adapters should resolve `node` explicitly: on PATH (`node.exe`), or from the project's toolchain. They should not use `process.execPath`.<br>The 3.1 Bun smoke should run one argv adapter end-to-end under opencode.<br>3.2 should fix the plan wording. |
+
+### Checked, no finding
+
+- **The run cannot settle twice when a sweep lands late.** In `finish` (`exec.ts:189`), a sweep
+  still pending is not disposed. `onSwept` (`:204-214`) only pushes notes, and `finish` returns
+  early once the run has settled.
+- **A pre-armed sweeper that failed before the kill.** Its `kill()` reports at once through
+  `ended` (`:531-533`). This is the CLM pre-armed case above.
+- **The `taskkill` timeout on the live-child path.** If `taskkill` runs past its 5000 ms limit,
+  `child.kill()` ends only the direct child. Its `exit` then arms the sweep for what it left
+  running (`:279-283`, `killRequested`), so the split of `TASKKILL_TIMEOUT_MS` from
+  `SWEEP_TIMEOUT_MS` does not open a new gap.
+
+### Deferred by plan (not open)
+
+- **deferred by plan (3.1)**, the e2e/CI phase:
+  - A **Bun smoke** on Windows and Linux that runs `test/unit/exec.test.ts`-equivalent cases under
+    bun. It should cover:
+    - the QA-1.2-17 refusal;
+    - the QA-1.2-18 Windows exit hook;
+    - on Linux: `nice`, the process-group kill and the `process.once("exit")` group hook under
+      Bun, none of which can run on this host.
+  - 3.1.2.d's no-orphans run under normal-priority load (QA-1.2-14, unchanged).
+  - The §4.2 coverage gate.
+- **deferred by plan (3.2)**, global QA and plan wording:
+  - QA-1.2-12;
+  - the G4 wording and risk-table row from round 2;
+  - the QA-1.2-20 plan wording.
+  - Add to the G4 known limits that on Windows, host exit reaches descendants only through the
+    exit hook (after QA-1.2-18), and that already-exited children remain under limit (a).
+- **deferred by plan (2.1):** QA-1.2-13, unchanged.
