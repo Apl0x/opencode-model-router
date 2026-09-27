@@ -4,11 +4,30 @@
 // seams. ./paths is pure path math (node:path only) and keeps that contract.
 
 import type { Check, DoD } from "./dod";
-import type { Verdict, DeterministicDeps, MutexRegistry, ExecResult, Deadline } from "./types";
+import type {
+  Verdict,
+  DeterministicDeps,
+  MutexRegistry,
+  ExecResult,
+  Deadline,
+  ArgvSeam,
+  ExecOptions,
+  ExecSeam,
+  OpenVerificationScope,
+  Rechecker,
+  ScopedExecutor,
+  ScopedOutcome,
+  VerificationScope,
+} from "./types";
+import type { LintSpec, RunnerFs, RunnerHost, RunResult } from "./runner";
+import type { VerifyBudget } from "../router/config";
+import type { PluginLogger } from "../router/logger";
 import { scrubText } from "../guard/scrub";
 import { resolveAgainst } from "./paths";
 import { isAbsolute } from "node:path";
 import { compareTests, observeTests } from "./baseline";
+import { readResult } from "./runner";
+import { acquireSlot, type SlotHandle } from "./slot";
 
 // ---------------------------------------------------------------------------
 // MutexRegistry — per-key serialization via promise-chaining
@@ -715,6 +734,224 @@ export function isInertUnreproduced(entry: string, platform: string): boolean {
     }
   }
   return false;
+}
+
+// -----------------------------------------------------------------------------------------------
+// Verification scopes (2.1.2.2): S3 slot, S4 caps, run and readResult (T2 P4-P6, P9)
+// -----------------------------------------------------------------------------------------------
+
+/** T7 u13 / P5: the stable abort phrases. */
+export const ABORTED_BEFORE_RUN = "gate budget exhausted before the scoped run";
+export const ABORTED_DURING_RUN = "gate budget exhausted during the scoped run";
+/** T9 1.4: the note on an outcome whose slot was reclaimed while it ran. */
+export const SLOT_LOST_NOTE = "verification slot was reclaimed during the run";
+
+/** What a non-spec command (buildPasses, run, lint, testScope "full") produced under a scope. */
+export type CommandOutcome =
+  | Extract<ScopedOutcome, { kind: "slot-busy" | "aborted" | "error" }>
+  | { readonly kind: "ran"; readonly exec: ExecResult; readonly notes: readonly string[] }
+  | { readonly kind: "timed-out"; readonly boundMs: number; readonly exec: ExecResult };
+
+/** A VerificationScope plus the 2.1-internal non-spec runs (P5f, T8), all under the same hold. */
+export interface CheckScope extends VerificationScope {
+  /** The resolved command through the shell seam (user text keeps shell + allowlist). Never rejects. */
+  runShell(command: string, cwd: string, deadline: Deadline): Promise<CommandOutcome>;
+  /** A scoped eslint spec through the argv seam. Never rejects. */
+  runLint(spec: LintSpec, deadline: Deadline): Promise<CommandOutcome>;
+}
+
+export type OpenCheckScope = (meta: Parameters<OpenVerificationScope>[0]) => CheckScope;
+
+export interface ScopeOpenerDeps {
+  argv: ArgvSeam;
+  exec: ExecSeam;
+  fs: RunnerFs;
+  acquire?: typeof acquireSlot;
+  budget: VerifyBudget;
+  /** deps.timeoutMs ?? 120000 (P5). */
+  checkTimeoutMs: number;
+  host?: Partial<RunnerHost>;
+  logger?: Pick<PluginLogger, "warn">;
+  /** Clock for slot-busy waitedMs; default Date.now. */
+  now?: () => number;
+}
+
+type Blocked = Extract<ScopedOutcome, { kind: "slot-busy" | "aborted" | "error" }>;
+type Hold = { readonly ok: true; readonly handle: SlotHandle } | { readonly ok: false; readonly outcome: Blocked };
+interface Spawned {
+  readonly kind: "spawned";
+  readonly exec: ExecResult;
+  /** Set when the seam threw; exec is then the synthesized { code: -1, stderr: <message> }. */
+  readonly threw?: string;
+  readonly boundMs: number;
+  /** The deadline's signal had aborted by the time the run ended. */
+  readonly cut: boolean;
+  readonly notes: readonly string[];
+}
+
+function errorText(err: unknown): string {
+  return scrubText(err instanceof Error ? err.message : String(err));
+}
+
+function toCommandOutcome(a: Blocked | Spawned): CommandOutcome {
+  if (a.kind !== "spawned") return a;
+  if (a.threw !== undefined) return { kind: "error", reason: `command failed to start: ${a.threw}` };
+  if (a.exec.timedOut) {
+    return a.cut ? { kind: "aborted", reason: "gate budget exhausted during the run" } : { kind: "timed-out", boundMs: a.boundMs, exec: a.exec };
+  }
+  return { kind: "ran", exec: a.exec, notes: a.notes };
+}
+
+/**
+ * P4-P6, P9: each opened scope takes at most one slot hold (lazily, on its first run; never nested,
+ * QA-1.4-18), runs every process at low priority under the deadline, calls readResult after every
+ * spec spawn attempt (QA-1.3-16) and releases the hold on close(). Nothing here rejects.
+ */
+export function createScopeOpener(deps: ScopeOpenerDeps): OpenCheckScope {
+  const { argv, exec, fs, budget, checkTimeoutMs, host, logger } = deps;
+  const acquire = deps.acquire ?? acquireSlot;
+  const now = deps.now ?? Date.now;
+
+  return (meta): CheckScope => {
+    let holdP: Promise<Hold> | undefined;
+    let lost = false;
+    let closed = false;
+    let closing: Promise<void> | undefined;
+    const inflight = new Set<Promise<unknown>>();
+
+    const onLost = (): void => {
+      lost = true;
+      logger?.warn(`${SLOT_LOST_NOTE}: ${scrubText(meta.command)}`);
+    };
+
+    const acquireHold = async (deadline: Deadline): Promise<Hold> => {
+      if (deadline.signal.aborted || deadline.remaining() === 0) {
+        return { ok: false, outcome: { kind: "slot-busy", waitedMs: 0, deadlineCut: true } };
+      }
+      const started = now();
+      try {
+        const r = await acquire({
+          max: budget.maxConcurrentVerifications,
+          waitMs: deadline.bound(budget.slotWaitMs),
+          signal: deadline.signal,
+          meta: { cwd: meta.cwd, command: meta.command },
+          onLost,
+        });
+        if ("busy" in r) {
+          return {
+            ok: false,
+            outcome: { kind: "slot-busy", waitedMs: Math.max(0, now() - started), deadlineCut: deadline.remaining() === 0 },
+          };
+        }
+        return { ok: true, handle: r };
+      } catch (err) {
+        return { ok: false, outcome: { kind: "error", reason: `verification slot failed: ${errorText(err)}` } };
+      }
+    };
+
+    const attempt = async (deadline: Deadline, launch: (opts: ExecOptions) => Promise<ExecResult>): Promise<Blocked | Spawned> => {
+      if (closed) return { kind: "error", reason: "verification scope already closed" };
+      holdP ??= acquireHold(deadline);
+      const hold = await holdP;
+      if (!hold.ok) return hold.outcome;
+      const boundMs = deadline.bound(checkTimeoutMs);
+      if (deadline.signal.aborted || boundMs <= 0) return { kind: "aborted", reason: ABORTED_BEFORE_RUN };
+
+      // A per-run signal linked to the deadline: aborting it after a timeout or a failed spawn
+      // makes the seam kill whatever tree is left (T3).
+      const run = new AbortController();
+      const onAbort = (): void => run.abort(deadline.signal.reason);
+      deadline.signal.addEventListener("abort", onAbort, { once: true });
+      let execResult: ExecResult;
+      let threw: string | undefined;
+      try {
+        execResult = await launch({ lowPriority: budget.lowPriority, signal: run.signal, timeoutMs: boundMs });
+      } catch (err) {
+        threw = errorText(err);
+        execResult = { code: -1, stdout: "", stderr: threw };
+      }
+      deadline.signal.removeEventListener("abort", onAbort);
+      if (threw !== undefined || execResult.timedOut === true) {
+        run.abort(new Error(threw ?? `run exceeded its ${boundMs}ms bound`));
+      }
+      return {
+        kind: "spawned",
+        exec: execResult,
+        ...(threw !== undefined ? { threw } : {}),
+        boundMs,
+        cut: deadline.signal.aborted,
+        notes: lost || hold.handle.lost ? [SLOT_LOST_NOTE] : [],
+      };
+    };
+
+    const track = <T>(p: Promise<T>): Promise<T> => {
+      inflight.add(p);
+      void p.finally(() => inflight.delete(p));
+      return p;
+    };
+
+    const runSpec = async (spec: Parameters<ScopedExecutor>[0], deadline: Deadline): Promise<ScopedOutcome> => {
+      try {
+        const a = await attempt(deadline, opts => argv(spec.file, spec.args, { ...opts, cwd: spec.cwd, env: { ...spec.env } }));
+        if (a.kind !== "spawned") return a;
+        let result: RunResult;
+        try {
+          // P6: on EVERY path after a spawn attempt; it deletes the report file (QA-1.3-16).
+          result = await readResult(spec, a.exec, fs, host);
+        } catch (err) {
+          return { kind: "error", reason: `reading the scoped result failed: ${errorText(err)}` };
+        }
+        if (a.threw !== undefined) return { kind: "error", reason: `scoped run failed to start: ${a.threw}` };
+        if (a.exec.timedOut) {
+          return a.cut ? { kind: "aborted", reason: ABORTED_DURING_RUN } : { kind: "timed-out", boundMs: a.boundMs, result };
+        }
+        const notes = [...spec.notes, ...a.notes, ...(result.note !== undefined ? [result.note] : [])];
+        return { kind: "ran", result, exitCode: a.exec.code, spec, notes };
+      } catch (err) {
+        return { kind: "error", reason: `scoped run errored: ${errorText(err)}` };
+      }
+    };
+
+    const runCommand = async (deadline: Deadline, launch: (opts: ExecOptions) => Promise<ExecResult>): Promise<CommandOutcome> => {
+      try {
+        return toCommandOutcome(await attempt(deadline, launch));
+      } catch (err) {
+        return { kind: "error", reason: `command errored: ${errorText(err)}` };
+      }
+    };
+
+    // 2.1.2.3 replaces this with the T4 Rechecker; until then a recheck is never usable (fail-closed).
+    const rechecker = (): Rechecker => async () => ({
+      kind: "unusable",
+      cause: "error",
+      reason: "the reference recheck is not available",
+    });
+
+    const close = (): Promise<void> => {
+      closing ??= (async (): Promise<void> => {
+        closed = true;
+        await Promise.allSettled([...inflight]);
+        if (holdP === undefined) return;
+        const hold = await holdP;
+        if (!hold.ok) return;
+        try {
+          await hold.handle.release();
+        } catch (err) {
+          logger?.warn(`verification slot release failed: ${errorText(err)}`);
+        }
+      })();
+      return closing;
+    };
+
+    return {
+      execute: (spec, deadline) => track(runSpec(spec, deadline)),
+      rechecker,
+      runShell: (command, cwd, deadline) => track(runCommand(deadline, opts => exec(command, { ...opts, cwd }))),
+      runLint: (spec, deadline) =>
+        track(runCommand(deadline, opts => argv(spec.file, spec.args, { ...opts, cwd: spec.cwd, env: { ...spec.env } }))),
+      close,
+    };
+  };
 }
 
 async function runCommandCheck(
