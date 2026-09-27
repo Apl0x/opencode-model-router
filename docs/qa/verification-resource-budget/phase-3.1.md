@@ -315,7 +315,8 @@ tool returned, an external editor) cannot be seen by any hook.
 ## CI round 1 (PR #54, head fa01168, Test run 36355282226)
 
 Four e2e failures, in the `e2e (node 22, ubuntu-latest)`, `coverage (node 22, ubuntu-latest)` (step
-"Linux e2e coverage") and `e2e (node 22, windows-latest)` jobs. The same run's unit-job failures
+"Linux e2e coverage") and `e2e (node 22, windows-latest)` jobs. A fifth (CI1-e) surfaced on the
+re-run of the first fixes. The same run's unit-job failures
 (baseline-wiring, exec, batch-wiring) are handled separately and are not covered here. Log excerpts
 are from `gh run view 36355282226 --job <id> --log` (ubuntu e2e 108721679255, coverage 108721679116,
 windows e2e 108721679488).
@@ -326,6 +327,7 @@ windows e2e 108721679488).
 | CI1-b | fixtures self-check: vitest-app pre-existing failure | ubuntu e2e, ubuntu coverage, windows e2e | test | 4c894db |
 | CI1-c | bound 3.1.2.d: no orphan 3 s after the gate | windows e2e | test | 1e26ca2 |
 | CI1-d | deferred 3.1.2.f: before hook within VERIFY_WAIT | windows e2e | product (in part) and test | ab81633, 4a2e4b8 |
+| CI1-e | bound 3.1.2.c: worker bound (on the re-run of d5c268b) | windows e2e | test | 99aac7f |
 
 ### CI1-a — 3.1.2.c: a duration floor is no proof that verification ran
 
@@ -413,20 +415,62 @@ loop, and the rest of the hook after the wait, serialised over 20 releases that 
 3.1.2.f now allows `HOOK_LATENCY_SLACK_MS` = 250 ms past VERIFY_WAIT (4a2e4b8). The worst case
 measured before the product fix was 104 ms.
 
+### CI1-e — 3.1.2.c on the re-run: finished forks still exiting counted as workers
+
+The first push of the fixes above (d5c268b, Test run 36357474278) passed every job except
+`e2e (node 22, windows-latest)`. There, 3.1.2.c failed with `expected 3 to be less than or equal
+to 2`, from `peak workers (both children)=3 per child=2,3` against a bound of 2 (maxWorkers 2 x one
+slot on 4 cores). Round 1 had passed the same test on Windows with `per child=2,2`. The other three
+Windows failures were fixed on that run: 3.1.2.d reported `created since the dispatch=8 ... alive >=
+3 s after return: descendants=0 machine-wide=0`, 3.1.2.f reported `beforeMs p50=5007ms p95=5036ms
+max=5044ms` (before the product fix: p50 5032, p95 5090, max 5104), and the fixtures self-check
+passed.
+
+**Mechanism.** vitest 4 does not await a finished fork's exit before it forks the next file's
+worker. `vitest/dist/chunks/cli-api.*.js` (pool `schedule`) says so: "Runner terminations are started
+but not awaited until the end of full run". With per-file forks (isolate), a sampler can see a
+run's `maxWorkers` running forks plus finished ones that are still exiting.
+
+**Reproduced locally.** 3.1.2.b and c ran on the 16-core host (bound 4) with 16
+`node -e "require('os').setPriority(10); for(;;){}"` burners. They run at the runner tree's own
+below-normal priority, so the host's normal-priority work is not starved. Two runs gave peak workers
+5 against the bound of 4. The new composition report showed the same thing in every snapshot over
+the bound: at most two runner mains (the slot count), and under one of them a third fork. That fork
+was in its last sighting and older than a sibling forked after it. Example:
+`worker 55044 ppid=6952 created=...300548 seen -2175..+0ms` beside `52960 created=...302222` and
+`59456 created=...302403`, both seen again for another second.
+
+**Verdict: test defect.** The bound is about workers running test files. The product's part of it is
+the slot (how many runs at once) and `--maxWorkers` on every run, and both held. A fork that vitest
+has finished with and is reaping is not a running worker. The fix is 99aac7f. `workerCensus`
+(`sampler.ts`) excuses only that excess. Under one main with more than maxWorkers forks alive, it
+excuses up to the excess, oldest first, and only forks that are in their last sighting (never the
+final snapshot's) and have a newer sibling. A main never counts fewer than min(alive, maxWorkers)
+running, so two runs at once still add up. Sightings are keyed by pid and creation time (pid reuse).
+3.1.2.b and c now assert the running peak, report the raw peak, and print every snapshot over the
+bound with each worker's parent, creation time, sightings and "retiring" mark. Pure cases cover the
+measured shape, a fork seen again later, the final snapshot, two concurrent runs (not excused) and
+pid reuse.
+
 ### Local verification
 
 - `tsc --noEmit` passes. `deferred-verification.test.ts` and `router-verify-tool.test.ts` pass
   108/108; `baseline-wiring.test.ts` (read-only here) passes 47/47. The always-on parser and
-  sampler-helper cases pass.
+  sampler-helper cases pass (12).
 - e2e with `RUN_VERIFY_E2E=1`: the fixtures self-check passes 9/9 with `CI=true` (the colour
   condition of CI1-b), and the deferred file passes 6/6.
-- The bound file could not be validated locally. During this round the host ran at 100% CPU: a
-  concurrent task had 14 `node -e "for(;;){}"` processes running for a CPU-saturation repro. Under
-  that load the local bound run failed in ways the CI run did not: captures timed out, gates took up
-  to 90 s, and in 3.1.2.d no runner had started before the 6 s budget ran out. The bound fixes are
-  checked by CI.
-- **Open observation (not verified, local, CPU-saturated host only).** In that saturated run, 3.1.2.b
-  and c measured peak workers 6 against a bound of 4 (3 per child with maxWorkers 2), with sampler
-  intervals of 420 ms (median) to 1085 ms. It did not happen on any CI runner (peak 2, bound 2). A
-  likely cause is workers of a killed or finishing run still exiting while the next run holds the
-  slot, but this was not investigated. Re-measure on an idle host before drawing a conclusion.
+- The bound file on an idle host passes 4/4 (53 s): `3.1.2.b peak workers=3 (running 3)`,
+  `3.1.2.c peak workers=4 (running 4)`, and 3.1.2.d reports `alive >= 3 s after return:
+  descendants=0 machine-wide=0`.
+- Under the below-normal CPU load above, c and d pass. b's worker bound passes
+  (`peak workers=5 (running 4)`, bound 4).
+- Earlier in this round, a concurrent task had 14 normal-priority `node -e "for(;;){}"` processes
+  running (host at 100% CPU). Bound runs taken then are not evidence either way: captures timed out,
+  gates took up to 90 s, and 3.1.2.d had no runner before its 6 s budget ran out.
+- **Open observation (not a CI failure, local, CPU-loaded host only).** Under the below-normal load,
+  3.1.2.b failed twice on its run-count heuristic, `expected 15 to be less than or equal to 14`
+  (runner-main invocations at most 5 + 5 + 2 x failing). The outputs show neutral dispatches judged
+  against references that already held a sibling's broken m12 ("no worse than before; pre-existing
+  failures: test/m12-1.test.js ..."). The captures were slow enough under that load for a sibling's
+  edit to land first. The worker bound, priority and scoping assertions held. Not investigated
+  further. The heuristic's slack assumes an unloaded host.
