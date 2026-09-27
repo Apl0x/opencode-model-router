@@ -175,6 +175,7 @@ not in any test, because every test gives the store a complete change set.
 | QA-2.1-9 | info | **A live `node_modules` that is itself a junction is not usable at the reference.** Repro scenario A, attempt 1: the recheck returned `reference unusable (rerun-unplannable): runner not installed: vitest` (unverifiable; fails closed). The cause was not isolated; most likely materialize does not link a `node_modules` that is itself a link. | None required unless linked-`node_modules` layouts are supported; if so, follow the link when materialize links `node_modules`. |
 | QA-2.1-10 | nit | **`INERT_UNREPRODUCED` matches the last path segment anywhere** (`deterministic.ts:752-774`). An ignored `test/fixtures/logs/` directory, or an ignored `*.log` fixture that a test reads, therefore counts as inert. T4.f asks for evidence that tests cannot read an inert entry. | Anchor the directory patterns (e.g. `coverage/` and `.nyc_output/` at a package root), or exclude paths under test directories. Low priority. |
 | QA-2.1-11 | major | **Plugin start holds the project directory** (found by the orchestrator's full capped suite run, after `9bb0ece`). `startReferenceGc` ran `gcStaleReferences(directory, …)` as the plugin factory returned, and its `git worktree list` child had the project directory as cwd. On Windows a process's cwd holds the directory, so 7 integration tests that remove their plugin directory right after start failed with `EBUSY: resource busy or locked, rmdir '<temp>/model-router-…'`: `test/integration/fable-effort-preset.test.ts` (2) and `test/integration/prompt-style-mixed.test.ts` (5). | Defer the GC on an unref'd timer and cancel it on plugin dispose. `git -C` is not enough: git changes into the directory itself. |
+| QA-2.1-12 | major | **False pass when HEAD moved** (the round 1 residual below, after `82af65a`). The QA-2.1-2 digests cover only paths that were dirty or untracked at dispatch. A producer that edits a file clean at dispatch through the shell and then commits it leaves nothing in `git status`, and `delta` never compares `TreeSnapshot.head`. The file is missing from the change set, so its tests are not selected and an empty set passes. | At the gate, when HEAD differs from the dispatch head, add the files of `git diff --name-status -z -M <dispatch head> HEAD` (through the argv seam, low priority, bounded by the deadline) to the change set. If the diff fails or a head is unknown, the change set is `"unavailable"`. |
 
 **Handoffs checked with no finding:**
 - QA-1.3-16 and -17 (mutants killed).
@@ -258,4 +259,31 @@ Residual for round 2 (not a fix in this round): the QA-2.1-2 digests cover paths
 untracked at dispatch. A producer that edits a file clean at dispatch through the shell and then
 commits it leaves nothing in `git status`, so that file is still unattributed. `delta` does not
 compare `head`. Candidates are a `git diff --name-status <dispatch head> HEAD` at the gate, or
-"unavailable" when `head` moved.
+"unavailable" when `head` moved. Recorded as QA-2.1-12.
+
+- QA-2.1-12 Resolution: c94e508. When the gate snapshot's `head` differs from the dispatch
+  snapshot's, `prepareVerification` runs `git --no-optional-locks -C <root> diff --name-status -z -M
+  <dispatch head> HEAD` through the argv seam. It runs at the budget's low priority, bounded by
+  `deadline.bound(COMMIT_DIFF_TIMEOUT_MS)` (10 s), with the deadline's signal and no `maxBuffer`.
+  `parseNameStatusZ` turns the output into absolute paths with the status letter, and a rename or
+  copy keeps its source as `previousPath`. `delta(…, committed)` adds these paths. A path the
+  current listing also holds keeps its current status and gains the rename source if it has none.
+  The change set is `"unavailable"` (testsPass unverifiable) when any of these holds:
+  - the diff exits non-zero, times out, cannot spawn, or prints malformed output;
+  - the deadline is spent;
+  - either head is not a full object name (e.g. an unborn repository at dispatch).
+
+  An unchanged HEAD spawns nothing. Tests in `baseline-wiring.test.ts`:
+  - real git: a file clean at dispatch is edited and committed, and it is in the change set (one
+    diff call, low priority, 10 s bound);
+  - real git: a rename commit carries `previousPath`;
+  - real git: an unchanged HEAD makes no git call;
+  - mocked seam: a failing, timed-out, unspawnable or malformed diff is unavailable, a successful
+    one adds its files, an unknown dispatch head is unavailable with no spawn, the deadline bounds
+    the diff, and a spent deadline runs no git.
+
+  With only the `src` change stashed, the first test fails with
+  `expected [] to deeply equal [ { …(2) } ]`, and so do all 6 QA-2.1-12 tests except the
+  unchanged-HEAD test. `npx vitest run --maxWorkers=2 test/unit/baseline-wiring.test.ts
+  test/unit/baseline.test.ts test/unit/tests-pass-pipeline.test.ts test/unit/tree.test.ts` gave
+  4 files, 228 passed. `npm run typecheck` is clean.
