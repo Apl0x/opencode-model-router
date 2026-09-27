@@ -455,9 +455,17 @@
 //      setupFilesAfterEnv, globalSetup and globalTeardown (one literal, or the literal elements
 //      of an array, calls such as require.resolve('./x') included) resolve against the config's
 //      directory and runnerCwd (vitest) or rootDir (jest: `<rootDir>` is the config's directory
-//      or a literal rootDir); a reference without an extension also matches <ref>.<ext> and
+//      and every literal rootDir); a reference without an extension also matches <ref>.<ext> and
 //      <ref>/index.<ext>. Each such file is a trigger. A non-literal value names nothing; the
-//      name rule above still applies (P).
+//      name rule above still applies (P). QA-1.3-41: jest's inline JSON `--config '{...}'` (a
+//      value that starts with "{" and ends with "}", jest's own test) is the config itself: it
+//      is parsed with JSON.parse (S6 unsupported-argument when it does not parse), rooted at
+//      runnerCwd, and is not a config file path. JSON configs (jest.config.json, package.json)
+//      are also read with JSON.parse, so escaped keys and paths count. QA-1.3-42: a reference is
+//      resolved only when its last segment names a changed file (basename, stem, or the
+//      directory of an index file), each distinct one once, and at most SETUP_REF_LIMIT (1000)
+//      resolutions (references times bases, plus rootDir literals) per plan; beyond that, S6
+//      config-too-large "too many setup references in <path> (limit 1000)".
 //        pytest  conftest.py, pyproject.toml, pytest.ini, setup.cfg, tox.ini (section 1.5-3),
 //                plus .pytest.ini, pytest.toml, .pytest.toml (QA-1.3-4: pytest 9 reads them;
 //                plan amendment to section 1.5-3, fixtures in 3.2) and uv.lock, poetry.lock,
@@ -769,6 +777,8 @@
 //                              (G.9a)
 //     config-too-large         config file too large to read: <path> (limit 1048576 bytes)
 //                              (QA-1.3-34)
+//                              too many setup references in <path> (limit 1000)   (G.7a,
+//                              QA-1.3-42; <path> is "the inline jest --config" for QA-1.3-41)
 //   M.2 NoAffected notes:
 //     "no changed files, no affected tests"                          (section 1.5-6, exactly)
 //     "no affected tests: no changed file is a test input"           (docs only, dropped paths,
@@ -952,6 +962,8 @@ export const PY_TEST_GLOBS: readonly string[] = [":(glob)**/test_*.py", ":(glob)
 export const DEFAULT_PYTHON_FILES: readonly string[] = ["test_*.py", "*_test.py"];
 /** Config files above this many bytes are not parsed: S6 config-too-large (QA-1.3-34). */
 export const CONFIG_SIZE_LIMIT = 1024 * 1024;
+/** Path resolutions of vitest/jest setup references per plan (G.7a, QA-1.3-42); beyond it, S6 config-too-large. */
+export const SETUP_REF_LIMIT = 1000;
 /** A deleted source whose stem appears in more test files than this is S6 stem-too-common. */
 export const STEM_MATCH_LIMIT = 20;
 /** More changed files needing a process-backed test search than this is S6 too-many-searches (G.9a). */
@@ -1149,6 +1161,11 @@ export interface DetectedRunner {
   readonly pytestFacts?: PytestFacts;
   /** Absolute canonical paths of the --config/-c (pytest: -c/--config-file) values. Config triggers (G.7, QA-1.3-5). */
   readonly configFiles?: readonly string[];
+  /**
+   * jest: the inline JSON `--config` values (QA-1.3-41), which jest reads as the config itself.
+   * They are not in configFiles; the setup files they name are triggers (G.7a).
+   */
+  readonly inlineConfigs?: readonly string[];
   /**
    * pytest: the python_files patterns the user's run can use (G.8, QA-1.3-33): the union over the
    * configs every pytest release line picks (defaults where a line's config sets none) and every
@@ -1511,6 +1528,20 @@ async function readJson(fs: FsSeam, path: string): Promise<{ ok: true; value: un
   } catch {
     return { ok: false };
   }
+}
+
+/** JSON.parse, or undefined when the text does not parse (JSON itself has no undefined). */
+function parseJson(text: string): unknown {
+  try {
+    return JSON.parse(text) as unknown;
+  } catch {
+    return undefined;
+  }
+}
+
+/** jest-config's isJSONString: a `--config` value it parses as the config itself (QA-1.3-41). */
+function isInlineJson(v: string): boolean {
+  return v.startsWith("{") && v.endsWith("}");
 }
 
 function isRecord(x: unknown): x is Record<string, unknown> {
@@ -2766,7 +2797,13 @@ async function finishDetection<K extends ToolKind>(
   if (isS6(a)) return a;
   const allNotes = [...notes, ...a.notes];
   const pathScopes = await Promise.all(a.pathScopes.map((p) => realOf(ctx, fs, p)));
-  const configFiles = await Promise.all(a.configs.map((c) => realOf(ctx, fs, ctx.P.resolve(runnerCwd, stripWinPrefix(ctx, c)))));
+  // QA-1.3-41: jest reads a `--config` value that starts with "{" and ends with "}" as the config
+  // itself (jest-config isJSONString + JSON.parse), not as a path. One that does not parse is S6.
+  const inlineConfigs = kind === "jest" ? a.configs.filter(isInlineJson) : [];
+  const badInline = inlineConfigs.find((c) => parseJson(c) === undefined);
+  if (badInline !== undefined) return s6("unsupported-argument", `unsupported jest argument "${badInline}" in ${where}`);
+  const configPaths = a.configs.filter((c) => !inlineConfigs.includes(c));
+  const configFiles = await Promise.all(configPaths.map((c) => realOf(ctx, fs, ctx.P.resolve(runnerCwd, stripWinPrefix(ctx, c)))));
   let userWorkers = a.userWorkers;
   let xdist = false;
   let covInConfig = false;
@@ -2812,6 +2849,7 @@ async function finishDetection<K extends ToolKind>(
     covInConfig,
     notes: allNotes,
     configFiles,
+    ...(inlineConfigs.length > 0 ? { inlineConfigs } : {}),
     ...(pytestFacts ? { pytestFacts } : {}),
     ...(pythonFiles ? { pythonFiles } : {}),
   };
@@ -3133,6 +3171,8 @@ const CONFIG_KEY_RE = /(?<![\w$])["']?(setupFiles|setupFilesAfterEnv|globalSetup
  * literal value maps to []. Comments are skipped; a template literal with `${` is not static. One
  * forward pass: the key search resumes after each scanned value, so the cost stays linear.
  */
+const isQuote = (c: string | undefined): boolean => c === '"' || c === "'" || c === "`";
+
 function configLiterals(text: string): Map<string, string[]> {
   const out = new Map<string, string[]>();
   const re = new RegExp(CONFIG_KEY_RE.source, "g");
@@ -3152,10 +3192,10 @@ function configLiterals(text: string): Map<string, string[]> {
       if (!(q === "`" && v.includes("${"))) vals.push(v);
       return true;
     };
-    if (/["'`]/.test(text[i] ?? "")) literal();
+    if (isQuote(text[i])) literal();
     else if (text[i] === "[") {
       for (i++; i < text.length && text[i] !== "]"; ) {
-        if (/["'`]/.test(text[i])) {
+        if (isQuote(text[i])) {
           if (!literal()) break;
         } else if (text.startsWith("//", i)) {
           const nl = text.indexOf("\n", i);
@@ -3181,11 +3221,16 @@ interface JsConfigFacts {
 
 /**
  * G.7a: read the vitest or jest config files (every directory from runnerCwd up to gitRoot, and the
- * --config file) once. setup references from any of them are triggers: a superset only adds S6.
- * jest `<rootDir>` resolves only when rootDir is absent (the config's directory) or one literal.
- * Exclusions are not read (G.8a, QA-1.3-38).
+ * --config file) once, plus jest's inline JSON --config (QA-1.3-41, rooted at runnerCwd). setup
+ * references from any of them are triggers: a superset only adds S6. A reference resolves against
+ * the config's directory and runnerCwd (vitest) or every literal rootDir (jest; `<rootDir>` is
+ * replaced by each base). JSON files are also read with JSON.parse, so escaped keys and paths
+ * count. QA-1.3-42: only a reference whose last segment names a changed file (its basename, its
+ * stem, or its directory for an index file: `names`) is resolved, each distinct one once, within
+ * SETUP_REF_LIMIT resolutions per plan (else S6 config-too-large); a planted config of 262000
+ * literals cost 3.6 s of path resolution under Bun. Exclusions are not read (G.8a, QA-1.3-38).
  */
-async function jsConfigFacts(ctx: Ctx, fs: PlannerFs, det: DetectedRunner): Promise<JsConfigFacts | Unverifiable> {
+async function jsConfigFacts(ctx: Ctx, fs: PlannerFs, det: DetectedRunner, names: ReadonlySet<string>): Promise<JsConfigFacts | Unverifiable> {
   const P = ctx.P;
   const kind = det.kind === "jest" ? "jest" : "vitest";
   const files = new Set<string>(det.configFiles ?? []);
@@ -3197,26 +3242,79 @@ async function jsConfigFacts(ctx: Ctx, fs: PlannerFs, det: DetectedRunner): Prom
   }
   const setupKeys = new Set<string>();
   const setupStems = new Set<string>();
+  const trailing = ctx.win ? /[\\/]+$/ : /\/+$/;
+  // The last segment of a reference; "", ".", "..", "<rootDir>" or a drive only resolve to know.
+  const wanted = (v: string): boolean => {
+    const t = v.replace(trailing, "");
+    const seg = t.slice(Math.max(t.lastIndexOf("/"), ctx.win ? t.lastIndexOf("\\") : -1) + 1);
+    return seg === "" || seg === "." || seg === ".." || /[<:]/.test(seg) || names.has(ctx.key(seg));
+  };
+  // QA-1.3-42: path resolution is the cost (about 12 us a call under Bun on win32), so it is
+  // bounded per plan: distinct wanted references times bases, plus the rootDir literals.
+  let budget = SETUP_REF_LIMIT;
+  const addRefs = (lits: ReadonlyMap<string, readonly string[]>, dir: string, where: string): Unverifiable | undefined => {
+    const refs = new Set<string>();
+    for (const key of SETUP_KEYS) {
+      for (const v of lits.get(key) ?? []) if (v.trim() !== "" && !/[*?{}]/.test(v) && wanted(v)) refs.add(v);
+    }
+    if (refs.size === 0) return undefined;
+    const roots = kind === "jest" ? [...new Set(lits.get("rootDir"))] : [det.runnerCwd];
+    budget -= refs.size * (roots.length + 1) + roots.length;
+    if (budget < 0) return s6("config-too-large", `too many setup references in ${where} (limit ${SETUP_REF_LIMIT})`);
+    const bases = [...new Set([dir, ...roots.map((r) => P.resolve(dir, r))])];
+    for (const v of refs) {
+      for (const b of bases) {
+        const abs = P.resolve(b, v.replace(/<rootDir>/g, b));
+        (JS_EXT_RE.test(v) ? setupKeys : setupStems).add(ctx.key(abs));
+      }
+    }
+    return undefined;
+  };
   for (const file of files) {
     const t = await readConfigText(ctx, fs, file);
     if (t === "too-large") return tooLarge(file);
     if (t === "unreadable") continue;
     const lits = configLiterals(t.text);
-    const dir = P.dirname(file);
-    const rootLits = lits.get("rootDir");
-    const rootDir = rootLits === undefined ? dir : rootLits.length === 1 ? P.resolve(dir, rootLits[0]) : undefined;
-    const bases = [...new Set([dir, kind === "jest" ? (rootDir ?? dir) : det.runnerCwd])];
-    for (const key of SETUP_KEYS) {
-      for (const v of lits.get(key) ?? []) {
-        if (v.trim() === "" || /[*?{}]/.test(v)) continue;
-        for (const b of bases) {
-          const abs = P.resolve(b, v.replace(/<rootDir>/g, b));
-          (JS_EXT_RE.test(v) ? setupKeys : setupStems).add(ctx.key(abs));
+    if (P.extname(file) === ".json") {
+      for (const [k, vs] of jsonLiterals(parseJson(t.text))) lits.set(k, [...(lits.get(k) ?? []), ...vs]);
+    }
+    const bad = addRefs(lits, P.dirname(file), file);
+    if (bad) return bad;
+  }
+  for (const c of det.inlineConfigs ?? []) {
+    const bad = addRefs(jsonLiterals(parseJson(c)), det.runnerCwd, "the inline jest --config");
+    if (bad) return bad;
+  }
+  return { setupKeys, setupStems };
+}
+
+/** The keys configLiterals and jsonLiterals collect. */
+const CONFIG_KEYS: readonly string[] = [...SETUP_KEYS, "rootDir"];
+
+/**
+ * G.7a (QA-1.3-41): configLiterals for parsed JSON, so JSON escapes in keys and paths are decoded:
+ * the string (or the string elements of an array) of every CONFIG_KEYS key at any depth. The walk
+ * uses its own stack, so a deeply nested value cannot overflow the call stack.
+ */
+function jsonLiterals(value: unknown): Map<string, string[]> {
+  const out = new Map<string, string[]>();
+  const stack: unknown[] = [value];
+  while (stack.length > 0) {
+    const v = stack.pop();
+    if (Array.isArray(v)) {
+      for (const x of v) stack.push(x);
+    } else if (isRecord(v)) {
+      for (const [k, x] of Object.entries(v)) {
+        if (CONFIG_KEYS.includes(k)) {
+          const vals = out.get(k) ?? [];
+          out.set(k, vals);
+          for (const y of Array.isArray(x) ? x : [x]) if (typeof y === "string") vals.push(y);
         }
+        stack.push(x);
       }
     }
   }
-  return { setupKeys, setupStems };
+  return out;
 }
 
 /** G.7a: `abs` is a setup file a config names (with its extension, or without it / as a directory index). */
@@ -3277,7 +3375,7 @@ async function plan(input: StaticScopingInput, search: TestSearchSeam | undefine
   const sourcePj = det.source.type === "script" ? ctx.key(det.source.packageJson) : undefined;
   const configKeys = new Set((det.configFiles ?? []).map((p) => ctx.key(p)));
   const js = det.kind === "vitest" || det.kind === "jest";
-  const facts = js ? await jsConfigFacts(ctx, fs, det) : undefined;
+  const facts = js ? await jsConfigFacts(ctx, fs, det, changedNames(ctx, sorted)) : undefined;
   if (facts && isS6(facts)) return facts;
   for (const f of sorted) {
     const names = namesOf(ctx, f);
@@ -3298,6 +3396,24 @@ async function plan(input: StaticScopingInput, search: TestSearchSeam | undefine
 
 /** Change attribution that names only paths the planner cannot use (G.4a). */
 const NO_PATH_KEPT = "change attribution unavailable: no changed path lies inside the git root";
+
+/**
+ * G.7a (QA-1.3-42): the last segments a config reference to one of `files` can have: each real and
+ * lexical basename, its stem (a reference without an extension), and the directory name of an
+ * index file (a directory reference). Keys (lower-cased on win32).
+ */
+function changedNames(ctx: Ctx, files: readonly FileRef[]): Set<string> {
+  const out = new Set<string>();
+  for (const f of files) {
+    for (const b of [ctx.P.basename(f.abs), ...(f.lexBase !== undefined ? [f.lexBase] : [])]) {
+      const dot = b.lastIndexOf(".");
+      const stem = ctx.key(dot > 0 ? b.slice(0, dot) : b);
+      out.add(ctx.key(b)).add(stem);
+      if (stem === "index") out.add(ctx.key(ctx.P.basename(ctx.P.dirname(f.abs))));
+    }
+  }
+  return out;
+}
 
 /** The basenames a trigger is matched against (G.7): real and lexical, lower-cased on win32. */
 function namesOf(ctx: Ctx, f: FileRef): string[] {

@@ -14,6 +14,7 @@ import {
   resolveEntry,
   REPORT_NAME_RE,
   CONFIG_SIZE_LIMIT,
+  SETUP_REF_LIMIT,
   DEFAULT_PYTHON_FILES,
   SEARCH_LIMIT,
   STEM_MATCH_LIMIT,
@@ -3041,5 +3042,91 @@ describe("QA-1.3-35: readResult relativises by prefix when a path is plainly bel
     const xml = `<testsuites>${cases}<testcase classname="tests.test_m" name="bad"><failure/></testcase></testsuites>`;
     const sp = mkSpec({ runner: "pytest", reportPath: RPT_XML, cwd: "/root/p", gitRoot: "/root/p", inputs: ["/root/p/tests/test_m.py"], inputsAreTests: true });
     expect(await read(sp, { [RPT_XML]: xml }, 1)).toMatchObject({ total: 5001, failingIds: ["tests/test_m.py::bad"], complete: true });
+  });
+});
+// ---------------------------------------------------------------------------------------------
+// QA round 4 (docs/qa/verification-resource-budget/phase-1.3.md, QA-1.3-38..42)
+// ---------------------------------------------------------------------------------------------
+
+describe("QA-1.3-41: jest's inline JSON --config is the config itself", () => {
+  const BOOT = "src/testing/bootstrap.js";
+  const planJest = (command: string, extra: Record<string, string> = {}, paths = [BOOT]) =>
+    planScopedRun(input({ command, files: jsRepo({}, { [`/r/${BOOT}`]: "", "/r/src/a.js": "", ...extra }), changedFiles: changed(...paths) }));
+
+  it.each([
+    `jest --config '{"setupFilesAfterEnv":["./src/testing/bootstrap.js"]}'`,
+    `jest -c '{"rootDir":"src","setupFiles":["./testing/bootstrap"]}'`,
+    `jest --config='{"setup\\u0046ilesAfterEnv":["./src/te\\u0073ting/bootstrap.js"]}'`,
+    `jest --config '{"projects":[{"globalSetup":"./src/testing/bootstrap.js"}]}'`,
+  ])("%s -> the setup file it names is a trigger", async (command) => {
+    expectS6(await planJest(command), "config-changed", `config file changed: ${BOOT}`);
+  });
+
+  it("the value is not a config path; other changes still plan, with the value kept", async () => {
+    const command = `jest --config '{"setupFiles":["./src/testing/bootstrap.js"]}'`;
+    const d = await detect(command);
+    expect(d.configFiles).toEqual([]);
+    expect(d.inlineConfigs).toEqual(['{"setupFiles":["./src/testing/bootstrap.js"]}']);
+    expect(spec(await planJest(command, {}, ["src/a.js"])).args).toContain('{"setupFiles":["./src/testing/bootstrap.js"]}');
+    // vitest has no inline form: the value stays a path.
+    expect((await detect("vitest --config '{}'")).inlineConfigs).toBeUndefined();
+  });
+
+  it("an inline value that does not parse is S6", async () => {
+    expectS6(await planJest("jest --config '{bad}'"), "unsupported-argument", 'unsupported jest argument "{bad}" in command');
+  });
+
+  it("JSON config files are read with JSON.parse too, so escaped keys and paths count", async () => {
+    const escaped = '{"setup\\u0046iles":["./src/te\\u0073ting/bootstrap.js"]}';
+    expectS6(await planJest("jest", { "/r/jest.config.json": escaped }), "config-changed");
+    expectS6(await planJest("jest", { "/r/package.json": `{"name":"app","jest":${escaped}}` }), "config-changed");
+    // Unparseable JSON keeps the literal scan.
+    expectS6(await planJest("jest", { "/r/jest.config.json": '{"setupFiles":["./src/testing/bootstrap.js"],}' }), "config-changed");
+  });
+});
+
+describe("QA-1.3-42: only references that can name a changed file are resolved", () => {
+  const planJest = (cfg: string, paths: string[], extra: Record<string, string> = {}) =>
+    planScopedRun(input({ command: "jest", files: jsRepo({}, { "/r/jest.config.js": cfg, ...extra }), changedFiles: changed(...paths) }));
+
+  it("a config just under the limit, full of literals, plans quickly and still finds the real reference", async () => {
+    const cfg = `module.exports = { setupFiles: [${"'a',".repeat(260000)} './tools/boot.js'] }`;
+    expect(cfg.length).toBeLessThan(CONFIG_SIZE_LIMIT);
+    const t0 = performance.now();
+    expectS6(await planJest(cfg, ["tools/boot.js"], { "/r/tools/boot.js": "" }), "config-changed", "config file changed: tools/boot.js");
+    expect(spec(await planJest(cfg, ["src/a.js"], { "/r/src/a.js": "" })).inputs).toEqual(["/r/src/a.js"]);
+    expect(performance.now() - t0).toBeLessThan(3000);
+  });
+
+  it("distinct references that all end in a changed name are bounded; repeats count once", async () => {
+    const boot = { "/r/tools/boot.js": "" };
+    const many = Array.from({ length: SETUP_REF_LIMIT + 1 }, (_, i) => `"d${i}/boot"`).join(",");
+    const why = (where: string) => `too many setup references in ${where} (limit ${SETUP_REF_LIMIT})`;
+    expectS6(await planJest(`module.exports = { setupFiles: [${many}] }`, ["tools/boot.js"], boot), "config-too-large", why("/r/jest.config.js"));
+    const inline = await planScopedRun(input({ command: `jest --config '{"setupFiles":[${many}]}'`, files: jsRepo({}, boot), changedFiles: changed("tools/boot.js") }));
+    expectS6(inline, "config-too-large", why("the inline jest --config"));
+    const same = Array.from({ length: SETUP_REF_LIMIT + 1 }, () => "'./tools/boot'").join(",");
+    expectS6(await planJest(`module.exports = { setupFiles: [${same}] }`, ["tools/boot.js"], boot), "config-changed");
+    // A rootDir multiplies the bases; the rest of the budget still covers a handful of references.
+    expectS6(await planJest("module.exports = { rootDir: 'tools', setupFiles: ['<rootDir>/boot.js'] }", ["tools/boot.js"], boot), "config-changed");
+  });
+
+  it.each([
+    ["<rootDir>", "index.js"],
+    ["./tools/shim/", "tools/shim/index.js"],
+    ["./tools/shim/.", "tools/shim/index.js"],
+    ["./tools/shim/x/..", "tools/shim/index.js"],
+    ["./tools/boot", "tools/boot.ts"],
+  ])("reference %j still names %s", async (ref, f) => {
+    expectS6(await planJest(`module.exports = { setupFiles: ['${ref}'] }`, [f], { [`/r/${f}`]: "" }), "config-changed", `config file changed: ${f}`);
+  });
+
+  it("win32: a backslash reference is split on either separator", async () => {
+    const W = {
+      ...Object.fromEntries(Object.entries(jsRepo()).map(([k, v]) => [k.replace(/^\/r/, "C:\\repo").replace(/\//g, "\\"), v])),
+      "C:\\repo\\jest.config.js": "module.exports = { setupFiles: ['.\\\\Tools\\\\Env.js'] }",
+      "C:\\repo\\tools\\env.js": "",
+    };
+    expectS6(await planScopedRun(input({ win: true, command: "jest", files: W, cwd: "C:\\repo", host: WIN_HOST, changedFiles: changed("tools\\env.js") })), "config-changed");
   });
 });
