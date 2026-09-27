@@ -178,9 +178,9 @@ A senior review already fixed these (plan commit `4174515`), so do not undo them
 - **Open dependabot PRs:** #41 (the vitest group bump) and #47 (`@types/node`). Do not merge them
   during execution. If #41 lands anyway, re-run Spike C, because the vitest CLI behaviour is pinned
   there.
-- **PR body attribution line** (repo convention for agent-authored PRs):
-  `🤖 Generated with [Claude Code](https://claude.com/claude-code)`. Commit trailer:
-  `Co-Authored-By: <your model> <noreply@anthropic.com>`.
+- **No AI attribution:** never add a `Co-Authored-By` trailer naming Anthropic, Claude or any
+  model, and never add a "Generated with Claude Code" line to commits or PR bodies. This is a
+  standing rule of the repository owner.
 
 ### Your own session's plugin
 
