@@ -944,5 +944,117 @@ under **Bun 1.3.14**, not Node.
     Under that load, "runs grandchildren of runShell below normal priority" failed once, and two
     other `lowPriority` runs hit their 20 s deadline (`expected 1 to be 3`). The tests passed in
     isolation and in every run once the load dropped. The two deadline hits match below-normal
-    priority starved by normal-priority load (the QA-1.2-14 conditions). The priority test's own
-    message was not captured.
+  priority starved by normal-priority load (the QA-1.2-14 conditions). The priority test's own
+  message was not captured.
+
+## QA re-review (round 4)
+
+Reviewer: heavy QA, adversarial re-review of the round-3 fixes, `git diff 982f78f..1ae22d6` on
+`vrb/p12` (`src/verify/exec.ts`, `test/unit/exec.test.ts`, `test/fixtures/exec/host.mjs`), under
+node and under **Bun 1.3.14**, the runtime the plugin actually runs in.
+
+**Setup.**
+- Host: Windows 11, 16 logical cores, node v24.21.0, bun 1.3.14. Other agents were using the
+  machine, so every process count below is filtered to this review's own PIDs.
+- `npx vitest run --maxWorkers=2 test/unit/exec.test.ts` was run once (node): **37 passed,
+  1 failed, 1 skipped** (39 in total), 54.44 s.
+  - The failure is "lowPriority > runs grandchildren of runArgv below normal priority":
+    `Error: timed out waiting for …\omr-exec-0KCncP\grandchild.pid` at
+    `waitForFile test/unit/exec.test.ts:143:9`, called from `:596:7`.
+  - During the run the CPU was at 100 %. Another agent had 14 normal-priority
+    `node -e "for(;;){}"` busy loops running (started 01:55:58–59).
+  - The cause is a test-harness limit: see QA-1.2-22.
+- The repro scripts lived in `%TEMP%\omr-qa12r4` and have been removed. No fixture, burner, stand-in
+  or sweeper process was left running. A `Win32_Process` query on the scratch, fixture and
+  stand-in names matched only the query itself, plus an unrelated process whose arguments happen
+  to contain `pinned`.
+  - `batch.mjs` tried the refusal-bypass spellings under both runtimes.
+  - `hookcheck.mjs` imported `exec.ts` with `%SystemRoot%` pointing at a scratch root. Its
+    `System32\taskkill.exe` was a `bun build --compile` stand-in that logs its arguments and runs
+    the real `taskkill`, so every taskkill `exec.ts` starts could be seen and still took effect.
+  - `exithost.mjs` put 3 `runShell` trees and 1 `runArgv` tree (cmd.exe → node → node) in flight,
+    then called `process.exit(0)`. It was launched from pwsh, the way opencode is started.
+  - `tkload.mjs` timed one 4-tree `taskkill /T /F` with no time limit.
+  - `prio.mjs` timed how long a `lowPriority` fixture takes to write its grandchild's PID.
+  - `rt.mjs` probed runtime details: the case of environment names, writes to a dead child's
+    stdin, the `pid` of a failed spawn, and `spawnSync` with `timeout` inside an `exit` hook.
+  - Load runs used 16 normal-priority node busy loops, one per logical core, each ending itself
+    after 60–75 s.
+
+**Result.**
+- QA-1.2-17, -18, -19 and the -20 cross-reference are verified, along with the absolute-path
+  hardening.
+- No spelling of a batch target got past the refusal under either runtime.
+- The exit hook never passed a stale PID, and one call killed every tree in flight, under both
+  runtimes.
+- There are 3 new findings: 1 minor and 2 nits.
+  - QA-1.2-21 is a load limit of the QA-1.2-18 fix.
+  - QA-1.2-22 is the test flake that failed the run above.
+  - QA-1.2-23 is a pre-existing POSIX bookkeeping race.
+- The DoD (zero open findings) is **not met**.
+
+### Round-3 findings
+
+| Finding | Status | Evidence |
+|---|---|---|
+| QA-1.2-17 | verified | **Code.** `BATCH_FILE = /\.(cmd\|bat)[. ]*$/i` (`exec.ts:111`) is tested in `runArgv` before `run` (`:130`), on win32 only, whatever `lowPriority` is. The result is exactly `BATCH_REFUSED` (`:113`). The unit test (7 spellings plus one relative to cwd, each with and without `lowPriority`) passes.<br>**Bypass hunt** (`batch.mjs`). Each case passed the argument `"&echo INJECTED&"` to a batch file that writes a marker. The results were the same under node v24.21.0 and bun 1.3.14.<br>• **Refused**: `probe.cmd`, `probe.CmD`, all forward slashes, a `\\?\` prefix, a `\\.\` prefix, UNC `\\127.0.0.1\C$\…\probe.cmd`, and `.\probe.cmd` relative to cwd.<br>• **Not refused, but no batch file ran** (no marker, no `INJECTED`):<br>&nbsp;&nbsp;– NUL bytes (`probe.cmd\0.exe`, `probe.cmd\0`): both runtimes throw `ERR_INVALID_ARG_VALUE … without null bytes`. The throw is caught, so the result is code 1.<br>&nbsp;&nbsp;– `probe.cmd\.`, `probe.cmd\`, `probe.cmd/`, `probe.cmd::$DATA` and `probe.cmd:` are all ENOENT. libuv looks only at the part after the last `\`, `/` or `:`; with no extension there, it tries `.com` and `.exe` only.<br>&nbsp;&nbsp;– A trailing NBSP gives ENOENT. A trailing tab gives EINVAL under node and ENOENT under bun.<br>&nbsp;&nbsp;– A hard link `link.exe` to the batch file gives `spawn UNKNOWN` (node) and `EUNKNOWN` (bun). This fits CreateProcess deciding "batch" from the name it is given.<br>&nbsp;&nbsp;– Batch content in `probe.cmdlong` gives EFTYPE. A bare `probe` gives ENOENT.<br>**8.3 names.** Not reproducible here: this volume no longer creates short names for new files (`dir /x` shows none). The short extension is the first three characters of the long one, so the short name of a `.cmd`/`.bat` file still ends `.CMD`/`.BAT`, and the regex matches it in any case. |
+| QA-1.2-18 | verified; load limit: QA-1.2-21 | **Code.** One `tracked` set, with one lazy `process.once("exit", killTrackedProcesses)` (`exec.ts:418-426`).<br>• Windows untracks a child only at its `exit` (`:308`). POSIX untracks on settle (`:222`) and at `exit` when the group is already empty (`:309-312`).<br>• The Windows hook makes one `spawnSync(TASKKILL, [/pid …, /T, /F], { timeout: 2000 })` call (`:433-449`).<br>**No stale PID in the set** (`hookcheck.mjs`, node and bun). The hook was called after each of these, and it started **no** taskkill every time:<br>• 9 natural runs;<br>• 2 deadline kills of live trees (`runShell` and `runArgv`);<br>• an `early-exit` sweep;<br>• a `broken-tree` grace settle;<br>• a spawn error. The `pid` of a failed spawn is `undefined` under both runtimes (`rt.mjs`), so it is never tracked.<br>So under Bun too, `exit` is delivered on every path, and the set holds only live direct children.<br>**One call, several trees.** 4 runs were in flight (3 `runShell` with `lowPriority`, 1 `runArgv`).<br>• One taskkill got exactly 4 `/pid` arguments.<br>• All 8 descendants were dead 844 ms (node) and 812 ms (bun) after the hook started. The hook itself took 843 ms and 810 ms.<br>• A second call started nothing, because the set had been cleared.<br>**A PID that is already gone.** `taskkill /pid 4194300 /pid <cmdA> /pid <cmdB> /T /F` exits 128, and both trees are dead under node and bun. A missing PID does not stop the others.<br>**A real exit** (`exithost.mjs`, launched from pwsh, idle machine): 8 of 8 descendants were dead when the host exited, under node ×2 and bun ×2. The host's wall time was 658–1000 ms.<br>**The 2 s bound holds under Bun.** In an `exit` hook, `spawnSync` of a 20 s sleeper with `timeout: 2000` returned at 2015 ms (node) and 2025 ms (bun), with `ETIMEDOUT`/`SIGTERM`, and no sleeper was left.<br>The in-process hook test and the `exit-mid-run` host test both pass. |
+| QA-1.2-19 | verified | **Code.**<br>• `finish` unrefs a sweep still in flight (`exec.ts:225`), and `unref()` covers the process handle, stdin and stdout (`:620-625`).<br>• The kill writes `kill\n` and does not end stdin (`:613`); the limit timer is unref'd (`:608`).<br>**Node.** The "sweep still in flight … does not keep the host alive" test passes.<br>**Bun.** `host.mjs hung-sweeper` ran with a `bun build --compile` `hang.exe` as the sweeper, launched from pwsh. Two runs:<br>• the result was `timedOut: true`, with only the force-closed note;<br>• the host exited **23 ms** and **26 ms** after the result (28042 ms before the fix);<br>• no `hang.exe` was alive afterwards.<br>**The live sweep still works without EOF.** The QA-1.2-1/-10 deadline and abort sweep tests pass.<br>**Writing to a sweeper that already exited adds no failure mode.** A write after the child's `exit` returns normally, and so does one after `close`, under node and bun (`rt.mjs`). |
+| QA-1.2-20 | verified (cross-reference) | `origin/vrb/p13`, `docs/qa/verification-resource-budget/phase-1.3.md`:<br>• QA-1.3-18 (major) records `process.execPath` under Bun (line 544);<br>• its resolution `ca57cc7` (line 577) stops the JS tools defaulting to `process.execPath`.<br>On `vrb/p12`, `rg "process\.execPath\|runArgv" src` finds no `process.execPath`, and `runArgv` only inside `exec.ts` (`:3`, `:129`, `:138`). The plan wording stays deferred to 3.2. |
+| Hardening (absolute `taskkill.exe` / `powershell.exe`) | verified | **Code.** `SYSTEM32`, `TASKKILL` and `DEFAULT_POWERSHELL` are built from `%SystemRoot%` (`exec.ts:93-95`) and used at `:400`, `:444` and `:489`.<br>**The path is really used.** With `%SystemRoot%` pointed at the scratch root, both the live-child kill and the exit hook ran `<root>\System32\taskkill.exe`, under node and under bun.<br>**The case of the variable does not matter.** A child whose environment block spells the name `SYSTEMROOT` (MSYS/Cygwin style) still resolves `process.env.SystemRoot`, under node and bun.<br>**No finding for reading it from the environment.** Bare names are the fallback only when `SystemRoot` is unset. Whoever controls the environment already controls `PATH` and the command being verified. |
+
+### Bun compatibility (additions to round 3)
+
+| Aspect | node v24.21.0 | bun 1.3.14 | Verdict |
+|---|---|---|---|
+| The `runArgv` refusal, and the bypass spellings above | as in the table above | the same | same |
+| Exit hook: tracked-set hygiene, one call for 4 trees, a gone PID in the list | as above | the same | same |
+| `process.exit(0)` from a host launched from pwsh, 4 trees in flight | 8/8 dead at exit | 8/8 dead at exit | same |
+| `spawnSync` with `timeout: 2000` inside `exit` | 2015 ms, `ETIMEDOUT` | 2025 ms, `ETIMEDOUT` | same |
+| A hung sweeper after the run settled | the test passes | result → exit in 23 and 26 ms | same |
+| `process.env.SystemRoot` with a `SYSTEMROOT` key | resolves | resolves | same |
+| `pid` of a failed spawn | `undefined` | `undefined` | same |
+| A child's environment under `spawnSync` with no `env` option | the current `process.env` | **the environment the process started with**: a variable set at run time was not seen | differs. No finding: the hook's `taskkill` needs no environment, `run` always passes `env` (`exec.ts:173`), and the async spawns did pass the run-time value |
+
+### New findings
+
+| ID | Severity | Where | Evidence | Fix |
+|---|---|---|---|---|
+| QA-1.2-21 | minor | `exec.ts:82` (`EXIT_TASKKILL_TIMEOUT_MS = 2000`) and `:444-448` | **Under normal-priority saturation, the exit hook's 2 s limit ends `taskkill` part-way, and what it had not reached yet runs on with nothing left to kill it.**<br>**Measured.** `exithost.mjs` ran under 16 normal-priority busy loops, with `lowPriority: false` so that the fixtures could start. There were 6 exits (node ×3, bun ×3).<br>• From `ready` to the host's exit took 1927, 2286, 2150, 2270, 1998 and 2001 ms: the hook sat at its limit.<br>• In the bun exit at 2286 ms, **3 of the 8** descendants were alive at the host's exit and still alive 3 s later. The reviewer killed them.<br>**The same taskkill with no limit** (`tkload.mjs`: one `taskkill /pid a /pid b /pid c /pid d /T /F`):<br>• idle: 309, 321, 364 and 376 ms;<br>• under the same load: 2033, 2124, 2181 and **3383 ms**.<br>So under saturation the limit usually lands before taskkill has finished. `spawnSync`'s timeout then terminates it.<br>This is QA-1.2-14's pattern again: a short limit turns "slow" into "never". This time nothing comes later, because opencode is gone. | 1. Raise `EXIT_TASKKILL_TIMEOUT_MS`, for example to 10000 ms. It only costs time when taskkill is slow: idle exits still take 0.3–0.8 s. And it is the last chance to reach these trees.<br>2. Add to G4's known limits (the wording is deferred to 3.2): under normal-priority saturation, host exit can leave part of a tree when the limit is hit.<br>3. Optionally, 3.1's load run can repeat the `exithost` shape. |
+| QA-1.2-22 | nit | `test/unit/exec.test.ts:134-144` (`waitForFile`: 100 × 50 ms = 5 s), used at `:596` and `:610` by the two `lowPriority` grandchildren tests (60 s test timeout) | **The gating run failed here, as in round 3's "Load flake".** Below-normal priority yields to normal-priority load by design, but the harness gives the fixture only 5 s to start.<br>**`prio.mjs` under 16 normal-priority busy loops.**<br>• One `runArgv` `lowPriority` fixture had not written its grandchild's PID after **30 s**. The other two took 138 and 137 ms.<br>• Normal-priority runs took 1021, 137 and 122 ms.<br>• Idle, every run took 120–139 ms.<br>The priority property itself does not depend on timing. The same load also hit the 20 s `timeoutMs` of the `lowPriority` exit-code tests in round 3. | 1. Give `waitForFile` a limit parameter and pass the test's own budget (for example 45 s) in the two `lowPriority` tests.<br>2. Raise `timeoutMs` in the `lowPriority` exit-code tests the same way.<br>3. Alternatively, state in the test file that the `lowPriority` tests need a machine that is not saturated by normal-priority load.<br>This is a test-only change. |
+| QA-1.2-23 | nit (pre-existing since `6966a5c`; POSIX only) | `exec.ts:222` together with `:309-312` | **The POSIX tracked set is keyed by a recyclable id, and one run can untrack another run's group.**<br>**How.** When the group is empty at `exit`, the id is untracked there, and `finish` untracks it again. The same happens when the group empties after `exit` but before `close`. In both cases the id is free in between. If a new run's child gets that PID (it leads a group with that id and is tracked), the old run's `finish` deletes the new run's entry. The exit hook then misses that group.<br>**Why it is rare.** The window stays open only while something outside the group holds the pipes: the `setsid` residual, bounded by the deadline plus the 2 s grace. The PID also has to wrap around inside it.<br>**Found by reading.** It cannot be run on this Windows host. `78c71dd` renamed this code without changing it. Windows is not affected: it untracks only at `exit` (`:308`). | 1. Make `tracked` a `Map<pid, runToken>`, and have `untrack` delete an entry only when the token is its own run's. A recycled id overwrites the entry, which is correct: the old group cannot still exist once its id belongs to a new group.<br>2. Record the related residual that no fix can close without pidfd. If the group empties after `exit` and its id is recycled by an unrelated group, the late `kill()` (`:292`) or the exit hook can signal that group. The conditions are the same (a `setsid` escapee holding the pipes, plus PID wrap-around). |
+
+### Checked, no finding
+
+- **Tracking order.** `track(pid)` runs after `setPriority` (`exec.ts:202`), so nothing new
+  sits between the spawn and the priority call. `exitHookInstalled` (`:419-425`) installs the hook
+  once, and the in-process test asserts exactly one listener after several runs.
+- **The hook's own cost when nothing is in flight.** With an empty set it returns before
+  spawning (`:440`): each empty call in `hookcheck.mjs` took 0–1 ms.
+- **A direct child that exited just before the hook.** Its PID is still tracked until libuv
+  delivers `exit`. taskkill then reports it as not found, which does not stop the other PIDs (the
+  stale-PID case above). What it left running stays under G4 limit (a), as the header says.
+- **The refusal checked before the abort.** A `.cmd` target with a signal that is already aborted
+  now resolves as the refusal (`code 1, timedOut: false`), not as a pre-aborted run. Both are "did
+  not run"; no caller depends on the difference.
+- **Over-refusal.** `probe.cmd.`, `\\?\…\probe.cmd.` and short names that end `.CMD` are refused
+  even where no such batch file exists. That only turns a would-be ENOENT into the refusal.
+
+### Deferred by plan (not open)
+
+- **deferred by plan (3.1)**, unchanged from round 3, with these additions:
+  - The Bun smoke should also cover the multi-run exit shape (`exithost`: several `runShell`
+    trees in flight, then `process.exit(0)`). It should be launched from a shell, not from node.
+  - The loaded run should include the exit hook (QA-1.2-21's measurement).
+  - The coverage gate is unchanged.
+- **deferred by plan (3.2):**
+  - QA-1.2-12;
+  - the G4 wording and risk-table row;
+  - the QA-1.2-20 plan wording;
+  - the known limit added in round 3;
+  - QA-1.2-21 item 2, once it is resolved.
+- **deferred by plan (2.1):** QA-1.2-13, unchanged.
+
+**Status: phase 1.2 QA is not CLEAN.** QA-1.2-21 (minor), QA-1.2-22 (nit) and QA-1.2-23 (nit)
+are open.
+
