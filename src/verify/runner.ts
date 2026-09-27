@@ -1,7 +1,7 @@
 // src/verify/runner.ts
 //
 // RUNNER ADAPTER: design note (plan Task 1.3.1) and typed contract.
-// Implementation is Task 1.3.2. Every function below is a stub until then, except the type guards.
+// Implementation: Task 1.3.2 (parts 1 and 2).
 //
 // Plan:     docs/plans/verification-resource-budget-plan.md, section 1.5 (decisions 1-6, 10, 11), Phase 1.3.
 // Evidence: docs/qa/verification-resource-budget/phase-1.3.md (Spike C: vitest 4.1.11, jest 30.5.2,
@@ -670,6 +670,7 @@
 import { randomUUID } from "node:crypto";
 import * as os from "node:os";
 import * as nodePath from "node:path";
+import { observeTests } from "./baseline";
 import type { ExecResult, FsSeam } from "./types";
 
 // ---------------------------------------------------------------------------------------------
@@ -1139,8 +1140,8 @@ function findComposite(s: string): string | undefined {
 
 const ASSIGN_RE = /^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/s;
 
-type Invocation =
-  | { readonly type: "direct"; readonly kind: RunnerKind; readonly launcher: Launcher; readonly env: Record<string, string>; readonly args: string[] }
+type Invocation<K extends ToolKind> =
+  | { readonly type: "direct"; readonly kind: K; readonly launcher: Launcher; readonly env: Record<string, string>; readonly args: string[] }
   | {
       readonly type: "script";
       readonly manager: PackageManager;
@@ -1154,8 +1155,21 @@ function unsupported(prefix: string, where: string): Unverifiable {
   return s6("unsupported-command", `unsupported command "${prefix}" in ${where}`);
 }
 
+/** The runner heads a detection accepts: JS tools by bare name, plus pytest when `py` is set. */
+interface Heads<K extends ToolKind> {
+  readonly js: readonly K[];
+  readonly py?: K & "pytest";
+}
+const TEST_HEADS: Heads<RunnerKind> = { js: ["vitest", "jest"], py: "pytest" };
+const LINT_HEADS: Heads<"eslint"> = { js: ["eslint"] };
+
 /** B step 2 + C.3: classify a token list. `allowScripts` is false inside a package script. */
-function parseInvocation(tokens: readonly string[], where: string, allowScripts: boolean): Invocation | Unverifiable {
+function parseInvocation<K extends ToolKind>(
+  tokens: readonly string[],
+  where: string,
+  allowScripts: boolean,
+  heads: Heads<K>,
+): Invocation<K> | Unverifiable {
   const env: Record<string, string> = {};
   let t = tokens;
   if (t[0] === "cross-env") {
@@ -1173,27 +1187,28 @@ function parseInvocation(tokens: readonly string[], where: string, allowScripts:
   if (inline) {
     return s6("inline-env", `inline environment assignment "${inline[1]}=" in ${where} (only cross-env is supported)`);
   }
-  const direct = (kind: RunnerKind, launcher: Launcher, args: string[]): Invocation => ({ type: "direct", kind, launcher, env, args });
-  const isJs = (x: string | undefined): x is "vitest" | "jest" => x === "vitest" || x === "jest";
-  if (isJs(h)) return direct(h, "direct", t.slice(1));
-  if (h === "pytest") return direct("pytest", "direct", t.slice(1));
+  const direct = (kind: K, launcher: Launcher, args: string[]): Invocation<K> => ({ type: "direct", kind, launcher, env, args });
+  const jsKind = (x: string | undefined): K | undefined => heads.js.find((k) => k === x);
+  const hk = jsKind(h);
+  if (hk) return direct(hk, "direct", t.slice(1));
+  if (h === "pytest" && heads.py) return direct(heads.py, "direct", t.slice(1));
   if (h === "npx") {
-    const r = t[1];
-    return isJs(r) ? direct(r, "npx", t.slice(2)) : unsupported(`npx ${r ?? ""}`.trim(), where);
+    const r = jsKind(t[1]);
+    return r ? direct(r, "npx", t.slice(2)) : unsupported(`npx ${t[1] ?? ""}`.trim(), where);
   }
   if (h === "uv") {
-    if (t[1] === "run" && t[2] === "pytest") return direct("pytest", "uv-run", t.slice(3));
+    if (t[1] === "run" && t[2] === "pytest" && heads.py) return direct(heads.py, "uv-run", t.slice(3));
     return unsupported(t[1] === "run" ? `uv run ${t[2] ?? ""}`.trim() : `uv ${t[1] ?? ""}`.trim(), where);
   }
   if (h === "pnpm" && t[1] === "exec") {
-    const r = t[2];
-    return isJs(r) ? direct(r, "pnpm-exec", t.slice(3)) : unsupported(`pnpm exec ${r ?? ""}`.trim(), where);
+    const r = jsKind(t[2]);
+    return r ? direct(r, "pnpm-exec", t.slice(3)) : unsupported(`pnpm exec ${t[2] ?? ""}`.trim(), where);
   }
   if (h !== "npm" && h !== "pnpm" && h !== "yarn" && h !== "bun") return unsupported(h, where);
   if (!allowScripts) return unsupported(h, where);
 
   const sub = t[1];
-  const script = (name: string | undefined, rest: string[]): Invocation | Unverifiable => {
+  const script = (name: string | undefined, rest: string[]): Invocation<K> | Unverifiable => {
     if (name === undefined) return unsupported(`${h} ${sub}`, where);
     if (h === "npm") {
       const dd = rest.indexOf("--");
@@ -1274,6 +1289,17 @@ const PYTEST_ARGS: readonly ArgEntry[] = [
   e("--co --collect-only --fixtures --fixtures-per-test --markers --setup-plan --setup-only --version -V -h --help", "s6", "0"),
 ];
 
+const ESLINT_ARGS: readonly ArgEntry[] = [
+  e("--fix --fix-dry-run --no-warn-ignored", "drop", "0"),
+  e("--fix-type -o --output-file", "drop", "1"),
+  e("--concurrency", "cap", "1"),
+  e("-c --config --ext --parser --parser-options --resolve-plugins-relative-to --rulesdir --plugin --rule --env --global --ignore-path --ignore-pattern --cache-location --cache-strategy -f --format --max-warnings --report-unused-disable-directives-severity --flag", "keep", "1"),
+  e("--cache --quiet --no-eslintrc --no-config-lookup --no-ignore --no-inline-config --report-unused-disable-directives --color --no-color --no-error-on-unmatched-pattern --exit-on-fatal-error --pass-on-no-patterns --stats --debug", "keep", "0"),
+  e("--init --print-config --inspect-config --env-info -v --version -h --help --stdin --stdin-filename", "s6", "0"),
+];
+
+const ARG_TABLES: Record<ToolKind, readonly ArgEntry[]> = { vitest: VITEST_ARGS, jest: JEST_ARGS, pytest: PYTEST_ARGS, eslint: ESLINT_ARGS };
+
 interface ArgMatch {
   readonly entry: ArgEntry;
   readonly name: string;
@@ -1328,6 +1354,7 @@ function parseCap(kind: ToolKind, raw: string): UserWorkerCap | undefined {
 }
 
 const PY_SCOPE_BAD_RE = /::|[*?[\]{}]/;
+const ESLINT_GLOB_RE = /[*?[\]{}]/;
 
 interface ArgResult {
   readonly kept: string[];
@@ -1339,16 +1366,16 @@ interface ArgResult {
   readonly notes: string[];
 }
 
-/** D.1 for vitest, jest and pytest. */
+/** D.1 for vitest, jest, pytest and eslint. */
 function processArgs(
   ctx: Ctx,
-  kind: RunnerKind,
+  kind: ToolKind,
   args: readonly string[],
   where: string,
   runnerCwd: string,
   gitRoot: string,
 ): ArgResult | Unverifiable {
-  const table = kind === "vitest" ? VITEST_ARGS : kind === "jest" ? JEST_ARGS : PYTEST_ARGS;
+  const table = ARG_TABLES[kind];
   const kept: string[] = [];
   const notes = new Set<string>();
   const filters: string[] = [];
@@ -1395,10 +1422,16 @@ function processArgs(
       switch (m.entry.action) {
         case "drop":
           break;
-        case "cap":
-          capRaw = m.inline ? (m.value ?? "") : (values[0] ?? "");
+        case "cap": {
+          const raw = m.inline ? (m.value ?? "") : (values[0] ?? "");
+          if (kind === "eslint" && raw === "off") {
+            kept.push(t, ...values);
+            break;
+          }
+          capRaw = raw;
           xdistArg = true;
           break;
+        }
         case "cap1-keep":
           kept.push(t);
           capRaw = "1";
@@ -1434,6 +1467,7 @@ function processArgs(
     } else if (kind === "jest") {
       filters.push(t);
     } else {
+      if (kind === "eslint" && ESLINT_GLOB_RE.test(t)) return s6("unsupported-argument", `eslint glob pattern in ${where}: "${t}"`);
       const abs = ctx.P.resolve(runnerCwd, t);
       if (PY_SCOPE_BAD_RE.test(t) || !isInside(ctx, gitRoot, abs)) return badArg(t);
       pathScopes.push(abs);
@@ -1477,7 +1511,16 @@ async function readPytestConfig(ctx: Ctx, fs: FsSeam, runnerCwd: string, gitRoot
 // B. Detection
 // ---------------------------------------------------------------------------------------------
 
-async function detectImpl(ctx: Ctx, command: string, cwd: string, fs: FsSeam): Promise<DetectedRunner | Unverifiable> {
+/** A detection result for any tool kind; Detected<RunnerKind> is a DetectedRunner. */
+type Detected<K extends ToolKind> = Omit<DetectedRunner, "kind"> & { readonly kind: K };
+
+async function detectImpl<K extends ToolKind>(
+  ctx: Ctx,
+  command: string,
+  cwd: string,
+  fs: FsSeam,
+  heads: Heads<K>,
+): Promise<Detected<K> | Unverifiable> {
   const P = ctx.P;
   const absCwd = P.resolve(cwd);
   const gitRoot = await findGitRoot(ctx, absCwd, fs);
@@ -1487,7 +1530,7 @@ async function detectImpl(ctx: Ctx, command: string, cwd: string, fs: FsSeam): P
   if (composite !== undefined) return s6("composite", `composite command: "${composite}"`);
   const tokens = tokenize(command);
   if (!tokens) return s6("unterminated-quote", "unterminated quote in command");
-  const inv = parseInvocation(tokens, "command", true);
+  const inv = parseInvocation(tokens, "command", true, heads);
   if (isS6(inv)) return inv;
 
   if (inv.type === "direct") {
@@ -1514,7 +1557,7 @@ async function detectImpl(ctx: Ctx, command: string, cwd: string, fs: FsSeam): P
   if (sc !== undefined) return s6("composite", `composite ${where}: "${sc}"`);
   const st = tokenize(text);
   if (!st) return s6("unterminated-quote", `unterminated quote in ${where}`);
-  const inner = parseInvocation(st, where, false);
+  const inner = parseInvocation(st, where, false, heads);
   if (isS6(inner)) return inner;
   if (inner.type !== "direct") return unsupported(inv.manager, where);
 
@@ -1538,10 +1581,10 @@ async function detectImpl(ctx: Ctx, command: string, cwd: string, fs: FsSeam): P
   );
 }
 
-async function finishDetection(
+async function finishDetection<K extends ToolKind>(
   ctx: Ctx,
   fs: FsSeam,
-  kind: RunnerKind,
+  kind: K,
   launcher: Launcher,
   source: CommandSource,
   gitRoot: string,
@@ -1550,7 +1593,7 @@ async function finishDetection(
   args: readonly string[],
   where: string,
   notes: string[],
-): Promise<DetectedRunner | Unverifiable> {
+): Promise<Detected<K> | Unverifiable> {
   const a = processArgs(ctx, kind, args, where, runnerCwd, gitRoot);
   if (isS6(a)) return a;
   const allNotes = [...notes, ...a.notes];
@@ -1671,6 +1714,8 @@ const TRIGGERS: Record<RunnerKind, RegExp> = {
 const NOTE_NO_CHANGES = "no changed files, no affected tests";
 const NOTE_NO_INPUT = "no affected tests: no changed file is a test input";
 const NOTE_NO_PY_MAP = "no affected tests: no test files map to the changed modules";
+const NOTE_NO_LINT = "no changed lintable files";
+const NOTE_NO_RERUN = "no rerun: none of the test files exist in this tree";
 
 interface FileRef {
   readonly abs: string;
@@ -1701,15 +1746,28 @@ async function plan(input: StaticScopingInput, search: TestSearchSeam | undefine
   if (input.changedFiles === "unavailable") return s6("attribution-unavailable", "change attribution unavailable");
   if (input.changedFiles.length === 0) return noAffected(NOTE_NO_CHANGES);
 
-  const det = await detectImpl(ctx, input.command, input.cwd, fs);
+  const det = await detectImpl(ctx, input.command, input.cwd, fs, TEST_HEADS);
   if (isS6(det)) return det;
   const gitRoot = det.gitRoot;
   const cwd = P.resolve(input.cwd);
   const notes: string[] = [...det.notes];
+  const sorted = collectChanged(ctx, cwd, gitRoot, input.changedFiles, notes);
 
-  // G.2-G.5: candidates, normalization, dedup, sort.
+  // G.7: config triggers.
+  const sourcePj = det.source.type === "script" ? ctx.key(det.source.packageJson) : undefined;
+  for (const f of sorted) {
+    const base = P.basename(f.abs);
+    if (TRIGGERS[det.kind].test(ctx.win ? base.toLowerCase() : base) || ctx.key(f.abs) === sourcePj) {
+      return s6("config-changed", `config file changed: ${f.rel}`);
+    }
+  }
+  return classify(ctx, input, det, sorted, notes, search);
+}
+
+/** G.2-G.5: candidates, normalization, dedup, sort. */
+function collectChanged(ctx: Ctx, cwd: string, gitRoot: string, changed: readonly ChangedPath[], notes: string[]): FileRef[] {
   const files = new Map<string, FileRef>();
-  for (const c of input.changedFiles) {
+  for (const c of changed) {
     for (const cand of [c.path, c.previousPath]) {
       if (cand === undefined) continue;
       if (cand.includes("\0")) {
@@ -1728,17 +1786,24 @@ async function plan(input: StaticScopingInput, search: TestSearchSeam | undefine
       if (!files.has(ctx.key(ref.abs))) files.set(ctx.key(ref.abs), ref);
     }
   }
-  const sorted = [...files.entries()].sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0)).map(([, v]) => v);
+  return [...files.entries()].sort(byKey).map(([, v]) => v);
+}
 
-  // G.7: config triggers.
-  const sourcePj = det.source.type === "script" ? ctx.key(det.source.packageJson) : undefined;
-  for (const f of sorted) {
-    const base = P.basename(f.abs);
-    if (TRIGGERS[det.kind].test(ctx.win ? base.toLowerCase() : base) || ctx.key(f.abs) === sourcePj) {
-      return s6("config-changed", `config file changed: ${f.rel}`);
-    }
-  }
+function byKey(a: readonly [string, unknown], b: readonly [string, unknown]): number {
+  return a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0;
+}
 
+async function classify(
+  ctx: Ctx,
+  input: StaticScopingInput,
+  det: Detected<RunnerKind>,
+  sorted: readonly FileRef[],
+  notes: string[],
+  search: TestSearchSeam | undefined,
+): Promise<ScopingPlan | StaticScoping> {
+  const P = ctx.P;
+  const fs = input.fs;
+  const gitRoot = det.gitRoot;
   // G.8: classification.
   const inputs = new Map<string, string>();
   const addInput = (abs: string) => inputs.set(ctx.key(abs), abs);
@@ -1828,8 +1893,8 @@ async function plan(input: StaticScopingInput, search: TestSearchSeam | undefine
   if (inputs.size === 0) return noAffected(emptyNote);
   const pre = await preflight(ctx, det, fs);
   if (isS6(pre)) return pre;
-  const F = [...inputs.entries()].sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0)).map(([, v]) => v);
-  return buildSpec(ctx, det, pre.entry, F, input.budget, input.cores, [...notes, ...pre.notes]);
+  const F = [...inputs.entries()].sort(byKey).map(([, v]) => v);
+  return buildSpec(ctx, det, pre.entry, F, input.budget, input.cores, [...notes, ...pre.notes], "related", det.runnerCwd, gitRoot);
 }
 
 /** Checks that need no search: entry resolution and the tmpdir location (F, H, N.4). */
@@ -1847,6 +1912,9 @@ function buildSpec(
   budget: RunnerBudget,
   inputCores: number | undefined,
   notes: string[],
+  mode: "related" | "rerun",
+  cwd: string,
+  gitRoot: string,
 ): ScopedSpec | Unverifiable {
   const C = inputCores ?? ctx.host.cores;
   const N = effectiveWorkers(det.userWorkers, budget, C);
@@ -1856,10 +1924,12 @@ function buildSpec(
   const env: Record<string, string> = { ...det.env };
   let args: string[];
   let workers: number | null = N;
+  const tail = [`--maxWorkers=${N}`];
   if (det.kind === "vitest") {
-    args = [...E, "related", ...F, ...K, "--run", "--passWithNoTests", `--maxWorkers=${N}`, "--coverage.enabled=false", "--reporter=json", `--outputFile=${R}`];
+    const head = mode === "related" ? ["related", ...F, ...K, "--run"] : ["run", ...F, ...K];
+    args = [...E, ...head, "--passWithNoTests", ...tail, "--coverage.enabled=false", "--reporter=json", `--outputFile=${R}`];
   } else if (det.kind === "jest") {
-    args = [...E, ...K, "--findRelatedTests", "--passWithNoTests", `--maxWorkers=${N}`, "--coverage=false", "--json", `--outputFile=${R}`, "--", ...F];
+    args = [...E, ...K, mode === "related" ? "--findRelatedTests" : "--runTestsByPath", "--passWithNoTests", `--maxWorkers=${N}`, "--coverage=false", "--json", `--outputFile=${R}`, "--", ...F];
   } else {
     args = [
       ...E, ...K, "-q", "-p", "no:cacheprovider", `--junitxml=${R}`,
@@ -1874,16 +1944,16 @@ function buildSpec(
   if (chars > MAX_ARGV_CHARS) return s6("argv-too-long", `too many inputs for one command line: ${F.length} files`);
   return {
     runner: det.kind,
-    mode: "related",
+    mode,
     file: entry.file,
     args,
-    cwd: det.runnerCwd,
+    cwd,
     env,
     reportPath: R,
-    gitRoot: det.gitRoot,
+    gitRoot,
     entry: entry.entry,
     inputs: F,
-    inputsAreTests: det.kind === "pytest",
+    inputsAreTests: mode === "rerun" || det.kind === "pytest",
     workers,
     notes,
   };
@@ -1900,7 +1970,7 @@ export async function detectRunner(
   fs: FsSeam,
   host?: Partial<RunnerHost>,
 ): Promise<DetectedRunner | Unverifiable> {
-  return detectImpl(makeCtx(host), command, cwd, fs);
+  return detectImpl(makeCtx(host), command, cwd, fs, TEST_HEADS);
 }
 
 /** 1.3.2.b: locate the JS bin entry or the native executable (F), walking from cwd up to runner.gitRoot. */
@@ -1937,7 +2007,36 @@ export async function planRerun(
   budget: RunnerBudget,
   deps: RerunDeps,
 ): Promise<ScopedSpec | NoAffected | Unverifiable> {
-  throw new Error("not implemented: runner.planRerun (Task 1.3.2.e)");
+  const ctx = makeCtx(deps.host);
+  const P = ctx.P;
+  const absCwd = P.resolve(cwd);
+  const gitRoot = await findGitRoot(ctx, absCwd, deps.fs);
+  if (gitRoot === undefined) return s6("no-git-root", `no git repository at or above ${cwd}`);
+  const notes: string[] = [];
+  const inputs = new Map<string, string>();
+  for (const f of testFiles) {
+    const ref = P.isAbsolute(f) && !f.includes("\0") ? canonicalize(ctx, gitRoot, gitRoot, f) : undefined;
+    if (!ref) {
+      notes.push(`rerun file dropped (relative or outside the git root): ${f}`);
+    } else if (!(await deps.fs.fileExists(ref.abs))) {
+      notes.push(`rerun file missing in this tree: ${ref.rel}`);
+    } else {
+      inputs.set(ctx.key(ref.abs), ref.abs);
+    }
+  }
+  if (inputs.size === 0) return noAffected(NOTE_NO_RERUN);
+  if (isInside(ctx, gitRoot, P.resolve(ctx.host.tmpdir))) {
+    return s6("tmpdir-in-repo", `temp dir is inside the repository: ${ctx.host.tmpdir}`);
+  }
+  let entry = deps.entry;
+  if (!entry) {
+    const r = await resolveEntryImpl(ctx, { kind: runner.kind, launcher: runner.launcher, gitRoot }, absCwd, deps.fs);
+    if (isS6(r)) return r;
+    entry = r.entry;
+    notes.push(...r.notes);
+  }
+  const F = [...inputs.entries()].sort(byKey).map(([, v]) => v);
+  return buildSpec(ctx, runner, entry, F, budget, deps.cores, notes, "rerun", absCwd, gitRoot);
 }
 
 /** 1.3.2.f: parse the report (or fall back to observeTests) and always delete the report file (I, N.4). */
@@ -1947,12 +2046,254 @@ export async function readResult(
   fs: RunnerFs,
   host?: Partial<RunnerHost>,
 ): Promise<RunResult> {
-  throw new Error("not implemented: runner.readResult (Task 1.3.2.f)");
+  const ctx = makeCtx(host);
+  const P = ctx.P;
+  const allowed =
+    ctx.key(P.dirname(P.resolve(spec.reportPath))) === ctx.key(P.resolve(ctx.host.tmpdir)) &&
+    REPORT_NAME_RE.test(P.basename(spec.reportPath));
+  try {
+    if (!allowed) return textResult(ctx, spec, execResult, `report path rejected: ${spec.reportPath}`);
+    let text: string | undefined;
+    try {
+      text = await fs.readFile(spec.reportPath);
+    } catch {
+      text = undefined; // Missing or unreadable: step 4.
+    }
+    const parsed =
+      text === undefined ? undefined : spec.runner === "pytest" ? parseJunit(ctx, spec, text, execResult.code) : parseJestJson(ctx, spec, text, execResult.code);
+    return parsed ?? textResult(ctx, spec, execResult, undefined);
+  } finally {
+    if (allowed) {
+      try {
+        await fs.unlink(spec.reportPath);
+      } catch {
+        // I: unlink errors are ignored; the seam already resolves for a missing file.
+      }
+    }
+  }
 }
 
 /** 1.3.2.g: scope a plain eslint invocation to the changed lintable files (K, section 1.5-10). */
 export async function planScopedLint(input: PlanScopedLintInput): Promise<LintSpec | NoAffected | Unscoped> {
-  throw new Error("not implemented: runner.planScopedLint (Task 1.3.2.g)");
+  const ctx = makeCtx(input.host);
+  const P = ctx.P;
+  const fs = input.fs;
+  if (input.changedFiles === "unavailable") return unscoped("change attribution unavailable");
+  if (input.changedFiles.length === 0) return noAffected(NOTE_NO_LINT);
+  const det = await detectImpl(ctx, input.command, input.cwd, fs, LINT_HEADS);
+  if (isS6(det)) return unscoped(det.reason);
+  const notes = [...det.notes];
+  const sorted = collectChanged(ctx, P.resolve(input.cwd), det.gitRoot, input.changedFiles, notes);
+  for (const f of sorted) {
+    const base = P.basename(f.abs);
+    if (ESLINT_TRIGGER_RE.test(ctx.win ? base.toLowerCase() : base)) return unscoped(`eslint config changed: ${f.rel}`);
+  }
+  const exts = lintExtensions(det.keptArgs);
+  const F: string[] = [];
+  for (const f of sorted) {
+    const inScope = isInside(ctx, det.runnerCwd, f.abs) && (det.pathScopes.length === 0 || det.pathScopes.some((s) => isInside(ctx, s, f.abs)));
+    if (inScope && exts.has(P.extname(f.abs).toLowerCase()) && (await fs.fileExists(f.abs))) F.push(f.abs);
+  }
+  if (F.length === 0) return noAffected(NOTE_NO_LINT);
+  const r = await resolveEntryImpl(ctx, det, det.runnerCwd, fs);
+  if (isS6(r)) return unscoped(r.reason);
+  const v9 = Number.parseInt(r.entry.version ?? "", 10) >= 9;
+  if (!v9 && det.keptArgs.some((a) => a === "--max-warnings" || a.startsWith("--max-warnings="))) {
+    return unscoped("eslint <9 cannot scope ignored files under --max-warnings");
+  }
+  const workers = det.userWorkers ? effectiveWorkers(det.userWorkers, input.budget, input.cores ?? ctx.host.cores) : null;
+  const args = [
+    ...r.entry.prefix,
+    ...det.keptArgs,
+    ...(workers !== null ? [`--concurrency=${workers}`] : []),
+    ...(v9 ? ["--no-warn-ignored"] : []),
+    ...F,
+  ];
+  if (args.reduce((n, a) => n + a.length + 1, 0) > MAX_ARGV_CHARS) return unscoped(`too many inputs for one command line: ${F.length} files`);
+  return {
+    runner: "eslint",
+    file: r.entry.file,
+    args,
+    cwd: det.runnerCwd,
+    env: det.env,
+    gitRoot: det.gitRoot,
+    entry: r.entry.entry,
+    inputs: F,
+    workers,
+    notes: [...notes, ...r.notes],
+  };
+}
+
+// ---------------------------------------------------------------------------------------------
+// I. Result parsing and K. lint helpers
+// ---------------------------------------------------------------------------------------------
+
+function unscoped(reason: string): Unscoped {
+  return { unscoped: true, reason };
+}
+
+const ESLINT_TRIGGER_RE = /^(?:eslint\.config\..+|\.eslintrc|\.eslintrc\..+|\.eslintignore|package\.json|tsconfig.*\.json)$/;
+const DEFAULT_LINT_EXTS = [".js", ".mjs", ".cjs", ".jsx", ".ts", ".mts", ".cts", ".tsx"];
+
+/** K: the --ext values (comma-separated, leading dots optional), or the defaults. */
+function lintExtensions(kept: readonly string[]): Set<string> {
+  const out: string[] = [];
+  for (let i = 0; i < kept.length; i++) {
+    const t = kept[i];
+    const v = t === "--ext" ? kept[++i] : t.startsWith("--ext=") ? t.slice(6) : undefined;
+    for (const x of (v ?? "").split(",")) if (x) out.push(`.${x.replace(/^\./, "")}`.toLowerCase());
+  }
+  return new Set(out.length > 0 ? out : DEFAULT_LINT_EXTS);
+}
+
+/** Dedup, sort and apply the I "exit code but no failure" rule. */
+function finishResult(
+  ids: Set<string>,
+  files: Set<string>,
+  collectionError: boolean,
+  total: number | undefined,
+  code: number,
+  forced: string | undefined,
+  exitOk: boolean,
+): RunResult {
+  const silent = !exitOk && ids.size === 0 && !collectionError;
+  const note = forced ?? (silent ? `runner exited ${code} but its report lists no failure` : undefined);
+  return {
+    failingIds: [...ids].sort(),
+    failingFiles: [...files].sort(),
+    collectionError,
+    total,
+    complete: forced === undefined && !silent,
+    source: "report",
+    ...(note !== undefined ? { note } : {}),
+  };
+}
+
+/** I step 2: the jest-compatible JSON of vitest and jest. undefined = unusable. */
+function parseJestJson(ctx: Ctx, spec: ScopedSpec, text: string, code: number): RunResult | undefined {
+  const P = ctx.P;
+  let v: unknown;
+  try {
+    v = JSON.parse(text);
+  } catch {
+    return undefined;
+  }
+  if (!isRecord(v) || !Array.isArray(v.testResults)) return undefined;
+  const ids = new Set<string>();
+  const files = new Set<string>();
+  let collectionError = typeof v.numRuntimeErrorTestSuites === "number" && v.numRuntimeErrorTestSuites > 0;
+  for (const s of v.testResults.filter(isRecord)) {
+    if (typeof s.name !== "string") continue;
+    const rel = P.relative(spec.cwd, s.name).replace(/\\/g, "/");
+    const results = Array.isArray(s.assertionResults) ? s.assertionResults.filter(isRecord) : [];
+    const failed = results.filter((a) => a.status === "failed");
+    for (const a of failed) {
+      const titles = Array.isArray(a.ancestorTitles) ? a.ancestorTitles.map(String) : [];
+      ids.add(`${rel} > ${[...titles, String(a.title)].join(" > ")}`);
+    }
+    if (s.status === "failed" && failed.length === 0) {
+      ids.add(rel);
+      collectionError = true;
+    }
+    if (s.status === "failed" || failed.length > 0) files.add(P.normalize(s.name));
+  }
+  const total = typeof v.numTotalTests === "number" ? v.numTotalTests : undefined;
+  return finishResult(ids, files, collectionError, total, code, undefined, code === 0);
+}
+
+const XML_ENTITIES: Record<string, string> = { amp: "&", lt: "<", gt: ">", quot: '"', apos: "'" };
+
+function decodeXml(s: string): string {
+  return s.replace(/&(#x[0-9a-fA-F]+|#\d+|amp|lt|gt|quot|apos);/g, (_m, g: string) =>
+    g.startsWith("#x") ? String.fromCodePoint(Number.parseInt(g.slice(2), 16)) : g.startsWith("#") ? String.fromCodePoint(Number(g.slice(1))) : XML_ENTITIES[g],
+  );
+}
+
+/** I step 3: pytest junit XML at regex level. undefined = unusable (truncated). */
+function parseJunit(ctx: Ctx, spec: ScopedSpec, text: string, code: number): RunResult | undefined {
+  const P = ctx.P;
+  if (!text.includes("</testsuites>")) return undefined;
+  const modules = spec.inputs.map((f) => {
+    const segs = P.relative(spec.gitRoot, f).replace(/\\/g, "/").replace(/\.py$/, "").split("/");
+    return { f, candidates: segs.map((_s, i) => segs.slice(i).join(".")) };
+  });
+  const map = (dotted: string): { file: string; rest: string[] } | undefined => {
+    let best: { file: string; d: string } | undefined;
+    for (const m of modules) {
+      for (const d of m.candidates) {
+        if ((dotted === d || dotted.startsWith(`${d}.`)) && (!best || d.length > best.d.length)) best = { file: m.f, d };
+      }
+    }
+    return best && { file: best.file, rest: dotted.slice(best.d.length + 1).split(".").filter(Boolean) };
+  };
+  const relOf = (f: string) => P.relative(spec.cwd, f).replace(/\\/g, "/");
+  const ids = new Set<string>();
+  const files = new Set<string>();
+  let collectionError = false;
+  let total = 0;
+  let unmapped: string | undefined;
+  const caseRe = /<testcase\b([^>]*?)(?:\/>|>([\s\S]*?)<\/testcase>)/g;
+  for (const m of text.matchAll(caseRe)) {
+    const attrs: Record<string, string> = {};
+    for (const a of m[1].matchAll(/([\w:-]+)="([^"]*)"/g)) attrs[a[1]] = decodeXml(a[2]);
+    const classname = attrs.classname ?? "";
+    const name = attrs.name ?? "";
+    const body = m[2] ?? "";
+    const collection = classname === "" || /<error\b[^>]*\bmessage="collection failure"/.test(body);
+    if (collection) {
+      collectionError = true;
+      const target = classname || name;
+      const hit = map(target);
+      if (hit) {
+        ids.add(relOf(hit.file));
+        files.add(hit.file);
+      } else {
+        ids.add(target);
+        unmapped ??= target;
+      }
+      continue;
+    }
+    total++;
+    if (!/<(?:failure|error)\b/.test(body)) continue;
+    const hit = map(classname);
+    if (hit) {
+      ids.add(`${relOf(hit.file)}::${[...hit.rest, name].join("::")}`);
+      files.add(hit.file);
+    } else {
+      ids.add(`${classname}::${name}`);
+      unmapped ??= classname;
+    }
+  }
+  const forced =
+    code === 4
+      ? "pytest usage error (exit 4)"
+      : code === 3
+        ? "pytest internal error (exit 3)"
+        : unmapped !== undefined
+          ? `pytest classname not mapped to a test file: ${unmapped}`
+          : undefined;
+  return finishResult(ids, files, collectionError, total, code, forced, code === 0 || code === 5);
+}
+
+/** I step 4: no usable report; the text observation is never a complete inventory. */
+function textResult(ctx: Ctx, spec: ScopedSpec, execResult: ExecResult, why: string | undefined): RunResult {
+  const obs = observeTests(execResult);
+  const files = new Set<string>();
+  for (const id of obs.failures) {
+    const m = /^(.*?)(?: > |::)/.exec(id);
+    if (m) files.add(ctx.P.resolve(spec.cwd, m[1]));
+  }
+  const note =
+    why ?? (execResult.code === 0 ? "runner exited 0 without writing its report" : `runner exited ${execResult.code} without a usable report`);
+  return {
+    failingIds: [...new Set(obs.failures)].sort(),
+    failingFiles: [...files].sort(),
+    collectionError: execResult.code !== 0,
+    total: undefined,
+    complete: false,
+    source: "text",
+    note,
+  };
 }
 
 /** Section E: the single worker-cap rule shared by every runner. It never exceeds the budget. */
