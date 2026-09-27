@@ -11,7 +11,9 @@ import { DEFAULT_TIMEOUT_MS, KILL_GRACE_MS, deadlineOf, runArgv, runShell, setSw
 // the OS tears a process tree down, which a fake child_process cannot model.
 const node = `"${process.execPath}"`;
 const dirs: string[] = [];
-afterEach(() => { for (const d of dirs.splice(0)) rmSync(d, { recursive: true, force: true }); });
+// Retries: on Windows a just-killed process can still hold its cwd (a scratch
+// dir) for a few hundred ms after `alive()` reports it dead (QA-1.2-30).
+afterEach(() => { for (const d of dirs.splice(0)) rmSync(d, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 }); });
 
 /** A shell -> node -> grandchild node chain, like `cmd /c npm test` -> vitest -> workers. */
 function forkingFixture() {
@@ -34,6 +36,10 @@ function forkingFixture() {
   };
 }
 
+/**
+ * Note: on Windows "dead" here does not mean the process's handles (including
+ * its cwd) are closed yet; they can be released a few hundred ms later.
+ */
 function alive(pid: number): boolean {
   try {
     process.kill(pid, 0);
