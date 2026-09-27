@@ -17,6 +17,14 @@ const suite = e2eEnabled() ? describe.sequential : describe.skip;
 const TEST_TIMEOUT_MS = 180_000;
 /** Default VERIFY_WAIT (captureWaitMs). */
 const VERIFY_WAIT_DEFAULT_MS = 5_000;
+/**
+ * CI round 1: what a before hook may take past VERIFY_WAIT. The plugin counts VERIFY_WAIT from the
+ * dispatch's start (the capture's start-up is inside it, src/verify/wiring.ts boundedCaptureWait);
+ * what is left is outside any timer's control: the wait's timer firing late on a busy event loop,
+ * and the rest of the hook running after it, serialised over 20 releases that fall due together.
+ * Measured on windows-latest under --coverage before that fix: up to 104 ms past 5000 ms.
+ */
+const HOOK_LATENCY_SLACK_MS = 250;
 /** DEFERRED_FINISH_MS (src/verify/wiring.ts) plus scheduling slack; see QA-2.4-11. */
 const DEFERRED_AFTER_BOUND_MS = 2_500;
 const FOOTER_RE = /\[router\] unverified \u00b7 (vrf_[0-9a-f]{24}) \u00b7 risk \S+/;
@@ -198,7 +206,7 @@ suite("verify resource budget: deferred (3.1.2.f-h)", () => {
     expect(runners.map(p => p.args)).toEqual([]);
     expect(broad.map(p => p.args)).toEqual([]);
     expect(locks).toEqual([]);
-    for (const x of before) expect(x).toBeLessThanOrEqual(VERIFY_WAIT_DEFAULT_MS);
+    for (const x of before) expect(x).toBeLessThanOrEqual(VERIFY_WAIT_DEFAULT_MS + HOOK_LATENCY_SLACK_MS);
     // QA-2.4-11: the plan said "within 50 ms"; the implementation bounds the deferred finish at
     // DEFERRED_FINISH_MS = 2 s (src/verify/wiring.ts), a documented deviation.
     for (const x of after) expect(x).toBeLessThanOrEqual(DEFERRED_AFTER_BOUND_MS);
