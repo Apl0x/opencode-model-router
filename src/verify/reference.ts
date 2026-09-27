@@ -328,9 +328,9 @@
 //      removed. Warn "reference worktree left in place: <reason>"; GC retries
 //      later.
 //   3. Run assertSafeRefDir(dir) and confirm lstat(dir) is a real directory.
-//      Then fs.rm(dir, { recursive: true, force: true, maxRetries:
-//      CLEANUP_RETRIES, retryDelay: CLEANUP_RETRY_BASE_MS }): Spike D SAFE #5,
-//      the only recursive deleter. fs.rm removes a link without following it,
+//      Then fs.rm(dir, { recursive: true, force: true, maxRetries: 0 }) inside
+//      the module's flat retry loop (see below): Spike D SAFE #5, the only
+//      recursive deleter. fs.rm removes a link without following it,
 //      so a junction created after the sweep costs nothing (QA-1.5-3 repro:
 //      `git worktree remove` in this slot deleted the late junction's target
 //      contents; fs.rm left them intact). The sweep stays, because fs.rm's
@@ -364,6 +364,14 @@
 //   CLEANUP_RETRIES times with CLEANUP_RETRY_BASE_MS * 2^n backoff, then
 //   logged, and the leftover is left for GC. They are never treated as
 //   success. If dir was deleted externally, every step tolerates ENOENT.
+//   There is ONE flat retry loop (withRetry); fs.rm itself runs with
+//   maxRetries: 0 (QA-1.5-11). Node's JS fs.promises.rm retries inside every
+//   recursive child call, so its own retries nest once per directory level
+//   above a held dir: T(d) ~ 6*T(d-1) + 1.5 s, measured by QA as 11 s at one
+//   level and 66 s at two (about 6.5 min at three, extrapolated). The flat
+//   loop costs about 3.1 s of backoff at any depth. GC passes its deadline:
+//   no retry starts after GC's budget is spent, and step 4 is then skipped
+//   (the dir is gone and the entry is collected by the next GC).
 //
 // ----------------------------------------------------------------------------
 // 7. REMOVAL RULES  (normative; QA checks every destructive call against them)
@@ -440,7 +448,11 @@
 // 11. CRASH GC  gcStaleReferences(root, deps) -> GcReport
 //     (called at plugin start, wired in 2.1)
 // ----------------------------------------------------------------------------
-//   Never throws. Budget: deps.timeoutMs (default DEFAULT_MATERIALIZE_TIMEOUT_MS).
+//   Never throws. Budget: deps.timeoutMs (default DEFAULT_MATERIALIZE_TIMEOUT_MS),
+//   checked before each candidate and before each cleanup retry (QA-1.5-11:
+//   a held dir used to keep GC inside fs.rm's nested retries for 66 s against
+//   a 30 s budget). A single fs call or git call already in flight is not
+//   interrupted; git calls keep CLEANUP_GIT_TIMEOUT_MS.
 //   1. `git worktree list --porcelain` (cwd: root). No -z flag, to support git
 //      < 2.36; a path containing a newline can never pass R3. Parse the
 //      `worktree <path>`, `locked` and `prunable` lines. Measured in 1.5.1: a
@@ -574,6 +586,14 @@
 //     is not proven (Spike D). R2 limits this to a link created between the
 //     sweep and fs.rm (the QA-1.5-3 window), which only a process running
 //     after the dispose contract was broken can create.
+//   - Bun (owner: 3.1, which adds a Bun smoke). opencode runs the plugin under
+//     Bun 1.3.14, not Node, and every measurement here is Node's. Bun's
+//     fs.promises.rm is native code: whether it follows junctions, and which
+//     code it reports for a held dir (EBUSY, EPERM, ...), are unverified. The
+//     flat retry loop no longer relies on the engine honouring maxRetries or
+//     retryDelay (QA-1.5-11), but a code outside TRANSIENT_FS_CODES would end
+//     it at once (the dir is then left for GC). The heartbeat assumes
+//     setInterval(...).unref() and AbortSignal.any/timeout behave as in Node.
 // ============================================================================
 
 import * as fsp from "node:fs/promises";
@@ -628,9 +648,10 @@ export interface ReferenceFs {
   unlink(path: string): Promise<void>;
   /** Only on files and dirs this module created (private index copy, heartbeat). */
   utimes(path: string, atime: Date, mtime: Date): Promise<void>;
+  /** maxRetries is always 0: the module's flat retry loop retries (QA-1.5-11). */
   rm(
     path: string,
-    options: { recursive: true; force: true; maxRetries: number; retryDelay: number },
+    options: { recursive: true; force: true; maxRetries: 0; retryDelay: number },
   ): Promise<void>;
 }
 
@@ -895,15 +916,21 @@ async function lstatOrMissing(fs: ReferenceFs, path: string): Promise<ReferenceS
   }
 }
 
-/** Section 6: retry TRANSIENT_FS_CODES with exponential backoff, then rethrow. */
-async function withRetry<T>(op: () => Promise<T>): Promise<T> {
+/**
+ * Section 6: the module's only retry loop. Retries TRANSIENT_FS_CODES with exponential
+ * backoff, then rethrows. It is flat: `op` must not retry on its own (fs.rm runs with
+ * maxRetries: 0, QA-1.5-11). No attempt starts at or after `deadline` (GC's budget).
+ */
+async function withRetry<T>(op: () => Promise<T>, deadline = Number.POSITIVE_INFINITY): Promise<T> {
   for (let attempt = 0; ; attempt++) {
     try {
       return await op();
     } catch (error) {
       const code = errorCode(error);
+      const delay = CLEANUP_RETRY_BASE_MS * 2 ** attempt;
       if (attempt >= CLEANUP_RETRIES || code === undefined || !TRANSIENT_FS_CODES.has(code)) throw error;
-      await sleep(CLEANUP_RETRY_BASE_MS * 2 ** attempt);
+      if (Date.now() + delay >= deadline) throw error;
+      await sleep(delay);
     }
   }
 }
@@ -1002,6 +1029,12 @@ interface CleanupContext {
   readonly tmpRoots: readonly string[];
   readonly platform: NodeJS.Platform;
   readonly logger?: Logger;
+  /**
+   * GC's budget end (Date.now() scale; QA-1.5-11): no cleanup retry starts after it,
+   * and step 4 is skipped once it has passed. Unset for dispose, which CLEANUP_RETRIES
+   * alone bounds, because cleanup must finish after an abort.
+   */
+  readonly deadline?: number;
 }
 
 function leftInPlace(ctx: CleanupContext, dir: string, reason: string): false {
@@ -1026,7 +1059,7 @@ async function sweepLinks(ctx: CleanupContext, dir: string): Promise<string | un
       // its lstat (QA-1.5-3); realpath narrows that window to this call and readdir.
       const real = p.resolve(await ctx.fs.realpath(current));
       if (!insideOrEqual(real, realDir, ctx.platform)) return `sweep reached ${current} resolving outside the dir`;
-      names = await withRetry(() => ctx.fs.readdir(current));
+      names = await withRetry(() => ctx.fs.readdir(current), ctx.deadline);
     } catch (error) {
       if (errorCode(error) === "ENOENT") continue;
       return `sweep could not read ${current}: ${describeError(error)}`;
@@ -1039,7 +1072,7 @@ async function sweepLinks(ctx: CleanupContext, dir: string): Promise<string | un
       if (!stats) continue;
       if (stats.isSymbolicLink()) {
         try {
-          await withRetry(() => ctx.fs.unlink(entry));
+          await withRetry(() => ctx.fs.unlink(entry), ctx.deadline);
         } catch (error) {
           if (errorCode(error) !== "ENOENT") return `link ${entry} could not be unlinked: ${describeError(error)}`;
         }
@@ -1087,7 +1120,7 @@ async function removeReferenceDir(
       const stats = await lstatOrMissing(ctx.fs, link);
       if (!stats || !stats.isSymbolicLink()) continue;
       try {
-        await withRetry(() => ctx.fs.unlink(link));
+        await withRetry(() => ctx.fs.unlink(link), ctx.deadline);
       } catch (error) {
         if (errorCode(error) !== "ENOENT") return leftInPlace(ctx, dir, `link ${link} could not be unlinked: ${describeError(error)}`);
       }
@@ -1097,13 +1130,14 @@ async function removeReferenceDir(
     if (sweepFailure) return leftInPlace(ctx, dir, sweepFailure);
     // 3. The only recursive deleter: guarded fs.rm (Spike D SAFE #5) on the link-free
     //    tree. fs.rm never follows a link that appears after the sweep (QA-1.5-3);
-    //    `git worktree remove` on an existing dir would.
+    //    `git worktree remove` on an existing dir would. maxRetries: 0 inside our flat
+    //    loop: Node's own retries nest once per directory level (QA-1.5-11).
     const stats = await lstatOrMissing(ctx.fs, dir);
     if (stats) {
       assertSafeRefDir(dir, ctx.tmpRoots, ctx.platform);
       if (stats.isSymbolicLink() || !stats.isDirectory()) return leftInPlace(ctx, dir, "not a real directory");
       try {
-        await ctx.fs.rm(dir, { recursive: true, force: true, maxRetries: CLEANUP_RETRIES, retryDelay: CLEANUP_RETRY_BASE_MS });
+        await withRetry(() => ctx.fs.rm(dir, { recursive: true, force: true, maxRetries: 0, retryDelay: CLEANUP_RETRY_BASE_MS }), ctx.deadline);
       } catch (error) {
         return leftInPlace(ctx, dir, `fs.rm failed: ${describeError(error)}`);
       }
@@ -1111,6 +1145,10 @@ async function removeReferenceDir(
     }
     // 4. Only now that the dir is gone: drop the admin entry with
     //    `git worktree remove --force`, which then deletes no tree. Never prune (D5).
+    if (opts.git && ctx.deadline !== undefined && Date.now() >= ctx.deadline) {
+      ctx.logger?.warn("reference worktree admin entry left registered: GC budget spent", { dir });
+      return false;
+    }
     const entry = opts.git ? await registeredEntry(ctx, dir) : null;
     if (entry !== null) {
       assertSafeRefDir(dir, ctx.tmpRoots, ctx.platform);
@@ -1690,7 +1728,9 @@ async function gcInner(
   const budget = makeBudget(new AbortController().signal, deps.timeoutMs ?? DEFAULT_MATERIALIZE_TIMEOUT_MS);
   const absRoot = p.resolve(root);
   const tmpRoots = await tmpRootsFor(fs, deps.tmpdir ?? osTmpdir(), platform);
-  const ctx: CleanupContext = { argv: deps.argv, fs, root: absRoot, tmpRoots, platform, logger: deps.logger };
+  const ctx: CleanupContext = {
+    argv: deps.argv, fs, root: absRoot, tmpRoots, platform, logger: deps.logger, deadline: Date.now() + budget.remaining(),
+  };
   // Section 11 step 3 (QA-1.5-4). The caller skips ACTIVE dirs first. An alive owner's dir
   // is stale only once its heartbeat (mtime) is older than STALE_REFERENCE_AGE_MS, i.e.
   // the PID was reused. Our own PID has no special case: RELEASED names our own leftovers.

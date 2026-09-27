@@ -542,7 +542,7 @@ describe("materialize / dispose", { timeout: 60_000 }, () => {
       holder = await holdCwd(join(handle.dir, "packages")); // READY-gated (QA-1.5-14)
       const started = Date.now();
       await expect(handle.dispose()).resolves.toBeUndefined();
-      expect(Date.now() - started).toBeLessThan(20_000);
+      expect(Date.now() - started).toBeLessThan(10_000); // nested fs.rm retries took ~11 s here (QA-1.5-11)
       expect(warnings.some((w) => w.startsWith("reference worktree left in place"))).toBe(true);
       expect(await exists(handle.dir)).toBe(true);
       expect(await worktreeCount(repo)).toBe(2); // git never ran on the existing dir
@@ -551,6 +551,35 @@ describe("materialize / dispose", { timeout: 60_000 }, () => {
       await holder?.release();
     }
     // The released dir is ours and stale at once, although this process is alive and it is fresh.
+    const report = await gcStaleReferences(repo, deps());
+    expect(report.removed.map((d) => d.toLowerCase())).toEqual([handle.dir.toLowerCase()]);
+    expect(await exists(handle.dir)).toBe(false);
+    expect(await fsp.readFile(join(repo, "node_modules", "sentinel.txt"), "utf8")).toBe("keep me");
+    expect(await fsp.readFile(join(repo, "packages", "a", "node_modules", "sentinel.txt"), "utf8")).toBe("keep me");
+  });
+
+  it.runIf(isWin)("QA-1.5-11: a cwd holder two levels deep -> dispose stays bounded, and GC stops at its budget", async () => {
+    const handle = await mat(await capture());
+    let holder: CwdHolder | undefined;
+    try {
+      // Depth 2 (packages/a): Node's nested fs.rm retries took 66 s here, for dispose and again for GC.
+      holder = await holdCwd(join(handle.dir, "packages", "a"));
+      const started = Date.now();
+      await expect(handle.dispose()).resolves.toBeUndefined();
+      expect(Date.now() - started).toBeLessThan(10_000);
+      expect(warnings.some((w) => w.startsWith("reference worktree left in place"))).toBe(true);
+      expect(await exists(handle.dir)).toBe(true);
+      // Still held: the released dir is a GC candidate whose fs.rm keeps failing. Without the
+      // budget check, the flat loop alone would sleep 3.1 s.
+      const gcStarted = Date.now();
+      const held = await gcStaleReferences(repo, deps({ timeoutMs: 1_500 }));
+      expect(Date.now() - gcStarted).toBeLessThan(3_000);
+      expect(held.failed.map((d) => d.toLowerCase())).toEqual([handle.dir.toLowerCase()]);
+      expect(held.removed).toEqual([]);
+      expect(await exists(handle.dir)).toBe(true);
+    } finally {
+      await holder?.release();
+    }
     const report = await gcStaleReferences(repo, deps());
     expect(report.removed.map((d) => d.toLowerCase())).toEqual([handle.dir.toLowerCase()]);
     expect(await exists(handle.dir)).toBe(false);
