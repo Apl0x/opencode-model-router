@@ -215,6 +215,16 @@ a data-deletion path that depends on a runtime contract; Low = hardening or test
   can then only strand a lock on the copy. In addition, or as an alternative, do not pass the caller's abort signal
   to this single call (hard timeout only; the result is discarded if the caller has aborted). Add a test that kills
   `stash create` mid-run through a tree-kill seam and asserts that `.git/index.lock` is absent.
+- Resolution: 0fe514d — `git stash create` runs with `GIT_INDEX_FILE` on a copy of the user's index (read with
+  `fs.readFile`, written `wx` 0o600) in a scratch `omr-ref-<pid>-<hex>` dir made with `mkdir(0o700)` under the tmp
+  root and removed through the section 6 pipeline, plus `-c core.splitIndex=false`. The call gets the timeout but
+  not the caller's signal; an abort discards the result. Test: a slow clean filter keeps `stash create` in its
+  refresh, the seam tree-kills it once the copy's `index.lock` exists; asserts no `signal` was passed, no
+  `.git/index.lock`, no `index.stash.*`, a byte-identical `.git/index`, and that the next `git add` works.
+  d66bf69 — follow-up found while fixing: a fresh copy has a later mtime, which disables git's racy-git check,
+  so `stash create` and the drift diff missed a same-size edit made in the index's second. The copy now gets the
+  original mtime (floored to ms); a deterministic test (stat-identical edit, racily clean index) failed without
+  it and passes with it.
 
 ### QA-1.5-2 — Medium — capture and materialize contend for the user's `index.lock` (D2 understated)
 - `:953` (`stash create`, mandatory lock) and `:1188` (drift `git diff`, which refreshes the index).
@@ -227,6 +237,12 @@ a data-deletion path that depends on a runtime contract; Low = hardening or test
   `stash create` needs the lock and fails.
 - Fix: the private index from QA-1.5-1, plus `--no-optional-locks` on every read-only git call in capture,
   materialize and GC. Update D2 accordingly.
+- Resolution: 0fe514d — every git call in `reference.ts` runs as `git --no-optional-locks …` (in `runGit`). Re-measured
+  while fixing: on git 2.51.0.windows.1, `git --no-optional-locks diff --name-only … <commit> --` **still rewrote**
+  `.git/index` after a stat-only change (porcelain diff's closing `refresh_index_quietly()` takes the lock whenever
+  it is free), unlike the QA measurement. So the drift diff also runs on a private index copy, like `stash create`.
+  D2 is rewritten. Test: every recorded git argv starts with `--no-optional-locks`, and `.git/index` is
+  byte-identical after capture + materialize + dispose with a stat-dirty tracked file.
 
 ### QA-1.5-3 — Medium — `git worktree remove --force` is still the recursive deleter (TOCTOU after the sweep)
 - `:879-890`: the sweep proves the tree link-free, then `git worktree remove --force` recursively deletes an
@@ -244,6 +260,13 @@ a data-deletion path that depends on a runtime contract; Low = hardening or test
   step 5, measured in 1.5.1). Git then never deletes a tree. Keep the sweep: `engines` is `node >=20`, and fs.rm's
   non-following of junctions is proven only on v24.21.0. Add a test that injects a junction just before the
   removal and asserts that the target survives.
+- Resolution: ad0a859 — dispose order is now: recorded links → sweep → `assertSafeRefDir` + lstat real dir →
+  `fs.rm(dir)` (the only recursive deleter) → only when lstat shows the dir is gone, `assertSafeRefDir` again and
+  `git worktree remove --force <dir>` to drop the admin entry. If the dir survives `fs.rm` (EBUSY), git is not run
+  and the dir is left for GC. The sweep also realpath-checks every directory before its readdir, which narrows the
+  junction-swap window. R2/R4 and D6 updated. Test: an fs seam creates `packages/late-link → victim` right before
+  `fs.rm`, and an argv seam records whether the dir existed when `worktree remove` ran (it would also plant a
+  junction then); the victim sentinel survives and the dir was gone.
 
 ### QA-1.5-4 — Medium — GC can remove a live reference
 - `:678`: `ACTIVE` is module-local. `:1307-1308`: `pid === ownPid` without `ACTIVE` membership counts as stale, and
@@ -257,6 +280,14 @@ a data-deletion path that depends on a runtime contract; Low = hardening or test
 - Fix: keep `ACTIVE` on `globalThis` (`Symbol.for("omr.reference.active")`). Treat `pid === ownPid` as stale only
   when the dir is also old. For an alive owner, do not use mtime age alone: use a heartbeat marker touched while the
   handle is in use, or the owner's process start time. 2.1 must classify "reference vanished" as `unverifiable`.
+- Resolution: 1ee91ce — the in-use set lives on `globalThis` under `Symbol.for("omr.reference.active")`. A
+  materialized dir's own mtime is the heartbeat: an unref'd timer (`heartbeatMs`, default 5 min) sets it to now
+  until dispose stops it, so the 1 h age rule fires only after the owner stopped using the dir (PID reuse). The
+  own-PID clause is gone. A dir this process created, released and failed to remove goes into a second
+  process-wide set (`omr.reference.released`), which GC treats as stale at once. Tests: a second module instance
+  (`vi.resetModules()`) keeps the first instance's live reference, even with the clock 10 h ahead; the heartbeat
+  refreshes a backdated mtime and stops at dispose; GC removes an alive owner's dir whose heartbeat is 2 h old
+  and keeps a fresh own-PID dir. The 2.1 "reference vanished → unverifiable" rule stays with 2.1.
 
 ### QA-1.5-5 — Medium — an abort during `git worktree add` leaves a permanently locked admin entry
 - `git worktree add` locks the new entry with reason `initializing` until the checkout finishes. Tree-killed
@@ -269,6 +300,13 @@ a data-deletion path that depends on a runtime contract; Low = hardening or test
 - Fix: only for an R3-valid `omr-ref-*` entry whose lock reason is exactly `initializing`, and only when it is our
   own abandon or the owner is dead: run `git worktree unlock <dir>`, then the normal pipeline. Leave every other
   lock reason alone. Add a test with a slow smudge filter.
+- Resolution: bca1f4a — the porcelain parser keeps the lock reason. Before dropping the admin entry, a lock whose
+  reason is exactly `initializing` is lifted with `git worktree unlock <dir>`, but only if the caller allows it
+  (materialize's own cleanup; GC when the owner is dead or the dir is in the released set). Any other reason is
+  kept and warned about. Our `worktree add` runs with `LC_ALL=C` so the reason is never translated. Tests: a
+  slow smudge filter, with the abort fired once `.git/worktrees/*/locked` exists → `aborted`, no omr-ref entry,
+  no warnings; GC unlocks and removes a dead owner's `initializing` entry but keeps a live owner's and a dead
+  owner's `on a usb stick` lock.
 
 ### QA-1.5-6 — Medium — `exact: true` while the tracked content differs from the dispatch tree
 - Exactness (`:55-76`, `:1232`) covers untracked files and drift since dispatch, but not two gaps between the live
@@ -289,6 +327,15 @@ a data-deletion path that depends on a runtime contract; Low = hardening or test
   clean files too whenever a conversion is configured (`core.autocrlf`≠false, or any `text`/`eol`/`filter`
   attribute) or mark such references inexact (`checkout-conversion`). Add tests with `core.autocrlf=true` and
   assume-unchanged.
+- Resolution: a650dfb — (b) capture runs `git ls-files -v -z`; the first path tagged lowercase or `S` becomes
+  `captureReasons: [{ cause: "index-flags", path }]`, which materialize copies into `inexactReasons`. (a)
+  materialize adds `{ cause: "checkout-conversion", path: "" }` when `core.autocrlf` is anything but false. Capture
+  also hashes the live bytes of every dirty tracked file (`git diff-tree -r --name-only <head> <commit>`, into
+  `DispatchReference.tracked`), and materialize adds `checkout-conversion` for each one whose checked-out bytes
+  differ, which covers `text`/`eol`/`filter` attributes on dirty files. Residual, documented under OPEN RISKS:
+  an attribute-converted file that git reports as clean, with `core.autocrlf=false`. Tests: `core.autocrlf=true`
+  (reference `a0\r\n`) and `input`; `*.txt text eol=crlf` with a dirty LF file; assume-unchanged +
+  skip-worktree edits.
 
 ### QA-1.5-7 — Medium — `exact` ignores ignored inputs present at dispatch (`.env`, generated files) — deferred by plan (2.1)
 - `:1147-1148` and `:82-86`: ignored entries only go to `unreproduced`, and `exact` stays true. The test asserts
@@ -298,6 +345,7 @@ a data-deletion path that depends on a runtime contract; Low = hardening or test
 - Fix: state in the header that `exact` is necessary but not sufficient for an excuse. The policy is 2.1's: a
   reference-side failure must not excuse while `unreproduced` holds anything outside a small inert allowlist
   (`coverage/`, logs, OS files). Env files and generated sources must never be on it.
+- Status: deferred to 2.1 by plan; unchanged in the QA-1.5 fix round.
 
 ### QA-1.5-8 — Low — D9 hook suppression is bypassable by committed content
 - `:1081`: `core.hooksPath=<dir>/.omr-no-hooks` points **inside the worktree**, so the checkout can create it.
@@ -308,6 +356,11 @@ a data-deletion path that depends on a runtime contract; Low = hardening or test
   (slot, priority, budget).
 - Fix: point `core.hooksPath` at a path that is outside the worktree and never created (for example
   `<tmp root>/<ref dir name>.nohooks`). Add a test with a committed `.omr-no-hooks/post-checkout`.
+- Resolution: 7dbfada — `core.hooksPath=<realpath tmp>/omr-nohooks-<16 random hex>`. The path is checked absent
+  (otherwise `unsafe-path`) and never created. D9 and section 4 updated. Test: controls first, both run in this
+  environment (the repository's `.git/hooks/post-checkout` on a plain `worktree add`, and the committed
+  `.omr-no-hooks/post-checkout` under the former D9 path). Then materialize runs neither hook, and the hooks path
+  it passed is directly under the tmp root, outside the dir, and absent.
 
 ### QA-1.5-9 — Low — test gaps in the cleanup and guard coverage
 - (a) The "file held open" test (`test:292-303`) never produces EBUSY. A Node `fsp.open` handle does not block
@@ -327,6 +380,16 @@ a data-deletion path that depends on a runtime contract; Low = hardening or test
   mutated to skip steps 1+2 (unlink and sweep), the KEY SAFETY sentinels (root and nested) were **GONE** and the
   extra-link target was **GONE**. With only the sweep skipped, the KEY sentinels survived but the extra-link target
   was GONE. So `test:241-258` and `test:260-272` both fail on those mutations.
+- Resolution: e7acc5d — (a) the open-file test is replaced (win32) by a child process whose cwd is inside the
+  reference: dispose resolves in < 20 s, warns "reference worktree left in place", leaves the admin entry (git
+  never runs on the existing dir), has already removed the links, and after the holder exits, the next GC collects
+  the released dir. (b) Table tests for `isStrictlyInside` and `assertSafeRefDir` with explicit platforms: case,
+  trailing separator, `.`/`..`, prefix sibling (`Temp2`), other drive, `/`-separated input, UNC (root and non-root),
+  filesystem roots, relative input, 8.3 vs long form, bad names, POSIX case-sensitivity. A round trip injects
+  `tmpdir` in `os.tmpdir()`'s own (8.3) form through capture, materialize, GC and dispose. (c) is covered by the
+  QA-1.5-1 test (0fe514d), (d) by the QA-1.5-8 test (7dbfada). The test seam is now spawn-based, like runArgv:
+  env merged, tree kill, resolves on close. On win32, MSYS `sleep.exe` escapes `taskkill /T` (its Windows parent
+  is a dead fork stub) and holds the stderr pipe, so the filter-based tests use `sleep 3`.
 
 ### QA-1.5-10 — Low — temp-dir exhaustion and POSIX exposure window — partly deferred by plan (2.1)
 - `MAX_UNTRACKED_*` (`:580-581`) bound only the untracked copy. Every materialize checks out the full tracked tree.
@@ -337,6 +400,12 @@ a data-deletion path that depends on a runtime contract; Low = hardening or test
   sits in a umask-default (typically 0755) dir until then. Fix: `mkdir(dir, 0o700)` first, then
   `git worktree add` into the empty dir (git accepts an existing empty dir). An injected or relocated win32 TEMP
   (for example `C:\Temp`) inherits broader ACLs than `%LOCALAPPDATA%\Temp`: document it.
+- Resolution (1.5 part): 28c5eae — materialize creates the dir with a non-recursive `mkdir(dir, { mode: 0o700 })`
+  (plus an exact `chmod` on POSIX) before `git worktree add` checks out into it. EEXIST gives `unsafe-path` and the
+  existing dir is left alone. Capture's scratch dir is made the same way. The win32 ACL caveat is documented in
+  section 9. Tests: the dir exists, is empty (and 0o700 on POSIX) when `worktree add` starts; a pre-existing dir
+  of the chosen name is refused and untouched. Header wording: 33633df.
+- Deferred to 2.1 by plan, unchanged: materialize only inside the S3 slot, and run GC before each materialize.
 
 ### Checked with no finding
 - `reference.ts` imports only `node:fs/promises`, `node:crypto`, `node:os` and `node:path` (`:422-425`), plus type-only
