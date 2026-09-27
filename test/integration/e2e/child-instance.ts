@@ -16,6 +16,8 @@ export interface ChildEdit {
   /** Replace `from` with `to`; absent -> append a neutral comment. */
   from?: string;
   to?: string;
+  /** Delay this dispatch (its before hook) by this much after startAt; default 0. */
+  startDelayMs?: number;
 }
 
 export interface ChildConfig {
@@ -74,8 +76,9 @@ async function main(): Promise<void> {
     if (wait > 0) await sleep(wait);
     const startedAt = Date.now();
     const results = await Promise.all(
-      cfg.edits.map((edit, i) => {
+      cfg.edits.map(async (edit, i) => {
         const callID = `${cfg.tag}-${i + 1}`;
+        if ((edit.startDelayMs ?? 0) > 0) await sleep(edit.startDelayMs ?? 0);
         return plugin
           .task({
             sessionID: `orch-${callID}`,

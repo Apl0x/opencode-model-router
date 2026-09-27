@@ -8,8 +8,8 @@
  *   within maxWorkers x maxConcurrentVerifications, the runner tree runs below normal priority,
  *   nothing runs inside a before hook, and no run covers the full file set.
  * - c: two child processes (two "opencode sessions"), each with its own plugin and repo but the
- *   same TEMP (so the same machine-wide slot dir), are jointly held to the same bound; every
- *   dispatch carries a verdict and no deferred footer.
+ *   same TEMP (so the same machine-wide slot dir), are jointly held to the same bound; each child
+ *   gets exactly one rejection (its broken leaf) and two verified passes, and no deferred footer.
  * - d: a gate with a small gateBudgetMs and a 120 s test returns on time, not as a pass, and no
  *   attributable process is alive 3 s after it returned.
  * - e (last): no reference worktree or omr-ref dir is left, and each fixture install is intact.
@@ -86,6 +86,11 @@ const CAVEAT_MARK = "Verification caveats \u2014 NOT verified";
 const DEFERRED_FOOTER = /\bvrf_/;
 /** 3.1.2.d: small enough for the 120 s slow test to hit it, larger than capture + planning (measured). */
 const GATE_BUDGET_MS = 6000;
+/**
+ * 3.1.2.b/c: neutral dispatches start this long after the broken ones: past the broken edit
+ * (produce delay 1000 ms) and the broken gate's batch window (batchWindowMs 2000 ms).
+ */
+const NEUTRAL_START_DELAY_MS = 3500;
 const SLOW_TEST = `\nit("slow", async () => { await new Promise(r => setTimeout(r, 120000)); }, 200000);\n`;
 
 /** Logs the measured numbers; with OMR_E2E_REPORT=<file> also appends them there (vitest may hide a passing test's console). */
@@ -217,7 +222,16 @@ suite("verify resource budget: machine-wide bound (3.1.2.b-e)", () => {
       if (!text.includes(from)) throw new Error(`${rel} does not contain ${from}`);
       return repo.write(rel, text.replace(from, to));
     };
-    const FAILING = new Set([2, 4]);
+    // The producers share one working tree and verification judges the current tree. In vitest-app
+    // module k imports module floor(k/2), so a neutral edit to m01..m05 has the tests of modules
+    // another producer broke among its related tests, and all five were rejected. m11..m20 have no
+    // importers (leaves): each leaf's related tests are its own. That alone is not enough: a
+    // dispatch's change set is the tree against its dispatch-time capture, so a neutral dispatch
+    // captured before a sibling's broken edit counts that edit as its own (measured: m11 rejected
+    // over m12/m14 failures). The neutral dispatches therefore start NEUTRAL_START_DELAY_MS later,
+    // after the broken edits are in the tree and outside their batch window (2000 ms).
+    const REQUIRED = [11, 12, 13, 14, 15];
+    const FAILING = new Set([12, 14]);
 
     // No profile restore here: the sampler must work with USERPROFILE at the plugin's fake home.
     const sampler = startSampler({ intervalMs: 100 });
@@ -227,8 +241,9 @@ suite("verify resource budget: machine-wide bound (3.1.2.b-e)", () => {
     let report = "";
     try {
       required = await Promise.all(
-        [1, 2, 3, 4, 5].map(i =>
-          plugin.task({
+        REQUIRED.map(async i => {
+          if (!FAILING.has(i)) await sleep(NEUTRAL_START_DELAY_MS);
+          return plugin.task({
             sessionID: `orch-b${i}`,
             callID: `b-req-${i}`,
             prompt: `VERIFY:required\nAdjust ${mod(i)}.\n${acceptance(repo.testCommand)}`,
@@ -238,8 +253,8 @@ suite("verify resource budget: machine-wide bound (3.1.2.b-e)", () => {
               if (FAILING.has(i)) await edit(mod(i), `return x + ${i};`, `return x + ${i * 100};`, `b${i}`);
               else await edit(mod(i), undefined, undefined, `b${i}`);
             },
-          }),
-        ),
+          });
+        }),
       );
       repo.git("reset", "-q", "--hard", base);
       repo.git("clean", "-q", "-fd", "-e", "node_modules");
@@ -274,7 +289,13 @@ suite("verify resource budget: machine-wide bound (3.1.2.b-e)", () => {
     const gitCmdNormal = all.filter(p => /\b(git|cmd)(\.exe)?\b/i.test(p.args) && p.lowPriority === false);
     const beforeWindows = [...required, ...deferred].map(r => [r.produceStartedAt - r.beforeMs, r.produceStartedAt] as const);
     const inBefore = snapshots.filter(s => beforeWindows.some(([a, b]) => s.t >= a && s.t <= b));
-    const runnersInBefore = inBefore.flatMap(s => seen([s], process.pid, excl, isRunnerTree));
+    // The staggered neutral before hooks overlap the broken dispatches' gates; those gate runs
+    // (scoped run and recheck) name a broken module and are not before-hook work.
+    const failingNames = new RegExp(`(src/m(${[...FAILING].join("|")})\\.js|test/m(${[...FAILING].join("|")})-\\d+\\.test\\.js)`);
+    const runnersInBefore = inBefore.flatMap(s => {
+      const gateMains = new Set(s.procs.filter(p => isMain(p) && failingNames.test(norm(p.args))).map(p => p.pid));
+      return seen([s], process.pid, excl, p => isRunnerTree(p) && !gateMains.has(p.pid) && !gateMains.has(p.ppid));
+    });
     const outputs = [...required, ...deferred].map(r => r.output);
     const failingOutputs = required.filter(r => r.output.includes("NOT ACCEPTED")).length;
 
@@ -316,14 +337,22 @@ suite("verify resource budget: machine-wide bound (3.1.2.b-e)", () => {
     }
     // Runs are batched/bounded: at most one per dispatch plus a recheck per failure (x2 slack).
     expect(mains.length).toBeLessThanOrEqual(5 + 5 + 2 * FAILING.size);
-    expect(failingOutputs).toBeGreaterThanOrEqual(1);
+    // Exactly the two broken leaves are rejected; the three neutral leaves pass.
+    REQUIRED.forEach((m, i) => {
+      const out = required[i].output;
+      expect(out.includes(REJECTED_MARK), `${mod(m)}:\n${out}`).toBe(FAILING.has(m));
+      expect(DEFERRED_FOOTER.test(out), out).toBe(false);
+    });
+    expect(failingOutputs).toBe(FAILING.size);
     expect(report).not.toBe("");
   }, TEST_TIMEOUT_MS);
 
   it("3.1.2.c: two plugin instances in two processes share the machine-wide bound", async () => {
+    // Leaf modules and staggered starts only (see 3.1.2.b): each child yields exactly one rejection
+    // and two passes.
     const children = [
-      { tag: "c1", repo: repos[1], mods: [1, 3, 5] },
-      { tag: "c2", repo: repos[2], mods: [2, 4, 6] },
+      { tag: "c1", repo: repos[1], mods: [16, 17, 18], broken: 16 },
+      { tag: "c2", repo: repos[2], mods: [19, 20, 13], broken: 19 },
     ];
     const startAt = Date.now() + 1500;
     const configPaths: string[] = [];
@@ -335,7 +364,11 @@ suite("verify resource budget: machine-wide bound (3.1.2.b-e)", () => {
         testCommand: c.repo.testCommand,
         startAt,
         produceDelayMs: 1000,
-        edits: c.mods.map(m => ({ rel: mod(m) })),
+        edits: c.mods.map(m =>
+          m === c.broken
+            ? { rel: mod(m), from: `return x + ${m};`, to: `return x + ${m * 100};` }
+            : { rel: mod(m), startDelayMs: NEUTRAL_START_DELAY_MS },
+        ),
       };
       const p = join(root, `${c.tag}.json`);
       await writeFile(p, JSON.stringify(cfg), "utf8");
@@ -386,15 +419,47 @@ suite("verify resource budget: machine-wide bound (3.1.2.b-e)", () => {
       ].join("\n"),
     );
 
+    /** Runner mains of this child, in its repo, whose args name module m's source or one of its test files. */
+    const mainsFor = (childPid: number, repoDir: string, m: number): ProcSample[] => {
+      const nn = String(m).padStart(2, "0");
+      const names = new RegExp(`(src/m${nn}\\.js|test/m${nn}-\\d+\\.test\\.js)`);
+      const repoSpellings = pathSpellings(repoDir);
+      return seen(snapshots, childPid, excl, p => isMain(p) && mentionsAny(p.args, repoSpellings) && names.test(norm(p.args)));
+    };
+    const perDispatch = children.flatMap((c, ci) =>
+      c.mods.map((m, di) => {
+        const s = summaries[ci];
+        const d = s?.dispatches[di];
+        return { tag: c.tag, m, broken: m === c.broken, d, mains: s === undefined ? [] : mainsFor(s.pid, c.repo.dir, m) };
+      }),
+    );
+    emit(
+      perDispatch
+        .map(x => `[3.1.2.c] ${x.tag} ${mod(x.m)}${x.broken ? " (broken)" : ""}: after=${x.d?.afterMs.toFixed(0) ?? "?"}ms runner mains naming it=${x.mains.length} ${x.mains.map(p => p.pid).join(",")}`)
+        .join("\n"),
+    );
+
     for (const r of runs) expect(r.code, r.stderr).toBe(0);
     for (const s of summaries) {
       expect(s).toBeDefined();
       expect(s?.dispatches.length).toBe(3);
-      for (const d of s?.dispatches ?? []) {
-        expect(d.output.trim()).not.toBe("");
-        // VERIFY:required: every dispatch carries a verdict and no deferred-verification footer.
-        expect(d.output.includes(ACCEPTED_MARK) || d.output.includes(REJECTED_MARK), d.output).toBe(true);
-        expect(DEFERRED_FOOTER.test(d.output), d.output).toBe(false);
+    }
+    for (const x of perDispatch) {
+      const out = x.d?.output ?? "";
+      const label = `${x.tag} ${mod(x.m)}:\n${out}`;
+      // VERIFY:required: never a deferred-verification footer.
+      expect(DEFERRED_FOOTER.test(out), label).toBe(false);
+      if (x.broken) {
+        // Exactly one rejection per child, naming the broken module's test.
+        expect(out.includes(REJECTED_MARK), label).toBe(true);
+        expect(new RegExp(`m${String(x.m).padStart(2, "0")}`).test(out), label).toBe(true);
+      } else {
+        // A clean required-mode pass leaves the output untouched: no rejection, no caveat.
+        expect(out.includes(REJECTED_MARK), label).toBe(false);
+        expect(out.includes(CAVEAT_MARK), label).toBe(false);
+        // Non-vacuity: verification really ran for this dispatch.
+        expect(x.d?.afterMs ?? 0, label).toBeGreaterThanOrEqual(1000);
+        expect(x.mains.length, label).toBeGreaterThanOrEqual(1);
       }
     }
     expect(peakWorkers).toBeGreaterThanOrEqual(1);
