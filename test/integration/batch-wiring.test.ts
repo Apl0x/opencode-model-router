@@ -278,6 +278,22 @@ function barrier(n: number): Promise<void> {
   });
 }
 
+/**
+ * barrier() for the gates `order` (by producer letter), released in that order: they join their
+ * window, and queue for the slot alone, in that order (W3 counts arrival order).
+ */
+function barrierInOrder(order: readonly string[]): void {
+  const waiting = new Map<string, () => void>();
+  state.planGate = changed =>
+    new Promise<void>(resolve => {
+      const x = /[\\/]([a-z])\.ts$/.exec(changed[0] ?? "")?.[1] ?? "";
+      waiting.set(x, resolve);
+      if (waiting.size < order.length) return;
+      state.planGate = undefined;
+      for (const y of order) waiting.get(y)?.();
+    });
+}
+
 /** Holds the planning of gate `x` until the returned function is called; others pass (W7: it stays in flight). */
 function holdPlanning(x: string): () => void {
   let release: () => void = () => {};
@@ -845,4 +861,51 @@ describe("QA-2.2-23 to QA-2.2-25: batched gates keep the verdict of batchWindowM
     expect(batched.out.map(verdictOf)).toEqual(alone.out.map(verdictOf));
     expect(batched.maxHolds).toBeLessThanOrEqual(2);
   }, 40_000);
+
+  it("N3 (QA-2.2-25): a union run is not priced as one member's run", async () => {
+    exactReference();
+    state.failing = { c: ["t2"], e: ["t1"] };
+    state.fifo = true;
+    // maxWorkers 2: a run takes 1 s per 2 inputs, so the 5-input union takes 3 s where f took 1 s.
+    state.runMsFor = inputs => Math.ceil(inputs / 2) * 1_000;
+    const budgets: Record<string, number> = { a: 18_300, b: 19_300, c: 17_300, d: 20_300, e: 21_300 };
+    const { batched, alone } = await twice(async wiring => {
+      // c arrives first (W3 then keeps every member in the window), and is first in the FIFO alone.
+      barrierInOrder(["c", "a", "b", "d", "e"]);
+      return await Promise.all(LETTERS.map(x => gate(wiring, x, { reference: captured(), budgetMs: budgets[x] })));
+    });
+    expect(alone.out.map(outcomeOf)).toEqual([
+      ["pass", true],
+      ["pass", true],
+      ["fail", false],
+      ["pass", true],
+      ["fail", false],
+    ]);
+    expect(batched.out.map(verdictOf)).toEqual(alone.out.map(verdictOf));
+  }, 60_000);
+
+  it("QA-2.2-25: a pooled batch that waits for the slot longer than its schedule allows runs its members alone", async () => {
+    exactReference();
+    state.failing = { c: ["t2"], d: ["t1"] };
+    state.fifo = true;
+    state.runMs = 1_000;
+    // Both members fit the pooled schedule when the window closes, but another check holds the
+    // one slot for 6.5 s. Pooled after that wait, d's recheck (two distinct references: two
+    // rechecks) would start at 10.5 s with 9.5 s left; alone it starts at 9.5 s with 10.5 s left.
+    const { batched, alone } = await twice(async wiring => {
+      const held = occupySlot(6_500);
+      void barrier(2);
+      const verdicts = await Promise.all([
+        gate(wiring, "c", { reference: captured("c".repeat(40)), budgetMs: 20_000 }),
+        gate(wiring, "d", { reference: captured("d".repeat(40)), budgetMs: 20_000 }),
+      ]);
+      await held;
+      return verdicts;
+    });
+    expect(alone.out.map(outcomeOf)).toEqual([
+      ["fail", false],
+      ["fail", false],
+    ]);
+    expect(batched.out.map(verdictOf)).toEqual(alone.out.map(verdictOf));
+  }, 60_000);
 });

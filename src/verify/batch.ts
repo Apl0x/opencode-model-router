@@ -146,14 +146,19 @@
 //   1. |M| = 1: skip steps 2a and 2. Step 4 runs the member's own spec with the member's own
 //      deadline. Steps 5 and 7 have nothing to do, and step 8 is a single-member recheck. This is
 //      exactly the direct path.
-//   2a. Deadline check (QA-2.2-17 c, QA-2.2-23), before union planning. Take the members in
-//      deadline order, and e and each member's floor as in W3. The batch pools only when every
-//      member's remaining() is at least
-//        floor + e x (1 + n + i),
+//   2a. Deadline check (QA-2.2-17 c, QA-2.2-23, QA-2.2-25), before union planning. Take the
+//      members in deadline order, and e and each member's floor as in W3. The batch pools only
+//      when every member's remaining() is at least
+//        floor + e x (2n + i),
 //      where n is the number of members and i the member's index. That sum is the worst case of
-//      the batched schedule ahead of its recheck: the union, every member's own run (mode B; a
-//      member can be held until the last of them, B5.7) and one recheck for each member ahead of
-//      it. Otherwise the batch splits (step 6), and every member runs alone.
+//      the batched schedule ahead of its recheck: the union (n x e), every member's own run (mode
+//      B; a member can be held until the last of them, B5.7) and one recheck for each member
+//      ahead of it. Otherwise the batch splits (step 6), and every member runs alone.
+//      QA-2.2-25: the union is priced at n runs, never at one. It runs each of the members'
+//      related test files once, where their own runs run each at least once; e itself is usually
+//      one member's own run, and the union's run grows with its inputs. The check repeats after
+//      union planning (step 2) and once the hold is taken (step 3), the schedule's two unmeasured
+//      parts, and both are bounded by the time the check has left: past it, the members split.
 //      QA-2.2-23: 9ed2abb instead ran the short members first inside the batch's scope. The
 //      scope's first execute takes its one hold, and 2.1's scope reports a failed hold attempt to
 //      every later call at once (P4). So a short member's cut slot wait became slot-busy for every
@@ -162,12 +167,17 @@
 //      D, and a split member's scope is its own.
 //      Before the first measured run of a key, e is 0 and only the floor counts (a residual,
 //      B15).
-//   2. Union planning (B6), bounded by D: runtime.plan({ command and cwd of the first member,
-//      changedFiles: unionChangedFiles(M) }, D). The batch splits (step 6) in three cases: the
-//      result is not a ScopedSpec; batchKey(unionSpec) differs from the batch key; or its inputs
-//      are not exactly the union of the members' inputs (set equality on platform keys).
+//   2. Union planning (B6): runtime.plan({ command and cwd of the first member, changedFiles:
+//      unionChangedFiles(M) }, D'), where D' is D cut off when step 2a's check would fail
+//      (QA-2.2-25). The batch splits (step 6) in four cases: the result is not a ScopedSpec;
+//      batchKey(unionSpec) differs from the batch key; its inputs are not exactly the union of
+//      the members' inputs (set equality on platform keys); or step 2a's check fails afterwards.
 //   3. scope = runtime.openScope({ cwd, command }) of the first member. It is opened once, and
-//      every execute and rechecker below goes through it (B10).
+//      every execute and rechecker below goes through it (B10). QA-2.2-25: when the scope has
+//      hold() (2.1's scopes do), the batch takes the hold first, under D' again, and repeats step
+//      2a's check once it holds the slot. A hold not taken in time, or a failed check, closes the
+//      scope and splits. The union's execute then reuses the hold (2.1's scope memoizes its one
+//      hold attempt), so a batch never takes two.
 //   4. U = scope.execute(unionSpec, D). By kind:
 //        slot-busy        -> every member gets U. (The scope would report it again without
 //                            waiting anyway.)
@@ -392,7 +402,9 @@
 //     alive with its long budget. D has no timer of its own: when the last attached member's
 //     signal aborts at its expiry, D aborts too. dispose() removes every listener.
 //   - Which deadline bounds what:
-//       union planning and the union run       D
+//       union planning and the union's hold    D', D cut off where the pooled schedule stops
+//                                              fitting (B5.2a, QA-2.2-25)
+//       the union run                          D
 //       a member's own run                     that member's deadline, exactly as alone
 //       a single-member recheck                that member's deadline, exactly as alone
 //       a shared recheck                       Rg, D restricted to the group
@@ -579,17 +591,26 @@
 //   - A config reload in the middle of a window keeps the opener's window length and scope
 //     options.
 //   - Deadline estimates (QA-2.2-17, B-G7). W3 and B5.2a rely on the key's last measured run
-//     duration, with a recheck estimated as one more run.
+//     duration, with a recheck estimated as one more run and a union as one run per member.
 //       - Before the first measured run of a key in a plugin instance, e is 0: the first
 //         concurrent window of a key pools any member that has its floor, and a failing
 //         vitest/jest union can still cost a tight member its recheck there (the QA's R5 with
 //         every gate in one window). A lone gate (W7), or any earlier batch of the key, measures
 //         e. The first window of a key was not made to split by default: that would give up the
 //         saving of every first fan-out.
-//       - A run slower than the last one, or a recheck slower than a run (materialize), can
-//         exceed the estimate by more than BATCH_RESERVE_MARGIN_MS.
+//       - A member's own run slower than the last measured run, or a recheck slower than a run
+//         (materialize), can exceed the estimate by more than BATCH_RESERVE_MARGIN_MS.
 //       - The first run of a scope includes its slot wait. That only overstates e, and costs
-//         batching, not verdicts, until the next measurement.
+//         batching, not verdicts, until the next measurement. A union's run also measures e, and
+//         a union is at least as long as one own run, so it too only overstates it.
+//       - Union planning and the union's slot wait are bounded by D' (B5.2a); a planner step that
+//         does not honour its deadline's bound can still overrun it, and the check after planning
+//         then splits a batch that is already late.
+//   - The window itself (W3). Under a first-come slot, a request that queues while a member waits
+//     in its window is served before that member, where the member's direct hook would have
+//     queued first. W3 keeps the member's split schedule out of the wait, but not the runs of such
+//     later requests. The wait is bounded by batchWindowMs (at most a tenth of the gate budget,
+//     QA-2.2-21), and W7 removes it when nothing else is in flight in the coordinator.
 //   - Serial runs under one hold. With maxConcurrentVerifications > 1, the direct path could run
 //     members in parallel where a batch runs their own runs and rechecks one at a time. B5.2a
 //     pools only when each member's worst case fits its own budget, whatever the slot count, and
@@ -744,6 +765,11 @@ export type BatchPlanner = (input: BatchPlanInput, deadline: Deadline) => Promis
  */
 export interface BatchScope extends VerificationScope {
   rechecker(command: string, cwd: string, currentTree?: TreeSnapshot): Rechecker;
+  /**
+   * 2.1's CheckScope.hold: the scope's one hold, taken without running anything; true when held
+   * (B5.3, QA-2.2-25). A scope without it takes its hold on the union's execute, under D.
+   */
+  hold?(deadline: Deadline): Promise<boolean>;
 }
 
 /** runtime.openScope: 2.1's scope opener, or any OpenVerificationScope. */
@@ -1251,11 +1277,16 @@ export function createBatchCoordinator(options: BatchCoordinatorOptions = {}): B
         dissolve(b, "the members' budgets cannot cover a batched run");
         return;
       }
-      // Step 2.
-      const planned = await planUnion(b, live(b));
+      // Step 2, bounded by the pooled schedule (QA-2.2-25): planning is not measured, so the check
+      // repeats once it is done.
+      const planned = await planUnion(b, live(b), untilPoolShort(b));
       if (b.deadline.signal.aborted) return;
       if (typeof planned === "string") {
         dissolve(b, planned);
+        return;
+      }
+      if (!poolFits(b)) {
+        dissolve(b, "union planning left a member short of the batched schedule");
         return;
       }
       unionSpec = planned;
@@ -1267,6 +1298,18 @@ export function createBatchCoordinator(options: BatchCoordinatorOptions = {}): B
     // deadline: the hold is never taken under another member's deadline (QA-2.2-23).
     const scope = b.runtime.openScope({ cwd: first.request.cwd, command: first.request.command });
     b.scope = scope;
+    if (unionSpec !== undefined && scope.hold !== undefined) {
+      // QA-2.2-25: the slot wait is the other unmeasured part of the batched schedule. The hold is
+      // taken first, and waits only while the pooled schedule still fits; after that the members
+      // run alone, and each still has what its split schedule needs (W3).
+      const held = await scope.hold(untilPoolShort(b));
+      if (b.deadline.signal.aborted) return;
+      if (!held || !poolFits(b)) {
+        void closeScope(b);
+        dissolve(b, held ? "the slot wait left a member short of the batched schedule" : "the slot was not free in time for a batched run");
+        return;
+      }
+    }
 
     // Step 4.
     if (unionSpec !== undefined) {
@@ -1325,20 +1368,44 @@ export function createBatchCoordinator(options: BatchCoordinatorOptions = {}): B
   }
 
   /**
-   * B5.2a (QA-2.2-17 c). Whether every member's budget covers the worst case of the batched
-   * schedule before its recheck: the union run, every member's own run (mode B; a member can be
-   * held until the last of them, B5.7) and one recheck for each member ahead of it in deadline
-   * order. Each run and recheck is estimated at the key's last measured duration; before the
-   * first measurement the estimate is 0 and only the floor counts (W3).
+   * B5.2a (QA-2.2-17 c, QA-2.2-25). How long the batch can still go on before some member's budget
+   * no longer covers the worst case of the batched schedule ahead of its recheck: the union run,
+   * every member's own run (mode B; a member can be held until the last of them, B5.7) and one
+   * recheck for each member ahead of it in deadline order. Each own run and recheck is estimated
+   * at e, the key's last measured duration. The union of n members is priced at n x e: it runs
+   * each of the members' related test files once, where their own runs run each at least once,
+   * so it is never priced as one member's run (QA-2.2-25). Before the first measurement e is 0
+   * and only the floor counts (W3). Negative: the members no longer fit.
    */
-  function poolFits(b: Batch): boolean {
+  function poolSlack(b: Batch): number {
     const e = estimate(b.key);
     const order = live(b).sort(byDeadline);
-    return order.every((m, i) => m.request.deadline.remaining() >= floorOf(m) + e * (1 + order.length + i));
+    const n = order.length;
+    let slack = Number.POSITIVE_INFINITY;
+    order.forEach((m, i) => {
+      slack = Math.min(slack, m.request.deadline.remaining() - floorOf(m) - e * (2 * n + i));
+    });
+    return slack;
+  }
+
+  function poolFits(b: Batch): boolean {
+    return poolSlack(b) >= 0;
+  }
+
+  /**
+   * QA-2.2-25: D, cut off where the pooled schedule stops fitting (poolSlack runs out). It has no
+   * timer: remaining() and bound() end there, and its signal is D's. Union planning and the
+   * union's slot wait run under it, so each ends while a split still fits every member (W3's
+   * split schedule is shorter than the pooled one by at least e).
+   */
+  function untilPoolShort(b: Batch): Deadline {
+    const end = now() + Math.max(0, poolSlack(b));
+    const remaining = () => Math.max(0, Math.min(b.deadline.remaining(), end - now()));
+    return { budgetMs: b.deadline.budgetMs, remaining, bound: (ownBudgetMs) => Math.min(ownBudgetMs, remaining()), signal: b.deadline.signal };
   }
 
   /** B6 and the step-2 consistency checks over the members. Returns the union spec, or the cause of a split. */
-  async function planUnion(b: Batch, pooled: readonly Member[]): Promise<ScopedSpec | string> {
+  async function planUnion(b: Batch, pooled: readonly Member[], deadline: Deadline): Promise<ScopedSpec | string> {
     const changes: BatchMemberChanges[] = [];
     for (const m of pooled) {
       const changedFiles = m.request.changedFiles;
@@ -1350,7 +1417,7 @@ export function createBatchCoordinator(options: BatchCoordinatorOptions = {}): B
     try {
       plan = await b.runtime.plan(
         { command: first.request.command, cwd: first.request.cwd, changedFiles: unionChangedFiles(changes, platform) },
-        b.deadline,
+        deadline,
       );
     } catch (e) {
       return `union planning failed: ${message(e)}`;

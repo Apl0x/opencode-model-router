@@ -1373,6 +1373,96 @@ describe("createBatchCoordinator: windows and the union run", () => {
     await c.dispose();
   });
 
+  it("QA-2.2-25, B5.2a: the union is priced at one run per member, and each member keeps one recheck per member ahead of it", async () => {
+    const RUN_MS = 1_000;
+    const tick = () => new Promise<void>((resolve) => setTimeout(resolve, RUN_MS));
+    const setup = async () => {
+      const h = harness(MODEL, {
+        execute: async (spec) => {
+          await tick();
+          return ranModel(MODEL, spec);
+        },
+      });
+      const c = createCoordinator({ platform: "linux" });
+      const warm = c.hook(h.runtime)(req(["src/h.ts"]));
+      await vi.advanceTimersByTimeAsync(RUN_MS);
+      await warm;
+      return { ...h, c, hook: c.hook(h.runtime) };
+    };
+    // e = 1 s, floor 2 s, two members: the first in deadline order needs 2 + (2 x 2 + 0) = 6 s,
+    // the second 2 + (2 x 2 + 1) = 7 s. W7 closes the window as the second joins, with no wait.
+    const fits = await setup();
+    const both = [fits.hook(req(["src/a.ts"], { deadline: liveDeadline(6_000) })), fits.hook(req(["src/b.ts"], { deadline: liveDeadline(7_000) }))];
+    await vi.advanceTimersByTimeAsync(2 * RUN_MS);
+    await Promise.all(both);
+    expect(fits.c.stats()).toMatchObject({ unionRuns: 1, splits: 0 });
+    // 6.5 s for the second: enough without its place in the recheck queue (QA-2.2-26 M12), and
+    // enough with the union priced as one run (1 + n + i: 5 s), but short of 7 s: the batch splits.
+    const short = await setup();
+    const split = [short.hook(req(["src/a.ts"], { deadline: liveDeadline(6_200) })), short.hook(req(["src/b.ts"], { deadline: liveDeadline(6_500) }))];
+    await vi.advanceTimersByTimeAsync(2 * RUN_MS);
+    await Promise.all(split);
+    expect(short.c.stats()).toMatchObject({ unionRuns: 0, ownRuns: 3, splits: 1 });
+    await Promise.all([fits.c.dispose(), short.c.dispose()]);
+  });
+
+  it("QA-2.2-25: union planning and the union's slot wait end where the pooled schedule stops fitting; then the members run alone", async () => {
+    const RUN_MS = 1_000;
+    const tick = () => new Promise<void>((resolve) => setTimeout(resolve, RUN_MS));
+    const unionPlanBounds: number[] = [];
+    const holdBounds: number[] = [];
+    const inner = harness(MODEL, {
+      execute: async (spec) => {
+        await tick();
+        return ranModel(MODEL, spec);
+      },
+      plan: async (input, deadline) => {
+        if (input.changedFiles !== "unavailable" && input.changedFiles.length > 1) unionPlanBounds.push(deadline.remaining());
+        return planModel(input);
+      },
+    });
+    // 2.1's hold (P4): another check keeps the slot, so the wait runs to its bound, then fails.
+    let slotFree = true;
+    const runtime: BatchRuntime = {
+      ...inner.runtime,
+      openScope: (meta) => ({
+        ...inner.runtime.openScope(meta),
+        hold: async (deadline) => {
+          holdBounds.push(deadline.remaining());
+          if (slotFree) return true;
+          await new Promise<void>((resolve) => setTimeout(resolve, deadline.bound(60_000)));
+          return false;
+        },
+      }),
+    };
+    const c = createCoordinator({ platform: "linux" });
+    const hook = c.hook(runtime);
+    const warm = hook(req(["src/h.ts"]));
+    await vi.advanceTimersByTimeAsync(RUN_MS);
+    await warm;
+    // e = 1 s, floor 2 s, two members with 20 s: the second in deadline order needs 7 s, so the
+    // batch may spend 13 s on planning and on the slot wait.
+    slotFree = false;
+    const outs = [hook(req(["src/a.ts"], { deadline: liveDeadline(20_000) })), hook(req(["src/b.ts"], { deadline: liveDeadline(20_000) }))];
+    await flush();
+    expect(unionPlanBounds).toEqual([13_000]);
+    expect(holdBounds).toEqual([13_000]);
+    await vi.advanceTimersByTimeAsync(12_999);
+    expect(inner.calls.executes).toHaveLength(1);
+    // At 13 s the hold is given up: its scope closes unused, and each member runs in its own.
+    await vi.advanceTimersByTimeAsync(1);
+    expect(inner.calls.executes.map((e) => [e.scope, e.spec.inputs])).toEqual([
+      [0, [at("src/h.ts")]],
+      [2, [at("src/a.ts")]],
+      [3, [at("src/b.ts")]],
+    ]);
+    expect(inner.calls.closes).toContain(1);
+    await vi.advanceTimersByTimeAsync(RUN_MS);
+    expect((await Promise.all(outs)).map((r) => ran(r).exitCode)).toEqual([0, 0]);
+    expect(c.stats()).toMatchObject({ unionRuns: 0, splits: 1 });
+    await c.dispose();
+  });
+
   it("a maximum size that is not a safe integer >= 1 means no batching", async () => {
     for (const maxBatchSize of [0, 1.5, Number.NaN]) {
       const { calls, runtime } = harness();
