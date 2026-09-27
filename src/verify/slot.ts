@@ -42,6 +42,16 @@
  * that still acts. Transient antivirus/indexer errors (EBUSY/EPERM/EACCES) are
  * retried, and a failed delete is never reported as success.
  *
+ * Fairness. A caller that waits files a ticket `wait-<startedAt>-<uuid>.ticket`
+ * (`{pid, hostname, token}`), refreshes it on every wake-up and tries the slots
+ * only while fewer than `max` live tickets are older than its own: strict FIFO for
+ * max=1, and for max>1 the `max` oldest waiters compete. A caller that does not
+ * wait defers while `max` live tickets exist, so a releaser that re-acquires at
+ * once queues behind the waiters. A ticket is dead when its PID is dead (same
+ * host), when it is older than `staleMs`, or when it has been seen unchanged for
+ * `staleMs` of monotonic time. Tickets only order the attempts: exclusion never
+ * depends on them, and a ticket I/O failure lets the caller try.
+ *
  * Loss. When the heartbeat finds the holder's file gone or owned by another token,
  * the handle's `lost` becomes true, `onLost` is called and a warning is logged,
  * once. A failing `utimes` is retried like an unlink.
@@ -57,7 +67,7 @@
  */
 import { createHash, randomUUID } from "node:crypto";
 import { closeSync, openSync, readFileSync, unlinkSync, writeSync } from "node:fs";
-import { mkdir, open, unlink, utimes, type FileHandle } from "node:fs/promises";
+import { mkdir, open, readdir, unlink, utimes, writeFile, type FileHandle } from "node:fs/promises";
 import { hostname as osHostname, tmpdir } from "node:os";
 import { join } from "node:path";
 import { performance } from "node:perf_hooks";
@@ -508,6 +518,14 @@ function releaseAllSync(): void {
     }
   }
   activeClaims.clear();
+  for (const t of tickets) {
+    try {
+      unlinkSync(t);
+    } catch (e) {
+      if (errCode(e) !== "ENOENT") noteExitFailure(e);
+    }
+  }
+  tickets.clear();
 }
 
 function hookExit(): void {
@@ -629,6 +647,107 @@ async function probeDir(cfg: Cfg): Promise<boolean> {
     if (FINAL_UNWRITABLE.has(code) || i >= 2) return false;
     await sleep(cfg.unlinkRetryMs * 2 ** i);
   }
+}
+
+// ---- fairness: FIFO waiter tickets ------------------------------------------
+
+interface Ticket {
+  path: string;
+  name: string;
+  body: string;
+}
+const TICKET_NAME = /^wait-\d{15}-[0-9a-f-]{36}\.ticket$/;
+/** Tickets of the waits in progress in this process, for the exit hook. */
+const tickets = new Set<string>();
+const ticketWarned = new Set<string>();
+
+/** Tickets only order the attempts; exclusion never depends on them. Say so once per dir. */
+function ticketTrouble(cfg: Cfg, path: string, e: unknown): void {
+  if (ticketWarned.has(cfg.dir)) return;
+  ticketWarned.add(cfg.dir);
+  warn(cfg, "verification slot: waiter ticket I/O failed, fairness is best effort", { path, code: errCode(e) ?? String(e) });
+}
+
+async function writeTicket(t: Ticket, cfg: Cfg): Promise<void> {
+  try {
+    await writeFile(t.path, t.body, { flag: "wx" });
+  } catch (e) {
+    if (errCode(e) !== "EEXIST") ticketTrouble(cfg, t.path, e);
+  }
+}
+
+async function createTicket(cfg: Cfg): Promise<Ticket> {
+  const startedAt = Math.max(0, Math.floor(cfg.now()));
+  const name = `wait-${String(startedAt).padStart(15, "0")}-${randomUUID()}.ticket`;
+  const info: LockInfo = { pid: cfg.pid, hostname: cfg.hostname, token: randomUUID(), startedAt, cwd: "", command: "wait" };
+  const t: Ticket = { path: join(cfg.dir, name), name, body: JSON.stringify(info) };
+  hookExit();
+  tickets.add(t.path);
+  await writeTicket(t, cfg);
+  return t;
+}
+
+/** Refreshed on every wake-up. A ticket deleted by someone who judged it dead comes back under its old name (same place). */
+async function refreshTicket(t: Ticket, cfg: Cfg): Promise<void> {
+  try {
+    await cfg.utimes(t.path, new Date(cfg.now()));
+  } catch (e) {
+    if (errCode(e) === "ENOENT") await writeTicket(t, cfg);
+    else ticketTrouble(cfg, t.path, e);
+  }
+}
+
+async function dropTicket(t: Ticket, cfg: Cfg): Promise<void> {
+  tickets.delete(t.path);
+  await unlinkRetry(t.path, cfg);
+}
+
+function ticketLive(path: string, s: LockState, cfg: Cfg): boolean {
+  if (s.kind === "missing") return false;
+  if (s.kind === "unreadable") return true;
+  // Seen unchanged for staleMs of monotonic time: dead whatever its mtime says (clock stepped back).
+  if (observe(path, observedKey(s), cfg) >= cfg.staleMs) return false;
+  const age = cfg.now() - s.mtimeMs;
+  if (s.kind === "corrupt") return age <= cfg.corruptGraceMs;
+  return !ownerDead(s, cfg) && age <= cfg.staleMs;
+}
+
+/**
+ * FIFO: true when fewer than `max` live tickets are older than `own` (than any
+ * ticket, for a caller that does not wait). Dead tickets are deleted; their names
+ * are unique, so a delete by path cannot hit another ticket.
+ */
+async function eligible(own: Ticket | undefined, max: number, cfg: Cfg): Promise<boolean> {
+  let names: string[];
+  try {
+    names = await readdir(cfg.dir);
+  } catch (e) {
+    ticketTrouble(cfg, cfg.dir, e);
+    return true;
+  }
+  let ahead = 0;
+  for (const name of names.filter((n) => TICKET_NAME.test(n)).sort()) {
+    if (own && name >= own.name) break;
+    const path = join(cfg.dir, name);
+    let s: LockState;
+    try {
+      s = await readLock(path, cfg);
+    } catch (e) {
+      ticketTrouble(cfg, path, e);
+      continue;
+    }
+    if (ticketLive(path, s, cfg)) {
+      if (++ahead >= max) return false;
+    } else if (s.kind !== "missing") {
+      observations.delete(path);
+      try {
+        await cfg.unlink(path);
+      } catch (e) {
+        if (errCode(e) !== "ENOENT") ticketTrouble(cfg, path, e);
+      }
+    }
+  }
+  return true;
 }
 
 // ---- file slots -------------------------------------------------------------
@@ -797,34 +916,42 @@ export async function acquireSlot(opts: SlotOptions, deps?: SlotDeps): Promise<S
     return acquireLocal(o, cfg);
   }
   const deadline = cfg.mono() + Math.max(0, opts.waitMs);
-  for (let k = 0; ; k++) {
-    cfg.onAttempt?.();
-    const h = await tryAcquireOnce(o, cfg);
-    if (h) {
-      if (opts.signal?.aborted) {
-        await h.release();
-        return { busy: true };
+  const ticket = opts.waitMs > 0 ? await createTicket(cfg) : undefined;
+  try {
+    for (let k = 0; ; k++) {
+      cfg.onAttempt?.();
+      if (ticket && k > 0) await refreshTicket(ticket, cfg);
+      if (await eligible(ticket, max, cfg)) {
+        const h = await tryAcquireOnce(o, cfg);
+        if (h) {
+          if (opts.signal?.aborted) {
+            await h.release();
+            return { busy: true };
+          }
+          return h;
+        }
       }
-      return h;
+      const remaining = deadline - cfg.mono();
+      if (remaining <= 0 || opts.signal?.aborted) return { busy: true };
+      const base = Math.min(cfg.backoffMaxMs, cfg.backoffMinMs * 2 ** k);
+      const jittered = Math.max(1, Math.round(base * (0.5 + cfg.random() * 0.5)));
+      // Observations need a wake-up at least every 2 heartbeats to stay unbroken.
+      const delay = Math.min(remaining, cfg.heartbeatMs, jittered);
+      const aborted = await new Promise<boolean>((resolve) => {
+        const onAbort = () => {
+          clearTimeout(t);
+          resolve(true);
+        };
+        const t = setTimeout(() => {
+          opts.signal?.removeEventListener("abort", onAbort);
+          resolve(false);
+        }, delay);
+        opts.signal?.addEventListener("abort", onAbort, { once: true });
+      });
+      if (aborted) return { busy: true };
     }
-    const remaining = deadline - cfg.mono();
-    if (remaining <= 0 || opts.signal?.aborted) return { busy: true };
-    const base = Math.min(cfg.backoffMaxMs, cfg.backoffMinMs * 2 ** k);
-    const jittered = Math.max(1, Math.round(base * (0.5 + cfg.random() * 0.5)));
-    // Observations need a wake-up at least every 2 heartbeats to stay unbroken.
-    const delay = Math.min(remaining, cfg.heartbeatMs, jittered);
-    const aborted = await new Promise<boolean>((resolve) => {
-      const onAbort = () => {
-        clearTimeout(t);
-        resolve(true);
-      };
-      const t = setTimeout(() => {
-        opts.signal?.removeEventListener("abort", onAbort);
-        resolve(false);
-      }, delay);
-      opts.signal?.addEventListener("abort", onAbort, { once: true });
-    });
-    if (aborted) return { busy: true };
+  } finally {
+    if (ticket) await dropTicket(ticket, cfg);
   }
 }
 

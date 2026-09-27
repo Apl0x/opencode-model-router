@@ -1,6 +1,7 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
-import { chmodSync, existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import { appendFileSync, chmodSync, existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { open as fsOpen, unlink as fsUnlink, utimes as fsUtimes } from "node:fs/promises";
 import { hostname, tmpdir, userInfo } from "node:os";
 import { join, resolve } from "node:path";
@@ -580,6 +581,49 @@ describe("slot: release never fails the caller (QA-1.4-4, QA-1.4-6, QA-1.4-17)",
     expect(claimsIn(dir)).toEqual([foreign.slice(dir.length + 1)]);
     expect(exitReleaseFailures).toBe(failures);
     rmSync(foreign);
+  });
+});
+
+describe("slot: fairness between processes (QA-1.4-9)", () => {
+  it("a process that re-acquires in a tight loop cannot starve a waiter: FIFO tickets hand the slot over", async () => {
+    const dir = freshDir();
+    const log = join(dir, "log.txt");
+    const stop = join(dir, "stop");
+    writeFileSync(log, "");
+    const a = runHolder({ dir, max: 1, waitMs: 20_000, holdMs: 150, log, id: "a", mode: "loop", stop });
+    await waitUntil(() => readFileSync(log, "utf8").includes("exit"), 10_000); // A is cycling
+    const t0 = Date.now();
+    // Production backoff (250 ms -> 2 s): without fairness this poll almost never lands in A's gap.
+    const r = await acquireSlot({ max: 1, waitMs: 5_000, meta }, { dir });
+    const waited = Date.now() - t0;
+    const now = () => performance.timeOrigin + performance.now();
+    appendFileSync(log, `b enter ${now()}\n`);
+    await sleep(100);
+    appendFileSync(log, `b exit ${now()}\n`);
+    await held(r).release();
+    writeFileSync(stop, "");
+    expect(await a.exit).toBe(0);
+    expect(waited).toBeLessThan(5_000);
+    expect(maxOverlap(intervals(log))).toBe(1);
+  }, 30_000);
+
+  it("a live older ticket makes a non-waiting caller defer even with a free slot; dead or aged tickets do not", async () => {
+    const dir = freshDir();
+    const ticket = (over: Record<string, unknown>) => {
+      const p = join(dir, `wait-${String(1).padStart(15, "0")}-${randomUUID()}.ticket`);
+      writeLock(p, { command: "wait", ...over });
+      return p;
+    };
+    const live = ticket({ pid: process.ppid, token: "w-live" });
+    expect(await acquireSlot({ max: 1, waitMs: 0, meta }, fast(dir))).toEqual({ busy: true });
+    await held(await acquireSlot({ max: 2, waitMs: 0, meta }, fast(dir))).release(); // 1 ticket ahead < max 2
+    setAge(live, 5_000); // older than staleMs (1 s): dead
+    await held(await acquireSlot({ max: 1, waitMs: 0, meta }, fast(dir))).release();
+    expect(existsSync(live)).toBe(false);
+    const dead = ticket({ pid: await deadPid(), token: "w-dead" });
+    await held(await acquireSlot({ max: 1, waitMs: 0, meta }, fast(dir))).release();
+    expect(existsSync(dead)).toBe(false);
+    expect(readdirSync(dir).filter((n) => n.endsWith(".ticket"))).toEqual([]);
   });
 });
 
