@@ -1630,7 +1630,7 @@ describe("createBatchCoordinator: windows and the union run", () => {
     expect(c.sweep()).toBe(1);
     expect(c.stats().runningBatches).toBe(0);
     expect(warn).toHaveBeenCalledWith(
-      "verify batch: evicted a batch whose seam never returned; its slot is released before the seam exits",
+      "verify batch: evicted a batch whose seam never returned; its scope closes, and its slot is released, once the seam exits",
       expect.objectContaining({ members: 2 }),
     );
     await c.dispose();
@@ -1719,7 +1719,7 @@ describe("createBatchCoordinator: windows and the union run", () => {
     await c2.dispose();
   });
 
-  it("QA-2.2-4: dispose waits at most the grace period for a hung seam, then releases its slot and logs it", async () => {
+  it("QA-2.2-4: dispose waits at most the grace period for a hung seam, then closes its scope and logs it", async () => {
     const { calls, runtime } = harness(MODEL, { execute: () => new Promise<ScopedOutcome>(() => undefined) });
     const warn = vi.fn();
     const c = createBatchCoordinator({ platform: "linux", logger: { warn } });
@@ -1738,11 +1738,60 @@ describe("createBatchCoordinator: windows and the union run", () => {
     await disposing;
     expect(calls.closes).toEqual([0]);
     expect(warn).toHaveBeenCalledWith(
-      "verify batch: evicted a batch whose seam never returned; its slot is released before the seam exits",
+      "verify batch: evicted a batch whose seam never returned; its scope closes, and its slot is released, once the seam exits",
       expect.objectContaining({ members: 2 }),
     );
     expect(vi.getTimerCount()).toBe(0);
     expect(c.stats().runningBatches).toBe(0);
+  });
+
+  it("QA-2.2-19: with a scope whose close waits for its hung seam, as 2.1's does, dispose still returns after one grace period", async () => {
+    const hung = deferred<ScopedOutcome>();
+    const inner = harness(MODEL, { execute: () => hung.promise });
+    const released: string[] = [];
+    const runtime: BatchRuntime = {
+      ...inner.runtime,
+      openScope: (meta) => {
+        const scope = inner.runtime.openScope(meta);
+        const inflight: Promise<ScopedOutcome>[] = [];
+        return {
+          ...scope,
+          execute: (spec, deadline) => {
+            const p = scope.execute(spec, deadline);
+            inflight.push(p);
+            return p;
+          },
+          // 2.1's close: the slot is released only once every tracked execute has returned.
+          close: async () => {
+            await Promise.allSettled(inflight);
+            await scope.close();
+            released.push("slot released");
+          },
+        };
+      },
+    };
+    const warn = vi.fn();
+    const c = createBatchCoordinator({ platform: "linux", logger: { warn } });
+    const outs = [c.hook(runtime)(req(["src/a.ts"])), c.hook(runtime)(req(["src/b.ts"]))];
+    await vi.advanceTimersByTimeAsync(WINDOW);
+    let done = false;
+    const disposing = c.dispose().then(() => {
+      done = true;
+    });
+    const gone = aborted(BATCH_REASONS.disposed);
+    expect(await Promise.all(outs)).toEqual([gone, gone]);
+    await vi.advanceTimersByTimeAsync(BATCH_STALE_GRACE_MS);
+    expect(done).toBe(true);
+    await disposing;
+    // The slot is still held: the seam has not exited, and nothing else can run beside it.
+    expect(released).toEqual([]);
+    expect(warn).toHaveBeenCalledWith("verify batch: dispose stopped waiting for scope closes; each slot is released once its seam exits", { closes: 1 });
+    expect(vi.getTimerCount()).toBe(0);
+    hung.resolve({ kind: "aborted", reason: "tree killed" });
+    await flush();
+    expect(released).toEqual(["slot released"]);
+    // A second dispose has nothing left to wait for.
+    await expect(c.dispose()).resolves.toBeUndefined();
   });
 
   it("uses the injected timers and clock", async () => {

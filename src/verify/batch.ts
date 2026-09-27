@@ -1578,15 +1578,16 @@ export function createBatchCoordinator(options: BatchCoordinatorOptions = {}): B
   }
 
   /**
-   * B11 (QA-2.2-4): gives up on a batch whose seam did not return after its tree was killed. Its
-   * scope is closed now, so the slot is released while that seam may still be exiting; this is
-   * only reached after BATCH_STALE_GRACE_MS, and it is logged.
+   * B11 (QA-2.2-4, QA-2.2-19): stops tracking a batch whose seam did not return after its tree was
+   * killed, and asks its scope to close. 2.1's scope closes only once its in-flight seams have
+   * returned, so the slot stays held until the hung seam exits: nothing else runs beside it. This
+   * is only reached after BATCH_STALE_GRACE_MS, and it is logged.
    */
   function evict(b: Batch): void {
     running.delete(b);
     b.group?.dispose();
     b.deadline.dispose();
-    warn("verify batch: evicted a batch whose seam never returned; its slot is released before the seam exits", {
+    warn("verify batch: evicted a batch whose seam never returned; its scope closes, and its slot is released, once the seam exits", {
       key: b.key,
       members: b.members.length,
     });
@@ -1682,21 +1683,29 @@ export function createBatchCoordinator(options: BatchCoordinatorOptions = {}): B
           b.deadline.dispose();
         }
       }
-      // B11.5: wait for the in-flight seams, at most BATCH_STALE_GRACE_MS. A seam still running
-      // after that is hung: its slot is released anyway, and logged (evict).
-      const inflight = [...running].map((b) => b.run);
-      if (inflight.length > 0) {
-        let grace: unknown;
-        await Promise.race([
-          Promise.all(inflight),
-          new Promise<void>((resolve) => {
-            grace = timers.setTimeout(resolve, BATCH_STALE_GRACE_MS);
-          }),
-        ]);
-        timers.clearTimeout(grace);
-        for (const b of running) evict(b);
+      // B11.5 and B11.6 (QA-2.2-19): one grace of BATCH_STALE_GRACE_MS bounds both waits, for
+      // the in-flight seams and then for the scope closes. A seam still running after it is hung:
+      // its batch is evicted and logged. A close still pending after it waits for such a seam
+      // (2.1's close awaits its in-flight executes), so dispose stops waiting and logs it; that
+      // slot is released when the seam exits.
+      if (running.size === 0 && closing.size === 0) return;
+      let handle: unknown;
+      const grace = new Promise<"grace">((resolve) => {
+        handle = timers.setTimeout(() => resolve("grace"), BATCH_STALE_GRACE_MS);
+      });
+      try {
+        const inflight = [...running].map((b) => b.run);
+        if (inflight.length > 0) {
+          await Promise.race([Promise.all(inflight), grace]);
+          for (const b of running) evict(b);
+        }
+        const closes = [...closing];
+        if (closes.length > 0 && (await Promise.race([Promise.all(closes).then(() => "closed" as const), grace])) === "grace") {
+          warn("verify batch: dispose stopped waiting for scope closes; each slot is released once its seam exits", { closes: closing.size });
+        }
+      } finally {
+        timers.clearTimeout(handle);
       }
-      await Promise.all([...closing]);
     },
   };
 }

@@ -19,7 +19,7 @@ import { isAbsolute, join, relative } from "node:path";
 import { createVerificationWiring, type PreparedVerification, type VerificationWiring } from "../../src/verify/wiring";
 import { createDeadline } from "../../src/verify/deterministic";
 import { accept, type GateResult } from "../../src/verify/gate";
-import { BATCH_REASONS } from "../../src/verify/batch";
+import { BATCH_REASONS, BATCH_STALE_GRACE_MS } from "../../src/verify/batch";
 import type { RouterConfig } from "../../src/router/config";
 import type { DoD } from "../../src/verify/dod";
 import type { TreeSnapshot } from "../../src/verify/dispatch";
@@ -54,6 +54,8 @@ const state = vi.hoisted(() => ({
   queue: [] as (() => void)[],
   /** When set, materialize returns an exact reference over this copy of the project. */
   refRoot: "",
+  /** When set, each scoped run waits for it and ignores its abort signal (QA-2.2-19, R3). */
+  hang: undefined as Promise<void> | undefined,
 }));
 
 vi.mock("../../src/verify/exec", () => ({
@@ -156,6 +158,7 @@ async function fakeVitest(args: readonly string[]): Promise<ExecOut> {
   const report = args.find(a => a.startsWith("--outputFile="))?.slice("--outputFile=".length);
   const inputs = args.filter(a => isAbsolute(a) && a.startsWith(root) && !a.includes("node_modules"));
   state.runs.push({ inputs: [...inputs].sort(), holds: state.holds });
+  if (state.hang !== undefined) await state.hang;
   if (state.runMs > 0) await new Promise(resolve => setTimeout(resolve, state.runMs));
   const letters = [...new Set(inputs.map(a => /[\\/]([a-z])(?:\.test)?\.ts$/.exec(a)?.[1]).filter((x): x is string => x !== undefined))].sort();
   const testResults = letters.map(x => {
@@ -311,6 +314,7 @@ beforeEach(() => {
   state.runMs = 0;
   state.fifo = false;
   state.refRoot = "";
+  state.hang = undefined;
   resetCounters();
 });
 
@@ -433,6 +437,49 @@ describe("batch coordinator behind the verification wiring (2.2.3)", () => {
     expect(state.acquires).toBe(0);
     // Idempotent.
     await expect(wiring.disposeVerification()).resolves.toBeUndefined();
+  });
+
+  it("QA-2.2-19 (R3, R4): a seam that ignores its abort keeps its slot until it exits; sweep evicts it and dispose returns after the grace", async () => {
+    let exit: () => void = () => {};
+    state.hang = new Promise<void>(resolve => {
+      exit = resolve;
+    });
+    let clock = Date.now();
+    const warns: string[] = [];
+    const cfg = config({ batchWindowMs: 2000 });
+    const wiring = createVerificationWiring({
+      client: {},
+      directory: state.root,
+      getConfig: () => cfg,
+      logger: { warn: message => void warns.push(message) },
+      batch: {
+        maxBatchSize: 5,
+        now: () => clock,
+        // The grace of B11 shortened to 20 ms; every other timer as is.
+        timers: {
+          setTimeout: (callback: () => void, ms: number) => setTimeout(callback, ms === BATCH_STALE_GRACE_MS ? 20 : ms),
+          clearTimeout: (handle: unknown) => clearTimeout(handle as ReturnType<typeof setTimeout>),
+        },
+      },
+    });
+    void barrier(2);
+    // Both gates run out of budget during the union run, whose tree never exits.
+    const gates = await Promise.all(["a", "b"].map(x => gate(wiring, x, { budgetMs: 1_500 })));
+    expect(gates.map(r => r.verdict.outcome)).toEqual(["unverifiable", "unverifiable"]);
+    expect(state.acquires).toBe(1);
+    expect(wiring.sweepVerification()).toBe(0);
+    clock += BATCH_STALE_GRACE_MS + 1;
+    // R4: evicted, and logged as it happens: the slot stays held while the seam runs.
+    expect(wiring.sweepVerification()).toBe(1);
+    expect(warns).toContain("verify batch: evicted a batch whose seam never returned; its scope closes, and its slot is released, once the seam exits");
+    expect(state.releases).toBe(0);
+    // R3: dispose returns once the grace is over, although the evicted scope's close still waits.
+    const outcome = await Promise.race([wiring.disposeVerification().then(() => "disposed"), sleep(3_000).then(() => "pending")]);
+    expect(outcome).toBe("disposed");
+    expect(warns).toContain("verify batch: dispose stopped waiting for scope closes; each slot is released once its seam exits");
+    expect(state.releases).toBe(0);
+    exit();
+    await vi.waitFor(() => expect(state.releases).toBe(1));
   });
 });
 
