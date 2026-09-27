@@ -3626,3 +3626,51 @@ describe("QA-1.3-50: a path built from several literals in one call", () => {
     expectS6(await plan("jest", `module.exports = { setupFiles: [${calls}] };`), "config-too-large", `too many setup references in /r/jest.config.js (limit ${SETUP_REF_LIMIT})`);
   });
 });
+
+describe("QA-1.3-51: the JS config probe lists each directory once", () => {
+  /** memFs plus a readdir derived from its paths; `listed` records every call, `over` replaces a listing. */
+  function listingFs(files: Record<string, string>, over: Record<string, string[] | "reject"> = {}) {
+    const base = memFs(files);
+    const listed: string[] = [];
+    const probed: string[] = [];
+    const fs: PlannerFs = {
+      fileExists: (p) => (/config/.test(p) && probed.push(p), base.fileExists(p)),
+      readFile: base.readFile,
+      readdir: async (dir) => {
+        listed.push(dir);
+        const o = over[dir];
+        if (o === "reject") throw new Error(`EACCES ${dir}`);
+        if (o) return o;
+        return [...new Set(Object.keys(files).filter((p) => p.startsWith(`${dir}/`)).map((p) => p.slice(dir.length + 1).split("/")[0]))];
+      },
+    };
+    return { fs, listed, probed };
+  }
+  const CFG = "export default { test: { setupFiles: ['./boot/init.js'] } };\n";
+  const files = jsRepo({}, { "/r/a/b/c/d.js": "", "/r/a/b/vitest.config.mjs": CFG, "/r/a/b/boot/init.js": "" });
+
+  it("one listing per directory and plan, no fileExists per config name, same triggers", async () => {
+    const { fs, listed, probed } = listingFs(files);
+    spec(await planScopedRun(input({ fs, changedFiles: changed("a/b/c/d.js") })));
+    expect(probed).toEqual([]);
+    expect([...listed].sort()).toEqual(["/r", "/r/a", "/r/a/b", "/r/a/b/c"]);
+    listed.length = 0;
+    const { search: _s, ...st } = input({ fs, changedFiles: changed("a/b/boot/init.js", "a/b/c/d.js") });
+    expectS6(await planStaticScoping(st), "config-changed", "config file changed: a/b/boot/init.js");
+    expect(new Set(listed).size).toBe(listed.length);
+  });
+
+  it("a name listed only in another case is what fileExists says; an unlistable directory falls back to fileExists", async () => {
+    const f = jsRepo({}, { "/r/a/vitest.config.mjs": "export default { test: { setupFiles: ['./init.js'] } };\n", "/r/a/init.js": "" });
+    const plan = (fs: PlannerFs) => planScopedRun(input({ fs, changedFiles: changed("a/init.js") }));
+    // A case-insensitive file system: the listing spells it Vitest.config.mjs, fileExists finds vitest.config.mjs.
+    expectS6(await plan(listingFs(f, { "/r/a": ["Vitest.config.mjs", "init.js"] }).fs), "config-changed", "config file changed: a/init.js");
+    // A case-sensitive one: vitest looks for vitest.config.mjs and does not find Vitest.config.mjs.
+    const { "/r/a/vitest.config.mjs": cfg, ...rest } = f;
+    const upper = { ...rest, "/r/a/Vitest.config.mjs": cfg };
+    expect(spec(await plan(listingFs(upper).fs)).inputs).toEqual(["/r/a/init.js"]);
+    const { fs, probed } = listingFs(f, { "/r/a": "reject" });
+    expectS6(await plan(fs), "config-changed", "config file changed: a/init.js");
+    expect(probed.filter((p) => p.startsWith("/r/a/"))).toContain("/r/a/vitest.config.mjs");
+  });
+});

@@ -506,9 +506,13 @@
 //      Before those reads, the S6s a large change reaches without them come first: more than
 //      SEARCH_LIMIT gone modules (too-many-searches), and existing inputs whose quoted paths
 //      alone exceed MAX_ARGV_CHARS (argv-too-long); the reads are then bounded by one command
-//      line. The string literals of setupFiles, setupFilesAfterEnv, globalSetup and
-//      globalTeardown resolve against the config's directory and runnerCwd (vitest, plus every
-//      literal `root`, against both: QA-1.3-44's inline projects) or rootDir (jest: `<rootDir>`
+//      line. QA-1.3-51: with PlannerFs.readdir each of those directories is listed once per
+//      plan (all listings started together) instead of checking each config name with
+//      fileExists; a name listed only in another case is confirmed with fileExists, and a
+//      directory that cannot be listed falls back to it. The string literals of setupFiles,
+//      setupFilesAfterEnv, globalSetup and globalTeardown resolve against the config's
+//      directory and runnerCwd (vitest, plus every literal `root`, against both: QA-1.3-44's
+//      inline projects) or rootDir (jest: `<rootDir>`
 //      is the config's directory, every literal rootDir, and QA-1.3-45 the command line's
 //      --rootDir, which jest-config's setFromArgv puts over the config's); a reference without
 //      an extension also matches <ref>.<ext> and <ref>/index.<ext>. QA-1.3-45: a key's value is
@@ -1179,10 +1183,15 @@ export interface RunnerHost {
  * config files are size-checked before they are read (QA-1.3-34), a directory named node(.exe) is
  * not a node (QA-1.3-36), and a PATH node that is the same file as a non-node runtime (Bun's
  * temporary hard link, QA-1.3-30) is skipped. 2.1 should pass it.
+ * `readdir` (optional, QA-1.3-51) is fs.promises.readdir(path): the entry names of a directory,
+ * files and directories alike. With it, the JS config probe (G.7a) lists each directory once per
+ * plan instead of checking every config name with fileExists; a directory it cannot list falls
+ * back to fileExists. 2.1 should pass it.
  */
 export interface PlannerFs extends FsSeam {
   realpath?(path: string): Promise<string>;
   stat?(path: string): Promise<FileStat>;
+  readdir?(path: string): Promise<readonly string[]>;
 }
 
 /** What PlannerFs.stat reports. bigint dev/ino keep win32 file ids exact. */
@@ -1461,7 +1470,15 @@ interface Ctx {
     readonly texts: Map<string, Promise<TextRead>>;
     readonly parsed: Map<string, ConfigParse>;
     readonly exists: Map<string, Promise<boolean>>;
+    /** QA-1.3-51: directory listings (PlannerFs.readdir); undefined when the directory could not be listed. */
+    readonly dirs: Map<string, Promise<DirListing | undefined>>;
   };
+}
+
+/** A directory's entry names, as listed and lower-cased (QA-1.3-51). */
+interface DirListing {
+  readonly exact: ReadonlySet<string>;
+  readonly folded: ReadonlySet<string>;
 }
 
 function resolveHost(h: Partial<RunnerHost> | undefined): RunnerHost {
@@ -1488,7 +1505,7 @@ function makeCtx(h: Partial<RunnerHost> | undefined): Ctx {
   // Neither may sit in Bun's temporary bun-node-<hex> directory (QA-1.3-30: `bun --bun run`).
   const bunDir = BUN_NODE_DIR_RE.test(P.basename(P.dirname(host.execPath)));
   const execIsNode = named && !bunDir && (h?.execPath !== undefined || process.versions.bun === undefined);
-  const cache = { texts: new Map(), parsed: new Map(), exists: new Map() };
+  const cache = { texts: new Map(), parsed: new Map(), exists: new Map(), dirs: new Map() };
   return { host, P, win, key: (p: string) => (win ? p.toLowerCase() : p), execIsNode, cache };
 }
 
@@ -1533,6 +1550,37 @@ function existsCached(ctx: Ctx, fs: FsSeam, p: string): Promise<boolean> {
     ctx.cache.exists.set(k, r);
   }
   return r;
+}
+
+/**
+ * QA-1.3-51: `dir` holds an entry `name` (a file or a directory, as fileExists answers). With
+ * PlannerFs.readdir each directory is listed once per plan; without it, or when the directory
+ * cannot be listed, this is fileExists. A name the listing has only in another case (win32, or a
+ * case-insensitive file system elsewhere) is confirmed with fileExists, so the answer stays the
+ * one fileExists would give.
+ */
+async function hasEntry(ctx: Ctx, fs: PlannerFs, dir: string, name: string): Promise<boolean> {
+  const p = ctx.P.join(dir, name);
+  const l = await dirListing(ctx, fs, dir);
+  if (l === undefined) return existsCached(ctx, fs, p);
+  if (l.exact.has(name)) return true;
+  return l.folded.has(name.toLowerCase()) && existsCached(ctx, fs, p);
+}
+
+/** QA-1.3-51: the cached PlannerFs.readdir listing of `dir`; undefined without readdir or when it rejects. */
+function dirListing(ctx: Ctx, fs: PlannerFs, dir: string): Promise<DirListing | undefined> {
+  const rd = fs.readdir;
+  if (!rd) return Promise.resolve(undefined);
+  const k = ctx.key(dir);
+  let listing = ctx.cache.dirs.get(k);
+  if (!listing) {
+    listing = rd.call(fs, dir).then(
+      (xs): DirListing => ({ exact: new Set(xs), folded: new Set(xs.map((x) => x.toLowerCase())) }),
+      () => undefined,
+    );
+    ctx.cache.dirs.set(k, listing);
+  }
+  return listing;
 }
 
 function s6(code: S6Code, reason: string): Unverifiable {
@@ -3831,10 +3879,12 @@ async function jsConfigFacts(
       if (ctx.key(d) === top || P.dirname(d) === d) break;
     }
   }
+  // QA-1.3-51: one listing per directory where the seam can list (hasEntry). The listings are
+  // started together; the configs are still taken in directory order.
+  await Promise.all([...dirs.values()].map((d) => dirListing(ctx, fs, d)));
   for (const d of dirs.values()) {
     for (const n of JS_CONFIG_NAMES[kind]) {
-      const p = P.join(d, n);
-      if (await existsCached(ctx, fs, p)) files.add(p);
+      if (await hasEntry(ctx, fs, d, n)) files.add(P.join(d, n));
     }
   }
   const cliRoot = kind === "jest" ? jestCliRootDir(det) : undefined;
