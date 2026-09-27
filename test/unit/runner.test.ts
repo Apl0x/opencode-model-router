@@ -50,6 +50,7 @@ const POSIX_HOST: Partial<RunnerHost> = {
   cores: 8,
   pathEnv: "",
   pytestAddopts: "",
+  env: {},
   randomId: () => UUID,
 };
 
@@ -2050,7 +2051,7 @@ describe("QA-1.3-4/8/15: config triggers", () => {
     },
   );
 
-  it.each(["test/setup.ts", "vitest.setup.ts", "setupTests.ts", "src/setup-tests.js", "global-setup.ts", "globalSetup.mts", "jest.setup.js", "jest.setupAfterEnv.js", "test-setup.tsx"])(
+  it.each(["vitest.setup.ts", "setupTests.ts", "src/setup-tests.js", "global-setup.ts", "globalSetup.mts", "jest.setup.js", "test-setup.tsx", "src/app.setup.ts", "test.setup.cjs"])(
     "vitest and jest: setup file %s -> config-changed",
     async (f) => {
       for (const command of ["vitest", "jest"]) {
@@ -2390,5 +2391,76 @@ describe("QA-1.3-25: junit parsing is linear", () => {
     const xml = '<testsuites><testcases/><testcase classname="tests.test_math" name="ok"/></testsuites><testcase';
     const sp = mkSpec({ runner: "pytest", reportPath: RPT_XML, cwd: "/root/p", gitRoot: "/root/p", inputs: ["/root/p/tests/test_math.py"], inputsAreTests: true });
     expect(await read(sp, { [RPT_XML]: xml }, 0)).toMatchObject({ total: 1, complete: true, source: "report" });
+  });
+});
+
+describe("QA-1.3-23: Python dependency files are pytest triggers", () => {
+  it.each(["requirements/base.txt", "requirements/dev.in", "deps/requirements/ci.txt", "requirements-dev.in", "constraints.txt", "constraints-py312.txt", "Pipfile", "setup.py", "src/setup.py"])(
+    "%s -> config-changed",
+    async (f) => {
+      expectS6(await planScopedRun(input({ command: "pytest", files: pyRepo(), changedFiles: changed("tests/test_a.py", f) })), "config-changed", `config file changed: ${f}`);
+    },
+  );
+
+  it("win32 matches the directory and the extension case-insensitively; other files are not triggers", async () => {
+    const W = { "C:\\repo\\.git": "", "C:\\py\\pytest.exe": "" };
+    const r = await planScopedRun(input({ win: true, command: "pytest", files: W, cwd: "C:\\repo", host: { ...WIN_HOST, pathEnv: "C:\\py" }, changedFiles: changed("Requirements\\Base.TXT") }));
+    expectS6(r, "config-changed", "config file changed: Requirements/Base.TXT");
+    for (const f of ["requirements/README.md", "docs/notes.txt", "requirements.md"]) {
+      expect(isNoAffected(await planScopedRun(input({ command: "pytest", files: pyRepo(), changedFiles: changed(f) })))).toBe(true);
+    }
+    expect(isNoAffected(await planScopedRun(input({ changedFiles: changed("requirements/base.txt") })))).toBe(true);
+  });
+});
+
+describe("QA-1.3-24: npm workspace configuration outside the command line is S6", () => {
+  const files = (extra: Record<string, string>) => jsRepo({ test: "vitest" }, { "/r/src/a.ts": "", "/r/pkg/package.json": JSON.stringify({ scripts: { test: "vitest" } }), ...extra });
+  const plan = (extra: Record<string, string>, over: Partial<PlanScopedRunInput> = {}) =>
+    planScopedRun(input({ command: "npm test", files: files(extra), changedFiles: changed("src/a.ts"), ...over }));
+
+  it.each([
+    ["workspace=packages/app", "npm workspace"],
+    ["workspaces = true", "npm workspaces"],
+    ["; c\nworkspace[] = a", "npm workspace"],
+    ["  Workspace=x", "npm workspace"],
+  ])(".npmrc %j -> S6 %s", async (npmrc, prefix) => {
+    expectS6(await plan({ "/r/.npmrc": npmrc }), "unsupported-command", `unsupported command "${prefix}" in /r/.npmrc`);
+  });
+
+  it("the .npmrc of any directory from cwd up to the git root counts; unreadable -> S6", async () => {
+    expectS6(await plan({ "/r/pkg/.npmrc": "workspace=x" }, { cwd: "/r/pkg" }), "unsupported-command", 'unsupported command "npm workspace" in /r/pkg/.npmrc');
+    const fs = memFs(files({ "/r/.npmrc": "x" }), false, {}, ["/r/.npmrc"]);
+    expectS6(await plan({}, { fs }), "unsupported-command", 'unsupported command "npm" in /r/.npmrc (unreadable)');
+  });
+
+  it("npm_config_workspace(s) in the host env (any case) or cross-env -> S6", async () => {
+    const host = (env: Record<string, string>) => ({ ...POSIX_HOST, pathEnv: "/usr/bin", env });
+    expectS6(await plan({}, { host: host({ NPM_CONFIG_WORKSPACE: "packages/app" }) }), "unsupported-command", 'unsupported command "npm NPM_CONFIG_WORKSPACE" in the environment');
+    expectS6(await plan({}, { host: host({ npm_config_workspaces: "true" }) }), "unsupported-command", 'unsupported command "npm npm_config_workspaces" in the environment');
+    expectS6(await plan({}, { command: "cross-env npm_config_workspace=a npm test" }), "unsupported-command", 'unsupported command "npm npm_config_workspace" in cross-env');
+    expect(isScopedSpec(await plan({}, { host: host({ npm_config_workspace: "", npm_config_prefix: "/opt/npm" }) }))).toBe(true);
+  });
+
+  it("prefix, comments, include-workspace-root alone and other managers still plan", async () => {
+    for (const npmrc of ["prefix=packages/app", "# workspace=x", "include-workspace-root=true", "workspaces-update=false"]) {
+      expect(isScopedSpec(await plan({ "/r/.npmrc": npmrc })), npmrc).toBe(true);
+    }
+    expect(isScopedSpec(await plan({ "/r/.npmrc": "workspace=x" }, { command: "pnpm test" }))).toBe(true);
+    expect(isScopedSpec(await plan({ "/r/.npmrc": "workspace=x" }, { command: "vitest" }))).toBe(true);
+  });
+});
+
+describe("QA-1.3-28: the setup-file trigger follows 1.6's rule", () => {
+  it("setup.ts, SetupWizard.tsx and test/setup.ts are application inputs", async () => {
+    const files = jsRepo({}, { "/r/src/setup.ts": "", "/r/src/SetupWizard.tsx": "", "/r/test/setup.ts": "" });
+    for (const command of ["vitest", "jest"]) {
+      const s = spec(await planScopedRun(input({ command, files, changedFiles: changed("src/setup.ts", "src/SetupWizard.tsx", "test/setup.ts") })));
+      expect(s.inputs).toEqual(["/r/src/SetupWizard.tsx", "/r/src/setup.ts", "/r/test/setup.ts"]);
+    }
+  });
+
+  it("win32 matches case-insensitively", async () => {
+    const W = { "C:\\repo\\.git": "" };
+    expectS6(await planScopedRun(input({ win: true, files: W, cwd: "C:\\repo", changedFiles: changed("SetupTests.TS") })), "config-changed", "config file changed: SetupTests.TS");
   });
 });

@@ -66,6 +66,13 @@
 //     --workspaces --include-workspace-root --workspace-root --prefix --dir --cwd --filter
 //     --recursive --global, also "=v" forms) -> S6 unsupported-command "<pm> <token>". Options
 //     before the subcommand are already S6 ("npm -w", "pnpm --filter").
+//   - npm configuration that selects a workspace (QA-1.3-24): a `workspace` or `workspaces` key
+//     (also `workspace[]`) in any .npmrc from cwd up to gitRoot -> S6 unsupported-command
+//     "npm workspace" in <.npmrc path>; an unreadable one -> "npm" in "<path> (unreadable)"; a
+//     non-empty npm_config_workspace(s) variable, any case, in the host env or cross-env -> S6
+//     "npm <NAME>" in "the environment" / "cross-env". npm 12.0.2 ran the workspace's script for
+//     each. `prefix` and `include-workspace-root` are not checked: set there they did not move
+//     `npm test` off the root script (prefix only moves the global prefix).
 //   - The script text goes through C.2 (<where> = "scripts.<s>"), C.1, C.3 and the head table,
 //     restricted to the DIRECT forms (vitest, jest, pytest, npx, pnpm exec, uv run pytest).
 //     Only one level of script resolution: a package-manager head inside a script (npm run x,
@@ -402,15 +409,19 @@
 //        vitest and jest, also (QA-1.3-8): package-lock.json, npm-shrinkwrap.json,
 //                pnpm-lock.yaml, yarn.lock, bun.lock, bun.lockb, pnpm-workspace.yaml, .npmrc,
 //                .yarnrc, .yarnrc.yml, .pnpmfile.cjs (a lockfile-only change can upgrade a
-//                dependency within its range); and conventional setup files that are not test
-//                files, /^(?:(?:vitest|jest|test)[.-])?(?:global[.-]?)?setup(?:[.-]?(?:tests?|
-//                files?|after[.-]?env|env))?\.[cm]?[jt]sx?$/i (QA-1.3-15: vitest adds setupFiles
-//                to forceRerunTriggers and reran every test file; jest's related graph never
-//                reaches a setup file). A setup file under another name is the P residual.
+//                dependency within its range); and setup files that are not test files, by the
+//                rule 1.6 risk.ts uses (QA-1.3-28): /\.setup\.[cm]?[jt]sx?$/ or the basenames
+//                setupTests, setup-tests, test-setup, global-setup, globalSetup, vitest.setup,
+//                jest.setup with a JS/TS extension, case-insensitive (QA-1.3-15: vitest adds
+//                setupFiles to forceRerunTriggers and reran every test file; jest's related graph
+//                never reaches a setup file). A bare setup.ts is application code. A setup file
+//                under another name is the P residual.
 //        pytest  conftest.py, pyproject.toml, pytest.ini, setup.cfg, tox.ini (section 1.5-3),
 //                plus .pytest.ini, pytest.toml, .pytest.toml (QA-1.3-4: pytest 9 reads them;
 //                plan amendment to section 1.5-3, fixtures in 3.2) and uv.lock, poetry.lock,
-//                pdm.lock, Pipfile.lock, requirements*.txt (QA-1.3-8)
+//                pdm.lock, Pipfile.lock, requirements*.txt (QA-1.3-8), plus (QA-1.3-23) Pipfile,
+//                setup.py, requirements*.in, constraints*.txt, and any *.txt or *.in below a
+//                directory named "requirements" (requirements/base.txt)
 //        all     the package.json that supplied the script (DetectedRunner.source), and every
 //                file named by a config option (DetectedRunner.configFiles: vitest/jest
 //                --config -c, pytest -c --config-file, eslint -c --config), resolved against
@@ -773,6 +784,11 @@
 //   - A `bail` set in a vitest or jest config file (not on the command line) still cuts the run
 //     short: the JS config cannot be read statically. 2.1's S2 comparison inherits this residual
 //     (QA-1.3-2 covers the command line; pytest addopts are covered by --maxfail=0).
+//   - npm workspace selection from the user or global npmrc (~/.npmrc, $PREFIX/etc/npmrc, or a
+//     npm_config_userconfig/globalconfig file) is not read (QA-1.3-24 covers the project .npmrc
+//     files and the environment).
+//   - Setup files under names the G.7 rule does not know (a bare test/setup.ts,
+//     jest.setupAfterEnv.js) are ordinary inputs (QA-1.3-28 narrowed the rule to 1.6's).
 //
 // ------------------------------------------------------------------------------------------------
 // Q. CONSUMER CONTRACT
@@ -945,6 +961,8 @@ export interface RunnerHost {
   readonly pathExt?: string;
   /** Default: process.env.PYTEST_ADDOPTS ?? "" (xdist/cov evidence, D.4). */
   readonly pytestAddopts: string;
+  /** The environment npm itself sees, read for npm_config_workspace(s) only (B, QA-1.3-24). Default: process.env. */
+  readonly env?: Readonly<Record<string, string | undefined>>;
   /** Default: crypto.randomUUID. It must return a UUID (REPORT_NAME_RE). */
   readonly randomId: () => string;
 }
@@ -1202,6 +1220,7 @@ function resolveHost(h: Partial<RunnerHost> | undefined): RunnerHost {
     pathEnv: h?.pathEnv ?? process.env.PATH ?? "",
     pathExt: h?.pathExt ?? process.env.PATHEXT ?? ".COM;.EXE;.BAT;.CMD",
     pytestAddopts: h?.pytestAddopts ?? process.env.PYTEST_ADDOPTS ?? "",
+    env: h?.env ?? process.env,
     randomId: h?.randomId ?? randomUUID,
   };
 }
@@ -2255,6 +2274,10 @@ async function detectImpl<K extends ToolKind>(
   if (inv.type === "direct") {
     return finishDetection(ctx, fs, inv.kind, inv.launcher, { type: "command" }, gitRoot, absCwd, inv.env, inv.args, "command", []);
   }
+  if (inv.manager === "npm") {
+    const redirect = await npmWorkspaceConfig(ctx, fs, absCwd, gitRoot, inv.env);
+    if (redirect) return redirect;
+  }
 
   let pkgPath: string | undefined;
   for (const d of ancestors(ctx, absCwd, gitRoot)) {
@@ -2298,6 +2321,44 @@ async function detectImpl<K extends ToolKind>(
     where,
     notes,
   );
+}
+
+/** npm config keys that make a plain `npm test` run another package's script (QA-1.3-24). */
+const NPM_WORKSPACE_KEY_RE = /^[ \t]*(workspaces?)[ \t]*(?:\[\])?[ \t]*=/im;
+const NPM_WORKSPACE_ENV_RE = /^npm_config_workspaces?$/i;
+
+/**
+ * B (QA-1.3-24): npm reads `workspace` / `workspaces` from a project .npmrc and from
+ * npm_config_* variables (any case), and then `npm test` runs the workspace's script, not the
+ * root one the adapter resolved (npm 12.0.2). Checked: every .npmrc from cwd up to gitRoot, the
+ * host env and the cross-env assignments. `prefix` is NOT checked: from .npmrc or the env it only
+ * moves the global prefix (npm 12.0.2 still ran the root script), and npm_config_prefix is a
+ * common global setting. The user and global npmrc are a P residual.
+ */
+async function npmWorkspaceConfig(
+  ctx: Ctx,
+  fs: FsSeam,
+  cwd: string,
+  gitRoot: string,
+  crossEnv: Readonly<Record<string, string>>,
+): Promise<Unverifiable | undefined> {
+  for (const [where, env] of [["cross-env", crossEnv], ["the environment", ctx.host.env ?? {}]] as const) {
+    const key = Object.keys(env).find((k) => NPM_WORKSPACE_ENV_RE.test(k) && (env[k] ?? "") !== "");
+    if (key !== undefined) return unsupported(`npm ${key}`, where);
+  }
+  for (const d of ancestors(ctx, cwd, gitRoot)) {
+    const p = ctx.P.join(d, ".npmrc");
+    if (!(await fs.fileExists(p))) continue;
+    let text: string;
+    try {
+      text = await fs.readFile(p);
+    } catch {
+      return unsupported("npm", `${p} (unreadable)`);
+    }
+    const m = NPM_WORKSPACE_KEY_RE.exec(text);
+    if (m) return unsupported(`npm ${m[1].toLowerCase()}`, p);
+  }
+  return undefined;
 }
 
 async function finishDetection<K extends ToolKind>(
@@ -2475,13 +2536,18 @@ const JS_DEPS = String.raw`package-lock\.json|npm-shrinkwrap\.json|pnpm-lock\.ya
 const TRIGGERS: Record<RunnerKind, RegExp> = {
   vitest: new RegExp(String.raw`^(?:package\.json|vitest\.config\..+|vite\.config\..+|vitest\.workspace\..+|vitest\.projects\..+|tsconfig.*\.json|${JS_DEPS})$`),
   jest: new RegExp(String.raw`^(?:package\.json|jest\.config\..+|babel\.config\..+|\.babelrc|\.babelrc\..+|tsconfig.*\.json|${JS_DEPS})$`),
-  pytest: /^(?:conftest\.py|pyproject\.toml|\.?pytest\.ini|\.?pytest\.toml|setup\.cfg|tox\.ini|uv\.lock|poetry\.lock|pdm\.lock|[Pp]ipfile\.lock|requirements[\w.-]*\.txt)$/,
+  pytest:
+    /^(?:conftest\.py|pyproject\.toml|\.?pytest\.ini|\.?pytest\.toml|setup\.cfg|setup\.py|tox\.ini|uv\.lock|poetry\.lock|pdm\.lock|[Pp]ipfile(?:\.lock)?|requirements[\w.-]*\.(?:txt|in)|constraints[\w.-]*\.txt)$/,
 };
+/** G.7 (QA-1.3-23): pip requirement files kept in a `requirements/` directory (requirements/base.txt, dev.in). */
+const PY_REQ_DIR_FILE_RE = /\.(?:txt|in)$/i;
 /**
- * G.7 (QA-1.3-15): conventional vitest/jest setup-file names. vitest reruns every test for a
- * setupFiles change and jest's related-test graph never reaches one, so both fail closed.
+ * G.7 (QA-1.3-15, QA-1.3-28): vitest/jest setup files, by the rule 1.6 risk.ts uses (QA-1.6-21):
+ * `*.setup.<js/ts>` or a conventional setup basename. vitest reruns every test for a setupFiles
+ * change and jest's related-test graph never reaches one, so both fail closed. A bare `setup.ts`
+ * or `SetupWizard.tsx` is application code.
  */
-const SETUP_FILE_RE = /^(?:(?:vitest|jest|test)[.-])?(?:global[.-]?)?setup(?:[.-]?(?:tests?|files?|after[.-]?env|env))?\.[cm]?[jt]sx?$/i;
+const SETUP_FILE_RE = /\.setup\.[cm]?[jt]sx?$|^(setupTests|setup-tests|test-setup|global-setup|globalSetup|vitest\.setup|jest\.setup)\.[cm]?[jt]sx?$/i;
 const NOTE_NO_CHANGES = "no changed files, no affected tests";
 const NOTE_NO_INPUT = "no affected tests: no changed file is a test input";
 const NOTE_NO_PY_MAP = "no affected tests: no test files map to the changed modules";
@@ -2534,7 +2600,9 @@ async function plan(input: StaticScopingInput, search: TestSearchSeam | undefine
   for (const f of sorted) {
     const names = namesOf(ctx, f);
     const setup = js && !isJsTestPath(f.rel) && names.some((b) => SETUP_FILE_RE.test(b));
-    if (setup || names.some((b) => TRIGGERS[det.kind].test(b)) || ctx.key(f.abs) === sourcePj || configKeys.has(ctx.key(f.abs))) {
+    const segs = f.rel.split("/");
+    const reqDir = det.kind === "pytest" && PY_REQ_DIR_FILE_RE.test(segs[segs.length - 1]) && segs.slice(0, -1).some((s) => ctx.key(s) === "requirements");
+    if (setup || reqDir || names.some((b) => TRIGGERS[det.kind].test(b)) || ctx.key(f.abs) === sourcePj || configKeys.has(ctx.key(f.abs))) {
       return s6("config-changed", `config file changed: ${f.rel}`);
     }
   }
