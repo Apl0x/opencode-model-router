@@ -451,3 +451,40 @@ row.
 or could prove, is accepted as unverifiable under the default config. There is no critical
 finding, and no real-git repro produced a false pass. QA-2.1-15 to -18 are minor or nit, and
 QA-2.1-19 is info.
+
+### Round-2 resolutions
+
+- QA-2.1-13 Resolution: 8fe73b5. `closeWithinDeadline` (`deterministic.ts`) now stops waiting for
+  the close `CLOSE_MARGIN_MS` (exported, 100 ms) before the deadline ends, or at its abort. The gate's
+  `withTimeout(remaining())` no longer races the close wait. The close keeps running in the
+  background as before. Test in `tests-pass-pipeline.test.ts`: real timers, index.ts's arming (the
+  deadline first, 20-26 ms of async preparation, 0-2 ms of synchronous work, then `withTimeout` at
+  `gateDeadline.remaining()`), a close that never settles and a proven introduced failure, 40
+  iterations in one test; every verdict must be `fail`. The fake-timer test now expects the wait to
+  end at `1000 - CLOSE_MARGIN_MS`. With only the `src` change stashed (plus a `CLOSE_MARGIN_MS = 0`
+  export so the test imports), the test failed in 4 of 4 runs (one run:
+  `+ "unverifiable"` among the 40). With the fix it passed 4 of 4 runs.
+- QA-2.1-14 Resolution: 9281844. When the per-file digests are unavailable (over `MAX_DIGEST_FILES`
+  or `MAX_DIGEST_BYTES`, or missing), `delta` (`dispatch.ts`) no longer makes the change set
+  unavailable. It adds every path listed dirty or untracked at dispatch: with its current listing
+  entry while `git status` still lists it, otherwise (restored, committed or deleted) as ` M` if it
+  is on disk and ` D` if not. That widens scope, which fails safe. The change set is `"unavailable"`
+  only when the dispatch or gate listing is missing, or the commit diff is (QA-2.1-12).
+  `MAX_DIGEST_FILES` stays 500: it now bounds the gate's reads, not attribution. A widened input
+  list over `MAX_ARGV_CHARS` is still S6 `argv-too-long` in the planner (fails closed). Tests:
+  - `baseline.test.ts`: without digests (either side unavailable or undefined), a changed
+    fingerprint gives an available change set with all five dispatch paths, the listed ones with
+    their current status, and a path that left the listing and is not on disk as ` D`;
+  - `baseline-wiring.test.ts` (real git, 501 untracked files): an unchanged tree is available and
+    empty; an edit-tool change to `src/a.js` gives an available change set of 502 paths, and the
+    gate runs one scoped `vitest related` call through the argv seam that includes `src/a.js`.
+
+  With only the `src` change stashed, both fail (`expected 'unavailable' to be 'available'`).
+
+Round 2, minor, info and nit findings: QA-2.1-15, QA-2.1-16, QA-2.1-17, QA-2.1-18 and QA-2.1-19
+are accepted per owner rule (post-round-2: only major/critical are fixed).
+
+Runs after these fixes: `npx vitest run --maxWorkers=2 test/unit/tests-pass-pipeline.test.ts
+test/unit/baseline.test.ts test/unit/baseline-wiring.test.ts test/unit/deterministic.test.ts
+test/integration/delegate-timeout.test.ts test/integration/layer2-wiring.test.ts` gave 6 files,
+335 passed. `npm run typecheck` is clean.
