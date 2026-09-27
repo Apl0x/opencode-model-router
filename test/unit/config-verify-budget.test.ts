@@ -137,11 +137,13 @@ describe("validateConfig — enforcement.verify budget keys", () => {
   const ge1 = ["maxWorkers", "maxConcurrentVerifications", "pendingTtlMs", "recheckTimeoutMs", "baselineTimeoutMs", "gateBudgetMs"];
   const ge0 = ["captureWaitMs", "slotWaitMs", "batchWindowMs"];
   const bools = ["lowPriority", "background", "failureRecheck", "testBaseline"];
-  const badNumbers: unknown[] = [-1, Number.NaN, Number.POSITIVE_INFINITY, 1.5, "5", null, true, {}];
+  const badNumbers: unknown[] = [-1, Number.NaN, Number.POSITIVE_INFINITY, 1.5, "5", null, true, {}, 1e21];
+  const msKeys = new Set([...ge1.filter((k) => k.endsWith("Ms")), ...ge0]);
 
   for (const key of ge1) {
     it(`${key} rejects 0 and bad values with the standard message`, () => {
-      for (const bad of [0, ...badNumbers]) {
+      const extra = msKeys.has(key) ? [2 ** 31] : [];
+      for (const bad of [0, ...badNumbers, ...extra]) {
         expect(() => cfgWith({ [key]: bad })).toThrow(
           new RegExp(`^tiers\\.json: enforcement\\.verify\\.${key} must be an integer >= 1`),
         );
@@ -152,13 +154,22 @@ describe("validateConfig — enforcement.verify budget keys", () => {
   for (const key of ge0) {
     it(`${key} accepts 0 and rejects bad values`, () => {
       expect(resolveVerifyBudget(cfgWith({ [key]: 0 }), { cores: 1 })[key as keyof VerifyBudget]).toBe(0);
-      for (const bad of badNumbers) {
+      for (const bad of [...badNumbers, 2 ** 31]) {
         expect(() => cfgWith({ [key]: bad })).toThrow(
-          `tiers.json: enforcement.verify.${key} must be an integer >= 0 (milliseconds)`,
+          `tiers.json: enforcement.verify.${key} must be an integer >= 0 and <= 2147483647 (milliseconds)`,
         );
       }
+      expect(() => cfgWith({ [key]: 2_147_483_647 })).not.toThrow();
     });
   }
+  it("millisecond keys accept the 2^31-1 timer ceiling", () => {
+    for (const key of ge1.filter((k) => k.endsWith("Ms"))) {
+      expect(() => cfgWith({ [key]: 2_147_483_647 })).not.toThrow();
+    }
+  });
+  it("count keys accept a large safe integer", () => {
+    expect(() => cfgWith({ maxWorkers: 2 ** 31 })).not.toThrow();
+  });
   for (const key of bools) {
     it(`${key} rejects non-booleans`, () => {
       for (const bad of ["true", 1, 0, null, {}]) {
@@ -185,11 +196,21 @@ describe("validateConfig — enforcement.verify budget keys", () => {
       );
     }
   });
-  it("a __proto__ key in parsed JSON neither bypasses validation nor pollutes", () => {
+  it("an own __proto__ key is inert and does not pollute", () => {
     const verify = JSON.parse('{"__proto__": {"maxWorkers": 99, "testScope": "all"}}');
-    const b = resolveVerifyBudget(cfgWith(verify), { cores: 16 });
-    expect(b).toEqual(DEFAULTS);
+    expect(Object.getPrototypeOf(verify)).toBe(Object.prototype);
+    expect(() => cfgWith(verify)).toThrow(
+      'tiers.json: enforcement.verify must not contain the key "__proto__"',
+    );
+    expect(Object.getPrototypeOf(verify)).toBe(Object.prototype);
     expect(({} as Record<string, unknown>).maxWorkers).toBeUndefined();
+    expect(({} as Record<string, unknown>).testScope).toBeUndefined();
+  });
+  it.each(["constructor", "prototype"])("rejects an own %s key inside verify", (key) => {
+    const verify = JSON.parse(`{"${key}": {"maxWorkers": 99}}`);
+    expect(() => cfgWith(verify)).toThrow(
+      `tiers.json: enforcement.verify must not contain the key "${key}"`,
+    );
   });
   it("a value inherited through a real prototype is validated and never applied", () => {
     const bad = Object.create({ maxWorkers: "x" });

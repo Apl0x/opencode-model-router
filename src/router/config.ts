@@ -698,6 +698,12 @@ function validateTaskPatterns(obj: Record<string, unknown>): void {
   }
 }
 
+/**
+ * Largest delay `setTimeout` honours (2^31 - 1 ms). Node and bun clamp any
+ * larger delay to 1 ms, turning a "huge" budget into an immediate timeout.
+ */
+const MAX_TIMER_MS = 2_147_483_647;
+
 function validateEnforcement(obj: Record<string, unknown>): void {
   // Validate enforcement if present (optional — absent means no enforcement)
   if (obj.enforcement !== undefined) {
@@ -725,6 +731,13 @@ function validateEnforcement(obj: Record<string, unknown>): void {
       enforcement.verify !== null
     ) {
       const verify = enforcement.verify as Record<string, unknown>;
+      // An own `__proto__`/`constructor`/`prototype` key is never read, but a
+      // later `Object.assign` copy would reparent through it; reject it here.
+      for (const key of ["__proto__", "constructor", "prototype"] as const) {
+        if (Object.prototype.hasOwnProperty.call(verify, key)) {
+          throw new Error(`tiers.json: enforcement.verify must not contain the key "${key}"`);
+        }
+      }
       if (verify.testBaseline !== undefined && typeof verify.testBaseline !== "boolean") {
         throw new Error("tiers.json: enforcement.verify.testBaseline must be a boolean");
       }
@@ -774,9 +787,13 @@ function validateEnforcement(obj: Record<string, unknown>): void {
       ] as const) {
         const value = verify[key];
         if (value !== undefined) {
-          if (!Number.isInteger(value) || (value as number) < 1) {
+          if (
+            !Number.isInteger(value) ||
+            (value as number) < 1 ||
+            (value as number) > MAX_TIMER_MS
+          ) {
             throw new Error(
-              `tiers.json: enforcement.verify.${key} must be an integer >= 1 (milliseconds)`,
+              `tiers.json: enforcement.verify.${key} must be an integer >= 1 and <= ${MAX_TIMER_MS} (milliseconds)`,
             );
           }
         }
@@ -784,15 +801,20 @@ function validateEnforcement(obj: Record<string, unknown>): void {
       // Waits/windows where 0 is meaningful ("no wait", "no batching").
       for (const key of ["captureWaitMs", "slotWaitMs", "batchWindowMs"] as const) {
         const value = verify[key];
-        if (value !== undefined && (!Number.isInteger(value) || (value as number) < 0)) {
+        if (
+          value !== undefined &&
+          (!Number.isInteger(value) || (value as number) < 0 || (value as number) > MAX_TIMER_MS)
+        ) {
           throw new Error(
-            `tiers.json: enforcement.verify.${key} must be an integer >= 0 (milliseconds)`,
+            `tiers.json: enforcement.verify.${key} must be an integer >= 0 and <= ${MAX_TIMER_MS} (milliseconds)`,
           );
         }
       }
+      // Safe integers only: `1e21` passes `Number.isInteger` but stringifies to
+      // `1e+21`, which no test runner parses as a worker count.
       for (const key of ["maxWorkers", "maxConcurrentVerifications"] as const) {
         const value = verify[key];
-        if (value !== undefined && (!Number.isInteger(value) || (value as number) < 1)) {
+        if (value !== undefined && (!Number.isSafeInteger(value) || (value as number) < 1)) {
           throw new Error(`tiers.json: enforcement.verify.${key} must be an integer >= 1`);
         }
       }
