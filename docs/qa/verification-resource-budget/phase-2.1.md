@@ -337,3 +337,117 @@ Runs after these fixes: `npx vitest run --maxWorkers=2 test/unit/tests-pass-pipe
 test/unit/baseline.test.ts test/unit/baseline-wiring.test.ts test/unit/deterministic.test.ts
 test/integration/delegate-timeout.test.ts test/integration/layer2-wiring.test.ts` gave 6 files,
 334 passed. `npm run typecheck` is clean.
+
+## QA re-review (round 2)
+
+Scope: the round-1 resolutions (QA-2.1-1 to -12), and the defects introduced by
+`git diff 7f397cb..HEAD` on `vrb/p21` (tip `0c5455c`: 11 files, +1220/-86). Code that round 1
+cleared was not re-audited. Reviewer: adversarial senior-engineer review, CAP:none. No code was
+changed.
+
+**Runs:**
+- The 11 files named in the dispatch (`tests-pass-pipeline`, `baseline`, `baseline-wiring`,
+  `deterministic`, `wiring`, `tree`, `delegate-timeout`, `reference-gc-start`, `layer2-wiring`,
+  `fable-effort-preset`, `prompt-style-mixed`): 11 files, 365 passed.
+- `npm run typecheck`: clean.
+
+**Real-process repros.** Each ran under Bun 1.3.14 and, bundled with `bun build --target=node`,
+under node v24.21.0. Each uses a real git repository in `%TEMP%` and the real store, wiring,
+`runDeterministic` and `accept`. The scripts are in `%TEMP%\opencode\qa21r2`, except the round-1
+script.
+- `qa21\repro-retry.ts` (round 1, unchanged) at HEAD: `A attempt1`, `A attempt2` and
+  `B bash-edit` are `unverifiable` on both runtimes, with `src\a.js` in the change set. In round 1,
+  `A attempt2` and `B` were `pass` while the full suite was RED. No false pass.
+- `repro-r2.ts` covers these scenarios:
+  - A3: a 3-attempt ladder with index.ts's per-attempt `clear()`;
+  - B: a shell edit of a file dirty at dispatch; B2: an unchanged tree;
+  - C (HEAD moved): C1 `commit -a`, C2 `commit --amend`, C3 `reset --hard` to an older commit
+    with the broken file, C4 a detached checkout of that commit, C5 `merge --no-ff`, C6 a
+    rename-and-edit commit, C7 one commit with 1500 new files and a broken file, C8 a rebase onto a
+    branch with the broken file;
+  - E (inherited environment): E1 `GIT_LITERAL_PATHSPECS`, E2 `GIT_ICASE_PATHSPECS`, E3
+    `GIT_GLOB_PATHSPECS` together with `GIT_NOGLOB_PATHSPECS`; E4 repo config `color.ui=always`,
+    `diff.relative`, `diff.renames=copies`, `diff.noprefix` and `core.quotepath`;
+  - D: a symlink alias of an edited file.
+
+  In every scenario whose full suite is RED, the broken file is in the change set and the verdict
+  is not a pass, on both runtimes. B2 passes with an empty change set. The verdicts are
+  `unverifiable` rather than `fail` only because of QA-2.1-9.
+- `race-close2.ts`: QA-2.1-13. `repro-cap.ts`: QA-2.1-14, run against HEAD and against
+  `git archive 7f397cb src`. `bench-realpath.ts`: QA-2.1-16.
+- Clean-up: junctions were unlinked before every `rm`. No `omr-ref-*`, `omr-verify-*` or
+  `omr-qa21r2-*` entries are left in `%TEMP%`, and no process is left.
+
+**Mutation check** (`qa21r2\mutate-r2.ps1`). It ran in a robocopy scratch copy with a
+`node_modules` junction, never in the worktree, against the 11 files for each mutant. A no-change
+control passed 365/365. 32 mutants: 27 killed, 5 survived.
+
+Killed:
+- QA-2.1-1: M1 `delta` reads only the current attempt.
+- QA-2.1-2: M3 digest comparison skipped; M4 the no-digest fallback stays available; M5 a
+  same-digest but unlisted path is skipped; M6 the gate digests its own listing; M7 file bound
+  removed; M8 byte bound removed.
+- QA-2.1-3: M10 close awaited without a bound; M11 no close-wait timer; M12 the close wait ignores
+  the abort.
+- QA-2.1-5: M27 the reference argv is not low priority.
+- QA-2.1-8: M28 lexical keys; M29 no ancestor walk.
+- QA-2.1-10: M30 anchors ignored; M31 package scope under test dirs; M32 package scope at any
+  depth.
+- QA-2.1-11: M13 GC at start; M14 cancel is a no-op; M15 a GC in flight is not aborted; M16
+  dispose does not cancel.
+- QA-2.1-12: M17 commit diff skipped; M18 `"unavailable"` ignored; M19 head-name check dropped;
+  M20, M21 and M22 a failed, unspawnable or malformed diff read as "no commits"; M23 rename source
+  dropped.
+
+Survived:
+- M2 (`evict` does not fold the cleared session, QA-2.1-1): equivalent in practice. `delta` folds
+  every producer at each gate, and index.ts clears a session only after its gate (`index.ts:689`,
+  `:771-774`), so nothing is left to fold. No finding.
+- M9 and M24: untested guards (QA-2.1-18).
+- M25 and M26: `gateDeadline` not passed to `prepareVerification` (QA-2.1-17).
+
+### Verdicts on the round-1 findings
+
+| id | verdict | evidence |
+|---|---|---|
+| QA-2.1-1 | resolved | A3 (Bun, node): attempts 2 and 3 carry attempt 1's `src\a.js` after `clear("p2")`. M1 is killed by the store and wiring retry tests. The lineage is keyed by session id. `observed` lives on the dispatch record, which the delegate's `finally` clears (`index.ts:771-774`) or the TTL sweep evicts, so its memory is bounded by the dispatch lifetime. |
+| QA-2.1-2 | resolved; its file bound regresses detection (QA-2.1-14) | B and B2 as above; M3-M8 killed. Digest kinds: a symlink is `link:` plus its target, and a binary is hashed raw (sha256). A path that vanishes between `lstat` and read makes the whole map unavailable, which fails closed. The digests are taken inside the same bounded snapshot, after the fingerprint's git calls. CRLF: digests are raw bytes, but they are consulted only when the fingerprint changed. A line-ending-only rewrite under `core.autocrlf` leaves `git diff HEAD` and the fingerprint unchanged, and does not change what the tests execute: no finding. M9 is untested (QA-2.1-18). |
+| QA-2.1-3 | partially resolved (QA-2.1-13) | M10-M12 are killed and the three new tests pass. With real timers and the index.ts arming, a close that outlasts the deadline still loses the verdict in 8-27 % of trials. The slot is safe: `close()` is memoised (`closing ??=`, `deterministic.ts:1173`), so a background close cannot release twice, and it releases only after the tracked disposals. A dispose that never settles holds the slot for the process lifetime. That was already so before the fix (dispose has no deadline, `reference.ts:1191`), so it is not introduced here. |
+| QA-2.1-4 | resolved in code, not pinned by a test (QA-2.1-17) | Both sites create the deadline first and pass it (`index.ts:604-607`, `:1121-1124`). They dispose it on a throw and on the read-only return (`:1153`), and arm `withTimeout` with `remaining()`. M25 and M26 survive. |
+| QA-2.1-5 | resolved | M27 killed. |
+| QA-2.1-6 | accepted residual (orchestrator decision) | Not re-audited. |
+| QA-2.1-7 | resolved | `rg "testBaseline\|baselines\.\|compareTests" src` outside `config.ts` returns only `types.ts:152`: the frozen block, an accepted exception. |
+| QA-2.1-8 | resolved; two side effects (QA-2.1-15, -16) | M28 and M29 killed. The repros print one long-path entry per file. Round 1 printed two entries for one file, `\src\b.js` and `C:\Users\Marquinho\…\src\b.js`. |
+| QA-2.1-9 | accepted (fails closed); cause narrowed | The reference still reports `runner not installed: vitest` when the live `node_modules` is a real directory holding `vitest` and `.bin` junctions (`repro-r2.ts`). So "node_modules is itself a link" (round 1's guess) is not the cause. The result is unverifiable, never pass. |
+| QA-2.1-10 | resolved | M30-M32 killed. |
+| QA-2.1-11 | resolved | M13-M16 killed. `fable-effort-preset` and `prompt-style-mixed` pass in the 11-file run. The GC now starts at 45 s, possibly beside this instance's own gates. That is safe: an alive owner's dir is stale only when it is RELEASED or its heartbeat is older than 1 h (`reference.ts:537-554`, `:1961-1962`). |
+| QA-2.1-12 | resolved | C1-C8 and E1-E4 on both runtimes: the broken file is always in the change set. E3 (conflicting pathspec env) and E4 (hostile diff config) parse cleanly. M17-M23 killed; M24 is untested (QA-2.1-18). One ordering residual remains (QA-2.1-19, info). |
+
+### New findings
+
+| id | severity | evidence | fix |
+|---|---|---|---|
+| QA-2.1-13 | major | **The QA-2.1-3 fix still loses a proven failure to the gate timeout, on a timer race.** `closeWithinDeadline` waits until the exact end of the deadline: its own `setTimeout(done, left)` and the deadline's abort (`deterministic.ts:1339-1346`). The gate's `withTimeout` is armed after preparation with `gateDeadline.remaining()` (`index.ts:650`, `:1182`), so it expires at the same instant. Timer bookkeeping decides which fires first: each timer's start time, and the synchronous work done before it was armed. When `withTimeout` wins, its catch runs before `onFailure`, so `completedFailures` is empty. The r1 fail then becomes "verification gate timed out" (unverifiable), accepted unless `strictUnverifiable`, which is QA-2.1-3's outcome. Measured with `race-close2.ts` (table below): 25-27 % of trials on Bun 1.3.14, the opencode runtime, and 8-16 % on node. The new regression test passes only because its two timers have the same duration, so they fire in insertion order. | End the close wait a margin before the gate ends. Either `closeWithinDeadline` waits `max(0, left - CLOSE_MARGIN_MS)`: 50 ms removed the race in the repro, and 250 ms leaves room under load. Or index.ts arms `withTimeout` with `remaining()` plus a grace, since every step inside is already deadline-bound. Add a real-timer test with the index.ts arming (deadline, async preparation, `withTimeout(remaining())`), repeated at least 50 times. |
+| QA-2.1-14 | major | **Over 500 dirty or untracked paths at dispatch, testsPass stops running.** `MAX_DIGEST_FILES` is 500 (`tree.ts:9`, `:40`), while the capture accepts 5000 untracked files (`MAX_UNTRACKED_FILES`, `reference.ts:869`). Over the bound, the dispatch digests are `"unavailable"`. Any gate whose fingerprint changed then gets `changeBaseline: "unavailable"` (`dispatch.ts:328-329`), and that is every gate where the producer edited anything. testsPass runs nothing (S6), and the gate is accepted as unverifiable by default. Before `1dacb5a`, the same gate ran the tests of the tool-observed files. Repro `repro-cap.ts`: 601 small untracked, unignored files at dispatch; the producer breaks `src/b.js` through the recorded edit tool. At `7f397cb`, testsPass ran and reported `observed failures: test/b.test.js > mul`. At HEAD: `dispatch digests=unavailable changeBaseline=unavailable -> accepted=true outcome=unverifiable reasons=["testsPass: scoping impossible (attribution-unavailable): change attribution unavailable"]`. With 5 untracked files, HEAD runs the tests. Given a usable reference, the old code rejects this regression (r1) and the new code accepts it. That is QA-2.1-3's outcome, for every gate of such a repository. The 64 MiB byte bound matches the capture's `MAX_UNTRACKED_BYTES`: a 65 MiB untracked file already failed the capture at `7f397cb`, so that half is not a regression. The exception is large dirty *tracked* files, which only the digest bound counts. | Widen instead of giving up, as `delta` already does for a single undigested path (`dispatch.ts:336-337`). When digests are unavailable, add every dispatch-listed path to the change set, since none can be proven unchanged, and keep the change set available. The recheck classifies their pre-existing failures. Check that the planner accepts that many inputs (Windows command-line length), and fall back to the full command if it cannot. The alternative is to raise `MAX_DIGEST_FILES` to `MAX_UNTRACKED_FILES`. Test: with 501+ untracked paths at dispatch, an edit-tool regression still runs its tests. |
+| QA-2.1-15 | minor | **Realpath of the last path component merges a symlink with its target.** `canonicalPath` (`dispatch.ts:69`) runs `realpathSync.native` on the whole path, so a symlink is keyed as its target. When both are in the change set, one entry overwrites the other. Repro D (Bun, node): the producer breaks `src/b.js` through the edit tool and adds `src/bz.js -> b.js`. The change set is `["??:src\bz.js"]`, and `src/b.js` is gone. `vitest related` follows the link and still ran `test/b.test.js`, so there is no false pass here. A planner that matches names, or does not follow symlinks, would lose `b.js`'s tests; jest was not checked. Before `30ebfac` the keys were lexical and both entries survived. | Canonicalise the parent directory only: `join(realpathSync.native(dirname(p)), basename(p))`, keeping the ancestor walk. This is the form QA-2.1-8 suggested. Test: a symlink and its target, both changed, stay two entries. |
+| QA-2.1-16 | minor | **Realpath keying adds synchronous fs calls on the edit hot path and in `delta`.** When the recording session is itself a dispatch id (the delegate ladder's first attempt), `record()` calls `observeEdit`. Its `overlaps` calls `pathKey` up to six times per tracked dispatch (`dispatch.ts:170`). Each call is a `realpathSync.native`, plus one throwing call per missing ancestor. `delta` also keys every listed, dispatch-listed, digested and committed path. `bench-realpath.ts` on this machine, per edit: 0.28-0.33 ms with 1 dispatch, 2.6 ms with 10, 12.4-12.7 ms with 50. With a missing dispatch cwd: 0.6-0.95, 17-25 and 94-125 ms. `delta` with 2000 listed paths takes 745 ms (node) and 869 ms (Bun) of synchronous event-loop time. It runs in the gate just before `withTimeout` is armed, which widens QA-2.1-13's window. Before `30ebfac`, both paths were lexical (microseconds). | Canonicalise each dispatch's cwd once and store it on the record, and compare cwd keys lexically. In `delta`, canonicalise the snapshot root once and key git-reported paths lexically under it. Keep the realpath only for tool-reported paths. |
+| QA-2.1-17 | minor | **QA-2.1-4 is not pinned by a test.** Mutants that drop `gateDeadline` from `prepareVerification` survive all 11 files: at the native site (M25, `index.ts:1124`) and at the delegate site (M26, `index.ts:607`). The new test's 1500 ms snapshot ends inside the 2000 ms budget, so the gate ends at 2000 ms whether or not preparation is bounded. The test checks only the creation order and `remaining()`, and the delegate site has no test. Without the deadline, a slow snapshot (up to 10 s) or a pending capture (up to `baselineTimeoutMs`) again runs past `gateBudgetMs`. | Make the snapshot outlast the budget (e.g. 3000 ms against 2000 ms) and assert that the gate settles at 2000 ms, at both sites. |
+| QA-2.1-18 | nit | **Two new guards are untested.** M9: an `lstat` error other than ENOENT or ENOTDIR is digested as absent instead of making the map unavailable (`tree.ts:50`). M24: the spent-deadline guard of `committedSinceDispatch` is removed (`wiring.ts:311`). The "spent deadline runs no git" test never reaches this guard, because a spent deadline already leaves the gate snapshot undefined. Both mutants survive. | Add a test where `lstat` fails with EACCES (mocked fs), expecting `"unavailable"`. Add one where the gate snapshot exists but the deadline is spent before the diff. |
+| QA-2.1-19 | info | **The commit diff can miss a dispatch snapshot that settles during the gate's capture wait.** For `committedSinceDispatch`, `prepareVerification` reads `store.baselineSnapshot(id)` before it waits for the capture (`wiring.ts:605-607`). `store.reference()` waits for the capture only, not for the snapshot (`dispatch.ts:270`). If the dispatch snapshot is still pending at gate start and settles during that wait, `delta` uses it with `committed === undefined` even when HEAD moved. Any `bash` or edit call discards a snapshot that was still pending while the producer ran (`dispatch.ts:101`, `:174`). So only an unobserved committer (an MCP tool, a git hook, another process) can reach this. Also, the diff uses the live `HEAD`, not the gate snapshot's `head`. | In `delta`, treat `snapshot.head !== current.head` with `committed === undefined` as `"unavailable"`. Diff against `now.head`. |
+
+QA-2.1-13 measurements (`race-close2.ts`). Setup: real timers; the real
+`createDirectTestsPassHook`, `accept`, `withTimeout` and `unverifiableGateResult`; a scoped run
+with a proven introduced failure; a `close()` that never settles; a 300 ms budget; 100 trials per
+row.
+
+| arrangement | Bun 1.3.14 | node v24.21.0 |
+|---|---|---|
+| The fix's test: `withTimeout(BUDGET)` armed right after `createDeadline` | 100 fail | 100 fail |
+| index.ts: 30 ms of async preparation, then `withTimeout(remaining())` | 75 fail, 25 accepted unverifiable | 92 fail, 8 accepted unverifiable |
+| Same, plus 2 ms of synchronous work before arming (`store.delta`, `buildGateDeps`) | 73 fail, 27 accepted unverifiable | 84 fail, 16 accepted unverifiable |
+| Same, with the hook's deadline ending 50 ms before the gate's | 100 fail | 100 fail |
+
+**Status: NOT CLEAN.** QA-2.1-13 and QA-2.1-14 are major. In both, a regression the gate proves,
+or could prove, is accepted as unverifiable under the default config. There is no critical
+finding, and no real-git repro produced a false pass. QA-2.1-15 to -18 are minor or nit, and
+QA-2.1-19 is info.
