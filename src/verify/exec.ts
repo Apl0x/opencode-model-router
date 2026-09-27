@@ -18,9 +18,13 @@
  *   reaches what it left running (POSIX: its process group; Windows: a
  *   creation-time-bounded sweep of its children, see `armSweeper`), without
  *   ever signalling a PID that may have been recycled.
- * - `timedOut` is true exactly when the deadline or abort had to end something
- *   (the command, a descendant it left running, or the held pipes). An abort
- *   that finds nothing left running is a no-op: the natural result stands.
+ * - `timedOut` is true when the deadline or abort fired while something still
+ *   held the run (the command, a descendant it left running, or the held
+ *   pipes), so a kill was attempted. A case that cannot be told apart counts as
+ *   a kill (fail-closed): on Windows, the grace settling the run while a sweep
+ *   that pinned trees is still reporting, even if the leftover exited on its
+ *   own during the grace (QA-1.2-24, QA-1.2-28). An abort that finds nothing
+ *   left running is a no-op: the natural result stands.
  * - Runs still in flight when opencode exits are killed from one
  *   `process.once("exit")` hook: on POSIX their process groups (QA-1.2-6), on
  *   Windows the tree of each direct child that has not exited (QA-1.2-18).
@@ -41,7 +45,12 @@ export interface ShellResult {
   code: number;
   stdout: string;
   stderr: string;
-  /** True when the deadline or the abort signal ended the command. */
+  /**
+   * True when the deadline or the abort signal fired while something still
+   * held the run and a kill was attempted. Fail-closed: a leftover that exited
+   * on its own during the kill grace, while a sweep that pinned trees was still
+   * reporting, also counts (see the header's G4 bullet).
+   */
   timedOut: boolean;
 }
 

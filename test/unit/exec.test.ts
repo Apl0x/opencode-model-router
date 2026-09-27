@@ -619,6 +619,30 @@ describe("process lifecycle around the direct child's exit", () => {
       await t.release();
     }
   }, 60000);
+
+  it.runIf(isWin && typeStripping)("leaves the natural result when a sweep that pinned nothing is still pending at the grace (QA-1.2-29, Windows-only: the sweeper; needs Node type stripping)", async () => {
+    const t = tree("early-exit");
+    const h = startHost(["unpinned-sweeper", t.dir]);
+    let standIn = 0;
+    try {
+      const first = await h.firstLine;
+      expect(first.line, h.stderr()).not.toBe("");
+      const out = JSON.parse(first.line) as { result: { code: number; timedOut: boolean; stderr: string }; sweeper: number | null; settledIn: number };
+      standIn = out.sweeper ?? 0;
+      expect(standIn).toBeGreaterThan(0);
+      // The holder ended on its own right after the abort; the stand-in never
+      // printed `pinned`, so it cannot have killed anything (QA-1.2-10).
+      expect(out.result).toMatchObject({ code: 0, stderr: "", timedOut: false });
+      // Settling at the grace proves the sweep was still pending there, so the
+      // pinned-count condition is what kept the natural result.
+      expect(out.settledIn).toBeGreaterThanOrEqual(KILL_GRACE_MS - 50);
+      expect((await h.exited).code).toBe(0);
+    } finally {
+      h.kill();
+      killIfAlive(standIn);
+      await t.release();
+    }
+  }, 60000);
 });
 
 describe("tracked-process bookkeeping (QA-1.2-23)", () => {

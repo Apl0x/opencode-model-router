@@ -21,6 +21,13 @@
 //       the kill grace, so the grace settles the run with the pipes closed
 //       and the sweep still reporting (QA-1.2-24).
 //
+//   node|bun host.mjs unpinned-sweeper <dir>
+//       The same run and abort (node only), with a stand-in that never prints
+//       the `pinned` marker, kills nothing and lives past the kill grace. The
+//       holder is released right after the abort, so it ends on its own and
+//       the grace finds the pipes closed with the sweep still pending
+//       (QA-1.2-29). The output also carries `settledIn`: ms from the abort.
+//
 // Node targets run on $OMR_NODE when set, else process.execPath (under bun
 // that is bun.exe, not node).
 import childProcess from "node:child_process";
@@ -33,6 +40,9 @@ const [mode, ...rest] = process.argv.slice(2);
 const node = process.env.OMR_NODE || process.execPath;
 const HUNG = "omr-hung-sweeper";
 const LATE = "omr-late-sweeper";
+const UNPINNED = "omr-unpinned-sweeper";
+/** unpinned-sweeper's stand-in: no marker, no kill, gone after 5 s. */
+const UNPINNED_SCRIPT = "process.stdin.resume(); setTimeout(() => process.exit(0), 5000);";
 /**
  * late-sweeper's stand-in: pins "1 tree", kills the holder as soon as it
  * reads `kill`, and reports the kill only after LATE_REPORT_MS.
@@ -54,11 +64,12 @@ const LATE_SCRIPT = [
 ].join("\n");
 /** hung-sweeper / late-sweeper: the stand-in started in place of PowerShell. */
 let standIn;
-if ((mode === "hung-sweeper" && !rest[1]) || mode === "late-sweeper") {
+if ((mode === "hung-sweeper" && !rest[1]) || mode === "late-sweeper" || mode === "unpinned-sweeper") {
   const realSpawn = childProcess.spawn;
   childProcess.spawn = (file, args, options) => {
     if (file === HUNG) standIn = realSpawn(node, ["-e", "setTimeout(() => {}, 60000)"], options);
     else if (file === LATE) standIn = realSpawn(node, ["-e", LATE_SCRIPT, rest[0]], options);
+    else if (file === UNPINNED) standIn = realSpawn(node, ["-e", UNPINNED_SCRIPT], options);
     else return realSpawn(file, args, options);
     return standIn;
   };
@@ -93,9 +104,9 @@ if (mode === "exit-mid-run") {
   await waitFor(() => hasContent(pidFile), pidFile);
   process.stdout.write("ready\n");
   process.exit(0);
-} else if (mode === "hung-sweeper" || mode === "late-sweeper") {
+} else if (mode === "hung-sweeper" || mode === "late-sweeper" || mode === "unpinned-sweeper") {
   const [dir, sweeper] = rest;
-  exec.setSweeperExecutableForTests(mode === "late-sweeper" ? LATE : sweeper || HUNG);
+  exec.setSweeperExecutableForTests(mode === "late-sweeper" ? LATE : mode === "unpinned-sweeper" ? UNPINNED : sweeper || HUNG);
   const controller = new AbortController();
   const tree = fileURLToPath(new URL("./tree.cjs", import.meta.url));
   const pending = exec.runArgv(node, [tree, "early-exit", dir], { cwd: dir, timeoutMs: 60000, signal: controller.signal });
@@ -107,9 +118,13 @@ if (mode === "exit-mid-run") {
   await waitFor(() => !alive(child), "the direct child to exit");
   await sleep(500);
   controller.abort();
+  const abortedAt = Date.now();
+  // unpinned-sweeper: the holder ends on its own inside the grace.
+  if (mode === "unpinned-sweeper") writeFileSync(join(dir, "release"), "");
   const result = await pending;
+  const settledIn = Date.now() - abortedAt;
   writeFileSync(join(dir, "release"), "");
-  process.stdout.write(`${JSON.stringify({ result, sweeper: standIn?.pid ?? null })}\n`);
+  process.stdout.write(`${JSON.stringify({ result, sweeper: standIn?.pid ?? null, settledIn })}\n`);
 } else {
   process.stderr.write(`host: unknown mode ${mode}\n`);
   process.exit(2);
