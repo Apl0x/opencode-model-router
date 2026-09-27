@@ -619,6 +619,15 @@ bypass the lock and empty the junction targets. The reason text itself says `do 
 
 Open non-deferred findings: QA-1.5-15 (Low), QA-1.5-16 (Medium), QA-1.5-17 (Low). Phase 1.5 QA is **not** clean.
 
+#### QA-1.5-15
+Resolution: ebf49d8 — GC collects a missing-dir entry that carries our exact lock reason whatever the pid's liveness; removal lifts only our reason, then a targeted `git worktree remove --force` on the missing dir (no prune). Test: omr-locked, dir missing, `isAlive` true, clock +30 days → removed.
+
+#### QA-1.5-16
+Resolution: 5d7df0c — `parseEolList` keeps `i/`; a path in the drift set and not in `ref.tracked` adds `checkout-conversion` when the reference's `w/` differs from its `i/`. Test reproduces S6d (`a.txt text eol=crlf`, clean at capture, edited before materialize → inexact for `a.txt`).
+
+#### QA-1.5-17
+Resolution: 8e71e32 — step 7b lists `ls-files --eol -z -- ':(attr:text)' ':(attr:text=auto)' ':(attr:eol=crlf)' ':(attr:eol=lf)'`; attribute-free conversion comes only from core.autocrlf, which already adds the `""` reason and skips 7b. Existing eol tests (QA-1.5-6a, QA-1.5-13) stay green. Header updated in 5ced990.
+
 ### Checked with no finding
 - `runArgv` (origin/vrb/p12 `src/verify/exec.ts:112-142`) spawns argv without a shell and merges env over
   `process.env`. The seam used here does the same, so the reason reaches git as a single argv element under Node and
