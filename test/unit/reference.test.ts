@@ -10,6 +10,7 @@ import {
   isStrictlyInside,
   materialize,
   nodeReferenceFs,
+  referenceLockReason,
   UnsafeReferencePathError,
   type CaptureDeps,
   type DispatchReference,
@@ -487,7 +488,7 @@ describe("materialize / dispose", { timeout: 60_000 }, () => {
     let seen: { isDir: boolean; entries: string[]; mode: number } | undefined;
     const checking: CaptureDeps["argv"] = async (file, args, opts) => {
       if (args.includes("worktree") && args.includes("add")) {
-        const target = args[args.indexOf("--detach") + 1];
+        const target = args[args.length - 2]; // `... add --detach --lock --reason <r> <dir> <commit>`
         const stats = await fsp.lstat(target);
         seen = { isDir: stats.isDirectory(), entries: await fsp.readdir(target), mode: stats.mode & 0o777 };
       }
@@ -766,6 +767,74 @@ describe("materialize / dispose", { timeout: 60_000 }, () => {
     expect(await worktreeCount(repo)).toBe(1);
   });
 
+  it("QA-1.5-12: the reference is locked with the omr reason; a user's `git worktree remove [--force]` refuses it", async () => {
+    const handle = await mat(await capture());
+    const reason = referenceLockReason(process.pid);
+    try {
+      expect(await git(repo, "worktree", "list", "--porcelain")).toContain(`locked ${reason}\n`);
+      // Sandbox guard, checked BEFORE any `git worktree remove` runs: every junction leads into
+      // this test's temp sandbox, to a dir holding only the sentinel, never into real data.
+      expect(handle.links).toHaveLength(2);
+      for (const link of handle.links) {
+        const target = await fsp.realpath(link);
+        expect(isStrictlyInside(target, base)).toBe(true);
+        expect(await fsp.readdir(target)).toEqual(["sentinel.txt"]);
+      }
+      for (const force of [[], ["--force"]]) {
+        const user = await argv("git", ["worktree", "remove", ...force, handle.dir], { cwd: repo, timeoutMs: 30_000, env: { LC_ALL: "C" } });
+        expect(user.code).not.toBe(0);
+        expect(user.stderr).toContain(`cannot remove a locked working tree, lock reason: ${reason}`);
+      }
+      expect(await fsp.readFile(join(handle.dir, "a.txt"), "utf8")).toBe("a0\n");
+      for (const link of handle.links) expect((await fsp.lstat(link)).isSymbolicLink()).toBe(true);
+      expect(await worktreeCount(repo)).toBe(2);
+    } finally {
+      await handle.dispose();
+    }
+    expect(await exists(handle.dir)).toBe(false);
+    expect(await worktreeCount(repo)).toBe(1); // dispose unlocked its own reason once the dir was gone
+    expect(warnings).toEqual([]);
+    expect(await fsp.readFile(join(repo, "node_modules", "sentinel.txt"), "utf8")).toBe("keep me");
+    expect(await fsp.readFile(join(repo, "packages", "a", "node_modules", "sentinel.txt"), "utf8")).toBe("keep me");
+  });
+
+  it("QA-1.5-12: dispose lifts only its own lock reason; someone else's lock keeps the admin entry", async () => {
+    const handle = await mat(await capture());
+    await git(repo, "worktree", "unlock", handle.dir);
+    await git(repo, "worktree", "lock", "--reason", "a user's lock", handle.dir);
+    await handle.dispose();
+    expect(await exists(handle.dir)).toBe(false); // the links went first, then fs.rm
+    expect(warnings).toContain("reference worktree admin entry left registered: locked");
+    expect(await git(repo, "worktree", "list", "--porcelain")).toContain("locked a user's lock");
+    expect(await fsp.readFile(join(repo, "node_modules", "sentinel.txt"), "utf8")).toBe("keep me");
+    // Test cleanup: the dir is already gone, so remove only drops the admin entry.
+    await git(repo, "worktree", "unlock", handle.dir);
+    await git(repo, "worktree", "remove", "--force", handle.dir);
+  });
+
+  it("QA-1.5-12: a git without `worktree add --reason` (< 2.33) falls back to an unlocked add, with a warning", async () => {
+    const rejected: string[][] = [];
+    const oldGit: CaptureDeps["argv"] = async (file, args, opts) => {
+      if (args.includes("add") && args.includes("--reason")) {
+        rejected.push([...args]);
+        return { code: 129, stdout: "", stderr: "error: unknown option `reason'\nusage: git worktree add [<options>] <path> [<commit-ish>]\n", timedOut: false };
+      }
+      return argv(file, args, opts);
+    };
+    const handle = await mat(await capture(), { argv: oldGit });
+    try {
+      expect(rejected).toHaveLength(1);
+      expect(warnings.some((w) => w.includes("--reason"))).toBe(true);
+      const list = await git(repo, "worktree", "list", "--porcelain");
+      expect(list).toContain("omr-ref-");
+      expect(list).not.toContain("locked");
+      expect(await fsp.readFile(join(handle.dir, "a.txt"), "utf8")).toBe("a0\n");
+    } finally {
+      await handle.dispose();
+    }
+    expect(await exists(handle.dir)).toBe(false);
+  });
+
   it("QA-1.5-5: an abort mid-checkout (slow smudge filter) leaves no locked admin entry", async () => {
     await fsp.writeFile(join(repo, ".gitattributes"), "slow.txt filter=slow\n");
     await fsp.writeFile(join(repo, "slow.txt"), "slow\n");
@@ -777,12 +846,18 @@ describe("materialize / dispose", { timeout: 60_000 }, () => {
     const admin = join(repo, ".git", "worktrees");
     const controller = new AbortController();
     let lockSeen = false;
+    let lockText = "";
     const aborting: CaptureDeps["argv"] = async (file, args, opts) => {
       if (!(args.includes("worktree") && args.includes("add"))) return argv(file, args, opts);
       const running = argv(file, args, opts);
+      // Mid-checkout: the entry is locked and the checkout (`reset --hard`) holds the worktree's index lock.
       lockSeen = await waitFor(async () => {
         if (!(await exists(admin))) return false;
-        for (const name of await fsp.readdir(admin)) if (await exists(join(admin, name, "locked"))) return true;
+        for (const name of await fsp.readdir(admin)) {
+          if (!(await exists(join(admin, name, "index.lock")))) continue;
+          lockText = (await fsp.readFile(join(admin, name, "locked"), "utf8").catch(() => "")).trim();
+          if (lockText) return true;
+        }
         return false;
       }, 15_000);
       controller.abort(); // tree-kills `git worktree add` in the middle of its checkout
@@ -790,6 +865,8 @@ describe("materialize / dispose", { timeout: 60_000 }, () => {
     };
     const result = await materialize(ref, undefined, controller.signal, deps({ argv: aborting }));
     expect(lockSeen).toBe(true);
+    // QA-1.5-12: with --lock --reason, git writes our reason from the start, never "initializing".
+    expect(lockText).toBe(referenceLockReason(process.pid));
     expect(result).toMatchObject({ ok: false, reason: "aborted" });
     expect(await git(repo, "worktree", "list", "--porcelain")).not.toContain("omr-ref-");
     expect(await worktreeCount(repo)).toBe(1);
@@ -865,6 +942,40 @@ describe("gcStaleReferences", { timeout: 60_000 }, () => {
 
     // Test cleanup of the kept worktrees (not the module under test).
     for (const wt of [liveInit, deadOther]) {
+      await git(repo, "worktree", "unlock", wt);
+      await git(repo, "worktree", "remove", "--force", wt);
+    }
+  });
+
+  it("QA-1.5-12: GC lifts the omr lock only for a dead owner, a stale heartbeat or its own pid's reason", async () => {
+    const DEAD = 111111;
+    const LIVE = 222222;
+    const deadOwn = join(tmp, `omr-ref-${DEAD}-00000000000000d1`);
+    const liveOwn = join(tmp, `omr-ref-${LIVE}-00000000000000d2`);
+    const liveStale = join(tmp, `omr-ref-${LIVE}-00000000000000d3`);
+    const otherPid = join(tmp, `omr-ref-${DEAD}-00000000000000d4`);
+    const lockedAdd = (wt: string, pid: number) =>
+      git(repo, "worktree", "add", "-q", "--detach", "--lock", "--reason", referenceLockReason(pid), wt, "HEAD");
+    await lockedAdd(deadOwn, DEAD);
+    await lockedAdd(liveOwn, LIVE);
+    await lockedAdd(liveStale, LIVE);
+    await lockedAdd(otherPid, LIVE); // an omr reason naming another pid is not this entry's own
+    const old = new Date(Date.now() - 2 * 60 * 60 * 1000);
+    await fsp.utimes(liveStale, old, old); // heartbeat stopped an hour ago: PID reuse
+
+    const report = await gcStaleReferences(repo, deps({ isAlive: (pid) => pid === LIVE }));
+    const lower = (dirs: readonly string[]) => dirs.map((d) => d.toLowerCase()).sort();
+    expect(lower(report.removed)).toEqual(lower([deadOwn, liveStale]));
+    expect(lower(report.kept)).toEqual(lower([liveOwn, otherPid]));
+    expect(report.failed).toEqual([]);
+    for (const gone of [deadOwn, liveStale]) expect(await exists(gone)).toBe(false);
+    for (const kept of [liveOwn, otherPid]) expect(await exists(kept)).toBe(true);
+    const list = await git(repo, "worktree", "list", "--porcelain");
+    expect(list).not.toContain("00000000000000d1");
+    expect(list).not.toContain("00000000000000d3");
+
+    // Test cleanup of the kept, junction-free worktrees (not the module under test).
+    for (const wt of [liveOwn, otherPid]) {
       await git(repo, "worktree", "unlock", wt);
       await git(repo, "worktree", "remove", "--force", wt);
     }
