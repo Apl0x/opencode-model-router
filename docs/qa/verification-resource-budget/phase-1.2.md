@@ -1161,3 +1161,114 @@ on Linux under WSL.
 - **QA-1.2-27.** Resolution: 024640e — the POSIX late kill now signals `-pgid` only while `ownsTracked(pid, trackToken)` holds, so a new run that took the recycled id (and overwrote the entry) is skipped. The residual comment is narrowed to groups that do not belong to a run of this process. Tests: a map-level test that runs on every platform replays track(old) → track(new) and checks the old run no longer owns the entry. A POSIX-only real-process test (`runIf(!isWin)`) overwrites a live run's entry, aborts, and asserts there is no group-kill note and the holder is still alive. It is **not run on this Windows host**.
 
 Verification (Windows 11, node): `npx vitest run --maxWorkers=2 test/unit/exec.test.ts` twice, 41 passed | 2 skipped (43) both times; `npm run typecheck` clean. No fixture or stand-in processes were left afterwards.
+
+## QA re-review (round 6)
+
+Reviewer: heavy QA, adversarial re-review of the round-5 fixes, `git diff db7ba68..2529f85` on
+`vrb/p12` (`dcf5ff7`, `a945e5e`, `024640e`, `2529f85`: `src/verify/exec.ts`,
+`test/unit/exec.test.ts`, `test/fixtures/exec/host.mjs` and this file), under node and
+**Bun 1.3.14**. The POSIX-only test was run on Linux under WSL.
+
+**Setup.**
+- Hosts:
+  - Windows 11, node v24.21.0, bun 1.3.14.
+  - WSL 2 Ubuntu (8 CPUs), node v25.9.0.
+- `npx vitest run --maxWorkers=2 test/unit/exec.test.ts` was run once (node, Windows):
+  **41 passed, 2 skipped** (43 in total), 40.44 s.
+- `npm run typecheck` is clean (exit 0).
+- The repro scripts lived in `%TEMP%\omr-qa12r6` (and `/tmp/omr-qa12r6` in WSL) and have been
+  removed. Afterwards, a `Win32_Process` query on the scratch, fixture and stand-in names matched
+  nothing, and so did `ps` in WSL. The worktree is unchanged.
+  - `standin.exe` was a `bun build --compile` sweeper stand-in, set through
+    `setSweeperExecutableForTests`. It reads its behaviour from the environment it inherits and
+    logs each event with a timestamp. The modes were:
+    - `late-kill`: print `pinned 1`, kill the holder when `kill` arrives, report it 2500 ms later;
+    - `fast-kill`: the same, but report at once;
+    - `unpinned`: print no marker for 5 s, kill nothing;
+    - `pinned-nokill-late`: print `pinned 1`, kill nothing, exit 2500 ms after `kill` without
+      reporting a PID;
+    - `pinned-nokill-fast`: the same, but exit at once.
+  - `repro.mjs` ran `runArgv(node, [tree.cjs, "early-exit", dir])` and aborted 500 ms after the
+    direct child's exit, when the sweeper was armed. In the modes whose stand-in kills nothing,
+    it released the holder right after the abort, so the holder ended on its own inside the
+    grace. The times below are measured from the abort.
+  - Mutants were built in a `git archive` copy of `2529f85` (Windows: `node_modules` linked to the
+    worktree's; WSL: `npm ci` for Linux). Only the copies were edited.
+
+**Result.**
+- QA-1.2-24, -25, -26 and -27 are verified. The new POSIX-only test ran on Linux, and it
+  passes. With the guard removed, it fails.
+- The QA-1.2-24 rule is judged sound: count a kill only when the sweep pinned trees.
+  - It never marks a run that finished before its deadline as killed.
+  - It counts a slow sweep that pinned trees as a kill even when that sweep ended nothing. That
+    is the fail-closed side, and it is accepted, but the header's contract now misstates it
+    (QA-1.2-28).
+- There are 2 new findings, both nits and both introduced by `dcf5ff7`:
+  - QA-1.2-28 (documentation);
+  - QA-1.2-29 (a test gap).
+- The DoD (zero open findings) is **not met**.
+
+### Round-5 findings
+
+| Finding | Status | Evidence |
+|---|---|---|
+| QA-1.2-24 | verified; wording: QA-1.2-28; test gap: QA-1.2-29 | **Code.**<br>• `onGrace` (`exec.ts:280-287`) takes the new branch only when `closed && sweepPending && sweeper.pinnedCount() > 0`. It sets `killed` and pushes `[orphan sweep still reporting at settle: it may have ended what held the pipes]`.<br>• `pinnedCount` (`:600-604`) reads the first `pinned <n>` line. A partial or non-integer line counts as 0.<br>• A settle through the branch unrefs the sweep that is still in flight (`:233`). Its later report is dropped by `finish`'s `settled` check.<br>**The fix, node and bun** (`repro.mjs` with `standin.exe`):<br>• `late-kill`, 3 runs under node: the holder died at +189, +58 and +78 ms. The run settled at +2009, +2008 and +2006 ms as `{ code: 1, timedOut: true }`, with the still-reporting note as its only stderr. The stand-in reported at +2697, +2566 and +2570 ms.<br>• `late-kill`, 3 runs under bun: the same result, settled at +2013, +2017 and +2012 ms.<br>• `fast-kill`, the control: `[killed 1 process tree(s)…]` at +77 ms (node) and +103 ms (bun).<br>**The implementer's choice to leave an unpinned sweep as a natural exit.**<br>• `unpinned`, 2 runs each under node and bun: the holder ended on its own at +29 to +61 ms. The run settled at the grace (+2009 to +2015 ms) as `{ code: 0, stdout: "", stderr: "", timedOut: false }`. So the QA-1.2-10 no-op holds with the sweep still pending at the grace.<br>• The choice is correct. The real script prints the marker before it reads `kill`, and kills only after that (`:582-585`). `[Console]::Out` flushes each line. A sweep with no marker has therefore killed nothing.<br>**Can a clean run now read as killed? No.**<br>• A run whose pipes close before a kill settles at `close`, because no sweep is pending (`:348-349`).<br>• A settled run ignores the kill (`:292`), and `finish` clears the timer and the abort listener (`:224-227`).<br>• So the branch is reachable only after a deadline or abort that found the pipes still held.<br>**Can a run whose sweep ended nothing read as killed? Yes, by design.** This is QA-1.2-28.<br>• `pinned-nokill-late`: the holder ended on its own (node +78/+61 ms, bun +78/+30 ms). The stand-in exited 2500 ms later without killing or reporting anything. Every run settled at the grace as `{ code: 1, timedOut: true }` with the still-reporting note.<br>• `pinned-nokill-fast`: the same events, with the report on time. The runs settled at +96 and +90 ms (node) and +51 ms (bun) as `{ code: 0, timedOut: false }` with empty stderr.<br>• The ambiguity is the mirror image of QA-1.2-24: at the grace, "the sweep's kill closed the pipes" and "the holder ended on its own" cannot be told apart. Counting it as a kill fails closed, which is the right side for a verifier. It needs a leftover still holding the pipes at the deadline, which ends on its own within 2 s, while PowerShell takes more than 2 s to report.<br>**The test discriminates.** Mutant B disables the branch (`else if (false)`). The QA-1.2-24 test then fails with `expected { code: +0, stdout: '', …(2) } to match object { code: 1, timedOut: true }`, as the resolution says. |
+| QA-1.2-25 | verified | The `.cmd` test's `t.cmd` run uses `timeoutMs: 60_000` (`exec.test.ts:725`), inside a 130 s vitest timeout (`:729`). Two runs of 60 s, each with the 2 s grace, stay under 130 s. The test passed in the gating run. |
+| QA-1.2-26 | verified; the tests are not weakened | **Code.**<br>• Both tests record `settledIn`. They then poll the holder with `waitForExit` until G4's bound: `start + 3000 + 3000` (`:432`) and `abortedAt + 3000` (`:456`). They still assert `settledIn` below the same bounds, and `{ code: 1, timedOut: true }`.<br>• `LEFTOVER_KILLED` (`:419`) also accepts the force-close note and the still-reporting note.<br>**What still proves the kill.**<br>• The holder ends on its own only when released (in `finally`, after the assertions) or after 20 s (`tree.cjs`). Inside the bound, only the sweep (Windows) or the group kill (POSIX) can end it.<br>• Mutant C disables `sweep()` (`if (swept \|\| !pid \|\| true) return`). Both tests then fail, at `exec.test.ts:432` and `:456` (`expected false to be true`, the `waitForExit` line). The force-close note and `timedOut: true` alone do not let them pass.<br>• Linux: both tests pass (3005 ms and 657 ms). The group-kill note matches `LEFTOVER_KILLED`. |
+| QA-1.2-27 | verified | **Code.** The late kill signals `-pid` only when `pid && !groupGone && ownsTracked(pid, trackToken)` (`exec.ts:307`). `ownsTracked` (`:458-461`) is also what `untrack` uses now.<br>**The guard never skips one of this run's own groups.**<br>• The run's own entry leaves the map in three ways, and none of them needs the late kill: (1) at `exit`, only with `groupGone` set, which the guard already excludes; (2) at settle, after which `kill` returns early; (3) in the exit hook, when opencode is exiting.<br>• An overwrite needs the same id in a new group. Linux and the BSDs do not hand out an id while a process group still uses it. So a skipped group is never this run's own.<br>**Linux (WSL).**<br>• The test file ran on a `git archive` copy with Linux dependencies (`npm ci`): **35 passed, 8 skipped** (43). The POSIX-only test "a late kill skips a process group whose entry another run now owns" passed in 2758 ms: the abort, then the 2 s grace, force-closing the streams the holder still held.<br>• Mutant D removed `ownsTracked(pid, trackToken) &&` (`sed`). The POSIX test then fails with `expected '[killed the process group left runnin…' not to match /killed the process group/`, so it discriminates. The map-level test still passes, as expected: it checks only the map.<br>• Round 5 showed with `ns_last_pid` that a real recycle overwrites the entry. The guard reads exactly that overwrite.<br>**The comment** (`:439-443`) now limits the residual to groups that are not runs of this process. That is accurate. |
+
+### Bun compatibility (additions to round 5)
+
+| Aspect | node v24.21.0 | bun 1.3.14 | Verdict |
+|---|---|---|---|
+| A pinned sweep reporting after the grace (`late-kill`) | `code 1, timedOut: true`, still-reporting note (3/3) | the same (3/3) | same |
+| An unpinned sweep pending at the grace (`unpinned`) | natural `code 0`, empty stderr (2/2) | the same (2/2) | same |
+| A pinned sweep that ended nothing, reporting late or on time | late: `timedOut: true`; on time: `code 0` | the same | same (QA-1.2-28 applies to both) |
+
+The `late-sweeper` host mode wraps `spawn` and runs under node only, like `hung-sweeper`. The
+table above covers Bun for QA-1.2-24 through the compiled stand-in. QA-1.2-27 is map logic in JS,
+with no runtime API in the new code. It was not run under Bun on Linux.
+
+### New findings
+
+| ID | Severity | Where | Evidence | Fix |
+|---|---|---|---|---|
+| QA-1.2-28 | nit (documentation; introduced by `dcf5ff7`) | `exec.ts:21-23` (the header's G4 bullet) and `:44` (`ShellResult.timedOut`) | **The documented contract no longer matches the code.**<br>• The header says "`timedOut` is true exactly when the deadline or abort had to end something … An abort that finds nothing left running is a no-op: the natural result stands". `ShellResult.timedOut` says "True when the deadline or the abort signal ended the command".<br>• Since `dcf5ff7`, a sweep that pinned trees and is still reporting at the grace counts as a kill even when it ended nothing. The code comment (`:281-284`) and the note ("it *may* have ended") say so; the contract does not.<br>**Measured** (`pinned-nokill-late`, node and bun): the holder ended on its own at +30 to +78 ms and the sweep killed nothing, yet the result was `{ code: 1, timedOut: true }`. With the report on time, the same events gave `{ code: 0, timedOut: false }`.<br>**The behaviour is right.** See the QA-1.2-24 row: it is the fail-closed side of an ambiguity that cannot be resolved at the grace. Only the wording is wrong. A caller or the 3.2 G4 wording that relies on "exactly" would be misled. | 1. In the header bullet, replace "exactly when" with a rule that names the ambiguity. For example: "`timedOut` is true when the deadline or abort had to end something. A case that cannot be told apart counts as a kill (fail-closed): on Windows, the grace settling the run while a sweep that pinned trees is still reporting."<br>2. Make `ShellResult.timedOut` match.<br>3. 3.2's G4 wording (deferred) should carry the same sentence.<br>This is a comment-only change. |
+| QA-1.2-29 | nit (test-only; a gap in the `dcf5ff7` test) | `exec.ts:280` (`sweeper.pinnedCount() > 0`); `test/unit/exec.test.ts:490-506` and `:599-621` | **The condition that keeps QA-1.2-10 a no-op has no deterministic test.**<br>• Mutant A drops `&& sweeper.pinnedCount() > 0`, so any sweep still pending counts as a kill. `-t "process lifecycle"` then gives **10 passed, 33 skipped**: no test fails.<br>• `repro.mjs unpinned` against mutant A gives `{ code: 1, timedOut: true }` with the still-reporting note at +2002 ms, for a run whose holder ended on its own at +78 ms. The code under review gives `{ code: 0, timedOut: false }`.<br>**Why the suite misses it.** The QA-1.2-10 test (`:490-506`) reaches the branch only when real PowerShell takes more than 2 s after the abort to print `pinned 0`. Idle, it reports first, and `onSwept` settles the run. So a regression would pass CI and then fail QA-1.2-10 under load, the pattern of QA-1.2-22 and QA-1.2-26. | Add the negative case beside the `late-sweeper` test. For example, a `host.mjs` mode, or an option to `late-sweeper`, whose stand-in prints no marker for longer than `KILL_GRACE_MS` and kills nothing, with the holder released right after the abort. Assert `{ code: 0, stderr: "", timedOut: false }` and that the run settled at or after the grace, which proves the branch was reached. This is a test-only change. |
+
+### Checked, no finding
+
+- **Late-marker ordering.** For the branch to miss a real kill, node would have to see the
+  child's pipes close before the sweeper's `pinned <n>` line. The marker is written before the
+  sweeper reads `kill`, so it is on the pipe before any kill. In every `late-kill` run, the
+  stand-in logged the marker 8–11 ms before it read `kill`, and the result counted the kill.
+- **`host.mjs` `late-sweeper`.**
+  - The stand-in gets the scratch dir as `process.argv[1]` (`node -e <script> <dir>`). It kills
+    through `process.kill` (TerminateProcess), not taskkill.
+  - It reports 2500 ms after `kill`, which is at least 500 ms after the grace.
+  - The host aborts 500 ms after the child's exit, when the stand-in is already armed.
+  - In the node `late-kill` runs, the holder was dead 58–189 ms after the abort, far inside the
+    2 s grace.
+  - A saturated machine could still push the kill past the grace, as with the other
+    lifecycle tests. That is 3.1's loaded run (deferred).
+- **The QA-1.2-27 POSIX test's own bookkeeping.**
+  - `finally` untracks the stand-in entry, so no entry for a live group is left behind. With
+    `child = 0`, the untrack is a no-op.
+  - `t.childExited()` waits until the child is reaped (the test process is its parent), plus
+    300 ms, so the run has seen `exit` before the abort.
+- **`trackingForTests` gains `ownsTracked`.** Its reachability is unchanged from round 5: it is
+  test-only, and no production importer uses it.
+- **The gating run matches the round-5 verification** (41 passed | 2 skipped). No new test is
+  load-sensitive beyond what 3.1 already covers.
+
+### Deferred by plan (not open)
+
+- **deferred by plan (3.1):** unchanged from round 4: the Bun smoke, the loaded run and the
+  coverage gate.
+- **deferred by plan (3.2):** unchanged from round 4 (QA-1.2-12, the G4 wording and risk-table
+  row, the QA-1.2-20 plan wording, the round-3 known limit, QA-1.2-21 item 2). QA-1.2-28 item 3
+  adds one sentence to the G4 wording.
+- **deferred by plan (2.1):** QA-1.2-13, unchanged.
+
+**Status: phase 1.2 QA is NOT CLEAN.** QA-1.2-28 and QA-1.2-29 (both nits) are open.
+QA-1.2-24 through QA-1.2-27 are verified.
