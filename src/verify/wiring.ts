@@ -918,8 +918,9 @@ export function createVerificationWiring(deps: {
         const r = await git(gitRoot, ["ls-files", "-z", "--cached", "--others", "--exclude-standard", "--", ...names.map(n => `:(glob)**/${n}`)]);
         return r && r.code === 0 ? splitZ(r.stdout).map(rel => resolve(gitRoot, rel)) : undefined;
       },
-      async findByContent(gitRoot, needle, globs) {
-        const r = await git(gitRoot, ["grep", "-l", "-z", "-F", "--untracked", "-e", needle, "--", ...globs]);
+      async findByContent(gitRoot, needle, globs, options) {
+        const word = options?.word === true ? ["-w"] : [];
+        const r = await git(gitRoot, ["grep", "-l", "-z", "-F", ...word, "--untracked", "-e", needle, "--", ...globs]);
         if (!r) return undefined;
         if (r.code === 1) return [];
         return r.code === 0 ? splitZ(r.stdout).map(rel => resolve(gitRoot, rel)) : undefined;

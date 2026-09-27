@@ -778,6 +778,14 @@ describe("gate seams", () => {
       state.argvImpl = async () => { throw new Error("spawn ENOENT"); };
       expect(await s.findByContent(root, "needle", ["*.test.ts"])).toBeUndefined();
     });
+    it("E2E-1: findByContent with word adds git grep -w (a pytest module name as a whole word)", async () => {
+      const s = search();
+      reply(0, "tests/test_mod02_1.py\0");
+      expect(await s.findByContent(root, "mod02", [":(glob)**/test_*.py", ":(glob)**/conftest.py"], { word: true })).toEqual([resolve(root, "tests/test_mod02_1.py")]);
+      expect(state.commands[0]).toBe(`git --no-optional-locks -C ${root} grep -l -z -F -w --untracked -e mod02 -- :(glob)**/test_*.py :(glob)**/conftest.py`);
+      reply(1); expect(await s.findByContent(root, "mod02", ["*.py"], { word: false })).toEqual([]);
+      expect(state.commands[1]).toBe(`git --no-optional-locks -C ${root} grep -l -z -F --untracked -e mod02 -- *.py`);
+    });
     it("a deadline bounds each search and a spent or aborted one runs no git", async () => {
       const ctl = new AbortController(); reply(0, "a.test.ts\0");
       expect(await search(fakeDeadline(2_500, ctl)).findByName(root, ["a.test.ts"])).toEqual([resolve(root, "a.test.ts")]);
