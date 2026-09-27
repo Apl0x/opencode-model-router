@@ -119,3 +119,75 @@ Open question for QA and the orchestrator: T11 describes the native `task` re-di
 rejection. The new dispatch's reference already contains the failed attempt's changes, as with the
 1.14 baseline. The candidate mitigation lives in 2.4's registry, which knows the orchestrator
 session.
+
+## QA findings (round 1)
+
+Scope: `git diff 5a79c0b..HEAD` on `vrb/p21` (tip `5dd3c35`). Reviewer: adversarial senior-engineer
+review, CAP:none.
+
+**Runs:**
+- The nine scoped test files named in the dispatch: 9 files, 388 passed.
+- `npm run typecheck`: clean.
+
+**Real-process repro:** `%TEMP%\opencode\qa21\repro-retry.ts`, run under Bun 1.3.14. It uses:
+- a real git repository in `%TEMP%`, with vitest through a `node_modules` junction;
+- the real `createChangedFileStore`, `createVerificationWiring` (snapshot, capture, planner, scope
+  opener, argv/shell seams) and `runDeterministic`.
+
+The scratch directory and the junction were removed afterwards. No `omr-ref-*` or `omr-verify-*`
+entries were left in `%TEMP%`.
+
+**Mutation check:** run in a scratch copy of the worktree, never in the worktree itself. Each mutant
+was run against the same nine test files. Result: 19 killed, 0 survived; one mutant was skipped
+because its pattern was ambiguous. The killed mutants were:
+- G1 excuse without a complete inventory;
+- an un-rerun file treated as preexisting;
+- an id-level report id treated as preexisting;
+- non-inert `unreproduced` inputs ignored;
+- a rerun with `total === 0`, one with `complete === false`, and one with a `collectionError`,
+  each accepted;
+- the vanished-dir check removed;
+- the recheck threshold set to 0;
+- `readResult` skipped after a spawn throw;
+- a retry that recaptures;
+- contamination ignored;
+- the native `task` gate left without `withTimeout`;
+- `failureRecheck: false` still rechecking;
+- full-mode keys not filtered to existing files;
+- `lowPriority` dropped;
+- the full-mode `collectionError` dropped;
+- a capture made while `failureRecheck` is off;
+- the per-run abort after a timeout dropped.
+
+The tests are strong on the verdict algebra and the recheck. The two critical findings below are
+not in any test, because every test gives the store a complete change set.
+
+| id | severity | evidence | fix |
+|---|---|---|---|
+| QA-2.1-1 | critical | **False pass on a delegate retry.** `delta` (`dispatch.ts:222`) reads only `bySession.get(childID)`, the *current* attempt's tool edits. The snapshot part (`dispatch.ts:230-234`) adds only paths that were *not* listed at dispatch. `index.ts:594` passes the retry's `producerSid` as `childID`, while the reference stays the first dispatch's. So an attempt-1 edit to a file already dirty at dispatch drops out of the retry's change set, and the scoped run never selects its tests. Repro, scenario A: `src/a.js` is dirty at dispatch. Attempt 1 breaks it through the edit tool. Attempt 2 touches only `src/b.js`. Result: `A attempt2 {"changed":["\src\b.js",…],"ref":"captured","pass":true,"outcome":"pass"}`, while `full-suite truth: RED`. The pre-2.1 full-suite baseline caught this; S1 scoping made the change set safety-critical. | Attribute the *cumulative* change since the reference: `delta` unions the tool-observed files of every producer session of the dispatch (record each attempt's session against the dispatch id, or pass `producerSessions`). Add a wiring test: a retry after a rejection re-runs the tests of attempt 1's files. |
+| QA-2.1-2 | critical | **False pass on shell edits to already-dirty files.** `record()` gets nothing from `bash`/`shell` (`extractChangedFile` returns null). `delta` adds only snapshot paths absent at dispatch (`dispatch.ts:232-233`). So `sed -i`, codemods, formatters, `git checkout -- f` or `git rm` on a file that was dirty at dispatch are invisible, and an empty set is a pass (§1.5-6). Repro, scenario B: `src/a.js` is dirty (and green) at dispatch; the producer breaks it without a tool record. Result: `B bash-edit {"changed":[],"ref":"captured","pass":true,"outcome":"pass","notes":["no changed files, no affected tests"]}`, while `full-suite truth: RED`. The whole-tree `fingerprint` changed but is never consulted. | Give `TreeSnapshot` a per-path content identity for listed paths (e.g. `git hash-object` of each dirty or untracked file, or a per-path hash of `git diff HEAD -- <p>`). `delta` then adds every path whose identity changed or that left the list. Minimum fail-closed fallback: if `current.fingerprint !== snapshot.fingerprint` and a listed-at-both-times path cannot be proven unchanged, return `changeBaseline: "unavailable"` (the §1.5-6 S6 path). Add a real-git test of both cases. |
+| QA-2.1-3 | major | **The verdict waits for reference disposal, contrary to the design.** T2 P9 (`deterministic.ts:338-340`) and design note 12 say the last `close()` of a gate is `void`ed. The hook instead runs `await scope.close()` in its `finally` (`deterministic.ts:1278`), and `close()` waits for every tracked `ref.dispose()`: git worktree removal plus up to 5 EBUSY retries with 100-1600 ms backoff (`reference.ts:866-867, 1025`). No gate deadline covers dispose (`reference.ts:1191`, "Unset for dispose"). The rerun may use all remaining time (`rd.bound`), so dispose can run past `gateBudgetMs`. The gate's `withTimeout` then rejects *before* `runDeterministic` calls `onFailure`. `completedFailures` is empty, and a proven introduced failure (r1) becomes "verification gate timed out" (unverifiable), which is accepted with a caveat unless `strictUnverifiable`. | Implement P9 as designed: return the `TestsPassRun` and let `close()` settle in the background (the hold stays until disposal ends; T8 sequencing still needs the earlier checks' closes awaited). Or bound the awaited close by `deadline.remaining()`. Add a test: a scope whose `close()` never resolves still yields the r1 verdict. |
+| QA-2.1-4 | minor | **The deadline starts after `prepareVerification`.** Design note 11 and T2 P0 put the deadline before `prepareVerification`. Both call sites call `prepareVerification(…)` with no deadline (`index.ts:594`, `index.ts:1102`), then `createDeadline` (`index.ts:611`, `:1138`). So the grade snapshot (≤ 10 s, `GRADE_SNAPSHOT_TIMEOUT_MS`) and the wait for a still-pending capture (≤ `baselineTimeoutMs`) run outside `gateBudgetMs`. `REFERENCE_NONE.gateBudget` (`dispatch.ts:207-209`) is unreachable in production. The wait is bounded, so this is not a hang. | Create the deadline before `prepareVerification` and pass it in both sites; or record the deviation and the extra ≤ 25 s worst case in the design notes. |
+| QA-2.1-5 | minor | **QA-1.2-13 is incomplete on the recheck side.** `buildGateDeps` calls `createScopeOpener({ argv: argvSeam, … })` with no `reference` (`wiring.ts:403`), so `refDeps.argv` is the raw seam (`deterministic.ts:887-892`). `reference.ts` `runGit` sets no `lowPriority` (`reference.ts:1137`). So GC, materialize and dispose git processes inside the hold run at normal priority. The capture (`wiring.ts:388`) and the start-up GC (`wiring.ts:478`) do wrap the seam. | Pass `reference: { argv: <lowPriority-wrapped argvSeam> }` in `buildGateDeps`, or have `createScopeOpener` wrap `refDeps.argv` with `budget.lowPriority`. Assert this through the argv seam in a recheck test. |
+| QA-2.1-6 | info | **Native `task` re-dispatch after a rejection** (T11 residual, the open question above). The new dispatch captures a reference that contains the rejected attempt, so that attempt's introduced failures read as preexisting (pass, n2 note "suite is NOT green"). This is the same class as the 1.14 baseline. The delegate ladder is not affected: it keeps its first reference (mutant "retry recaptures" killed). QA-2.1-1 is the separate change-set gap. | Orchestrator decision. The mitigation (link the re-dispatch to the rejected dispatch's reference through 2.4's registry) is not in the plan text for 2.4. Schedule it explicitly, or accept it in the plan as a residual. |
+| QA-2.1-7 | nit | **The acceptance grep is not literally met.** `rg "testBaseline\|baselines\.\|compareTests" src` also returns three comments outside `config.ts`: `deterministic.ts:526`, `deterministic.ts:624` and `types.ts:152`. | Reword the two `deterministic.ts` comments. `types.ts:152` is in the frozen 2.1.1 block: record it as an accepted exception. |
+| QA-2.1-8 | info | **Duplicate change-set entries under a Windows 8.3 short-name directory.** `pathKey` does not canonicalise short names. A tool-observed path under `C:\Users\MARQUI~1\…` and the realpath'd snapshot path of the same file are two entries; the repro printed `\src\b.js` and `C:\Users\Marquinho\…\src\b.js` for one file. The snapshot's status and `previousPath` then do not override the tool entry (`dispatch.ts:221-228`). This fails safe (wider scope), but a deletion seen through the short spelling keeps status `modified`. | Key by the realpath of the dispatch cwd (or a root-relative path), or canonicalise tool paths through native `realpath` of their parent. |
+| QA-2.1-9 | info | **A live `node_modules` that is itself a junction is not usable at the reference.** Repro scenario A, attempt 1: the recheck returned `reference unusable (rerun-unplannable): runner not installed: vitest` (unverifiable; fails closed). The cause was not isolated; most likely materialize does not link a `node_modules` that is itself a link. | None required unless linked-`node_modules` layouts are supported; if so, follow the link when materialize links `node_modules`. |
+| QA-2.1-10 | nit | **`INERT_UNREPRODUCED` matches the last path segment anywhere** (`deterministic.ts:752-774`). An ignored `test/fixtures/logs/` directory, or an ignored `*.log` fixture that a test reads, therefore counts as inert. T4.f asks for evidence that tests cannot read an inert entry. | Anchor the directory patterns (e.g. `coverage/` and `.nyc_output/` at a package root), or exclude paths under test directories. Low priority. |
+
+**Handoffs checked with no finding:**
+- QA-1.3-16 and -17 (mutants killed).
+- QA-1.5-7 (except QA-2.1-10) and QA-1.5-4 (mutants killed).
+- QA-1.5-10: GC, then materialize, both inside the hold (`deterministic.ts:1099-1116`).
+- PlannerFs: native `realpath`, `stat` with bigint, `readdir` (`wiring.ts:236-241`).
+- TestSearchSeam: `git ls-files` / `git grep` through argv, low priority, deadline-bound (`wiring.ts:253-281`).
+- `previousPath` and `TreeSnapshot.root` (`tree.ts`).
+- `warnDeprecatedVerifyKeys` after every plugin-path `loadConfig` (`index.ts:115` and `:131` are the persistence helpers).
+- The `captureWaitMs` clamp (`config.ts`).
+- `tiers.json` `gateBudgetMs` removed.
+- QA-1.5-25: no per-call `maxBuffer` (`wiring.ts:204-220`).
+- No test command at dispatch: `captureDepsFor` only calls `captureReference`.
+- Native `task` gate: `withTimeout`, abort and `unverifiableGateResult` (mutant killed).
+- Every deadline, timer and listener is disposed or removed on each path read.
+
+**Status: NOT CLEAN.** QA-2.1-1 and -2 are critical false passes on the default config.
