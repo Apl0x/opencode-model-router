@@ -358,21 +358,30 @@
 //   F.1 node (QA-1.3-18). The plugin runtime is Bun, and a compiled opencode reports itself as
 //     process.execPath; jest 30 fails every suite under bun.exe ("Attempted to assign to readonly
 //     property"). So the JS tools never inherit the runtime blindly:
-//       1. host.nodePath when given (absolute; otherwise S6 node-not-found).
+//       1. host.nodePath when given (absolute, and on win32 with a drive or UNC host; otherwise
+//          S6 node-not-found "node path is not absolute: <p>"; with PlannerFs.stat, not an
+//          existing file -> "node path is not a file: <p>").
 //       2. host.execPath when its basename is node or node.exe. The DEFAULT execPath
-//          (process.execPath) also needs process.versions.bun to be undefined.
-//       3. The first node on an absolute host.pathEnv entry: posix "<dir>/node"; win32
-//          "<dir>\node<ext>" for each PATHEXT ext in order (the shell's rule). A win32 hit that is
-//          not .exe (node.cmd, node.bat) needs a shell -> S6 node-not-found "node on PATH is not an
-//          executable file: <f>". A hit whose realpath is bun or bun.exe (the temporary node link
-//          `bun run` creates when node is missing) is skipped. fileExists and realpath only.
+//          (process.execPath) also needs process.versions.bun to be undefined. With
+//          PlannerFs.stat it must be an existing file, else step 3.
+//       3. The first node on a usable host.pathEnv entry: posix "<dir>/node"; win32
+//          "<dir>\node<ext>" for each PATHEXT ext in order (the shell's rule). A usable entry is
+//          absolute and, on win32, starts with a drive ("C:\") or a UNC host: a root-relative
+//          "\Users\..." resolves against whichever drive is current (QA-1.3-36). A hit that stat
+//          reports as a directory is skipped (QA-1.3-36). A win32 hit that is not .exe (node.cmd,
+//          node.bat) needs a shell -> S6 node-not-found "node on PATH is not an executable file:
+//          <f>". Bun's temporary node is skipped three ways (QA-1.3-18, QA-1.3-30): its
+//          directory is named bun-node-<hex> (%TEMP%\bun-node-0d9b296af); its realpath is bun or
+//          bun.exe (posix symlink); or stat gives it the dev and ino of host.execPath, the
+//          non-node runtime (the win32 hard link, nlink=4). fileExists, realpath and stat only.
 //       4. Nothing -> S6 node-not-found "node not found: no absolute PATH entry has a node
 //          executable".
 //     Only JS tools resolve node, after their package entry (a missing package is reported
 //     first). pytest and uv are native executables.
 //   pytest (launcher "direct"): the first PATH hit, then a venv.
-//     - PATH: for each ABSOLUTE entry of host.pathEnv split by P.delimiter (relative entries such
-//       as "." are skipped), check win32 "<dir>\pytest.exe" or posix "<dir>/pytest".
+//     - PATH: for each usable entry of host.pathEnv split by P.delimiter (F.1 step 3: relative
+//       entries such as "." and win32 root-relative ones are skipped), check win32
+//       "<dir>\pytest.exe" or posix "<dir>/pytest"; a hit stat reports as a directory is skipped.
 //     - venv fallback: for dir = runnerCwd ... gitRoot, check win32 ".venv\Scripts\pytest.exe" or
 //       posix ".venv/bin/pytest", and add the note `pytest resolved from <path>`.
 //     - Nothing found -> S6 runner-not-installed "pytest".
@@ -797,7 +806,8 @@
 //      add runner options (the same trust as `npm test` today), but they cannot choose the
 //      program. The package.json that supplied the script is a config trigger, so a producer
 //      that rewrites the script gets S6 instead of a run of its own command.
-//   7. Paths that leave gitRoot are dropped, and PATH entries must be absolute. Outside gitRoot,
+//   7. Paths that leave gitRoot are dropped, and PATH entries must be absolute (win32: with a
+//      drive or UNC host, QA-1.3-36). Outside gitRoot,
 //      the module reads only the runner's own package under node_modules, executables on
 //      absolute PATH entries, and the pytest config candidates pytest itself would read above
 //      gitRoot (D.4).
@@ -1343,7 +1353,9 @@ function makeCtx(h: Partial<RunnerHost> | undefined): Ctx {
   const P = win ? nodePath.win32 : nodePath.posix;
   const named = /^node(?:\.exe)?$/.test(win ? P.basename(host.execPath).toLowerCase() : P.basename(host.execPath));
   // F.1: an explicit execPath is trusted by name; the default also needs a runtime that is not Bun.
-  const execIsNode = named && (h?.execPath !== undefined || process.versions.bun === undefined);
+  // Neither may sit in Bun's temporary bun-node-<hex> directory (QA-1.3-30: `bun --bun run`).
+  const bunDir = BUN_NODE_DIR_RE.test(P.basename(P.dirname(host.execPath)));
+  const execIsNode = named && !bunDir && (h?.execPath !== undefined || process.versions.bun === undefined);
   const cache = { texts: new Map(), parsed: new Map(), exists: new Map() };
   return { host, P, win, key: (p: string) => (win ? p.toLowerCase() : p), execIsNode, cache };
 }
@@ -2812,9 +2824,9 @@ async function resolveEntryImpl(
   const exe = (name: string) => (ctx.win ? `${name}.exe` : name);
   const onPath = async (name: string): Promise<string | undefined> => {
     for (const dir of ctx.host.pathEnv.split(P.delimiter)) {
-      if (!dir || !P.isAbsolute(dir)) continue;
+      if (!dir || !isFullPath(ctx, dir)) continue;
       const f = P.join(dir, exe(name));
-      if (await fs.fileExists(f)) return f;
+      if ((await fs.fileExists(f)) && (await statOf(fs, f))?.isFile !== false) return f;
     }
     return undefined;
   };
@@ -2830,7 +2842,7 @@ async function resolveEntryImpl(
     const venvRel = ctx.win ? P.join(".venv", "Scripts", "pytest.exe") : P.join(".venv", "bin", "pytest");
     for (const d of ancestors(ctx, cwd, req.gitRoot)) {
       const f = P.join(d, venvRel);
-      if (await fs.fileExists(f)) return { entry: { file: f, prefix: [], entry: f }, notes: [`pytest resolved from ${f}`] };
+      if ((await fs.fileExists(f)) && (await statOf(fs, f))?.isFile !== false) return { entry: { file: f, prefix: [], entry: f }, notes: [`pytest resolved from ${f}`] };
     }
     return s6("runner-not-installed", "runner not installed: pytest");
   }
@@ -2873,27 +2885,67 @@ async function resolveEntryImpl(
  * F.1 (QA-1.3-18): the node executable that runs a JS tool. Never Bun or a compiled binary:
  * jest fails every suite under bun.exe. Order: host.nodePath, host.execPath when it is node, then
  * the first node on an absolute PATH entry. On win32 each PATHEXT extension is tried in order, as
- * the shell does; a hit that is not a .exe (a .cmd/.bat shim) needs a shell -> S6. A PATH node that
- * realpaths to bun (Bun's temporary node link) is skipped. fileExists only, nothing is spawned.
+ * the shell does; a hit that is not a .exe (a .cmd/.bat shim) needs a shell -> S6. Bun's temporary
+ * node is skipped by its bun-node-<hex> directory, a realpath to bun (symlink), or the same dev/ino
+ * as host.execPath (the win32 hard link, QA-1.3-30); a directory named node is skipped and a
+ * root-relative win32 PATH entry is unusable (QA-1.3-36). fileExists, realpath and stat only,
+ * nothing is spawned.
  */
 async function resolveNode(ctx: Ctx, fs: PlannerFs): Promise<string | Unverifiable> {
   const { P, host } = ctx;
   if (host.nodePath !== undefined) {
-    return P.isAbsolute(host.nodePath) ? host.nodePath : s6("node-not-found", `node path is not absolute: ${host.nodePath}`);
+    if (!isFullPath(ctx, host.nodePath)) return s6("node-not-found", `node path is not absolute: ${host.nodePath}`);
+    // QA-1.3-36: with the stat seam, a configured node must be an existing file.
+    const bad = fs.stat !== undefined && (await statOf(fs, host.nodePath))?.isFile !== true;
+    return bad ? s6("node-not-found", `node path is not a file: ${host.nodePath}`) : host.nodePath;
   }
-  if (ctx.execIsNode) return host.execPath;
+  if (ctx.execIsNode && (fs.stat === undefined || (await statOf(fs, host.execPath))?.isFile === true)) return host.execPath;
   const exts = ctx.win ? (host.pathExt ?? "").split(";").map((x) => x.trim().toLowerCase()).filter((x) => x.startsWith(".")) : [""];
+  // QA-1.3-30: the running runtime is not node here (Bun, or a compiled binary). A PATH node that
+  // is the same file (Bun's temporary node on win32 is a HARD link to bun.exe) is not node either.
+  let self: FileStat | undefined | null = null;
   for (const dir of host.pathEnv.split(P.delimiter)) {
-    if (!dir || !P.isAbsolute(dir)) continue;
+    if (!dir || !isFullPath(ctx, dir) || BUN_NODE_DIR_RE.test(P.basename(dir))) continue;
     for (const ext of exts) {
       const f = P.join(dir, `node${ext}`);
       if (!(await fs.fileExists(f))) continue;
+      const st = await statOf(fs, f);
+      if (st && !st.isFile) continue; // QA-1.3-36: a directory named node.exe.
       if (ctx.win && ext !== ".exe") return s6("node-not-found", `node on PATH is not an executable file: ${f}`);
       if (await isBunLink(ctx, fs, f)) break;
+      if (st && self === null) self = await statOf(fs, host.execPath);
+      if (st && self && sameFile(st, self)) break;
       return f;
     }
   }
   return s6("node-not-found", "node not found: no absolute PATH entry has a node executable");
+}
+
+/** QA-1.3-30: the directory `bun run` puts first on PATH with its temporary node (%TEMP%\bun-node-<hash>, /tmp/bun-node-<hash>). */
+const BUN_NODE_DIR_RE = /^bun-node-[0-9a-f]+$/i;
+
+/**
+ * N.1/N.7 (QA-1.3-36): a PATH entry or configured executable path the planner may use: absolute,
+ * and on win32 with a drive letter or a UNC host. A root-relative "\dir" is absolute to
+ * path.win32 but resolves against whichever drive is current (the plugin's for fileExists,
+ * spec.cwd's for the spawn), so it names no one file.
+ */
+function isFullPath(ctx: Ctx, p: string): boolean {
+  return ctx.P.isAbsolute(p) && (!ctx.win || /^[A-Za-z]:[\\/]|^[\\/]{2}[^\\/]+[\\/][^\\/]/.test(p));
+}
+
+/** PlannerFs.stat when the seam has it and the call succeeds; undefined otherwise. */
+async function statOf(fs: PlannerFs, p: string): Promise<FileStat | undefined> {
+  if (!fs.stat) return undefined;
+  return fs.stat(p).then(
+    (s) => s,
+    () => undefined,
+  );
+}
+
+/** The same file (hard links included): equal dev and ino. An ino of 0 (a file system without ids) proves nothing. */
+function sameFile(a: FileStat, b: FileStat): boolean {
+  return String(a.ino) !== "0" && String(a.dev) === String(b.dev) && String(a.ino) === String(b.ino);
 }
 
 /** A PATH node that is really Bun: `bun run` links a temporary `node` to itself when node is missing. */

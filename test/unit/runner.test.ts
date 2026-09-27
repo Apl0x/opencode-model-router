@@ -2933,3 +2933,106 @@ describe("QA-1.3-32: .npmrc keys as npm's ini parser reads them, and npx", () =>
     expectS6(await plan({ "/r/.npmrc": "x".repeat(CONFIG_SIZE_LIMIT + 1) }), "config-too-large");
   });
 });
+/** memFs plus a stat seam: `ids` gives a file's ino (the same ino = hard links), `dirs` are directories. */
+function statFs(files: Record<string, string>, win: boolean, ids: Record<string, number> = {}, dirs: string[] = []): PlannerFs {
+  const base = memFs(files, win);
+  const k = (p: string) => (win ? p.toLowerCase() : p);
+  const idOf = new Map(Object.entries(ids).map(([p, i]) => [k(p), i]));
+  const dirSet = new Set(dirs.map(k));
+  const auto = new Map<string, number>();
+  const inoOf = (p: string) => {
+    const known = idOf.get(k(p)) ?? auto.get(k(p));
+    if (known !== undefined) return known;
+    auto.set(k(p), 1000 + auto.size);
+    return 999 + auto.size;
+  };
+  return {
+    ...base,
+    fileExists: async (p) => dirSet.has(k(p)) || base.fileExists(p),
+    stat: async (p) => {
+      if (dirSet.has(k(p))) return { isFile: false, size: 0, dev: 1, ino: 5 };
+      if (!(await base.fileExists(p))) throw new Error(`ENOENT ${p}`);
+      return { isFile: true, size: 10, dev: 1n, ino: BigInt(inoOf(p)) };
+    },
+  };
+}
+
+describe("QA-1.3-30: Bun's temporary node is never taken for node", () => {
+  const BUN = "C:\\Users\\u\\.bun\\bin\\bun.exe";
+  const W = {
+    "C:\\repo\\.git": "",
+    "C:\\repo\\node_modules\\jest\\package.json": JEST_PKG,
+    "C:\\repo\\node_modules\\jest\\bin\\jest.js": "",
+    "C:\\repo\\src\\a.js": "",
+    [BUN]: "",
+    "C:\\Users\\u\\AppData\\Local\\Temp\\bun-node-0d9b296af\\node.exe": "",
+    "C:\\Tools\\hl\\node.exe": "",
+    "C:\\Program Files\\nodejs\\node.exe": "",
+  };
+  const plan = (host: Partial<RunnerHost>, fs: PlannerFs) =>
+    planScopedRun(input({ win: true, command: "jest", fs, cwd: "C:\\repo", changedFiles: changed("src\\a.js"), host: { ...WIN_HOST, ...host } }));
+  const PATH = "C:\\Users\\u\\AppData\\Local\\Temp\\bun-node-0d9b296af;C:\\Tools\\hl;C:\\Program Files\\nodejs";
+  const links = { [BUN]: 7, "C:\\Users\\u\\AppData\\Local\\Temp\\bun-node-0d9b296af\\node.exe": 7, "C:\\Tools\\hl\\node.exe": 7 };
+
+  it("a bun-node-<hex> directory is skipped, and so is a hard link to the runtime under any name", async () => {
+    expect(spec(await plan({ execPath: BUN, pathEnv: PATH }, statFs(W, true, links))).file).toBe("C:\\Program Files\\nodejs\\node.exe");
+    expectS6(await plan({ execPath: BUN, pathEnv: PATH.replace(";C:\\Program Files\\nodejs", "") }, statFs(W, true, links)), "node-not-found");
+  });
+
+  it("`bun --bun run`: an execPath named node.exe inside bun-node-<hex> is not node", async () => {
+    const host = { execPath: "C:\\Users\\u\\AppData\\Local\\Temp\\bun-node-0d9b296af\\node.exe", pathEnv: PATH };
+    expect(spec(await plan(host, statFs(W, true, links))).file).toBe("C:\\Program Files\\nodejs\\node.exe");
+    const posix = jsRepo({}, { "/r/src/a.js": "", "/tmp/bun-node-ab12/node": "", "/usr/bin/node": "" });
+    const s = spec(await planScopedRun(input({ command: "jest", files: posix, changedFiles: changed("src/a.js"), host: { ...POSIX_HOST, execPath: "/tmp/bun-node-ab12/node", pathEnv: "/tmp/bun-node-ab12:/usr/bin" } })));
+    expect(s.file).toBe("/usr/bin/node");
+  });
+
+  it("identity needs real ids: ino 0 or no stat for the runtime proves nothing", async () => {
+    const zero = { [BUN]: 0, "C:\\Tools\\hl\\node.exe": 0 };
+    expect(spec(await plan({ execPath: BUN, pathEnv: "C:\\Tools\\hl" }, statFs(W, true, zero))).file).toBe("C:\\Tools\\hl\\node.exe");
+    const { [BUN]: _b, ...noRuntime } = W;
+    expect(spec(await plan({ execPath: BUN, pathEnv: "C:\\Tools\\hl" }, statFs(noRuntime, true, links))).file).toBe("C:\\Tools\\hl\\node.exe");
+  });
+});
+
+describe("QA-1.3-36: executables must be files on full paths", () => {
+  const W = {
+    "C:\\repo\\.git": "",
+    "C:\\repo\\node_modules\\jest\\package.json": JEST_PKG,
+    "C:\\repo\\node_modules\\jest\\bin\\jest.js": "",
+    "C:\\repo\\src\\a.js": "",
+    "C:\\repo\\tests\\test_a.py": "",
+    "\\Users\\x\\node.exe": "",
+    "\\Users\\x\\pytest.exe": "",
+    "\\Users\\x\\uv.exe": "",
+    "\\\\srv\\share\\bin\\node.exe": "",
+    "C:\\Program Files\\nodejs\\node.exe": "",
+  };
+  const plan = (host: Partial<RunnerHost>, fs: PlannerFs = memFs(W, true), command = "jest", file = "src\\a.js") =>
+    planScopedRun(input({ win: true, command, fs, cwd: "C:\\repo", changedFiles: changed(file), host: { ...WIN_HOST, execPath: "C:\\b\\bun.exe", ...host } }));
+
+  it("win32 PATH entries need a drive or a UNC host", async () => {
+    expect(spec(await plan({ pathEnv: "\\Users\\x;C:\\Program Files\\nodejs" })).file).toBe("C:\\Program Files\\nodejs\\node.exe");
+    expect(spec(await plan({ pathEnv: "\\Users\\x;\\\\srv\\share\\bin" })).file).toBe("\\\\srv\\share\\bin\\node.exe");
+    expectS6(await plan({ pathEnv: "\\Users\\x" }, memFs(W, true), "pytest", "tests\\test_a.py"), "runner-not-installed", "runner not installed: pytest");
+    expectS6(await plan({ pathEnv: "\\Users\\x" }, memFs(W, true), "uv run pytest", "tests\\test_a.py"), "runner-not-installed", "runner not installed: uv");
+    expectS6(await plan({ nodePath: "\\Users\\x\\node.exe" }), "node-not-found", "node path is not absolute: \\Users\\x\\node.exe");
+  });
+
+  it("with stat, a directory named node.exe or pytest.exe is skipped, and a configured node must be a file", async () => {
+    const dirs = ["C:\\nd\\node.exe", "C:\\nd\\pytest.exe", "C:\\repo\\.venv\\Scripts\\pytest.exe"];
+    const fs = statFs(W, true, {}, dirs);
+    expect(spec(await plan({ pathEnv: "C:\\nd;C:\\Program Files\\nodejs" }, fs)).file).toBe("C:\\Program Files\\nodejs\\node.exe");
+    expectS6(await plan({ pathEnv: "C:\\nd" }, fs, "pytest", "tests\\test_a.py"), "runner-not-installed");
+    expectS6(await plan({ nodePath: "C:\\nd\\node.exe" }, fs), "node-not-found", "node path is not a file: C:\\nd\\node.exe");
+    expectS6(await plan({ nodePath: "C:\\missing\\node.exe" }, fs), "node-not-found", "node path is not a file: C:\\missing\\node.exe");
+    expect(spec(await plan({ nodePath: "C:\\Program Files\\nodejs\\node.exe" }, fs)).file).toBe("C:\\Program Files\\nodejs\\node.exe");
+  });
+
+  it("with stat, an execPath named node must exist; without stat it is trusted as before", async () => {
+    const host = { execPath: "C:\\missing\\node.exe", pathEnv: "C:\\Program Files\\nodejs" };
+    expect(spec(await plan(host, statFs(W, true))).file).toBe("C:\\Program Files\\nodejs\\node.exe");
+    expect(spec(await plan(host)).file).toBe("C:\\missing\\node.exe");
+    expect(spec(await plan({ ...host, execPath: "C:\\Program Files\\nodejs\\node.exe", pathEnv: "" }, statFs(W, true))).file).toBe("C:\\Program Files\\nodejs\\node.exe");
+  });
+});
