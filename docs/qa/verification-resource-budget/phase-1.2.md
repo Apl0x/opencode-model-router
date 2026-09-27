@@ -1152,3 +1152,12 @@ on Linux under WSL.
 
 **Status: phase 1.2 QA is not CLEAN.** QA-1.2-24 (minor) and QA-1.2-25, QA-1.2-26 and QA-1.2-27
 (nits) are open.
+
+### Round-5 resolutions
+
+- **QA-1.2-24.** Resolution: dcf5ff7 — `onGrace` now counts a run as killed when the pipes closed while the sweep was still reporting and the sweeper had already printed `pinned <n>` with n > 0. It sets `timedOut: true` (code 1) and appends `[orphan sweep still reporting at settle: it may have ended what held the pipes]`. A sweep that has not pinned anything yet leaves the natural result in place (QA-1.2-10). `Sweeper.pinnedCount()` reads the marker. Test: the `late-sweeper` host mode uses `setSweeperExecutableForTests` with a stand-in that pins 1, kills the holder at once and reports after 2500 ms. Without the fix it failed with `{ code: 0, timedOut: false }`; with the fix it passes.
+- **QA-1.2-25.** Resolution: a945e5e — the `.cmd` exit-code test's `lowPriority` `t.cmd` run now uses `timeoutMs: 60_000`. Two runs of 60 s plus 2 s stay inside the 130 s vitest timeout.
+- **QA-1.2-26.** Resolution: a945e5e — both lifecycle tests now record when the run settled and then poll the holder with `waitForExit` until G4's bound (3 s after the deadline or the abort), rather than requiring it dead at resolve time. The note may be the sweep's, the grace's force-close note or the still-reporting note (`LEFTOVER_KILLED`).
+- **QA-1.2-27.** Resolution: 024640e — the POSIX late kill now signals `-pgid` only while `ownsTracked(pid, trackToken)` holds, so a new run that took the recycled id (and overwrote the entry) is skipped. The residual comment is narrowed to groups that do not belong to a run of this process. Tests: a map-level test that runs on every platform replays track(old) → track(new) and checks the old run no longer owns the entry. A POSIX-only real-process test (`runIf(!isWin)`) overwrites a live run's entry, aborts, and asserts there is no group-kill note and the holder is still alive. It is **not run on this Windows host**.
+
+Verification (Windows 11, node): `npx vitest run --maxWorkers=2 test/unit/exec.test.ts` twice, 41 passed | 2 skipped (43) both times; `npm run typecheck` clean. No fixture or stand-in processes were left afterwards.
