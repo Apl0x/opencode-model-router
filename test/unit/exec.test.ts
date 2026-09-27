@@ -143,7 +143,7 @@ async function waitForFile(path: string, limitMs = 5000): Promise<void> {
       readFileSync(path, "utf8");
       return;
     } catch {
-      await new Promise(r => setTimeout(r, 50));
+await new Promise(done => setTimeout(done, 50));
     }
   }
   throw new Error(`timed out waiting for ${path}`);
@@ -528,7 +528,10 @@ describe("process lifecycle around the direct child's exit", () => {
       expect(r.timedOut).toBe(true);
       expect(r.code).not.toBe(0);
       expect(r.stderr).toMatch(/output streams force-closed \d+ ms after the kill: a descendant still held them/);
-      expect(alive(t.pid("child"))).toBe(false);
+      // Windows can report a killed process alive for a moment after the kill (see alive()).
+      const child = t.pid("child");
+      for (const until = Date.now() + 3000; alive(child) && Date.now() < until;) await new Promise(r => setTimeout(r, 50));
+      expect(alive(child)).toBe(false);
       // Documented residual: a descendant whose parent died cannot be attributed safely.
       expect(alive(t.pid("holder"))).toBe(true);
     } finally {
