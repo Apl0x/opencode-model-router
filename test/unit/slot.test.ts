@@ -658,7 +658,7 @@ describe("slot: claims replace the time-leased reap lock (QA-1.4-2, QA-1.4-11)",
     expect(existsSync(claim)).toBe(true);
     // Inert: unchanged for staleMs (1 s here) since its first sighting above, witnessed for 2 x claimHoldMaxMs
     // (each plus the view's slack). The +10.5 s look has another origin, so it has its own view.
-    held(await acquireSlot({ max: 1, waitMs: 5_000, meta }, deps));
+    held(await acquireSlot({ max: 1, waitMs: 10_000, meta }, deps));
     expect(Date.now() - t0).toBeGreaterThanOrEqual(950);
     expect(claimsIn(dir)).toEqual([]);
   }, 20_000);
@@ -705,7 +705,9 @@ describe("slot: claims replace the time-leased reap lock (QA-1.4-2, QA-1.4-11)",
     scanner = false;
     const t0 = Date.now();
     held(await acquireSlot({ max: 1, waitMs: 10_000, meta }, deps));
-    expect(Date.now() - t0).toBeGreaterThanOrEqual(900); // inert after staleMs (1 s) from its first readable sighting
+    // Inert once witnessed for 2 x claimHoldMaxMs + the slacks (2.2 s) from its first readable sighting; with
+    // claimHoldMaxMs at 1 s that, not staleMs, decides. 900 ms still separates "inert" from "dropped at once".
+    expect(Date.now() - t0).toBeGreaterThanOrEqual(900);
     expect(claimsIn(dir)).toEqual([]);
   }, 20_000);
 
@@ -924,7 +926,10 @@ describe("slot: release never fails the caller (QA-1.4-4, QA-1.4-6, QA-1.4-17)",
       const p = join(dir, "slot-0.lock");
       writeLock(p, { pid: process.pid, token: "hung" }); // a live PID: not provably dead
       let shift = 0;
-      const deps = fast(dir, { heartbeatMs: WATCHER_HEARTBEAT_MS, staleMs: 1_000, now: () => Date.now() + shift, mono: () => performance.now() + shift });
+      // Frozen clocks (QA-1.4-39): only the shift moves them, so the gaps are exactly the step whatever the load.
+      const wall0 = Date.now();
+      const mono0 = performance.now();
+      const deps = fast(dir, { heartbeatMs: WATCHER_HEARTBEAT_MS, staleMs: 1_000, now: () => wall0 + shift, mono: () => mono0 + shift });
       const out: string[] = [];
       for (let i = 0; i < 8; i++) {
         shift = i * step;

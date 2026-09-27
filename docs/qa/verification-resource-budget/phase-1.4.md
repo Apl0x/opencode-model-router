@@ -69,8 +69,8 @@ mtime = fresh" rule are gone. So is round 1's per-process observation map.
     staleness needs a span ≥ `staleMs` + 2 s (or the wall age) and a witness ≥ 2 heartbeats + 2 s;
     a claim is inert at span ≥ `staleMs` + 2 s and witness ≥ 2 × `claimHoldMaxMs` + 2 s.
   - `first` is the view's first sighting of the key. `last` is its latest look. `from` is the first
-    look after the latest gap between two looks of more than 2 heartbeats minus both looks' slacks
-    (8 s in production: 2 × 5 s − 2 × 1 s). `span = now − first`
+    look after the latest gap between two looks of more than 2 heartbeats minus this look's slack
+    and the view's (8 s in production: 2 × 5 s − 2 × 1 s). `span = now − first`
     and `witnessed = now − from`. A stamp from the future (another boot's clock) restarts the view.
   - At most 4 views are kept; the oldest goes first.
   - The host is part of the name, so hosts sharing a dir never mix clocks.

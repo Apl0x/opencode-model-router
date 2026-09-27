@@ -45,7 +45,8 @@
  * writers', 2 s), and every `mono` threshold below adds that, so it never shortens
  * a margin. `first` is the view's first sighting of the key, `last` its latest
  * look, and `from` the first look after the latest gap between two looks of more
- * than 2 heartbeats minus both looks' slacks (8 s in production: 2 x 5 s - 2 x 1 s). So `span = now - first` is how long the file has been
+ * than 2 heartbeats minus this look's slack and the view's (8 s in production:
+ * 2 x 5 s - 2 x 1 s). So `span = now - first` is how long the file has been
  * unchanged, and `witnessed = now - from` how long it has been watched without a
  * gap. A new key drops every view; a stamp from the future (another boot's clock)
  * restarts one. The host is part of the name, so hosts sharing a dir never mix
@@ -75,7 +76,7 @@
  * `waitMs: 0` once a minute still reclaims a lock whose owner is not provably
  * dead (a reused PID, another host, a hung holder). Short-lived processes that
  * each look once do it through the sidecar when their looks are less than 2
- * heartbeats minus both looks' slacks apart (8 s in production: 2 x 5 s - 2 x 1 s),
+ * heartbeats minus this look's slack and the view's apart (8 s in production: 2 x 5 s - 2 x 1 s),
  * and their clocks share a view.
  *
  * Residual (accepted in QA-1.4-21): looks further apart than that (8 s) cannot
@@ -523,7 +524,7 @@ function parseSeen(text: string): SeenRecord | undefined {
 interface Look {
   /** How long the file has had its current key (mono), since the view's first sighting. */
   span: number;
-  /** How long it has been watched without a gap of more than 2 heartbeats minus both looks' slacks. */
+  /** How long it has been watched without a gap of more than 2 heartbeats minus this look's slack and the view's. */
   witnessed: number;
   /** How far two stamps of the view may disagree: every threshold adds it. */
   errMs: number;
