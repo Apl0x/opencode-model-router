@@ -334,8 +334,9 @@
 //
 //   - A producer can end its final text with a fake `[router] …` line. The real footer is always
 //     appended last; the 2.3 protocol text says only the last `[router]` footer counts.
-//   - Drift digests are taken just after the producer returns (not atomically with it): an edit
-//     in those milliseconds is attributed to the producer, not reported as drift.
+//   - Drift digests are taken just after the producer returns (not atomically with it), but before
+//     the deferred result is released (QA-2.4-8): only an edit that lands during the deferred
+//     finish itself (at most DEFERRED_FINISH_MS) is attributed to the producer.
 //   - The registry lives in one plugin instance: a restarted opencode process loses its handles
 //     (router_verify then says "unknown handle"); nothing persists across processes by design.
 //   - Lineage (R11) is id-based: a renamed test id escapes it (the pass keeps 2.1's n2 note).

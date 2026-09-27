@@ -601,6 +601,21 @@ describe("verifyHandles (2.4.3a)", () => {
     expect(report.text).not.toContain("\u00b7 work a \u00b7 pass");
   });
 
+  it("QA-2.4-8: an edit right after the deferred result is returned is drift, never part of the baseline", async () => {
+    const { wiring } = makeWiring();
+    const store = createChangedFileStore();
+    await wiring.startDispatch(store, "task:orch:d", state.root, DOD, "", false);
+    state.treeFiles = [{ path: src("a"), status: " M" }];
+    const finish = await wiring.finishDeferred(store, { dispatchID: "task:orch:d", orchestratorSessionID: "orch", producerSessionID: "child-d", producerTier: "fast", description: "work a", cwd: state.root, dod: DOD, dispatchedAt: 0 });
+    // A second writer, in the same tick as the return: before any read the old code left pending.
+    writeFileSync(src("a"), "export const a = 2;\n");
+    if (!finish.deferred) throw new Error(finish.detail);
+    const item = verdictOf((await wiring.verifyHandles("orch", { kind: "handles", handles: [finish.handle] })).items[0]);
+    expect(item.result.driftedPaths).toEqual([src("a")]);
+    expect(item.result.verdict.outcome).toBe("unverifiable");
+    expect(item.result.verdict.caveats).toContain(DRIFT_NOTICE);
+  });
+
   it("drift that cannot be checked (no stored digests) never lets a pass stand either", async () => {
     const { wiring } = makeWiring();
     const h = await register(wiring.pending, "a", { digests: undefined });

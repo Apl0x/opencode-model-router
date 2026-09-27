@@ -613,7 +613,8 @@ export interface VerificationWiring {
   /**
    * 2.4.2a: the deferred finish. No gate, no test command, no slot: a tree snapshot and the commit
    * diff (git only, as prepareVerification) under DEFERRED_FINISH_MS, the static scoping plan
-   * (runner.ts: no spawn), the risk (pending.ts R10), the drift digests (fs reads, not awaited),
+   * (runner.ts: no spawn), the risk (pending.ts R10), the drift digests (fs reads, awaited inside
+   * the same bound so the baseline predates the result, QA-2.4-8),
    * `pending.register`, and the section 1.5-16 footer. The dispatch's reference promise is
    * registered un-awaited, and the dispatch record is cleared only after it settles (clearing it
    * earlier would abort the capture). Never rejects. QA-2.4-4: when the registry refuses the entry
@@ -1291,7 +1292,12 @@ export function createVerificationWiring(deps: {
         changedFiles = paths;
         const scopingPlan = await staticScoping(input.dod, input.cwd, paths, deadline);
         risk = assessRisk({ changedFiles: paths, reference: referenceCaptured, producerTier, scopingPlan, root: change.snapshot?.root });
-        digests = digestFiles(paths.map(p => p.path));
+        // QA-2.4-8: the drift baseline is taken BEFORE the result is released (fs reads only, under
+        // the same DEFERRED_FINISH_MS bound). An edit that lands right after the return is then
+        // drift, never part of the baseline. Not taken in time: no digests, so drift is
+        // "unchecked" and a later pass is downgraded.
+        const taken = await untilAborted(digestFiles(paths.map(p => p.path)), deadline.signal, () => undefined);
+        if (taken !== undefined) digests = Promise.resolve(taken);
       }
       const reg = pending.register({
         orchestratorSessionID: input.orchestratorSessionID,
