@@ -272,8 +272,9 @@ describe("detectRunner: package scripts", () => {
 
   it("npm: flags before -- are ignored with a note, args after -- are appended", async () => {
     const d = await detect("npm test --silent -- --bail 1 -t x", jsRepo({ test: "vitest" }));
-    expect(d.keptArgs).toEqual(["--bail", "1", "-t", "x"]);
+    expect(d.keptArgs).toEqual(["-t", "x"]);
     expect(d.notes).toContain("npm options ignored: --silent");
+    expect(d.notes).toContain("early-exit option dropped for a full failure inventory");
     const d2 = await detect("npm test --silent", jsRepo({ test: "vitest" }));
     expect(d2.keptArgs).toEqual([]);
   });
@@ -413,17 +414,16 @@ describe("detectRunner: vitest arguments", () => {
     expect((await detect("vitest run related")).notes).toContain("vitest filters dropped: related");
   });
 
-  it("unknown options: = form and flags kept, value-looking next token ambiguous", async () => {
-    expect((await detect("vitest --foo=1 --bar --baz")).keptArgs).toEqual(["--foo=1", "--bar", "--baz"]);
-    await detectS6("vitest --foo bar", "ambiguous-option", 'ambiguous vitest option "--foo" in command: cannot tell whether "bar" is its value');
+  it.each(["--foo=1", "--bar", "--foo bar", "-z"])("unknown option %s fails closed (QA-1.3-10)", async (a) => {
+    await detectS6(`vitest ${a}`, "unsupported-argument", `unsupported vitest argument "${a.split(" ")[0]}" in command`);
   });
 });
 
 describe("detectRunner: jest arguments", () => {
   it("drops, caps and keeps per D.3", async () => {
     const d = await detect("jest --json --reporters default summary --ci --outputFile o.json --bail --testPathPatterns a b -e --coverage x");
-    expect(d.keptArgs).toEqual(["--ci", "--bail", "--testPathPatterns", "a", "b", "-e"]);
-    expect(d.notes).toEqual(["coverage disabled for the scoped run", "jest filters dropped: x"]);
+    expect(d.keptArgs).toEqual(["--ci", "--testPathPatterns", "a", "b", "-e"]);
+    expect(d.notes).toEqual(["early-exit option dropped for a full failure inventory", "coverage disabled for the scoped run", "jest filters dropped: x"]);
   });
 
   it.each([
@@ -442,15 +442,16 @@ describe("detectRunner: jest arguments", () => {
     await detectS6("jest --showConfig", "unsupported-argument", 'unsupported jest argument "--showConfig" in command');
   });
 
-  it("-c attached value is kept", async () => {
-    expect((await detect("jest -cjest.config.js")).keptArgs).toEqual(["-cjest.config.js"]);
+  it("-c=value is kept; -cvalue is S6 because yargs reads it as grouped flags (QA-1.3-10)", async () => {
+    expect((await detect("jest -c=jest.config.js")).keptArgs).toEqual(["-c=jest.config.js"]);
+    await detectS6("jest -cjest.config.js", "unsupported-argument", 'unsupported jest argument "-cjest.config.js" in command');
   });
 });
 
 describe("detectRunner: pytest arguments and xdist evidence", () => {
   it("drops the adapter's own flags, keeps the rest", async () => {
     const d = await detect("pytest -q -p no:cacheprovider -pno:cacheprovider -p myplugin -rA --cov src --junitxml=j.xml -x -k slow", pyRepo());
-    expect(d.keptArgs).toEqual(["-p", "myplugin", "-rA", "-x", "-k", "slow"]);
+    expect(d.keptArgs).toEqual(["-p", "myplugin", "-rA", "-k", "slow"]);
     expect(d.xdist).toBe(false);
     expect(d.covInConfig).toBe(false);
   });
@@ -869,7 +870,7 @@ describe("planScopedRun: pytest", () => {
     const s = spec(await planScopedRun(input({ command: "pytest", files: pyRepo(mods), changedFiles: changed("src/pkg/mod.py"), search })));
     expect(search.findByName).toHaveBeenCalledWith("/r", ["test_mod.py", "mod_test.py"]);
     expect(s.inputs).toEqual(["/r/tests/pkg/mod_test.py", "/r/tests/test_mod.py"]);
-    expect(s.args).toEqual(["-q", "-p", "no:cacheprovider", `--junitxml=/tmp/omr-verify-${UUID}.xml`, "--", "/r/tests/pkg/mod_test.py", "/r/tests/test_mod.py"]);
+    expect(s.args).toEqual(["-q", "-p", "no:cacheprovider", `--junitxml=/tmp/omr-verify-${UUID}.xml`, "--maxfail=0", "--", "/r/tests/pkg/mod_test.py", "/r/tests/test_mod.py"]);
     expect(s).toMatchObject({ file: "/usr/bin/pytest", inputsAreTests: true, workers: null, env: { PYTEST_XDIST_AUTO_NUM_WORKERS: "2" } });
   });
 
@@ -877,7 +878,7 @@ describe("planScopedRun: pytest", () => {
     const files = pyRepo({ ...mods, "/r/pytest.ini": "[pytest]\naddopts = -n auto --cov" });
     const s = spec(await planScopedRun(input({ command: "uv run pytest -x", files, changedFiles: changed("tests/test_mod.py") })));
     expect(s.file).toBe("/usr/bin/uv");
-    expect(s.args).toEqual(["run", "pytest", "-x", "-q", "-p", "no:cacheprovider", `--junitxml=/tmp/omr-verify-${UUID}.xml`, "-n", "2", "--no-cov", "--", "/r/tests/test_mod.py"]);
+    expect(s.args).toEqual(["run", "pytest", "-q", "-p", "no:cacheprovider", `--junitxml=/tmp/omr-verify-${UUID}.xml`, "--maxfail=0", "-n", "2", "--no-cov", "--", "/r/tests/test_mod.py"]);
     expect(s.workers).toBe(2);
   });
 
@@ -1304,7 +1305,7 @@ describe("planRerun", () => {
     const det = await detect("pytest", files, host);
     const r = spec(await planRerun(det, ["/r/tests/test_a.py"], "/r", budget, { fs: memFs(files), host }));
     expect(r.file).toBe("/usr/bin/pytest");
-    expect(r.args).toEqual(["-q", "-p", "no:cacheprovider", `--junitxml=${RPT_XML}`, "--", "/r/tests/test_a.py"]);
+    expect(r.args).toEqual(["-q", "-p", "no:cacheprovider", `--junitxml=${RPT_XML}`, "--maxfail=0", "--", "/r/tests/test_a.py"]);
     expect(r.workers).toBeNull();
   });
 
@@ -1716,10 +1717,161 @@ describe("QA-1.3-14: argv length counts win32 quoting and the program path", () 
     expectS6(await planScopedRun(input({ win: true, files, cwd: "C:\\repo", changedFiles: changed(...names) })), "argv-too-long", "too many inputs for one command line: 296 files");
   });
 
+  it("posix counts the program path too", async () => {
+    const names = Array.from({ length: 280 }, (_, i) => `src/${String(i).padStart(3, "0")}${"x".repeat(92)}.ts`);
+    const files = jsRepo({}, Object.fromEntries(names.map((n) => [`/r/${n}`, ""])));
+    const long = { ...POSIX_HOST, pathEnv: "/usr/bin", execPath: `/${"n".repeat(300)}/node` };
+    expectS6(await planScopedRun(input({ files, host: long, changedFiles: changed(...names) })), "argv-too-long");
+    expect(isScopedSpec(await planScopedRun(input({ files, changedFiles: changed(...names) })))).toBe(true);
+  });
+
   it("quotes, trailing backslashes and empty arguments are counted without failing a normal plan", async () => {
     const files = W({ 'C:\\repo\\src\\q"u o.ts': "" });
     const s = spec(await planScopedRun(input({ win: true, files, cwd: "C:\\repo", command: `vitest -t "" --dir 'C:\\a b\\'`, changedFiles: changed('src\\q"u o.ts') })));
     expect(s.args).toContain('C:\\repo\\src\\q"u o.ts');
     expect(s.args).toContain("C:\\a b\\");
+  });
+});
+
+describe("QA-1.3-2: early-exit options are dropped for a full failure inventory", () => {
+  const EE = "early-exit option dropped for a full failure inventory";
+  const mods = { "/r/tests/test_a.py": "" };
+
+  it.each(["-x", "--exitfirst", "--maxfail 3", "--maxfail=3", "-xq", "-qx"])("pytest %s", async (a) => {
+    const d = await detect(`pytest ${a} -v`, pyRepo(mods));
+    expect(d.keptArgs).toEqual(["-v"]);
+    expect(d.notes).toContain(EE);
+    const s = spec(await planScopedRun(input({ command: `pytest ${a}`, files: pyRepo(mods), changedFiles: changed("tests/test_a.py") })));
+    expect(s.args.filter((x) => x === "-x" || x.startsWith("--maxfail"))).toEqual(["--maxfail=0"]);
+  });
+
+  it.each(["--bail 1", "--bail=1"])("vitest %s", async (a) => {
+    const d = await detect(`vitest ${a} --silent`);
+    expect(d.keptArgs).toEqual(["--silent"]);
+    expect(d.notes).toContain(EE);
+  });
+
+  it.each(["--bail", "-b", "--bail=2", "-b 1", "-ib"])("jest %s", async (a) => {
+    const d = await detect(`jest ${a} --ci`);
+    expect(d.keptArgs).toEqual(["--ci"]);
+    expect(d.notes).toContain(EE);
+  });
+});
+
+describe("QA-1.3-10: option spellings are normalized before the D tables", () => {
+  it.each([
+    ["--update-snapshot", []],
+    ["-u", []],
+    ["-ou", []],
+    ["-uo", []],
+    ["--watch-all", []],
+    ["--watch-all=false", []],
+    ["--list-tests", []],
+    ["-f", []],
+    ["--only-failures", []],
+    ["--onlyFailures", []],
+    ["--no-coverage", []],
+    ["--detect-open-handles", ["--detect-open-handles"]],
+    ["--test-name-pattern x", ["--test-name-pattern", "x"]],
+    ["-ie", ["-e"]],
+    ["-ic cfg.js", ["-c", "cfg.js"]],
+  ])("jest %s -> kept %j", async (a, kept) => {
+    expect((await detect(`jest ${a}`)).keptArgs).toEqual(kept);
+  });
+
+  it.each([
+    ["-iw4", { count: 4 }],
+    ["--max-workers=3", { count: 3 }],
+    ["--run-in-band", { count: 1 }],
+  ])("jest %s -> cap %j", async (a, cap) => {
+    expect((await detect(`jest ${a}`)).userWorkers).toEqual(cap);
+  });
+
+  it.each(["-tfoo", "-oz", "-z", "--frobnicate", "--frobnicate=1", "--test-failure-exit-code 0"])("jest %s fails closed", async (a) => {
+    await detectS6(`jest ${a}`, "unsupported-argument", `unsupported jest argument "${a.split(" ")[0]}" in command`);
+  });
+
+  it.each([
+    ["--merge-reports=.vitest-reports", []],
+    ["--merge-reports", []],
+    ["--pass-with-no-tests", []],
+    ["-uw", []],
+    ["-u=1", []],
+    ["--no-file-parallelism", ["--no-file-parallelism"]],
+    ["--test-name-pattern x", ["--test-name-pattern", "x"]],
+    ["-ut x", ["-t", "x"]],
+    ["-t=x", ["-t=x"]],
+    ["--typecheck.only", ["--typecheck.only"]],
+  ])("vitest %s -> kept %j", async (a, kept) => {
+    expect((await detect(`vitest ${a}`)).keptArgs).toEqual(kept);
+  });
+
+  it.each(["-cfoo", "-w4", "-tu", "-uz", "--poolOptions.threads.maxThreads=8", "--pool-options.forks.max-forks=8"])("vitest %s fails closed", async (a) => {
+    await detectS6(`vitest ${a}`, "unsupported-argument", `unsupported vitest argument "${a}" in command`);
+  });
+
+  it("pytest and eslint keep rule g: = form and flags kept, a value-looking next token is ambiguous", async () => {
+    expect((await detect("pytest --foo=1 --bar --baz", pyRepo())).keptArgs).toEqual(["--foo=1", "--bar", "--baz"]);
+    await detectS6("pytest --reruns 2", "ambiguous-option", 'ambiguous pytest option "--reruns" in command: cannot tell whether "2" is its value', pyRepo());
+    expectUnscoped(await lint("eslint --foo bar", changed("src/a.ts")), 'ambiguous eslint option "--foo" in command: cannot tell whether "bar" is its value');
+  });
+
+  it("vitest --max-workers is the cap under either spelling", async () => {
+    expect((await detect("vitest --max-workers 8")).userWorkers).toEqual({ count: 8 });
+    expect((await detect("vitest --max-workers=1 --maxWorkers=6")).userWorkers).toEqual({ count: 6 });
+  });
+});
+
+describe("QA-1.3-3b: pytest grouped short flags follow argparse", () => {
+  it.each([
+    ["-qn3", { count: 3 }, true, []],
+    ["-vn 2", { count: 2 }, true, ["-v"]],
+    ["-qk slow", undefined, false, ["-k", "slow"]],
+    ["-vrA", undefined, false, ["-v", "-rA"]],
+    ["-qpno:xdist -n 2", { count: 2 }, false, ["-pno:xdist"]],
+    ["-vvv", undefined, false, ["-v", "-v", "-v"]],
+  ])("%s -> cap %j, xdist %s, kept %j", async (a, cap, xdist, kept) => {
+    const d = await detect(`pytest ${a}`, pyRepo());
+    expect(d.userWorkers).toEqual(cap);
+    expect(d.xdist).toBe(xdist);
+    expect(d.keptArgs).toEqual(kept);
+  });
+
+  it("an -n inside a group is capped in the argv", async () => {
+    const s = spec(await planScopedRun(input({ command: "pytest -qn3", files: pyRepo({ "/r/tests/test_a.py": "" }), changedFiles: changed("tests/test_a.py") })));
+    expect(s.args.slice(s.args.indexOf("-n"), s.args.indexOf("-n") + 2)).toEqual(["-n", "2"]);
+    expect(s.args.filter((x) => x.startsWith("-qn") || x === "-n3")).toEqual([]);
+  });
+
+  it.each(["-qz", "-zq", "--tx=3*popen", "--tx 3*popen"])("%s -> S6", async (a) => {
+    await detectS6(`pytest ${a}`, "unsupported-argument", `unsupported pytest argument "${a.split(" ")[0]}" in command`, pyRepo());
+  });
+});
+
+describe("QA-1.3-6: package-manager location options are S6", () => {
+  it.each([
+    ["npm test -w packages/app", "npm -w"],
+    ["npm test --workspace=packages/app", "npm --workspace=packages/app"],
+    ["npm test --workspaces", "npm --workspaces"],
+    ["npm test -ws", "npm -ws"],
+    ["npm test --prefix x", "npm --prefix"],
+    ["npm run test --include-workspace-root", "npm --include-workspace-root"],
+    ["npm test foo", "npm foo"],
+    ["npm -w a test", "npm -w"],
+    ["pnpm test --filter app", "pnpm --filter"],
+    ["pnpm test -C dir", "pnpm -C"],
+    ["pnpm run test --dir=x", "pnpm --dir=x"],
+    ["pnpm --filter app test", "pnpm --filter"],
+    ["yarn test --cwd x", "yarn --cwd"],
+    ["bun run test --filter=x", "bun --filter=x"],
+  ])("%s -> unsupported %j", async (cmd, prefix) => {
+    await detectS6(cmd, "unsupported-command", `unsupported command "${prefix}" in command`, jsRepo({ test: "vitest" }));
+  });
+
+  it("harmless npm options are ignored with a note; after -- everything reaches the script", async () => {
+    const d = await detect("npm test -s --if-present --loglevel=silent --color=always -- -t x", jsRepo({ test: "vitest" }));
+    expect(d.keptArgs).toEqual(["-t", "x"]);
+    expect(d.notes).toContain("npm options ignored: -s --if-present --loglevel=silent --color=always");
+    expect((await detect("pnpm test -- --dir x", jsRepo({ test: "vitest" }))).keptArgs).toEqual(["--dir", "x"]);
   });
 });

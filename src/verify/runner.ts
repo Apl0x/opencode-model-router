@@ -57,8 +57,15 @@
 //     S6 no-package-json. JSON parse error or not an object -> S6 bad-package-json. scripts[s]
 //     missing or not a string -> S6 no-script.
 //   - Extra args. npm: tokens after "--" are appended to the script. Tokens between the script
-//     name and "--" are npm's own flags: ignored, with a note. pnpm, yarn and bun: tokens after
-//     the script name are appended, minus a leading "--".
+//     name and "--" are npm's own flags. Only the harmless ones (-s --silent -q --quiet -d
+//     --if-present --ignore-scripts --color[=v] --no-color --loglevel=v) are ignored, with a
+//     note; any other token there (-w, --workspace[s], -ws, --prefix, --include-workspace-root, a
+//     positional, ...) -> S6 unsupported-command "npm <token>", because it can select another
+//     package's script (QA-1.3-6). pnpm, yarn and bun: tokens after the script name are appended,
+//     minus a leading "--". Without that "--", a location option (-w -ws -C -F -r -g --workspace
+//     --workspaces --include-workspace-root --workspace-root --prefix --dir --cwd --filter
+//     --recursive --global, also "=v" forms) -> S6 unsupported-command "<pm> <token>". Options
+//     before the subcommand are already S6 ("npm -w", "pnpm --filter").
 //   - The script text goes through C.2 (<where> = "scripts.<s>"), C.1, C.3 and the head table,
 //     restricted to the DIRECT forms (vitest, jest, pytest, npx, pnpm exec, uv run pytest).
 //     Only one level of script resolution: a package-manager head inside a script (npm run x,
@@ -99,6 +106,21 @@
 // ------------------------------------------------------------------------------------------------
 // D. USER ARGUMENTS (the tokens after the runner head)
 //
+//   D.0 Spelling normalization (QA-1.3-3b, QA-1.3-10), applied before every table lookup:
+//     - vitest and jest: "--kebab-case" is compared as "--camelCase" (yargs and cac accept both);
+//       "--no-" stays a negation prefix. The table names are normalized the same way. A kept
+//       token keeps the user's spelling.
+//     - Grouped short options are split the way the runner's parser splits them:
+//         vitest (mri)      flags w u h v, values c r t. Every letter but the last must be a
+//                           flag; the last takes "=v" or the next token. "-cfoo", "-w4" -> S6.
+//         jest (yargs)      flags b e f h i o u v, values c t w. Flags chain until a value
+//                           letter, whose attached value must be "=v" or a number ("-w4",
+//                           "-iw4"); "-cjest.config.js" (yargs: c, j, e, s, t=".config.js")
+//                           -> S6.
+//         pytest (argparse) flags q v x s l h V f, values k m c o W r p n. Flags chain until a
+//                           value letter, which takes the rest or the next token: "-qn3" is
+//                           "-q -n3", "-vrA" is "-v -rA".
+//       A group containing any other letter -> S6 unsupported-argument. eslint is not split.
 //   D.1 Algorithm, one token t at a time, left to right:
 //     a. t === "--"              -> S6 unsupported-argument "--".
 //     b. DROP entry              -> remove t and its value tokens.
@@ -108,6 +130,8 @@
 //     e. KEEP-flag entry         -> keep t.
 //     f. S6 entry                -> S6 unsupported-argument t (lint: Unscoped).
 //     g. any other option (a token starting with "-"):
+//          vitest and jest: S6 unsupported-argument (QA-1.3-10: an unknown spelling of a DROP
+//          option, such as "--update-snapshot", must never pass through). pytest and eslint:
 //          if it contains "=", keep it verbatim;
 //          if the next token is absent or starts with "-", keep it verbatim (a flag);
 //          otherwise -> S6 ambiguous-option (we cannot tell whether the next token is its value).
@@ -134,25 +158,30 @@
 //
 //   D.2 vitest
 //     DROP 0  --run --watch -w --no-watch --ui --open --standalone --update -u --passWithNoTests
-//             --clearScreen --inspect --inspect-brk --coverage   (adds note "coverage disabled
-//             for the scoped run")
+//             --clearScreen --inspect --inspect-brk --coverage --no-coverage   (coverage adds the
+//             note "coverage disabled for the scoped run")
 //     DROP ?  --changed --api --mergeReports --coverage.*
+//     DROP 1  --bail   (note "early-exit option dropped for a full failure inventory": a new
+//             failure could hide behind an old one, QA-1.3-2)
 //     DROP 1  --reporter --outputFile --outputFile.* --shard --minWorkers --min-workers --api.*
 //     CAP  1  --maxWorkers --max-workers
 //     CAP  0  --no-file-parallelism, "--fileParallelism=false": the token is KEPT and the user
 //             cap is {count: 1}
 //     KEEP 1  --config -c --root -r --dir --project --environment --pool --testNamePattern -t
-//             --mode --testTimeout --hookTimeout --teardownTimeout --retry --bail --exclude
+//             --mode --testTimeout --hookTimeout --teardownTimeout --retry --exclude
+//             --maxConcurrency --slowTestThreshold
 //     KEEP ?  --browser --sequence.* --typecheck.* --browser.*
 //     KEEP 0  --globals --dom --isolate --no-isolate --allowOnly --silent --hideSkippedTests
 //             --logHeapUsage --color --no-color --expandSnapshotDiff --disableConsoleIntercept
-//             --typecheck
+//             --typecheck --printConsoleTrace --includeTaskLocation
 //     Example: `vitest run --coverage` -> run dropped, --coverage dropped, note added.
 //
 //   D.3 jest
 //     DROP 0  --watch --watchAll --json --findRelatedTests --listTests --onlyChanged -o --lastCommit
 //             --changedFilesWithAncestor --updateSnapshot -u --passWithNoTests --runTestsByPath
-//             --coverage --collectCoverage   (coverage adds the note from D.2)
+//             --onlyFailures -f --coverage --collectCoverage --no-coverage   (coverage adds the
+//             note from D.2)
+//     DROP ?  --bail -b   (the early-exit note from D.2)
 //     DROP 1  --outputFile --changedSince --shard --collectCoverageFrom --coverageDirectory
 //             --coverageProvider --coverageThreshold
 //     DROP *  --reporters --coverageReporters --coveragePathIgnorePatterns
@@ -161,7 +190,6 @@
 //     KEEP 1  --config -c --rootDir --testNamePattern -t --testEnvironment --env --testTimeout
 //             --testRunner --testSequencer --cacheDirectory --workerIdleMemoryLimit --seed
 //             --maxConcurrency --openHandlesTimeout
-//     KEEP ?  --bail -b
 //     KEEP *  --roots --selectProjects --ignoreProjects --projects --testPathPatterns
 //             --testPathPattern --testPathIgnorePatterns --testMatch
 //     KEEP 0  --ci --silent --verbose --detectOpenHandles --detectLeaks --forceExit --cache
@@ -174,6 +202,9 @@
 //     DROP 0  -q --quiet --lf --last-failed --ff --failed-first --nf --new-first --sw --stepwise
 //             --sw-skip --stepwise-skip --cache-clear --pdb --trace -f --looponfail --cov-append
 //             --cov-branch --no-cov --no-cov-on-fail --self-contained-html --json-report
+//     DROP 0  -x --exitfirst; DROP 1 --maxfail   (the early-exit note from D.2). The argv also
+//             ends the options with "--maxfail=0", which overrides an -x or --maxfail from
+//             addopts or PYTEST_ADDOPTS (argparse: the last value of dest "maxfail" wins).
 //     DROP ?  --cov
 //     DROP 1  --junitxml --junit-xml --pdbcls --cov-report --cov-config --cov-fail-under
 //             --cov-context --html --json-report-file
@@ -182,12 +213,13 @@
 //             is KEEP 1.
 //     CAP  1  -n --numprocesses --maxprocesses   (values: N, auto, logical; attached "-n4")
 //     KEEP 1  -k -m -c --config-file --rootdir -o --override-ini -W --pythonwarnings --tb -r
-//             --import-mode --basetemp --durations --durations-min --timeout --maxfail --ignore
+//             --import-mode --basetemp --durations --durations-min --timeout --ignore
 //             --ignore-glob --deselect --confcutdir --dist --capture --log-level --log-cli-level
-//     KEEP 0  -x --exitfirst -v -vv --verbose -s -l --showlocals --strict-markers --strict-config
+//     KEEP 0  -v -vv --verbose -s -l --showlocals --strict-markers --strict-config
 //             --disable-warnings --no-header --runxfail
 //     S6      --co --collect-only --fixtures --fixtures-per-test --markers --setup-plan
-//             --setup-only --version -V -h --help
+//             --setup-only --version -V -h --help --tx --rsyncdir   (--tx starts xdist workers
+//             that no -n caps)
 //     xdist evidence (DetectedRunner.xdist). It is true when either of these holds, and
 //     "-p no:xdist" is absent:
 //       - the user args contain a CAP entry or --dist;
@@ -380,7 +412,7 @@
 //   jest rerun: the same, with "--runTestsByPath" in place of "--findRelatedTests".
 //   pytest (scoped and rerun are the same; F are test files). E is [] for direct pytest and
 //   ["run", "pytest"] for uv:
-//     [...E, ...K, "-q", "-p", "no:cacheprovider", `--junitxml=${R}`,
+//     [...E, ...K, "-q", "-p", "no:cacheprovider", `--junitxml=${R}`, "--maxfail=0",
 //      ...(xdist ? ["-n", String(N)] : []), ...(covInConfig ? ["--no-cov"] : []), "--", ...F]
 //     env.PYTEST_XDIST_AUTO_NUM_WORKERS = String(N >= 1 ? N : min(C, B)). It is always set:
 //     harmless without xdist, and it caps `-n auto|logical` from sources the adapter cannot see.
@@ -602,8 +634,8 @@
 //      the module reads only the runner's own package under node_modules and executables on
 //      absolute PATH entries.
 //   8. The adapter-owned flags appear exactly once, because D removes user copies: the worker
-//      cap, reporter, outputFile, passWithNoTests, run, the coverage switch, junitxml and
-//      -p no:cacheprovider.
+//      cap, reporter, outputFile, passWithNoTests, run, the coverage switch, junitxml,
+//      -p no:cacheprovider and --maxfail=0.
 //   9. The argv-length cap (H) exists so that a failed spawn (Windows' limit is 32767 chars)
 //      never masquerades as a test failure. It counts the program path and win32 quoting.
 //
@@ -649,6 +681,9 @@
 //     POSIX rules everywhere.
 //   - A vitest `run <absolute path>` filter may also select a longer name with the same prefix
 //     (a.test.ts also selects a.test.tsx). That runs extra tests but never misses one.
+//   - A `bail` set in a vitest or jest config file (not on the command line) still cuts the run
+//     short: the JS config cannot be read statically. 2.1's S2 comparison inherits this residual
+//     (QA-1.3-2 covers the command line; pytest addopts are covered by --maxfail=0).
 //
 // ------------------------------------------------------------------------------------------------
 // Q. CONSUMER CONTRACT
@@ -1238,6 +1273,12 @@ type Invocation<K extends ToolKind> =
       readonly notes: string[];
     };
 
+/** npm options between the script name and "--" that are safe to ignore (B, QA-1.3-6). */
+const NPM_HARMLESS_RE = /^(?:-s|--silent|-q|--quiet|-d|--if-present|--ignore-scripts|--no-color|--color(?:=.*)?|--loglevel=.*)$/s;
+/** pnpm/yarn/bun options that select another package or directory (QA-1.3-6). */
+const PM_LOCATION_RE =
+  /^(?:-w|-ws|-C|-F|-r|-g|--workspace|--workspaces|--include-workspace-root|--workspace-root|--prefix|--dir|--cwd|--filter|--recursive|--global)(?:=.*)?$/s;
+
 function unsupported(prefix: string, where: string): Unverifiable {
   return s6("unsupported-command", `unsupported command "${prefix}" in ${where}`);
 }
@@ -1300,9 +1341,14 @@ function parseInvocation<K extends ToolKind>(
     if (h === "npm") {
       const dd = rest.indexOf("--");
       const ignored = dd < 0 ? rest : rest.slice(0, dd);
+      // B (QA-1.3-6): only npm options that cannot pick another package, directory or script.
+      const bad = ignored.find((x) => !NPM_HARMLESS_RE.test(x));
+      if (bad !== undefined) return unsupported(`npm ${bad}`, where);
       const notes = ignored.length > 0 ? [`npm options ignored: ${ignored.join(" ")}`] : [];
       return { type: "script", manager: "npm", name, env, extra: dd < 0 ? [] : rest.slice(dd + 1), notes };
     }
+    const location = rest[0] === "--" ? undefined : rest.find((x) => PM_LOCATION_RE.test(x));
+    if (location !== undefined) return unsupported(`${h} ${location}`, where);
     return { type: "script", manager: h, name, env, extra: rest[0] === "--" ? rest.slice(1) : rest, notes: [] };
   };
   if (h === "npm") {
@@ -1337,30 +1383,32 @@ interface ArgEntry {
 }
 
 const COVERAGE_NOTE = "coverage disabled for the scoped run";
+const EARLY_EXIT_NOTE = "early-exit option dropped for a full failure inventory";
 const e = (names: string, action: ArgAction, arity: Arity, note?: string): ArgEntry => ({ names: names.split(" "), action, arity, note });
 
 const VITEST_ARGS: readonly ArgEntry[] = [
   e("--run --watch -w --no-watch --ui --open --standalone --update -u --passWithNoTests --clearScreen --inspect --inspect-brk", "drop", "0"),
-  e("--coverage", "drop", "0", COVERAGE_NOTE),
+  e("--coverage --no-coverage", "drop", "0", COVERAGE_NOTE),
   e("--changed --api --mergeReports", "drop", "?"),
   e("--coverage.*", "drop", "?", COVERAGE_NOTE),
+  e("--bail", "drop", "1", EARLY_EXIT_NOTE),
   e("--reporter --outputFile --outputFile.* --shard --minWorkers --min-workers --api.*", "drop", "1"),
   e("--maxWorkers --max-workers", "cap", "1"),
   e("--no-file-parallelism --fileParallelism=false", "cap1-keep", "0"),
-  e("--config -c --root -r --dir --project --environment --pool --testNamePattern -t --mode --testTimeout --hookTimeout --teardownTimeout --retry --bail --exclude", "keep", "1"),
+  e("--config -c --root -r --dir --project --environment --pool --testNamePattern -t --mode --testTimeout --hookTimeout --teardownTimeout --retry --exclude --maxConcurrency --slowTestThreshold", "keep", "1"),
   e("--browser --sequence.* --typecheck.* --browser.*", "keep", "?"),
-  e("--globals --dom --isolate --no-isolate --allowOnly --silent --hideSkippedTests --logHeapUsage --color --no-color --expandSnapshotDiff --disableConsoleIntercept --typecheck", "keep", "0"),
+  e("--globals --dom --isolate --no-isolate --allowOnly --silent --hideSkippedTests --logHeapUsage --color --no-color --expandSnapshotDiff --disableConsoleIntercept --typecheck --printConsoleTrace --includeTaskLocation", "keep", "0"),
 ];
 
 const JEST_ARGS: readonly ArgEntry[] = [
-  e("--watch --watchAll --json --findRelatedTests --listTests --onlyChanged -o --lastCommit --changedFilesWithAncestor --updateSnapshot -u --passWithNoTests --runTestsByPath", "drop", "0"),
-  e("--coverage --collectCoverage", "drop", "0", COVERAGE_NOTE),
+  e("--watch --watchAll --json --findRelatedTests --listTests --onlyChanged -o --lastCommit --changedFilesWithAncestor --updateSnapshot -u --passWithNoTests --runTestsByPath --onlyFailures -f", "drop", "0"),
+  e("--coverage --collectCoverage --no-coverage", "drop", "0", COVERAGE_NOTE),
+  e("--bail -b", "drop", "?", EARLY_EXIT_NOTE),
   e("--outputFile --changedSince --shard --collectCoverageFrom --coverageDirectory --coverageProvider --coverageThreshold", "drop", "1"),
   e("--reporters --coverageReporters --coveragePathIgnorePatterns", "drop", "*"),
   e("--maxWorkers --max-workers -w", "cap", "1"),
   e("--runInBand -i", "cap1-drop", "0"),
   e("--config -c --rootDir --testNamePattern -t --testEnvironment --env --testTimeout --testRunner --testSequencer --cacheDirectory --workerIdleMemoryLimit --seed --maxConcurrency --openHandlesTimeout", "keep", "1"),
-  e("--bail -b", "keep", "?"),
   e("--roots --selectProjects --ignoreProjects --projects --testPathPatterns --testPathPattern --testPathIgnorePatterns --testMatch", "keep", "*"),
   e("--ci --silent --verbose --detectOpenHandles --detectLeaks --forceExit --cache --no-cache --colors --watchman --no-watchman --errorOnDeprecated --injectGlobals --noStackTrace --useStderr --workerThreads --randomize --showSeed --clearMocks --resetMocks --restoreMocks --expand -e --logHeapUsage", "keep", "0"),
   e("--showConfig --clearCache --init", "s6", "0"),
@@ -1368,12 +1416,14 @@ const JEST_ARGS: readonly ArgEntry[] = [
 
 const PYTEST_ARGS: readonly ArgEntry[] = [
   e("-q --quiet --lf --last-failed --ff --failed-first --nf --new-first --sw --stepwise --sw-skip --stepwise-skip --cache-clear --pdb --trace -f --looponfail --cov-append --cov-branch --no-cov --no-cov-on-fail --self-contained-html --json-report", "drop", "0"),
+  e("-x --exitfirst", "drop", "0", EARLY_EXIT_NOTE),
+  e("--maxfail", "drop", "1", EARLY_EXIT_NOTE),
   e("--cov", "drop", "?"),
   e("--junitxml --junit-xml --pdbcls --cov-report --cov-config --cov-fail-under --cov-context --html --json-report-file", "drop", "1"),
   e("-n --numprocesses --maxprocesses", "cap", "1"),
-  e("-k -m -c --config-file --rootdir -o --override-ini -W --pythonwarnings --tb -r --import-mode --basetemp --durations --durations-min --timeout --maxfail --ignore --ignore-glob --deselect --confcutdir --dist --capture --log-level --log-cli-level", "keep", "1"),
-  e("-x --exitfirst -v -vv --verbose -s -l --showlocals --strict-markers --strict-config --disable-warnings --no-header --runxfail", "keep", "0"),
-  e("--co --collect-only --fixtures --fixtures-per-test --markers --setup-plan --setup-only --version -V -h --help", "s6", "0"),
+  e("-k -m -c --config-file --rootdir -o --override-ini -W --pythonwarnings --tb -r --import-mode --basetemp --durations --durations-min --timeout --ignore --ignore-glob --deselect --confcutdir --dist --capture --log-level --log-cli-level", "keep", "1"),
+  e("-v -vv --verbose -s -l --showlocals --strict-markers --strict-config --disable-warnings --no-header --runxfail", "keep", "0"),
+  e("--co --collect-only --fixtures --fixtures-per-test --markers --setup-plan --setup-only --version -V -h --help --tx --rsyncdir", "s6", "0"),
 ];
 
 const ESLINT_ARGS: readonly ArgEntry[] = [
@@ -1385,7 +1435,76 @@ const ESLINT_ARGS: readonly ArgEntry[] = [
   e("--init --print-config --inspect-config --env-info -v --version -h --help --stdin --stdin-filename", "s6", "0"),
 ];
 
-const ARG_TABLES: Record<ToolKind, readonly ArgEntry[]> = { vitest: VITEST_ARGS, jest: JEST_ARGS, pytest: PYTEST_ARGS, eslint: ESLINT_ARGS };
+/**
+ * D.0 (QA-1.3-10): yargs (jest) and cac (vitest) read `--kebab-case` as `--camelCase`. Both the
+ * tables and the user tokens are compared in camelCase; "--no-" stays a negation prefix.
+ */
+function camelOption(t: string): string {
+  if (!t.startsWith("--")) return t;
+  const eq = t.indexOf("=");
+  const name = eq < 0 ? t : t.slice(0, eq);
+  const neg = name.startsWith("--no-") ? "--no-" : "--";
+  return neg + name.slice(neg.length).replace(/-([A-Za-z0-9])/g, (_m, c: string) => c.toUpperCase()) + (eq < 0 ? "" : t.slice(eq));
+}
+
+const camelTable = (t: readonly ArgEntry[]): readonly ArgEntry[] => t.map((x) => ({ ...x, names: x.names.map(camelOption) }));
+
+const ARG_TABLES: Record<ToolKind, readonly ArgEntry[]> = {
+  vitest: camelTable(VITEST_ARGS),
+  jest: camelTable(JEST_ARGS),
+  pytest: PYTEST_ARGS,
+  eslint: ESLINT_ARGS,
+};
+
+/**
+ * D.0 (QA-1.3-3b, QA-1.3-10): short options per parser. `flags` take no value, `values` take one.
+ *   mri (vitest/cac): every letter of a group is a flag except the last, which takes "=v" or the
+ *                     next token; attached values ("-cfoo") do not exist.
+ *   yargs (jest):     flags chain until a value letter; an attached value must be "=v" or a number.
+ *   argparse (pytest): flags chain until a value letter, which takes the rest or the next token.
+ */
+const SHORT_GROUPS: Partial<Record<ToolKind, { readonly style: "mri" | "yargs" | "argparse"; readonly flags: string; readonly values: string }>> = {
+  vitest: { style: "mri", flags: "wuhv", values: "crt" },
+  jest: { style: "yargs", flags: "befhiouv", values: "ctw" },
+  pytest: { style: "argparse", flags: "qvxslhVf", values: "kmcoWrpn" },
+};
+
+/**
+ * Split a grouped short-option token the way the runner's parser does: `-qn3` -> `-q -n3`,
+ * `-ou` -> `-o -u`. Returns [t] when t is not a group, undefined for a group the adapter cannot
+ * model (an unknown letter, or an attached value the parser would read differently) -> S6.
+ */
+function expandShort(kind: ToolKind, t: string): string[] | undefined {
+  const g = SHORT_GROUPS[kind];
+  if (!g || t.startsWith("--") || !/^-[A-Za-z]./s.test(t)) return [t];
+  const yargsValue = (rest: string) => g.style !== "yargs" || rest === "" || /^(?:=.*|-?\d+(?:\.\d*)?)$/s.test(rest);
+  if (g.style === "mri") {
+    const eq = t.indexOf("=");
+    const letters = t.slice(1, eq < 0 ? undefined : eq);
+    const out: string[] = [];
+    for (let i = 0; i < letters.length; i++) {
+      const c = letters[i];
+      const last = i === letters.length - 1;
+      if (!g.flags.includes(c) && !(last && g.values.includes(c))) return undefined;
+      out.push(last && eq >= 0 ? `-${c}${t.slice(eq)}` : `-${c}`);
+    }
+    return out;
+  }
+  if (g.values.includes(t[1])) return yargsValue(t.slice(2)) ? [t] : undefined;
+  const out: string[] = [];
+  for (let i = 1; i < t.length; i++) {
+    const c = t[i];
+    if (g.values.includes(c)) {
+      const rest = t.slice(i + 1);
+      if (!yargsValue(rest)) return undefined;
+      out.push(`-${c}${rest}`);
+      return out;
+    }
+    if (!g.flags.includes(c)) return undefined;
+    out.push(`-${c}`);
+  }
+  return out;
+}
 
 interface ArgMatch {
   readonly entry: ArgEntry;
@@ -1457,12 +1576,14 @@ interface ArgResult {
 function processArgs(
   ctx: Ctx,
   kind: ToolKind,
-  args: readonly string[],
+  input: readonly string[],
   where: string,
   runnerCwd: string,
   gitRoot: string,
 ): ArgResult | Unverifiable {
   const table = ARG_TABLES[kind];
+  const camel = kind === "vitest" || kind === "jest";
+  const args = [...input];
   const kept: string[] = [];
   const notes = new Set<string>();
   const filters: string[] = [];
@@ -1476,6 +1597,13 @@ function processArgs(
   for (let i = 0; i < args.length; i++) {
     const t = args[i];
     if (t === "--") return badArg(t);
+    const parts = expandShort(kind, t);
+    if (!parts) return badArg(t);
+    if (parts.length !== 1 || parts[0] !== t) {
+      args.splice(i, 1, ...parts);
+      i--;
+      continue;
+    }
     if (kind === "pytest" && t.startsWith("-p") && !t.startsWith("--")) {
       const attached = t.length > 2;
       const value = attached ? t.slice(2) : args[i + 1];
@@ -1491,7 +1619,7 @@ function processArgs(
       }
       continue;
     }
-    const m = matchArg(table, t);
+    const m = matchArg(table, camel ? camelOption(t) : t);
     if (m) {
       const values: string[] = [];
       if (!m.inline) {
@@ -1535,6 +1663,8 @@ function processArgs(
       continue;
     }
     if (t.startsWith("-")) {
+      // D.1 g (QA-1.3-10): an option the vitest/jest tables do not know fails closed.
+      if (camel) return badArg(t);
       const next = args[i + 1];
       if (t.includes("=") || next === undefined || next.startsWith("-")) {
         kept.push(t);
@@ -2075,7 +2205,7 @@ function buildSpec(
     args = [...E, ...K, mode === "related" ? "--findRelatedTests" : "--runTestsByPath", "--passWithNoTests", `--maxWorkers=${N}`, "--coverage=false", "--json", `--outputFile=${R}`, "--", ...F];
   } else {
     args = [
-      ...E, ...K, "-q", "-p", "no:cacheprovider", `--junitxml=${R}`,
+      ...E, ...K, "-q", "-p", "no:cacheprovider", `--junitxml=${R}`, "--maxfail=0",
       ...(det.xdist ? ["-n", String(N)] : []),
       ...(det.covInConfig ? ["--no-cov"] : []),
       "--", ...F,
