@@ -666,6 +666,7 @@ Method:
 | QA-1.6-33 | Info | The lower-case prose guard deviates from §1.5-15 "same rules as `CAP:`" but is not recorded as a deviation |
 
 **QA-1.6-27 — Low — a valid lower-case directive followed by another directive on the same line is dropped silently**
+- Resolution: 288cb6a — after a non-upper-case key the tail may be closing marks/a table pipe/horizontal space, then end of line or another `VERIFY`/`VERIFY_WAIT`/`CAP` key (any case) + `:`; sticky regex on the text, no 256-char slice. L1/L2/L3/L6 → required; 300 spaces/dots + prose, L4, L5 stay rejected (L7 `<!-- … -->` stays prose, recorded in the header). Tests added.
 - Where: directives.ts:90 (`LINE_TAIL`), :127-131.
 - Evidence (probe; every case logs nothing):
   - [L1] `verify:required verify_wait:2s` → `deferred/default`, while the wait on the same line applies (2000/directive);
@@ -687,6 +688,7 @@ Method:
   tests. L4, L5 and L7 may stay prose, but record that decision in the header.
 
 **QA-1.6-28 — Low — the directive scan is quadratic on whitespace-free runs of keys (a regression from dcbd023)**
+- Resolution: 288cb6a — run end memoised per whitespace-free run, values matched in place with sticky regexes, only the ≤32-char logged value sliced. Probe at 1M: `VERIFY:` 41.7 ms, `VERIFY_WAIT:` 14.5 ms, `verify:` 41.0 ms, `VERIFY:a,` 29.3 ms. Timing test (1M chars < 500 ms per key form); all prior tests unchanged and green.
 - Where: directives.ts:117-123. Each key match re-reads the rest of its whitespace-free token with
   `/\S*/y` and copies it (`raw.replace(LEAD, "")`). Because scanning resumes right after the colon
   (the QA-1.6-19 fix), a run of k keys costs O(k × run length).
@@ -714,6 +716,7 @@ Method:
   `"VERIFY:".repeat(15_000)` < 50 ms (the QA-1.6-21 pattern).
 
 **QA-1.6-29 — Info — log escaping still passes invisible code points raw**
+- Resolution: 288cb6a — after `JSON.stringify` everything outside `[\x20-\x7e]` is escaped (`\uXXXX`, astral as `\u{…}`). Test covers U+E0049, U+034F, U+202E.
 - Where: directives.ts:93 (`UNSAFE`).
 - Evidence: the probe enumerated every non-whitespace code point in `\p{Cc}`, `\p{Cf}`,
   `\p{Default_Ignorable_Code_Point}`, `\p{Zl}` or `\p{Zp}`, placed each one inside a logged value, and
@@ -726,6 +729,7 @@ Method:
   That is complete, and simpler than a list; every valid value is ASCII.
 
 **QA-1.6-30 — Info — purity-guard false negatives and false positives**
+- Resolution: 7267b6c — both guards strip comments first and match `\bimport\s*\(`, `\brequire\s*\(`, `\bimport\b`, `\bfetch\b`, `\bprocess\b`, `export\s*\*`, indented `import/export … from`, `Worker`, `EventSource`, `sendBeacon`, `Bun.`, `Deno.`; risk removes its one allowed `import type` line before scanning.
 - Where: directives.test.ts:155-156; the risk.test.ts purity test.
 - Evidence: the guard regexes, copied verbatim, were run on sample lines.
   - Missed by **both** guards:
@@ -746,6 +750,7 @@ Method:
   and add `\bWorker\b|\bEventSource\b|sendBeacon|\bBun\.|\bDeno\.`. False positives are acceptable.
 
 **QA-1.6-31 — Info — test/dependency config conventions outside the rules**
+- Resolution: 7267b6c — added `setup-jest`, `jest-setup`, `vitest-setup`, `global-teardown` (`.[cm]?[jt]sx?`), `playwright.config.*`, `requirements*.in`, `Pipfile`. Tests added. (`cypress`/`karma`/`.mocharc`/`babel`/`environment.yml` not added: outside the dispatch scope.)
 - Where: risk.ts:147-148 (`SETUP_FILE`), :165-179.
 - Evidence (probe): each of these → low `["1-5 files changed"]`:
   - test-setup/teardown names:
@@ -769,6 +774,7 @@ Method:
   - add `Pipfile`.
 
 **QA-1.6-32 — Info — trimming trailing slashes from `root` is quadratic**
+- Resolution: 7267b6c — trailing `/` trimmed with an `endsWith` loop; timing test with 1M-slash roots (< 200 ms).
 - Where: risk.ts:109 (`norm(root).replace(/\/+$/, "")`).
 - Evidence (timing, root = `"/".repeat(n) + "x"`): 10k → 66.9 ms, 20k → 282.3 ms, 40k → 1217.6 ms,
   100k → 6744.2 ms, 1M → killed > 30 s. The round-2 claim "all other directive and risk regexes are
@@ -779,6 +785,7 @@ Method:
 - Fix (optional): trim with a loop (`while (r.endsWith("/")) r = r.slice(0, -1)`).
 
 **QA-1.6-33 — Info — the lower-case prose guard is an unrecorded deviation from §1.5-15**
+- Resolution: 288cb6a — Deviation (QA-1.6-18): a non-upper-case VERIFY key counts only when its value ends the line (or is followed by another directive key / table pipe, QA-1.6-27); `CAP:` has no such guard. Recorded in the directives.ts header and here; plan amendment stays in the next plan revision.
 - Where: this report, "Result" (the deviation list) and the round-2 "Deferred by plan" row "Amend the
   plan's 1.6.1 signature".
 - Evidence: §1.5-15 says "the same rules as `CAP:`". `CAP:`'s key is case-insensitive with no prose
