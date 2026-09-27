@@ -102,7 +102,7 @@
  * created the claim, and checked again right before each unlink, and drops its
  * own claim only within 1.5 x that (7.5 s). That includes a claim it created but
  * could not confirm (a scanner held the re-read): the process remembers its token
- * and drops it at its next readable look within those 7.5 s, and at exit; after
+ * and drops it at its next readable look within those 7.5 s, and at exit only within them too (QA-1.4-32); after
  * that it is left to the rules above. So a claimer acts on a claim judged inert
  * only if it freezes for more than 25 s (target) or 22.5 s (drop) between that
  * last check and the unlink syscall; when every process was frozen together, the
@@ -561,7 +561,7 @@ async function observe(slotPath: string, target: string, s: Present, at: number,
   let view: SeenView;
   // A stamp far in the future is another boot's clock: the view restarts.
   if (old !== undefined && at >= old.last - maxGap) {
-    view = { ...old, slack: Math.max(old.slack, slack), from: at - old.last > maxGap ? at : old.from, last: Math.max(old.last, at) };
+    view = { ...old, slack: Math.max(old.slack, slack), from: at - old.last > maxGap - (slack + old.slack) ? at : old.from, last: Math.max(old.last, at) };
   } else {
     view = { boot, bootAt, slack, first: at, from: at, last: at };
   }
@@ -668,8 +668,10 @@ const MAX_CLAIM_DEPTH = 3;
 interface Unconfirmed {
   token: string;
   dropBy: number;
+  /** The clock `dropBy` is on, so the exit hook can apply the same fence (QA-1.4-32). */
+  mono: () => number;
 }
-/** Claim path -> this process's unconfirmed claim there. Dropped at the next readable look, or at exit. */
+/** Claim path -> this process's unconfirmed claim there. Dropped at the next readable look, or at exit while within its fence. */
 const unconfirmedClaims = new Map<string, Unconfirmed>();
 const MAX_UNCONFIRMED = 64;
 
@@ -679,7 +681,7 @@ function noteUnconfirmed(claim: string, token: string, since: number, cfg: Cfg):
     const oldest = unconfirmedClaims.keys().next();
     if (!oldest.done) unconfirmedClaims.delete(oldest.value);
   }
-  unconfirmedClaims.set(claim, { token, dropBy: since + 1.5 * cfg.claimHoldMaxMs });
+  unconfirmedClaims.set(claim, { token, dropBy: since + 1.5 * cfg.claimHoldMaxMs, mono: cfg.mono });
 }
 
 /**
@@ -905,7 +907,10 @@ function releaseAllSync(): void {
   }
   held.clear();
   strays.clear();
-  for (const [claim, token] of [...activeClaims, ...[...unconfirmedClaims].map(([c, u]) => [c, u.token] as const)]) {
+  // An unconfirmed claim only within its drop fence, like the normal drop path: past it, another
+  // process may already be removing it as inert, and a late delete here could free a third reaper's claim (QA-1.4-32).
+  const unconfirmed = [...unconfirmedClaims].filter(([, u]) => u.mono() <= u.dropBy).map(([c, u]) => [c, u.token] as const);
+  for (const [claim, token] of [...activeClaims, ...unconfirmed]) {
     try {
       unlinkIfTokenSync(claim, token);
     } catch (e) {

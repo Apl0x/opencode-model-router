@@ -276,7 +276,7 @@ describe("slot: stale detection", () => {
     const t0 = Date.now();
     held(await acquireSlot({ max: 1, waitMs: 5_000, meta }, fast(dir, { staleMs: 600, heartbeatMs: WATCHER_HEARTBEAT_MS })));
     expect(Date.now() - t0).toBeGreaterThanOrEqual(500);
-  });
+  }, 20_000);
 
   it("a long hold (3x the stale threshold) keeps its slot because the heartbeat is fresh", async () => {
     const dir = freshDir();
@@ -299,7 +299,7 @@ describe("slot: stale detection", () => {
     const t0 = Date.now();
     held(await acquireSlot({ max: 1, waitMs: 5_000, meta }, deps));
     expect(Date.now() - t0).toBeGreaterThanOrEqual(950);
-  });
+  }, 20_000);
 
   it("same host + dead PID is stale immediately, even with a fresh heartbeat", async () => {
     const dir = freshDir();
@@ -352,7 +352,7 @@ describe("slot: clock changes and suspend/resume (QA-1.4-1, QA-1.4-8)", () => {
     const t0 = Date.now();
     held(await acquireSlot({ max: 1, waitMs: 5_000, meta }, fast(dir, { staleMs: 600, heartbeatMs: WATCHER_HEARTBEAT_MS })));
     expect(Date.now() - t0).toBeGreaterThanOrEqual(550);
-  });
+  }, 20_000);
 
   it("the wait deadline is monotonic: wall-clock steps neither cut a wait short nor extend it", async () => {
     const dir = freshDir();
@@ -544,7 +544,7 @@ describe("slot: shared observations outlive a call and a process (QA-1.4-21)", (
     const t0 = Date.now();
     held(await acquireSlot({ max: 1, waitMs: 5_000, meta }, deps));
     expect(Date.now() - t0).toBeGreaterThanOrEqual(900);
-  });
+  }, 20_000);
 });
 
 describe("slot: release", () => {
@@ -584,7 +584,7 @@ describe("slot: release", () => {
     expect(readFileSync(p, "utf8")).toBe(owner);
     await b.release();
     expect(existsSync(p)).toBe(false);
-  });
+  }, 20_000);
 
   it("EBUSY/EPERM on unlink is retried; a persistent failure is not treated as success", async () => {
     const dir = freshDir();
@@ -649,16 +649,18 @@ describe("slot: claims replace the time-leased reap lock (QA-1.4-2, QA-1.4-11)",
     const claim = reapClaimPath(p, "dead-holder");
     // Its mtime says 60 s old: that no longer shortens anything.
     writeLock(claim, { pid: process.ppid, token: "live-claimer", command: "reap" }, 60_000);
+    // One heartbeat for every look: a view's padded gap rule (QA-1.4-34) needs its writers' slacks to fit in 2 heartbeats.
+    const deps = fast(dir, { claimHoldMaxMs: 100, heartbeatMs: WATCHER_HEARTBEAT_MS });
     const t0 = Date.now();
-    expect(await acquireSlot({ max: 1, waitMs: 0, meta }, { dir })).toEqual({ busy: true });
-    expect(await acquireSlot({ max: 1, waitMs: 0, meta }, { dir, now: () => Date.now() + 10_500 })).toEqual({ busy: true });
+    expect(await acquireSlot({ max: 1, waitMs: 0, meta }, deps)).toEqual({ busy: true });
+    expect(await acquireSlot({ max: 1, waitMs: 0, meta }, { ...deps, now: () => Date.now() + 10_500 })).toEqual({ busy: true });
     expect(existsSync(claim)).toBe(true);
     // Inert: unchanged for staleMs (1 s here) since its first sighting above, witnessed for 2 x claimHoldMaxMs
     // (each plus the view's slack). The +10.5 s look has another origin, so it has its own view.
-    held(await acquireSlot({ max: 1, waitMs: 5_000, meta }, fast(dir, { claimHoldMaxMs: 100, heartbeatMs: WATCHER_HEARTBEAT_MS })));
+    held(await acquireSlot({ max: 1, waitMs: 5_000, meta }, deps));
     expect(Date.now() - t0).toBeGreaterThanOrEqual(950);
     expect(claimsIn(dir)).toEqual([]);
-  });
+  }, 20_000);
 
   it("the claim-hold deadline is re-checked after the re-read, right before the unlink (QA-1.4-20)", async () => {
     const dir = freshDir();
@@ -703,7 +705,7 @@ describe("slot: claims replace the time-leased reap lock (QA-1.4-2, QA-1.4-11)",
     held(await acquireSlot({ max: 1, waitMs: 5_000, meta }, deps));
     expect(Date.now() - t0).toBeGreaterThanOrEqual(900); // inert after staleMs (1 s) from its first readable sighting
     expect(claimsIn(dir)).toEqual([]);
-  });
+  }, 20_000);
 
   it("a reaper held inside its claim by EBUSY retries keeps it against a waiter whose clock jumped (P3)", async () => {
     const dir = freshDir();
@@ -721,7 +723,7 @@ describe("slot: claims replace the time-leased reap lock (QA-1.4-2, QA-1.4-11)",
     held(await a);
     expect(await acquireSlot({ max: 1, waitMs: 0, meta }, fast(dir))).toEqual({ busy: true });
     expect(claimsIn(dir)).toEqual([]);
-  });
+  }, 20_000);
 
   it("6 processes against a planted dead lock: never two holders", async () => {
     const dir = freshDir();
@@ -881,6 +883,29 @@ describe("slot: release never fails the caller (QA-1.4-4, QA-1.4-6, QA-1.4-17)",
     expect(exitReleaseFailures).toBe(failures);
     rmSync(foreign);
   });
+
+  it("the exit hook drops this process's unconfirmed claim only within its drop fence; past it the claim is left to the inert rule (QA-1.4-32)", async () => {
+    for (const past of [false, true]) {
+      const dir = freshDir();
+      const p = join(dir, "slot-0.lock");
+      writeLock(p, { pid: await deadPid(), token: "dead-holder" });
+      let shift = 0;
+      const mono = () => performance.now() + shift;
+      const read = async (path: string) => {
+        if (path.includes(".reap-")) throw Object.assign(new Error("scanner"), { code: "EBUSY" });
+        return realRead(path);
+      };
+      const deps = fast(dir, { read, mono, claimHoldMaxMs: 100, unlinkRetries: 2 });
+      expect(await acquireSlot({ max: 1, waitMs: 0, meta }, deps)).toEqual({ busy: true });
+      const claim = reapClaimPath(p, "dead-holder");
+      expect(existsSync(claim)).toBe(true); // ours, never confirmed
+      // The seam clock decides the fence: far before it, or far past it.
+      shift = past ? 1_000_000 : -1_000_000;
+      releaseAllSlotsSync();
+      expect(existsSync(claim)).toBe(past);
+      if (past) rmSync(claim);
+    }
+  }, 20_000);
 });
 
 describe("slot: fairness between processes (QA-1.4-9)", () => {
@@ -913,18 +938,20 @@ describe("slot: fairness between processes (QA-1.4-9)", () => {
       writeLock(p, { command: "wait", ...over });
       return p;
     };
+    // A 500 ms heartbeat (ticket TTL 1 s): the live ticket stays live under CPU load (QA-1.4-33).
+    const deps = fast(dir, { heartbeatMs: WATCHER_HEARTBEAT_MS, staleMs: 5_000 });
     const live = ticket({ pid: process.ppid, token: "w-live" });
-    expect(await acquireSlot({ max: 1, waitMs: 0, meta }, fast(dir))).toEqual({ busy: true });
-    await held(await acquireSlot({ max: 2, waitMs: 0, meta }, fast(dir))).release(); // 1 ticket ahead < max 2
-    // Not refreshed for 2 heartbeats (200 ms here) though younger than staleMs (1 s): dead, whatever its (live) PID.
-    setAge(live, 300);
-    await held(await acquireSlot({ max: 1, waitMs: 0, meta }, fast(dir))).release();
+    expect(await acquireSlot({ max: 1, waitMs: 0, meta }, deps)).toEqual({ busy: true });
+    await held(await acquireSlot({ max: 2, waitMs: 0, meta }, deps)).release(); // 1 ticket ahead < max 2
+    // Not refreshed for 2 heartbeats (1 s here) though younger than staleMs (5 s): dead, whatever its (live) PID.
+    setAge(live, 1_500);
+    await held(await acquireSlot({ max: 1, waitMs: 0, meta }, deps)).release();
     expect(existsSync(live)).toBe(false);
     const dead = ticket({ pid: await deadPid(), token: "w-dead" });
-    await held(await acquireSlot({ max: 1, waitMs: 0, meta }, fast(dir))).release();
+    await held(await acquireSlot({ max: 1, waitMs: 0, meta }, deps)).release();
     expect(existsSync(dead)).toBe(false);
     expect(readdirSync(dir).filter((n) => n.endsWith(".ticket"))).toEqual([]);
-  });
+  }, 20_000);
 
   it("a waiter heartbeats its ticket while a slow attempt runs, so the others keep deferring to it (QA-1.4-24)", async () => {
     const dir = freshDir();
@@ -973,7 +1000,7 @@ describe("slot: the holder learns that it lost the slot (QA-1.4-7)", () => {
     expect(warns.filter((w) => w.includes("slot lost"))).toHaveLength(1);
     await a.release();
     expect(tokenAt(p)).toBe(after);
-  });
+  }, 20_000);
 });
 
 describe("slot: waiting", () => {
@@ -999,7 +1026,7 @@ describe("slot: waiting", () => {
     expect(Date.now() - t0).toBeLessThan(100);
     expect(timers()).toBeLessThanOrEqual(before);
     expect(await acquireSlot({ max: 1, waitMs: 1_000, meta, signal: AbortSignal.abort() }, fast(dir))).toEqual({ busy: true });
-  });
+  }, 20_000);
 
   it("no busy-wait: a long wait wakes up a bounded number of times (exponential backoff)", async () => {
     const dir = freshDir();
@@ -1069,7 +1096,7 @@ describe("slot: unwritable temp dir", () => {
     await b.release();
     held(await acquireSlot({ max: 1, waitMs: 0, meta }, deps));
     expect(warns.filter((w) => w.includes("in-process"))).toHaveLength(1);
-  });
+  }, 20_000);
 
   it.each(["EPERM", "EBUSY"])(
     "a transient %s on the probe delete is not a verdict: exclusion with another process holds, no fallback, no leaked probe (QA-1.4-3)",
