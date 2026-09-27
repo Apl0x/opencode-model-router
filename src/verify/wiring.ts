@@ -32,7 +32,8 @@ import {
 } from "./dispatch";
 import { runArgv, runShell } from "./exec";
 import { snapshotTree } from "./tree";
-import { captureReference, DEFAULT_CAPTURE_TIMEOUT_MS, nodeReferenceFs } from "./reference";
+import { captureReference, DEFAULT_CAPTURE_TIMEOUT_MS, gcStaleReferences, nodeReferenceFs } from "./reference";
+import type { PluginLogger } from "../router/logger";
 import { REFERENCE_NONE } from "./baseline";
 import { scrubText } from "../guard/scrub";
 import type { DoD } from "./dod";
@@ -107,6 +108,14 @@ export interface VerificationWiring {
    * baselineTimeoutMs. Resolves when both settled; never rejects. No test command runs (G6).
    */
   beginVerification(store: ReturnType<typeof createChangedFileStore>, id: string, cwd: string | undefined, dod: DoD): Promise<void>;
+  /**
+   * 2.1.5b: beginVerification, awaited for at most captureWaitMs. The capture keeps running (up to
+   * baselineTimeoutMs) in the store after a timeout; a timeout or error only means "no reference
+   * yet" and is logged. Never rejects.
+   */
+  beginVerificationBounded(store: ReturnType<typeof createChangedFileStore>, id: string, cwd: string | undefined, dod: DoD): Promise<void>;
+  /** 2.1.5b: fire-and-forget crash GC of stale reference dirs at plugin start. Never throws. */
+  startReferenceGc(): void;
   /** P0: the snapshot, the changed files and the settled reference, each bounded by `deadline` when given. */
   prepareVerification(
     store: ReturnType<typeof createChangedFileStore>,
@@ -141,6 +150,31 @@ export interface VerificationWiring {
   buildGateDeps(parentSessionID?: string, inFlight?: Set<string>, prepared?: PreparedVerification, deadline?: Deadline): GateDeps;
 }
 
+/** How a bounded wait ended (awaitBounded). */
+export type BoundedOutcome = { kind: "settled" } | { kind: "timeout" } | { kind: "error"; error: unknown };
+
+/**
+ * Wait for `promise` for at most `ms`. Never rejects; clears its timer; the timer is unref'd so a
+ * pending wait never keeps the process alive. The promise itself keeps running after a timeout.
+ */
+export function awaitBounded(promise: Promise<unknown>, ms: number): Promise<BoundedOutcome> {
+  return new Promise<BoundedOutcome>(resolveOutcome => {
+    let done = false;
+    const finish = (outcome: BoundedOutcome): void => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      resolveOutcome(outcome);
+    };
+    const timer = setTimeout(() => finish({ kind: "timeout" }), Math.max(0, ms));
+    timer.unref?.();
+    promise.then(() => finish({ kind: "settled" }), (error: unknown) => finish({ kind: "error", error }));
+  });
+}
+
+/** Logging for the dispatch-time wait and the start-up GC. `debug` is optional (PluginLogger has none). */
+export type WiringLogger = Pick<PluginLogger, "warn"> & { debug?: (message: string, extra?: Record<string, unknown>) => void };
+
 function splitZ(out: string): string[] {
   return out.split("\0").filter(s => s.length > 0);
 }
@@ -154,8 +188,11 @@ export function createVerificationWiring(deps: {
   /** Project root; relative paths in checks resolve against it. */
   directory: string;
   getConfig: () => RouterConfig;
+  /** Default: console.warn, no debug output. */
+  logger?: WiringLogger;
 }): VerificationWiring {
   const { client, directory, getConfig } = deps;
+  const logger: WiringLogger = deps.logger ?? { warn: (message, extra) => console.warn(message, extra ?? "") };
   const graderSessions = new Set<string>();
   /** Child sessions already torn down; see disposeChildSession. */
   const disposed = new Set<string>();
@@ -397,20 +434,57 @@ export function createVerificationWiring(deps: {
     };
   };
 
+  const beginVerification: VerificationWiring["beginVerification"] = async (store, id, cwd, dod) => {
+    let deps: DispatchCaptureDeps;
+    try {
+      deps = captureDepsFor(dod);
+    } catch (err) {
+      // Never blocks or fails the dispatch: snapshot only, and no reference.
+      deps = {
+        snapshot: snapshotTree,
+        timeoutMs: DEFAULT_CAPTURE_TIMEOUT_MS,
+        uncaptured: { kind: "none", reason: `${REFERENCE_NONE.failed} (${errorText(err)})` },
+      };
+    }
+    await store.beginDispatch(id, resolve(directory, cwd || "."), deps);
+  };
+
   return {
-    async beginVerification(store, id, cwd, dod) {
-      let deps: DispatchCaptureDeps;
+    beginVerification,
+    async beginVerificationBounded(store, id, cwd, dod) {
+      let waitMs: number;
+      let begun: Promise<void>;
       try {
-        deps = captureDepsFor(dod);
+        waitMs = resolveVerifyBudget(getConfig()).captureWaitMs;
+        begun = beginVerification(store, id, cwd, dod);
       } catch (err) {
-        // Never blocks or fails the dispatch: snapshot only, and no reference.
-        deps = {
-          snapshot: snapshotTree,
-          timeoutMs: DEFAULT_CAPTURE_TIMEOUT_MS,
-          uncaptured: { kind: "none", reason: `${REFERENCE_NONE.failed} (${errorText(err)})` },
-        };
+        logger.warn("[verify] dispatch reference capture could not start", { id, error: errorText(err) });
+        return;
       }
-      await store.beginDispatch(id, resolve(directory, cwd || "."), deps);
+      const outcome = await awaitBounded(begun, waitMs);
+      if (outcome.kind === "timeout") {
+        logger.debug?.("[verify] dispatch reference not ready; proceeding without waiting further", { id, waitMs });
+      } else if (outcome.kind === "error") {
+        logger.warn("[verify] dispatch reference capture failed; proceeding without a reference", { id, error: errorText(outcome.error) });
+      }
+    },
+    startReferenceGc() {
+      if (!directory) {
+        logger.debug?.("[verify] reference GC skipped: plugin root unknown");
+        return;
+      }
+      try {
+        const budget = resolveVerifyBudget(getConfig());
+        const argv: ArgvSeam = (file, args, opts) => argvSeam(file, args, { ...opts, lowPriority: budget.lowPriority });
+        gcStaleReferences(directory, { argv, fs: nodeReferenceFs, logger }).then(
+          report => {
+            if (report.removed.length > 0) logger.debug?.("[verify] reference GC removed stale dirs", { removed: report.removed.length });
+          },
+          (err: unknown) => logger.warn("[verify] reference GC failed", { error: errorText(err) }),
+        );
+      } catch (err) {
+        logger.warn("[verify] reference GC failed", { error: errorText(err) });
+      }
     },
     async prepareVerification(store, id, childID, cwd, deadline) {
       const base = resolve(directory, cwd || ".");

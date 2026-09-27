@@ -340,12 +340,22 @@ const ModelRouterPlugin: Plugin = async (ctx: PluginInput) => {
   // Layer-2's impure corner: exec, fs, and the opencode client, built once and
   // read back through getConfig so a reloaded cfg (from /preset, /budget or
   // /router enforce) applies to graded work too.
-  const { graderSessions, dispatchGrader, buildGateDeps, disposeChildSession, beginVerification, prepareVerification } =
-    createVerificationWiring({
-      client: ctx.client,
-      directory: ctx.directory,
-      getConfig: () => cfg,
-    });
+  // Passive warnings go to opencode's log rather than stderr: console output
+  // from a plugin paints over the TUI. Falls back to console when the server
+  // has no /log endpoint. See src/router/logger.ts.
+  const logger = createPluginLogger(ctx.client);
+
+  const {
+    graderSessions, dispatchGrader, buildGateDeps, disposeChildSession,
+    beginVerificationBounded, prepareVerification, startReferenceGc,
+  } = createVerificationWiring({
+    client: ctx.client,
+    directory: ctx.directory,
+    getConfig: () => cfg,
+    logger,
+  });
+  // 2.1.5b: sweep reference dirs a crashed instance left behind. Fire-and-forget; never throws.
+  startReferenceGc();
 
   // Best-effort, secret-free delegate scorecard dump (counts only).
   const dumpDelegateScorecard = (
@@ -369,10 +379,6 @@ const ModelRouterPlugin: Plugin = async (ctx: PluginInput) => {
   // current plugin lifetime (i.e., until OpenCode is restarted).
   let bypassed = false;
 
-  // Passive warnings go to opencode's log rather than stderr: console output
-  // from a plugin paints over the TUI. Falls back to console when the server
-  // has no /log endpoint. See src/router/logger.ts.
-  const logger = createPluginLogger(ctx.client);
   warnDeprecatedVerifyKeys(cfg, logger);
 
   // Fetch and normalize opencode's live provider/model catalog. Best-effort:
@@ -537,7 +543,8 @@ const ModelRouterPlugin: Plugin = async (ctx: PluginInput) => {
               // recapturing after a failed attempt would excuse its regression.
               if (!baselineID) {
                 baselineID = producerSid;
-                beginVerification(changedFileStore, baselineID, args.cwd, dod);
+                // 2.1.5b: wait at most captureWaitMs; the capture continues in the background.
+                await beginVerificationBounded(changedFileStore, baselineID, args.cwd, dod);
               }
               // Compose with Layer 1: guard the plugin-created producer session.
               try {
@@ -901,7 +908,8 @@ const ModelRouterPlugin: Plugin = async (ctx: PluginInput) => {
       if (input?.tool === "task" && typeof input.callID === "string" && typeof input.sessionID === "string") {
         const mode = resolveEnforcementMode({ config: cfg, env: process.env }).mode;
         if (shouldVerifyTask("task", mode, cfg.enforcement?.verify?.require)) {
-          beginVerification(changedFileStore, `task:${input.sessionID}:${input.callID}`,
+          // 2.1.5b: wait at most captureWaitMs; the capture continues in the background.
+          await beginVerificationBounded(changedFileStore, `task:${input.sessionID}:${input.callID}`,
             typeof output?.args?.cwd === "string" ? output.args.cwd : undefined,
             buildDelegationDoD({
               prompt: typeof output?.args?.prompt === "string" ? output.args.prompt : undefined,

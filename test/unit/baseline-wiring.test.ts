@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { join, resolve } from "node:path";
 import { execFileSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
@@ -18,6 +18,9 @@ const state = vi.hoisted(() => ({
   captures: [] as { cwd: string; timeoutMs: number | undefined }[],
   captureResult: undefined as unknown,
   held: false, finish: undefined as (() => void) | undefined,
+  /** When set, the capture settles after this many (fake) ms; captureThrows rejects instead. */
+  captureDelayMs: undefined as number | undefined, captureThrows: false,
+  gcCalls: [] as string[], gcRejects: false,
 }));
 vi.mock("../../src/verify/tree", () => ({ snapshotTree: async () => state.snapshot }));
 // G6: no process may run at dispatch time; any shell or argv spawn is recorded and fails the assertion.
@@ -27,11 +30,16 @@ vi.mock("../../src/verify/exec", () => ({
 }));
 vi.mock("../../src/verify/reference", async importOriginal => ({
   ...(await importOriginal<typeof import("../../src/verify/reference")>()),
-  captureReference: (at: string, _signal: AbortSignal, deps: { timeoutMs?: number }) => new Promise(resolve => {
+  captureReference: (at: string, _signal: AbortSignal, deps: { timeoutMs?: number }) => new Promise((resolve, reject) => {
     state.captures.push({ cwd: at, timeoutMs: deps.timeoutMs });
-    const finish = () => resolve(state.captureResult);
-    if (state.held) state.finish = finish; else finish();
+    const finish = () => (state.captureThrows ? reject(new Error("capture exploded")) : resolve(state.captureResult));
+    if (state.captureDelayMs !== undefined) setTimeout(finish, state.captureDelayMs);
+    else if (state.held) state.finish = finish; else finish();
   }),
+  gcStaleReferences: (root: string) => {
+    state.gcCalls.push(root);
+    return state.gcRejects ? Promise.reject(new Error("gc exploded")) : Promise.resolve({ removed: [], kept: [], failed: [] });
+  },
 }));
 const cwd = resolve("baseline-wiring-project");
 const dod: DoD = { kind: "deterministic", source: "explicit", criteria: [], deliverable: null, checks: [{ kind: "testsPass", command: "pnpm test" }] };
@@ -39,6 +47,7 @@ const REF: DispatchReference = { root: cwd, head: "HEAD", commit: "HEAD", untrac
 beforeEach(() => Object.assign(state, {
   snapshot: { cwd, head: "HEAD", fingerprint: "before", dirty: true, files: [{ path: resolve(cwd, "old.ts"), status: " M" }] },
   commands: [], captures: [], captureResult: REF, held: false, finish: undefined,
+  captureDelayMs: undefined, captureThrows: false, gcCalls: [], gcRejects: false,
 }));
 function harness() {
   const cfg: RouterConfig = { activePreset: "a", presets: { a: { medium: { model: "p/m" } } }, defaultTier: "medium", rules: [], enforcement: { verify: { baselineTimeoutMs: 1234 } } };
@@ -150,6 +159,48 @@ describe("dispatch reference wiring", () => {
     expect((await wiring.prepareVerification(store, "dispatch", "retry")).reference).toEqual({ kind: "captured", reference: REF });
     expect((await wiring.prepareVerification(store, "never-begun", "child")).reference).toEqual({ kind: "none", reason: REFERENCE_NONE.untracked });
   });
+  describe("bounded wait (2.1.5b, fake timers)", () => {
+    const bounded = (verify: Record<string, unknown>) => {
+      const warnings: string[] = [];
+      const cfg: RouterConfig = { activePreset: "a", presets: { a: { medium: { model: "p/m" } } }, defaultTier: "medium", rules: [], enforcement: { verify: { baselineTimeoutMs: 30_000, ...verify } } };
+      const wiring = createVerificationWiring({ client: {}, directory: cwd, getConfig: () => cfg, logger: { warn: m => void warnings.push(m) } });
+      return { wiring, store: createChangedFileStore(), warnings };
+    };
+    const track = (p: Promise<void>) => { const s = { done: false }; void p.then(() => { s.done = true; }); return s; };
+    beforeEach(() => { vi.useFakeTimers(); });
+    afterEach(() => { vi.useRealTimers(); });
+
+    it("a capture resolving at 2 s lets the dispatch proceed at 2 s", async () => {
+      const { wiring, store } = bounded({ captureWaitMs: 5_000 }); state.captureDelayMs = 2_000;
+      const s = track(wiring.beginVerificationBounded(store, "d", undefined, dod));
+      await vi.advanceTimersByTimeAsync(1_999); expect(s.done).toBe(false);
+      await vi.advanceTimersByTimeAsync(1); expect(s.done).toBe(true);
+      expect((await wiring.prepareVerification(store, "d", "child")).reference).toEqual({ kind: "captured", reference: REF });
+    });
+    it("a capture at 20 s with captureWaitMs 5 s proceeds at 5 s and the capture is still usable later", async () => {
+      const { wiring, store } = bounded({ captureWaitMs: 5_000 }); state.captureDelayMs = 20_000;
+      const s = track(wiring.beginVerificationBounded(store, "d", undefined, dod));
+      await vi.advanceTimersByTimeAsync(4_999); expect(s.done).toBe(false);
+      await vi.advanceTimersByTimeAsync(1); expect(s.done).toBe(true);
+      await vi.advanceTimersByTimeAsync(15_000);
+      expect((await wiring.prepareVerification(store, "d", "child")).reference).toEqual({ kind: "captured", reference: REF });
+    });
+    it("a capture that throws never fails the dispatch", async () => {
+      const { wiring, store } = bounded({ captureWaitMs: 5_000 }); state.captureDelayMs = 1_000; state.captureThrows = true;
+      const p = wiring.beginVerificationBounded(store, "d", undefined, dod);
+      await vi.advanceTimersByTimeAsync(1_000);
+      await expect(p).resolves.toBeUndefined();
+      expect((await wiring.prepareVerification(store, "d", "child")).reference.kind).not.toBe("captured");
+    });
+    it("gcStaleReferences runs once per start and its rejection is logged, not thrown", async () => {
+      const { wiring, warnings } = bounded({}); state.gcRejects = true;
+      expect(() => wiring.startReferenceGc()).not.toThrow();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(state.gcCalls).toEqual([cwd]);
+      expect(warnings.some(w => w.includes("reference GC failed"))).toBe(true);
+    });
+  });
+
   it("an overlapping edit before the capture resolves discards the reference", async () => {
     const { wiring, store } = harness(); state.held = true;
     const begun = wiring.beginVerification(store, "dispatch", undefined, dod);
