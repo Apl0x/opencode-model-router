@@ -25,8 +25,25 @@ export interface ExecResult {
   timedOut?: boolean;
 }
 
+/** Options shared by every verification process seam (shell string or argv). */
+export interface ExecOptions {
+  cwd?: string;
+  timeoutMs?: number;
+  /** Aborting kills the whole process tree; an already-aborted signal never spawns. */
+  signal?: AbortSignal;
+  /** Run the process (and its descendants) at below-normal OS priority. */
+  lowPriority?: boolean;
+  /** Merged over process.env; never replaces it. */
+  env?: Record<string, string>;
+}
+
 export interface ExecSeam {
-  (command: string, opts?: { cwd?: string; timeoutMs?: number }): Promise<ExecResult>;
+  (command: string, opts?: ExecOptions): Promise<ExecResult>;
+}
+
+/** Spawn `file` with `args` and no shell: arguments reach the child byte-for-byte. */
+export interface ArgvSeam {
+  (file: string, args: readonly string[], opts?: ExecOptions): Promise<ExecResult>;
 }
 
 export interface FsSeam {
