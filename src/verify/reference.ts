@@ -110,7 +110,12 @@
 //      returns undefined.
 //      - `git rev-parse --git-path index` names the index file (the
 //        per-worktree one in a linked worktree). Its bytes are read with
-//        fs.readFile and written (mode 0o600, flag "wx") to <scratch>/index.
+//        fs.readFile and written (mode 0o600, flag "wx") to <scratch>/index,
+//        and the copy gets the original's mtime (floored to ms). Git's
+//        racy-git check compares entry mtimes with the index FILE's mtime; a
+//        fresh copy's later mtime made git trust stale stat data and miss a
+//        same-size edit made in the index's second (found while fixing
+//        QA-1.5-1: the stash commit and the drift diff lost such edits).
 //        scratch is a fresh omr-ref-<pid>-<16 hex> dir, made with
 //        mkdir(0o700) directly under realpath(deps.tmpdir ?? os.tmpdir())
 //        after assertSafeRefDir (R3), and kept in the in-use set meanwhile.
@@ -535,6 +540,8 @@ export interface ReferenceFs {
   readdir(path: string): Promise<string[]>;
   symlink(target: string, path: string, type: "junction" | "dir"): Promise<void>;
   unlink(path: string): Promise<void>;
+  /** Only on files and dirs this module created (private index copy, heartbeat). */
+  utimes(path: string, atime: Date, mtime: Date): Promise<void>;
   rm(
     path: string,
     options: { recursive: true; force: true; maxRetries: number; retryDelay: number },
@@ -1112,8 +1119,15 @@ async function withPrivateIndex<T>(
     created = true;
     if (env.platform !== "win32") await env.fs.chmod(scratch, 0o700);
     const copy = p.join(scratch, "index");
+    const original = await env.fs.lstat(indexFile);
     const bytes = await env.fs.readFile(indexFile, { signal: budget.signal });
     await env.fs.writeFile(copy, bytes, { mode: 0o600, flag: "wx" });
+    // Racy-git detection re-checks the content of entries whose mtime is not older than
+    // the index FILE's mtime. A fresh copy's later mtime would make git trust stale stat
+    // data and miss a same-size edit made in the index's second. The original mtime,
+    // floored to ms (never later than the original), keeps that protection.
+    const mtime = new Date(Math.floor(original.mtimeMs));
+    await env.fs.utimes(copy, mtime, mtime);
     if (budget.spent()) return undefined;
     return await use(copy);
   } finally {

@@ -281,6 +281,32 @@ describe("captureReference", { timeout: 60_000 }, () => {
     await git(repo, "add", "slow.txt");
   });
 
+  it("private index keeps racy-git detection: stat-identical same-size edits are captured and seen as drift", async () => {
+    const userIndex = join(repo, ".git", "index");
+    // Make an edit only a content check can see: same size, same mtime as the index entry,
+    // and the index file no newer than that mtime (racily clean). Git re-reads such an
+    // entry only while the index file is not newer; a fresh copy of the index would be.
+    const statIdenticalEdit = async (rel: string, content: string) => {
+      const file = join(repo, rel);
+      const { mtime } = await fsp.stat(file);
+      await fsp.writeFile(file, content);
+      await fsp.utimes(file, mtime, mtime);
+      await fsp.utimes(userIndex, mtime, mtime);
+      await new Promise((resolve) => setTimeout(resolve, 1100)); // any copy made now is in a later second
+    };
+    await statIdenticalEdit("a.txt", "a1\n");
+    const ref = await capture();
+    expect(ref.commit).not.toBe(ref.head);
+    expect(await git(repo, "show", `${ref.commit}:a.txt`)).toBe("a1\n");
+    await statIdenticalEdit("package.json", '{"name":"toor"}\n');
+    const handle = await mat(ref);
+    try {
+      expect(handle.inexactReasons).toContainEqual({ cause: "dependency-drift", path: "package.json" });
+    } finally {
+      await handle.dispose();
+    }
+  });
+
   it("QA-1.5-2: every git call carries --no-optional-locks; capture and materialize never write the user's index", async () => {
     await fsp.writeFile(join(repo, "a.txt"), "a-dirty\n");
     const past = new Date(Date.now() - 60_000);
