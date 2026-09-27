@@ -336,8 +336,11 @@ export function resolveRepoCommand(
 //   P7  The recheck runs only for "ran" with >= 1 failing id and >= 1 failing file (T4).
 //   P8  judgeScoped(scoped, recheck) -> TestsPassJudgement, returned as the check's CheckResult.
 //   P9  scope.close() waits for pending disposals, then releases the slot; never rejects. The
-//       verdict path does not wait for the LAST close of a gate (void scope.close()), so a slow
-//       dispose never costs a verdict; earlier checks' closes are awaited (T8).
+//       testsPass hook waits for it only while the gate deadline lasts (closeWithinDeadline,
+//       QA-2.1-3): within the budget a close is awaited, so scopes never nest (T8); once the
+//       budget is spent the close carries on in the background (errors logged), still releasing
+//       the slot only after the disposal, and no later check of the gate can acquire one. A slow
+//       dispose never costs a verdict.
 //
 // -----------------------------------------------------------------------------------------------
 // T3. DEADLINE SEMANTICS (section 1.5-13)
@@ -1274,11 +1277,48 @@ export function createDirectTestsPassHook(deps: DirectTestsPassHookDeps): TestsP
       if (scoped !== undefined) return { scoped, recheck: { kind: "unusable", cause: "error", reason: `the reference recheck errored: ${reason}` } };
       return { scoped: { kind: "error", reason: `testsPass hook errored: ${reason}` }, recheck: undefined };
     } finally {
-      if (scope !== undefined) {
-        await scope.close().catch((err: unknown) => deps.logger?.warn(`verification scope close failed: ${errorText(err)}`));
-      }
+      if (scope !== undefined) await closeWithinDeadline(scope, req.deadline, deps.logger);
     }
   };
+}
+
+/**
+ * P9 (QA-2.1-3): waits for `scope.close()` only until `deadline` is spent (its abort, or its
+ * remaining time), so a reference dispose (EBUSY retries) never outlasts the gate budget and turns
+ * a verdict into a gate timeout. The close carries on in the background after that: it still
+ * releases the slot only once every tracked disposal and killed tree has settled, and its failure
+ * is logged. A spent deadline also bars every later scope of the gate from acquiring a slot
+ * (acquireHold), so an unfinished close never nests with another hold. Never rejects.
+ */
+export function closeWithinDeadline(scope: CheckScope, deadline: Deadline, logger?: Pick<PluginLogger, "warn">): Promise<void> {
+  const warn = (err: unknown): void => logger?.warn(`verification scope close failed: ${errorText(err)}`);
+  let closing: Promise<void>;
+  try {
+    closing = scope.close().catch(warn);
+  } catch (err) {
+    warn(err);
+    return Promise.resolve();
+  }
+  return new Promise<void>(settle => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const done = (): void => {
+      if (timer !== undefined) clearTimeout(timer);
+      timer = undefined;
+      deadline.signal.removeEventListener("abort", done);
+      settle();
+    };
+    void closing.then(done);
+    const left = deadline.remaining();
+    if (deadline.signal.aborted || left <= 0) {
+      done();
+      return;
+    }
+    deadline.signal.addEventListener("abort", done, { once: true });
+    if (Number.isFinite(left)) {
+      timer = setTimeout(done, Math.min(left, MAX_TIMER_MS));
+      timer.unref?.();
+    }
+  });
 }
 
 // -----------------------------------------------------------------------------------------------

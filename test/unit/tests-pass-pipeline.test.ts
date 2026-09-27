@@ -28,6 +28,9 @@ import type {
   TestsPassRequest,
 } from "../../src/verify/types";
 import type { TreeSnapshot } from "../../src/verify/dispatch";
+import type { DoD } from "../../src/verify/dod";
+import { accept, unverifiableGateResult, type Artefact, type GateResult } from "../../src/verify/gate";
+import { withTimeout } from "../../src/verify/timeout";
 import {
   type CheckScope,
   type CommandOutcome,
@@ -978,6 +981,82 @@ describe("createDirectTestsPassHook (2.1.2.4)", () => {
     const b = setup({ scoped: new Error("executor exploded") });
     expect(await b.hook(request())).toEqual({ scoped: { kind: "error", reason: "testsPass hook errored: executor exploded" }, recheck: undefined });
     expect(b.close).toHaveBeenCalledTimes(1);
+  });
+
+  describe("a close that outlasts the gate deadline (QA-2.1-3)", () => {
+    const failing = (): Opts => ({ scoped: { kind: "ran", result: FAILING, exitCode: 1, spec: SPEC, notes: [] } });
+    afterEach(() => { vi.useRealTimers(); });
+
+    it("is awaited while the deadline lasts, and the hook returns its run once the deadline is spent", async () => {
+      vi.useFakeTimers();
+      const s = setup(failing());
+      let finish!: () => void;
+      s.close.mockImplementation(() => new Promise<void>(resolve => { finish = resolve; }));
+      const d = createDeadline(1_000);
+      let out: Awaited<ReturnType<typeof s.hook>> | undefined;
+      void s.hook(request({ deadline: d })).then(o => { out = o; });
+      // Within the budget the close is awaited, so no later check's scope can nest with this hold.
+      await vi.advanceTimersByTimeAsync(999);
+      expect(out).toBeUndefined();
+      await vi.advanceTimersByTimeAsync(1);
+      expect(out).toEqual({ scoped: { kind: "ran", result: FAILING, exitCode: 1, spec: SPEC, notes: [] }, recheck: EXACT });
+      expect(s.close).toHaveBeenCalledTimes(1);
+      finish(); // The close still settles later, in the background.
+      d.dispose();
+    });
+
+    it("an already spent deadline does not wait at all, and a rejecting close is logged", async () => {
+      const warnings: string[] = [];
+      const s = setup(failing());
+      s.close.mockImplementation(() => Promise.reject(new Error("dispose exploded")));
+      const hook = createDirectTestsPassHook({
+        openScope: s.openScope, plannerFs: { fileExists: async () => true, readFile: async () => "" },
+        search: { findByName: async () => [], findByContent: async () => [] }, plan: s.plan,
+        budget: { maxWorkers: 2, failureRecheck: true }, logger: { warn: m => void warnings.push(m) },
+      });
+      const d = createDeadline(0);
+      expect((await hook(request({ deadline: d }))).recheck).toBe(EXACT);
+      await vi.waitFor(() => expect(warnings).toEqual(["verification scope close failed: dispose exploded"]));
+      s.close.mockImplementation(() => new Promise<void>(() => {}));
+      expect((await hook(request({ deadline: d }))).scoped.kind).toBe("ran");
+    });
+
+    it("the gate still returns a proven introduced failure within its budget when close never settles", async () => {
+      const s = setup(failing());
+      s.close.mockImplementation(() => new Promise<void>(() => {}));
+      const BUDGET_MS = 300;
+      const dod: DoD = { kind: "deterministic", source: "explicit", criteria: [], deliverable: null, checks: [{ kind: "testsPass" }] };
+      const artefact: Artefact = { changedFiles: [], declaredOutputs: [], finalReturnText: "done", producerTier: "medium", producerSessionID: "child" };
+      // As index.ts: the deadline first, then the gate's withTimeout over the same budget.
+      const gateDeadline = createDeadline(BUDGET_MS);
+      const completedFailures: string[] = [];
+      const started = Date.now();
+      let res: GateResult;
+      try {
+        res = await withTimeout(accept({ dod }, artefact, {
+          deterministic: {
+            cwd: ROOT,
+            exec: async () => { throw new Error("testsPass must never run its command through deps.exec"); },
+            fs: { fileExists: async () => false, readFile: async () => "" },
+            testsPass: s.hook,
+            deadline: gateDeadline,
+            reference: { kind: "captured", reference: REFERENCE },
+            changedFiles: [{ path: join(ROOT, "src", "a.ts"), status: "modified" }],
+            onFailure: reason => completedFailures.push(reason),
+          },
+          checker: { dispatchGrader: async () => ({ sessionID: "grader", text: "" }) },
+        }), BUDGET_MS, "verification gate");
+      } catch (error) {
+        gateDeadline.abort("verification gate timed out");
+        res = unverifiableGateResult(`verification gate timed out: ${String(error)}`, dod.source, false, completedFailures);
+      } finally {
+        gateDeadline.dispose();
+      }
+      expect(Date.now() - started).toBeLessThan(BUDGET_MS + 1_000);
+      expect(res.accepted).toBe(false);
+      expect(res.verdict.outcome).toBe("fail");
+      expect(res.verdict.reasons.join(" ")).toContain("test/a.test.ts > fails");
+    });
   });
 
   it("keeps the scoped outcome when the Rechecker throws, and still closes", async () => {
