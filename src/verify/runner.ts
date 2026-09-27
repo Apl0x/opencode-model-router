@@ -317,9 +317,24 @@
 //     - entry = P.resolve(pkgDir, bin). It must stay inside pkgDir (P.relative(pkgDir, entry) has
 //       no ".." segment and is not absolute), end in .js, .mjs or .cjs, and exist. Otherwise
 //       -> bad-bin.
-//     - Result: {file: host.execPath, prefix: [entry], entry, version}.
+//     - Result: {file: node (F.1), prefix: [entry], entry, version}.
 //     - npx and pnpm exec resolve exactly like direct invocations. They are never executed, so
 //       npx can never download a runner.
+//   F.1 node (QA-1.3-18). The plugin runtime is Bun, and a compiled opencode reports itself as
+//     process.execPath; jest 30 fails every suite under bun.exe ("Attempted to assign to readonly
+//     property"). So the JS tools never inherit the runtime blindly:
+//       1. host.nodePath when given (absolute; otherwise S6 node-not-found).
+//       2. host.execPath when its basename is node or node.exe. The DEFAULT execPath
+//          (process.execPath) also needs process.versions.bun to be undefined.
+//       3. The first node on an absolute host.pathEnv entry: posix "<dir>/node"; win32
+//          "<dir>\node<ext>" for each PATHEXT ext in order (the shell's rule). A win32 hit that is
+//          not .exe (node.cmd, node.bat) needs a shell -> S6 node-not-found "node on PATH is not an
+//          executable file: <f>". A hit whose realpath is bun or bun.exe (the temporary node link
+//          `bun run` creates when node is missing) is skipped. fileExists and realpath only.
+//       4. Nothing -> S6 node-not-found "node not found: no absolute PATH entry has a node
+//          executable".
+//     Only JS tools resolve node, after their package entry (a missing package is reported
+//     first). pytest and uv are native executables.
 //   pytest (launcher "direct"): the first PATH hit, then a venv.
 //     - PATH: for each ABSOLUTE entry of host.pathEnv split by P.delimiter (relative entries such
 //       as "." are skipped), check win32 "<dir>\pytest.exe" or posix "<dir>/pytest".
@@ -430,7 +445,7 @@
 //   Notation: F = the sorted absolute inputs, K = runner.keptArgs, N = the effective workers,
 //   R = reportPath, E = entry.prefix.
 //
-//   vitest scoped (mode "related"): file = host.execPath
+//   vitest scoped (mode "related"): file = node (F.1)
 //     [...E, "related", ...F, ...K, "--run", "--passWithNoTests", `--maxWorkers=${N}`,
 //      "--coverage.enabled=false", "--reporter=json", `--outputFile=${R}`]
 //     NEVER add "--" here: cac takes the tokens after "--" out of related's file list, and that
@@ -440,7 +455,7 @@
 //      "--reporter=json", `--outputFile=${R}`]
 //     Filters match as substrings. An absolute path selects that file, and at most a longer name
 //     with the same prefix (see P).
-//   jest scoped: file = host.execPath
+//   jest scoped: file = node (F.1)
 //     [...E, ...K, "--findRelatedTests", "--passWithNoTests", `--maxWorkers=${N}`, "--coverage=false",
 //      "--json", `--outputFile=${R}`, "--", ...F]
 //   jest rerun: the same, with "--runTestsByPath" in place of "--findRelatedTests".
@@ -633,6 +648,9 @@
 //     tmpdir-in-repo           temp dir is inside the repository: <tmpdir>
 //                              temp dir is not an absolute path: <tmpdir>   (H)
 //     argv-too-long            too many inputs for one command line: <n> files
+//     node-not-found           node not found: no absolute PATH entry has a node executable
+//                              node path is not absolute: <path>
+//                              node on PATH is not an executable file: <f>   (F.1)
 //   M.2 NoAffected notes:
 //     "no changed files, no affected tests"                          (section 1.5-6, exactly)
 //     "no affected tests: no changed file is a test input"           (docs only, dropped paths,
@@ -646,9 +664,10 @@
 // ------------------------------------------------------------------------------------------------
 // N. SECURITY INVARIANTS (the 1.3 QA review checks each one in code)
 //
-//   1. No shell, ever. This module never imports child_process. spec.file is one of:
-//      host.execPath; or a native file named pytest(.exe) or uv(.exe) from an absolute PATH entry
-//      or the .venv fallback. It is never a .cmd/.bat/.ps1/.sh shim. npx, pnpm, yarn and bun are
+//   1. No shell, ever. This module never imports child_process. spec.file is one of: node (F.1:
+//      host.nodePath, a node-named host.execPath, or node(.exe) from an absolute PATH entry); or a
+//      native file named pytest(.exe) or uv(.exe) from an absolute PATH entry or the .venv
+//      fallback. It is never a .cmd/.bat/.ps1/.sh shim, and never Bun. npx, pnpm, yarn and bun are
 //      only parsed, never executed.
 //   2. File arguments are argv elements, each absolute, normalized and inside gitRoot, so no
 //      file argument can start with "-". A file literally named "--config=evil" becomes
@@ -836,7 +855,8 @@ export type S6Code =
   | "stem-too-common"
   | "search-failed"
   | "tmpdir-in-repo"
-  | "argv-too-long";
+  | "argv-too-long"
+  | "node-not-found";
 
 /** S6: scoping is impossible. The reason names the construct (section M.1) and never triggers a full suite. */
 export interface Unverifiable {
@@ -882,14 +902,22 @@ export type UserWorkerCap =
 export interface RunnerHost {
   /** Picks path.win32 or path.posix for every path operation. Default: process.platform. */
   readonly platform: NodeJS.Platform;
-  /** Default: process.execPath. */
+  /**
+   * The running process's executable. Default: process.execPath. JS tools run under it only when
+   * it is node (basename node or node.exe; the default also requires a non-Bun runtime). Under Bun,
+   * or inside a compiled binary, node comes from PATH instead (F.1, QA-1.3-18).
+   */
   readonly execPath: string;
+  /** An explicit absolute node executable for JS tools (F.1). It wins over execPath and PATH. */
+  readonly nodePath?: string;
   /** Default: os.tmpdir(). */
   readonly tmpdir: string;
   /** Default: os.availableParallelism(). */
   readonly cores: number;
   /** Default: process.env.PATH ?? "". */
   readonly pathEnv: string;
+  /** win32 only, the node PATH lookup (F.1). Default: process.env.PATHEXT ?? ".COM;.EXE;.BAT;.CMD". */
+  readonly pathExt?: string;
   /** Default: process.env.PYTEST_ADDOPTS ?? "" (xdist/cov evidence, D.4). */
   readonly pytestAddopts: string;
   /** Default: crypto.randomUUID. It must return a UUID (REPORT_NAME_RE). */
@@ -986,7 +1014,7 @@ export interface EntryRequest {
 }
 
 export interface ResolvedEntry {
-  /** host.execPath for JS tools; the native pytest/uv executable otherwise. */
+  /** node (F.1) for JS tools; the native pytest/uv executable otherwise. */
   readonly file: string;
   /** Leading args: [entryJs] for JS tools, [] for pytest, ["run", "pytest"] for uv. */
   readonly prefix: readonly string[];
@@ -1000,7 +1028,7 @@ export interface ResolvedEntry {
 export interface ScopedSpec {
   readonly runner: RunnerKind;
   readonly mode: "related" | "rerun";
-  /** process.execPath for vitest/jest; the native pytest/uv executable otherwise. Never a shim. */
+  /** node (F.1) for vitest/jest; the native pytest/uv executable otherwise. Never a shim, never Bun. */
   readonly file: string;
   /** The complete argv after `file` (H). */
   readonly args: readonly string[];
@@ -1030,7 +1058,7 @@ export interface ScopedSpec {
 /** An executable scoped eslint run (section K). Pass or fail comes from the exit code. */
 export interface LintSpec {
   readonly runner: "eslint";
-  /** host.execPath. */
+  /** node (F.1). */
   readonly file: string;
   readonly args: readonly string[];
   readonly cwd: string;
@@ -1134,15 +1162,19 @@ interface Ctx {
   readonly P: PathApi;
   readonly win: boolean;
   key(p: string): string;
+  /** host.execPath is a node executable JS tools can run under (F.1, QA-1.3-18). */
+  readonly execIsNode: boolean;
 }
 
 function resolveHost(h: Partial<RunnerHost> | undefined): RunnerHost {
   return {
     platform: h?.platform ?? process.platform,
     execPath: h?.execPath ?? process.execPath,
+    ...(h?.nodePath !== undefined ? { nodePath: h.nodePath } : {}),
     tmpdir: h?.tmpdir ?? os.tmpdir(),
     cores: h?.cores ?? os.availableParallelism(),
     pathEnv: h?.pathEnv ?? process.env.PATH ?? "",
+    pathExt: h?.pathExt ?? process.env.PATHEXT ?? ".COM;.EXE;.BAT;.CMD",
     pytestAddopts: h?.pytestAddopts ?? process.env.PYTEST_ADDOPTS ?? "",
     randomId: h?.randomId ?? randomUUID,
   };
@@ -1151,7 +1183,11 @@ function resolveHost(h: Partial<RunnerHost> | undefined): RunnerHost {
 function makeCtx(h: Partial<RunnerHost> | undefined): Ctx {
   const host = resolveHost(h);
   const win = host.platform === "win32";
-  return { host, P: win ? nodePath.win32 : nodePath.posix, win, key: (p: string) => (win ? p.toLowerCase() : p) };
+  const P = win ? nodePath.win32 : nodePath.posix;
+  const named = /^node(?:\.exe)?$/.test(win ? P.basename(host.execPath).toLowerCase() : P.basename(host.execPath));
+  // F.1: an explicit execPath is trusted by name; the default also needs a runtime that is not Bun.
+  const execIsNode = named && (h?.execPath !== undefined || process.versions.bun === undefined);
+  return { host, P, win, key: (p: string) => (win ? p.toLowerCase() : p), execIsNode };
 }
 
 function s6(code: S6Code, reason: string): Unverifiable {
@@ -2205,7 +2241,7 @@ async function resolveEntryImpl(
   ctx: Ctx,
   req: EntryRequest,
   cwd: string,
-  fs: FsSeam,
+  fs: PlannerFs,
 ): Promise<{ entry: ResolvedEntry; notes: string[] } | Unverifiable> {
   const P = ctx.P;
   const exe = (name: string) => (ctx.win ? `${name}.exe` : name);
@@ -2263,7 +2299,46 @@ async function resolveEntryImpl(
   if (!/\.(?:js|mjs|cjs)$/.test(entry)) return badBin("bin is not a .js, .mjs or .cjs file");
   if (!(await fs.fileExists(entry))) return badBin(`bin entry missing: ${entry}`);
   const version = typeof meta.version === "string" ? meta.version : undefined;
-  return { entry: { file: ctx.host.execPath, prefix: [entry], entry, ...(version !== undefined ? { version } : {}) }, notes: [] };
+  const node = await resolveNode(ctx, fs);
+  if (typeof node !== "string") return node;
+  return { entry: { file: node, prefix: [entry], entry, ...(version !== undefined ? { version } : {}) }, notes: [] };
+}
+
+/**
+ * F.1 (QA-1.3-18): the node executable that runs a JS tool. Never Bun or a compiled binary:
+ * jest fails every suite under bun.exe. Order: host.nodePath, host.execPath when it is node, then
+ * the first node on an absolute PATH entry. On win32 each PATHEXT extension is tried in order, as
+ * the shell does; a hit that is not a .exe (a .cmd/.bat shim) needs a shell -> S6. A PATH node that
+ * realpaths to bun (Bun's temporary node link) is skipped. fileExists only, nothing is spawned.
+ */
+async function resolveNode(ctx: Ctx, fs: PlannerFs): Promise<string | Unverifiable> {
+  const { P, host } = ctx;
+  if (host.nodePath !== undefined) {
+    return P.isAbsolute(host.nodePath) ? host.nodePath : s6("node-not-found", `node path is not absolute: ${host.nodePath}`);
+  }
+  if (ctx.execIsNode) return host.execPath;
+  const exts = ctx.win ? (host.pathExt ?? "").split(";").map((x) => x.trim().toLowerCase()).filter((x) => x.startsWith(".")) : [""];
+  for (const dir of host.pathEnv.split(P.delimiter)) {
+    if (!dir || !P.isAbsolute(dir)) continue;
+    for (const ext of exts) {
+      const f = P.join(dir, `node${ext}`);
+      if (!(await fs.fileExists(f))) continue;
+      if (ctx.win && ext !== ".exe") return s6("node-not-found", `node on PATH is not an executable file: ${f}`);
+      if (await isBunLink(ctx, fs, f)) break;
+      return f;
+    }
+  }
+  return s6("node-not-found", "node not found: no absolute PATH entry has a node executable");
+}
+
+/** A PATH node that is really Bun: `bun run` links a temporary `node` to itself when node is missing. */
+async function isBunLink(ctx: Ctx, fs: PlannerFs, f: string): Promise<boolean> {
+  if (!fs.realpath) return false;
+  const real = await fs.realpath(f).then(
+    (x) => stripWinPrefix(ctx, x),
+    () => f,
+  );
+  return /^bun(?:\.exe)?$/i.test(ctx.P.basename(real));
 }
 
 // ---------------------------------------------------------------------------------------------

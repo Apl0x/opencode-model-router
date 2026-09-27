@@ -2108,3 +2108,81 @@ describe("QA-1.3-9: eslint >= 9 lints what its flat config matches", () => {
     expect(await lint("eslint", changed("src/App.vue"), files)).toEqual({ noAffected: true, note: "no changed lintable files" });
   });
 });
+
+// ---------------------------------------------------------------------------------------------
+// QA round 2 (docs/qa/verification-resource-budget/phase-1.3.md, QA-1.3-18..28)
+// ---------------------------------------------------------------------------------------------
+
+describe("QA-1.3-18: JS tools run under node, never under Bun or a compiled binary", () => {
+  const W = {
+    "C:\\repo\\.git": "",
+    "C:\\repo\\node_modules\\jest\\package.json": JEST_PKG,
+    "C:\\repo\\node_modules\\jest\\bin\\jest.js": "",
+    "C:\\repo\\src\\a.js": "",
+    "C:\\Program Files\\nodejs\\node.exe": "",
+  };
+  const winPlan = (host: Partial<RunnerHost>, files: Record<string, string> = W, fs?: PlannerFs) =>
+    planScopedRun(input({ win: true, command: "jest", files, cwd: "C:\\repo", changedFiles: changed("src\\a.js"), host, ...(fs ? { fs } : {}) }));
+  const bunHost = (execPath: string, pathEnv: string, pathExt = ".COM;.EXE;.BAT;.CMD") => ({ ...WIN_HOST, execPath, pathEnv, pathExt });
+
+  it.each(["C:\\Users\\M\\.bun\\bin\\bun.exe", "C:\\tools\\opencode.exe"])("execPath %s -> node.exe from PATH", async (execPath) => {
+    const s = spec(await winPlan(bunHost(execPath, "rel\\bin;C:\\nope;C:\\Program Files\\nodejs")));
+    expect(s.file).toBe("C:\\Program Files\\nodejs\\node.exe");
+    expect(s.args[0]).toBe("C:\\repo\\node_modules\\jest\\bin\\jest.js");
+  });
+
+  it("PATHEXT order decides, as in the shell: a node.cmd shim first -> S6; .exe first -> the exe", async () => {
+    const files = { ...W, "C:\\shim\\node.cmd": "", "C:\\shim\\node.exe": "" };
+    expectS6(await winPlan(bunHost("C:\\b\\bun.exe", "C:\\shim;C:\\Program Files\\nodejs", ".CMD;.EXE"), files), "node-not-found", "node on PATH is not an executable file: C:\\shim\\node.cmd");
+    expect(spec(await winPlan(bunHost("C:\\b\\bun.exe", "C:\\shim", ".EXE;.CMD"), files)).file).toBe("C:\\shim\\node.exe");
+    expectS6(await winPlan(bunHost("C:\\b\\bun.exe", "C:\\Program Files\\nodejs", ".CMD; ;bat")), "node-not-found", "node not found: no absolute PATH entry has a node executable");
+  });
+
+  it("no node anywhere -> S6 for tests, Unscoped for lint; pytest needs no node", async () => {
+    expectS6(await winPlan(bunHost("C:\\b\\bun.exe", "C:\\nope")), "node-not-found", "node not found: no absolute PATH entry has a node executable");
+    const noNode = { ...POSIX_HOST, execPath: "/home/u/.bun/bin/bun", pathEnv: "/usr/bin" };
+    expectUnscoped(await lint("eslint", changed("src/a.ts"), lintRepo(), noNode), "node not found: no absolute PATH entry has a node executable");
+    const py = spec(await planScopedRun(input({ command: "pytest", files: pyRepo({ "/r/tests/test_a.py": "" }), host: noNode, changedFiles: changed("tests/test_a.py") })));
+    expect(py.file).toBe("/usr/bin/pytest");
+  });
+
+  it("host.nodePath wins over execPath and PATH; a relative one -> S6", async () => {
+    expect(spec(await winPlan({ ...WIN_HOST, nodePath: "D:\\n\\node.exe" })).file).toBe("D:\\n\\node.exe");
+    expectS6(await winPlan({ ...WIN_HOST, nodePath: "node.exe" }), "node-not-found", "node path is not absolute: node.exe");
+  });
+
+  it("the default execPath is used only when the runtime is not Bun", async () => {
+    // The host platform must be the real one: the default execPath is process.execPath.
+    const win = process.platform === "win32";
+    const { execPath: _e, ...noExec } = win ? WIN_HOST : POSIX_HOST;
+    const pathNode = win ? "C:\\opt\\node\\node.exe" : "/opt/node/bin/node";
+    const files = win ? { ...W, [pathNode]: "" } : jsRepo({}, { "/r/src/a.js": "", [pathNode]: "" });
+    const host = { ...noExec, platform: process.platform, pathEnv: win ? "C:\\opt\\node" : "/opt/node/bin" };
+    const run = async () =>
+      spec(await planScopedRun(input({ win, command: "jest", files, host, cwd: win ? "C:\\repo" : "/r", changedFiles: changed(win ? "src\\a.js" : "src/a.js") }))).file;
+    expect(await run()).toBe(process.execPath);
+    Object.defineProperty(process.versions, "bun", { value: "1.3.14", configurable: true });
+    try {
+      expect(await run()).toBe(pathNode);
+    } finally {
+      Reflect.deleteProperty(process.versions, "bun");
+    }
+  });
+
+  it("a PATH node that realpaths to bun (bun run's temporary link) is skipped", async () => {
+    const files = jsRepo({}, { "/r/src/a.js": "", "/home/u/.bun/bin/bun": "", "/usr/local/bin/node": "" });
+    const fs = aliasFs(files, false, { "/tmp/bun-node-1/node": "/home/u/.bun/bin/bun" });
+    const host = { ...POSIX_HOST, execPath: "/home/u/.bun/bin/bun", pathEnv: "/tmp/bun-node-1:/usr/local/bin" };
+    expect(spec(await planScopedRun(input({ command: "jest", fs, host, changedFiles: changed("src/a.js") }))).file).toBe("/usr/local/bin/node");
+    const wfs = aliasFs({ ...W, "C:\\Users\\u\\.bun\\bin\\bun.exe": "" }, true, { "C:\\Temp\\bun-node-1\\node.exe": "C:\\Users\\u\\.bun\\bin\\bun.exe" });
+    const wspec = spec(await winPlan(bunHost("C:\\Users\\u\\.bun\\bin\\bun.exe", "C:\\Temp\\bun-node-1;C:\\Program Files\\nodejs"), W, wfs));
+    expect(wspec.file).toBe("C:\\Program Files\\nodejs\\node.exe");
+  });
+
+  it("a realpath failure keeps the PATH node", async () => {
+    const base = memFs(jsRepo({}, { "/r/src/a.js": "", "/usr/local/bin/node": "" }));
+    const fs: PlannerFs = { ...base, realpath: async (p) => (p === "/usr/local/bin/node" ? Promise.reject(new Error("EACCES")) : p) };
+    const host = { ...POSIX_HOST, execPath: "/b/bun", pathEnv: "/usr/local/bin" };
+    expect(spec(await planScopedRun(input({ command: "jest", fs, host, changedFiles: changed("src/a.js") }))).file).toBe("/usr/local/bin/node");
+  });
+});
