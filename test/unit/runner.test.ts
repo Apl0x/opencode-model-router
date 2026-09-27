@@ -1223,8 +1223,13 @@ describe("readResult: pytest junit", () => {
     expect(r).toMatchObject({ collectionError: true, total: 0, complete: true });
   });
 
-  it("exit 5: no tests collected is complete with total 0; pass is complete", async () => {
-    expect(await read(pspec(), { [RPT_XML]: report("pytest-none.xml", "/root") }, 5)).toMatchObject({ failingIds: [], total: 0, complete: true });
+  it("exit 5: nothing collected from test-file inputs is incomplete (QA-1.3-19); pass is complete", async () => {
+    expect(await read(pspec(), { [RPT_XML]: report("pytest-none.xml", "/root") }, 5)).toMatchObject({
+      failingIds: [],
+      total: 0,
+      complete: false,
+      note: "pytest ran no tests although a test file was passed",
+    });
     expect(await read(pspec(), { [RPT_XML]: report("pytest-pass.xml", "/root") }, 0)).toMatchObject({ failingIds: [], total: 1, complete: true });
   });
 
@@ -1551,9 +1556,9 @@ describe("QA-1.3-1: canonical paths through the realpath seam", () => {
       expect(await run(over)).toMatchObject({ total: 0, complete: false, note });
     });
 
-    it("jest related over sources only, canonical paths, vitest related: 0 stays a complete result", async () => {
+    it("related over sources only with canonical paths: 0 stays a complete result (jest and vitest)", async () => {
       expect(await run({ inputs: ["/root/vitest-proj/src/a.js"] })).toMatchObject({ total: 0, complete: true });
-      expect(await run({ runner: "vitest", inputs: ["/root/vitest-proj/test/a.test.js"], lexicalPaths: true })).toMatchObject({ total: 0, complete: true });
+      expect(await run({ runner: "vitest", inputs: ["/root/vitest-proj/src/a.js"] })).toMatchObject({ total: 0, complete: true });
     });
 
     it("the guard never touches a run with tests, failures or a collection error", async () => {
@@ -2184,5 +2189,75 @@ describe("QA-1.3-18: JS tools run under node, never under Bun or a compiled bina
     const fs: PlannerFs = { ...base, realpath: async (p) => (p === "/usr/local/bin/node" ? Promise.reject(new Error("EACCES")) : p) };
     const host = { ...POSIX_HOST, execPath: "/b/bun", pathEnv: "/usr/local/bin" };
     expect(spec(await planScopedRun(input({ command: "jest", fs, host, changedFiles: changed("src/a.js") }))).file).toBe("/usr/local/bin/node");
+  });
+});
+
+describe("QA-1.3-19: the zero-test guard covers every runner; lexical mode stays fail-closed", () => {
+  const zero = (over: Partial<ScopedSpec>) => read(mkSpec(over), { [RPT_JSON]: jsonReport(0) }, 0);
+
+  it.each<[string, Partial<ScopedSpec>, string]>([
+    ["vitest lexical related over sources", { runner: "vitest", inputs: ["/root/vitest-proj/src/str.js"], lexicalPaths: true }, "vitest ran no tests and the paths were not canonicalized (no realpath seam)"],
+    ["vitest related given a test file", { runner: "vitest", inputs: ["/root/vitest-proj/src/str.js", "/root/vitest-proj/test/str.test.js"] }, "vitest ran no tests although a test file was passed"],
+    ["jest lexical", { runner: "jest", inputs: ["/root/vitest-proj/src/str.js"], lexicalPaths: true }, "jest ran no tests and the paths were not canonicalized (no realpath seam)"],
+  ])("%s -> complete false", async (_n, over, note) => {
+    expect(await zero(over)).toMatchObject({ total: 0, complete: false, note });
+  });
+
+  it("pytest scoped (inputs are tests) with 0 tests is incomplete; a spec without inputs is left alone", async () => {
+    const sp = mkSpec({ runner: "pytest", reportPath: RPT_XML, inputs: ["/root/vitest-proj/tests/test_a.py"], inputsAreTests: true });
+    expect(await read(sp, { [RPT_XML]: report("pytest-none.xml", "/root") }, 5)).toMatchObject({ complete: false, note: "pytest ran no tests although a test file was passed" });
+    expect(await zero({ runner: "vitest", inputs: [], lexicalPaths: true })).toMatchObject({ total: 0, complete: true });
+  });
+
+  it("win32 lexical mode: ::$DATA spellings of a trigger or a rerun file are the file itself", async () => {
+    const W = { "C:\\repo\\.git": "", "C:\\py\\pytest.exe": "", "C:\\repo\\tests\\test_a.py": "" };
+    const host = { ...WIN_HOST, pathEnv: "C:\\py" };
+    for (const f of ["conftest.py::$DATA", "pytest.ini::$data", "tests\\conftest.py::$DATA"]) {
+      const r = await planScopedRun(input({ win: true, command: "pytest", files: W, cwd: "C:\\repo", host, changedFiles: changed(f) }));
+      expectS6(r, "config-changed", `config file changed: ${f.replace(/::\$data$/i, "").replace(/\\/g, "/")}`);
+    }
+    const det = await detect("pytest", W, host, "C:\\repo");
+    const r = spec(await planRerun(det, ["C:\\repo\\tests\\test_a.py::$DATA"], "C:\\repo", { maxWorkers: 2 }, { fs: memFs(W, true), host }));
+    expect(r.inputs).toEqual(["C:\\repo\\tests\\test_a.py"]);
+    const posix = await planScopedRun(input({ command: "pytest", files: pyRepo(), changedFiles: changed("conftest.py::$DATA") }));
+    expect(isNoAffected(posix)).toBe(true);
+  });
+
+  describe("real filesystem: vitest through a junction (win32) or symlink", () => {
+    const base = mkdtempSync(path.join(tmpdir(), "omr-qa1319-"));
+    afterAll(() => rmSync(base, { recursive: true, force: true }));
+    const repo = path.join(base, "repo");
+    for (const [rel, body] of Object.entries({
+      ".git": "gitdir: elsewhere",
+      "package.json": JSON.stringify({ name: "x", scripts: { test: "vitest run" } }),
+      "node_modules/vitest/package.json": VITEST_PKG,
+      "node_modules/vitest/vitest.mjs": "",
+      "src/str.js": "",
+      "test/str.test.js": "",
+    })) {
+      mkdirSync(path.dirname(path.join(repo, rel)), { recursive: true });
+      writeFileSync(path.join(repo, rel), body);
+    }
+    const link = path.join(base, "vlink");
+    symlinkSync(repo, link, "junction");
+    const lexicalFs: RunnerFs = {
+      fileExists: async (p) => existsSync(p),
+      readFile: async (p) => readFileSync(p, "utf8"),
+      unlink: async (p) => rmSync(p, { force: true }),
+    };
+    const host = { ...POSIX_HOST, platform: process.platform, tmpdir: base };
+
+    it.each(["src/str.js", "test/str.test.js"])("changed %s: a 0-test report from the lexical plan is incomplete", async (f) => {
+      const plan = { command: "npm test", cwd: link, changedFiles: changed(path.join(link, f)), budget: { maxWorkers: 2 }, search: stubSearch(), host };
+      const s = spec(await planScopedRun({ ...plan, fs: lexicalFs }));
+      expect(s).toMatchObject({ runner: "vitest", cwd: link, lexicalPaths: true });
+      writeFileSync(s.reportPath, JSON.stringify({ numTotalTests: 0, testResults: [] }));
+      const r = await readResult(s, exec(0), lexicalFs, host);
+      expect(r).toMatchObject({ total: 0, complete: false });
+      expect(existsSync(s.reportPath)).toBe(false);
+      const real = spec(await planScopedRun({ ...plan, fs: { ...lexicalFs, realpath: (p) => fsRealpath(p) } }));
+      expect(real.cwd).toBe(realpathSync.native(repo));
+      expect(real.lexicalPaths).toBeUndefined();
+    });
   });
 });

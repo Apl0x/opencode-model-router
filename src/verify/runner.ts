@@ -504,14 +504,22 @@
 //     complete = true. Exception: exit != 0 with no failing id and no collection error ->
 //     complete = false, note `runner exited <code> but its report lists no failure` (vitest
 //     unhandled errors, coverage thresholds).
-//   Step 2a (QA-1.3-1) Zero-test guard, for JSON and junit alike. A complete report with total 0,
-//     no failing id and no collection error becomes complete = false when
+//   Step 2a (QA-1.3-1, QA-1.3-19) Zero-test guard, for JSON and junit and for EVERY runner. A
+//     complete report with total 0, no failing id and no collection error, from a spec with
+//     non-empty inputs, becomes complete = false when
 //       - mode is "rerun" (every input is an existing test file), note `rerun ran no tests
 //         although every input is a test file`;
-//       - jest related was given a JS test file (G.8 rule), note `jest ran no tests although a
-//         test file was passed`;
-//       - jest ran from a spec with lexicalPaths, note `jest ran no tests and the paths were not
-//         canonicalized (no realpath seam)`.
+//       - the inputs are test files (inputsAreTests: pytest), or related was given a JS test file
+//         (G.8 rule; a test file passed to related runs itself), note `<runner> ran no tests
+//         although a test file was passed`;
+//       - the spec has lexicalPaths, note `<runner> ran no tests and the paths were not
+//         canonicalized (no realpath seam)`. QA-1.3-19: vitest through a junction cwd without
+//         realpath also ran 0 tests with exit 0, exactly like jest.
+//     A legitimately empty selection (a -k/-m/-t filter that deselects every test of a changed
+//     test file, or a test file with no tests) is therefore unverifiable, never a pass.
+//     realpath stays OPTIONAL in PlannerFs: making it required would break every planner caller
+//     that passes a plain FsSeam (1.6 static scoping included), and the lexical run is already
+//     fail-closed by this guard. 2.1 must still pass the native realpath (Q).
 //     A parser exception is an unusable report: step 4 with the note `report could not be
 //     parsed: <message>` (QA-1.3-12). readResult never rejects.
 //   Step 3  pytest junit XML, parsed at regex level (no XML library).
@@ -930,7 +938,8 @@ export interface RunnerHost {
  * 8.3 short names, and it rejects for a missing path. The JS fs.realpathSync does not expand 8.3
  * names and must not be used. `fileExists` must accept directories as well as files (B step 0).
  * Without `realpath`, paths stay lexical, every spec carries `lexicalPaths: true`, and readResult
- * never trusts a jest run that reports 0 tests.
+ * never trusts a run that reports 0 tests (I step 2a, any runner: QA-1.3-19). It stays optional so
+ * a plain FsSeam still type-checks; 2.1 must pass the native realpath.
  */
 export interface PlannerFs extends FsSeam {
   realpath?(path: string): Promise<string>;
@@ -1049,8 +1058,8 @@ export interface ScopedSpec {
   readonly notes: readonly string[];
   /**
    * Set when the fs seam had no realpath, so cwd and inputs may not be the canonical spelling
-   * (G.3a). jest matches files against its realpath'd rootDir, so readResult treats a jest run
-   * reporting 0 tests as incomplete.
+   * (G.3a). jest and vitest match files against a realpath'd root, so readResult treats a run
+   * reporting 0 tests as incomplete (I step 2a).
    */
   readonly lexicalPaths?: true;
 }
@@ -1237,6 +1246,16 @@ async function findGitRoot(ctx: Ctx, cwd: string, fs: FsSeam): Promise<string | 
     if (parent === d) return undefined;
     d = parent;
   }
+}
+
+/**
+ * G.3a (QA-1.3-19): a changed or rerun path as the producer spelled it, minus win32 spellings of
+ * the same file: the prefixes (stripWinPrefix) and the unnamed data stream suffix `::$DATA`, which
+ * writes the file itself. realpath resolves those too; this keeps lexical mode equal.
+ */
+function lexicalSpelling(ctx: Ctx, p: string): string {
+  const q = stripWinPrefix(ctx, p);
+  return ctx.win ? q.replace(/::\$DATA$/i, "") : q;
 }
 
 /** G.3a: drop the win32 `\\?\`, `\\.\` and `\\?\UNC\` prefixes (QA-1.3-7). Other platforms: unchanged. */
@@ -2446,7 +2465,7 @@ async function collectChanged(
         notes.push("dropped a path containing a NUL byte");
         continue;
       }
-      const lexical = ctx.P.resolve(cwd, stripWinPrefix(ctx, cand));
+      const lexical = ctx.P.resolve(cwd, lexicalSpelling(ctx, cand));
       const ref = canonicalize(ctx, gitRoot, gitRoot, await realOf(ctx, fs, lexical));
       if (!ref) {
         notes.push(`dropped outside the git root: ${cand}`);
@@ -2732,7 +2751,7 @@ export async function planRerun(
   const notes: string[] = [];
   const inputs = new Map<string, string>();
   for (const f of testFiles) {
-    const lexical = stripWinPrefix(ctx, f);
+    const lexical = lexicalSpelling(ctx, f);
     const usable = P.isAbsolute(lexical) && !f.includes("\0");
     const ref = usable ? canonicalize(ctx, gitRoot, gitRoot, await realOf(ctx, deps.fs, P.resolve(lexical))) : undefined;
     if (!ref) {
@@ -2940,20 +2959,20 @@ function isJsTestPath(p: string): boolean {
 }
 
 /**
- * I step 2a (QA-1.3-1): a report that lists no test at all is not trusted when the inputs say
- * tests must have run: every rerun (inputs are test files), a jest related run given a test file,
- * and any jest run planned without realpath (jest silently matches nothing when cwd is not the
- * realpath).
+ * I step 2a (QA-1.3-1, QA-1.3-19): a report that lists no test at all is not trusted when the
+ * inputs say tests must have run, for every runner: a rerun, inputs that are test files (pytest,
+ * or a JS test file given to related), and any spec planned without realpath (jest and vitest
+ * both match nothing through a junction cwd).
  */
 function zeroTestsGuard(spec: ScopedSpec, r: RunResult): RunResult {
-  if (r.total !== 0 || !r.complete || r.failingIds.length > 0 || r.collectionError) return r;
+  if (r.total !== 0 || !r.complete || r.failingIds.length > 0 || r.collectionError || spec.inputs.length === 0) return r;
   const note =
     spec.mode === "rerun"
       ? "rerun ran no tests although every input is a test file"
-      : spec.runner === "jest" && spec.inputs.some(isJsTestPath)
-        ? "jest ran no tests although a test file was passed"
-        : spec.runner === "jest" && spec.lexicalPaths === true
-          ? "jest ran no tests and the paths were not canonicalized (no realpath seam)"
+      : spec.inputsAreTests || spec.inputs.some(isJsTestPath)
+        ? `${spec.runner} ran no tests although a test file was passed`
+        : spec.lexicalPaths === true
+          ? `${spec.runner} ran no tests and the paths were not canonicalized (no realpath seam)`
           : undefined;
   return note === undefined ? r : { ...r, complete: false, note };
 }
