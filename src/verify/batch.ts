@@ -121,19 +121,32 @@
 //        aborted          -> D aborted, so every member was already settled (B9).
 //        ran              -> attribution per member (B7).
 //        timed-out, error -> every member is "own-run".
-//   5. Own runs: the members marked "own-run", earliest deadline first, one after the other:
-//      scope.execute(memberSpec, member.deadline). The outcome is the member's scoped outcome,
-//      verbatim. A member settled in the meantime (an abort) is skipped, and nothing is spawned
-//      for it.
+//   5. One queue under the hold (QA-2.2-3). Own runs and rechecks run one command at a time,
+//      EARLIEST DEADLINE FIRST across both kinds: at each step the member with the least
+//      remaining() among those with a runnable step goes next (arrival order breaks ties). Its
+//      step is either
+//        - its own run (the members marked "own-run"): scope.execute(memberSpec,
+//          member.deadline), whose outcome is the member's scoped outcome, verbatim; or
+//        - its recheck (B8), as soon as its outcome is final (step 7).
+//      So a member never waits for a step it does not need: the member with the least time left
+//      runs, rechecks and settles first, and the queue never nests a scope. A member settled in
+//      the meantime (an abort) is skipped, and nothing is spawned for it.
 //   6. Split: every member is "own-run" (step 5), and there is no union run. The cost is the
 //      same as without batching, and the verdicts are the same by construction. The split is
 //      logged once per batch.
-//   7. Flaky taint (B7.5), once every run of steps 4 and 5 has returned.
-//   8. Rechecks (B8), for the members whose scoped outcome is "ran" with >= 1 failing id and >= 1
-//      failing file (2.1-T2 P7). A member that needs no recheck settles as soon as step 7 is
-//      done. A green member of a green union therefore settles right after step 4.
-//   9. Every remaining member settles. Then `void scope.close()`: a requester never waits for
-//      the close (2.1-T2 P9). The batch leaves the registry.
+//   7. Finality and the flaky taint (B7.5). A member's outcome is known after step 4 (derived) or
+//      after its own run. It is FINAL once no taint can change it: the union was green or did not
+//      run, or every union failing id is reproduced (by a finished own run or a static
+//      derivation, B7.5), or no own run is left, in which case the taint is applied once. Until
+//      then the member holds its outcome.
+//   8. A final outcome settles AT ONCE when it needs no recheck (2.1-T2 P7: "ran" with >= 1
+//      failing id and >= 1 failing file), when its reference decides it (B8.1), or when a recheck
+//      already run in this batch at the same reference answers it (B8.6). Otherwise the member
+//      queues for its recheck (step 5). A green member of a green union therefore settles right
+//      after step 4, and a member whose own run reproduces every union failure rechecks right
+//      after that run, before the own runs of members with more time left.
+//   9. When the queue is empty every member is settled. Then `void scope.close()`: a requester
+//      never waits for the close (2.1-T2 P9). The batch leaves the registry.
 //
 // -----------------------------------------------------------------------------------------------
 // B6. UNION SPEC AND DEDUPLICATION
@@ -212,11 +225,14 @@
 //       outcome, verbatim. Or it is a derived "ran" outcome that judges the same: its spec is
 //       the member's own spec, and its notes are the member's plan notes plus
 //       "batched: 1 run for <n> requests".
-//   7.5 Flaky taint (B-G2). When U had failing ids, unreproduced = U.failingIds minus every
-//       member's final failingIds. If that set is non-empty, some union failure was reproduced
-//       by no member's own run. Then taintUnreproduced makes EVERY member's "ran" result
-//       complete = false, with the note "batched run failure not reproduced by any request's own
-//       run: <ids>". Per 2.1-T6, complete = false never passes (R4 u12; R2i u10 or u8), and a
+//   7.5 Flaky taint (B-G2). When U had failing ids, unreproduced = U.failingIds minus the ids of
+//       every finished own run and every static derivation (7.3a). A derivation counts even for
+//       a member that left during the union run, because pytest attribution is exact (QA-2.2-3);
+//       an own run counts even when its member left before it returned. The set only shrinks, so
+//       it is decided once it is empty or no own run is left (B5.7). If it is then non-empty,
+//       some union failure was reproduced by no member's own run, and taintUnreproduced makes
+//       EVERY live member's "ran" result complete = false, with the note "batched run failure not
+//       reproduced by any request's own run: <ids>". Per 2.1-T6, complete = false never passes (R4 u12; R2i u10 or u8), and a
 //       proven introduced id still rejects (R2i x X- = F r1). The unreproduced id could belong to
 //       any member's related set, and for vitest/jest a green own run cannot rule that out.
 //
@@ -250,10 +266,12 @@
 //          router_verify may name several handles of one dispatch);
 //        - captures of the same clean HEAD with the same untracked files.
 //      Distinct stash commits never share.
-//   3. Groups run one at a time under the scope, ordered by their earliest deadline. A member
-//      whose deadline.remaining() is below runtime.recheckMinRemainingMs (2.1's
+//   3. Rechecks are steps of the B5.5 queue. When a member's recheck turn comes, every member
+//      ready at that moment at the same reference joins it (its group, earliest deadline first).
+//      A member whose deadline.remaining() is below runtime.recheckMinRemainingMs (2.1's
 //      RECHECK_MIN_REMAINING_MS, injected) gets { kind: "skipped-deadline", remainingMs } and
-//      leaves its group, as it would alone (2.1-T3).
+//      leaves its group, as it would alone (2.1-T3): a member whose budget cannot fit its
+//      recheck is never passed on a guess.
 //   4. A group of one member -> scope.rechecker(command, cwd)(reference, its failingFiles, its
 //      own deadline). This is the direct path.
 //   5. A group of several members:
@@ -278,10 +296,20 @@
 //            (QA-1.3-17);
 //            without counts, a member that has ran files but no failing id among them at the
 //            reference -> "split".
-//   6. pytest: 2.1's Rechecker returns unusable "runner-unsupported" without spawning (2.1
+//   6. Reuse (QA-2.2-3). A member that becomes ready AFTER a recheck ran at its reference (it
+//      finished its own run later) first derives its outcome from each recorded outcome at that
+//      reference with the rule of step 5; the first answer that is not "split" settles it with
+//      no spawn. Only outcomes that hold for any member are recorded: exact, approximate, and
+//      unusable "reference-vanished", "unreproduced-inputs" or "runner-unsupported". Never
+//      timed-out or skipped-deadline (the deadline of the member that ran it), nor
+//      "materialize-failed" (an aborted materialize reports it) or "error" (transient).
+//   7. pytest: 2.1's Rechecker returns unusable "runner-unsupported" without spawning (2.1
 //      decision 5), so sharing it costs nothing.
-//   Recheck calls per window: one per distinct reference among the failing members, plus any
-//   split rechecks. The plan's "single shared recheck" holds when the members share a reference.
+//   Recheck calls per window: at most one per distinct reference among the failing members when
+//   each later member's failing files are covered by an earlier recheck at its reference, plus
+//   split rechecks and rechecks of files no earlier recheck covered (at most one per member, as
+//   alone). The plan's "single shared recheck" holds when the members share a reference and a
+//   pre-existing failure, the plan's case.
 //
 // -----------------------------------------------------------------------------------------------
 // B9. DEADLINES AND CANCELLATION
@@ -304,10 +332,19 @@
 //   - A member whose signal aborts is settled at once. The result depends on its phase:
 //       waiting in the window                  aborted BATCH_REASONS.window
 //       union planning or union run            aborted BATCH_REASONS.run (2.1-T2 P5's phrase)
-//       its own run is running                 that run's outcome (the executor kills it and
-//                                              reports aborted)
 //       queued for its own run                 aborted BATCH_REASONS.attribution
-//       waiting for its recheck                { scoped: its outcome, recheck: { kind:
+//       its own run is running                 that run's outcome (the executor kills it and
+//                                              reports aborted); a "ran" outcome is settled as
+//                                              in the next row
+//       holding a known outcome (B5.7)         QA-2.2-3: that outcome, never a bare abort. While
+//                                              a union failure is still unexplained it is made
+//                                              incomplete by taintUnreproduced with those ids
+//                                              (never a pass); a needed recheck becomes its
+//                                              reference decision, else skipped-deadline
+//       final, waiting for its recheck turn    { scoped: its outcome, recheck: its reference
+//                                              decision, else skipped-deadline }, as alone
+//                                              below the recheck threshold
+//       its recheck is running                 { scoped: its outcome, recheck: { kind:
 //                                              "timed-out", boundMs: its remaining() when the
 //                                              recheck started } }, as 2.1-T4.j reports an
 //                                              aborted rerun
@@ -389,7 +426,8 @@
 //   green union, P1 absent            1 + the number of guard-sensitive members
 //   pytest, failing, report complete  1 scoped run; rechecks spawn nothing (runner-unsupported)
 //   vitest/jest, failing              1 + n scoped runs (mode B), + 1 recheck per distinct
-//                                     reference among the failing members
+//                                     reference among the failing members when later members'
+//                                     files are covered (B8.6), else up to 1 per member
 //   split (union inconsistent)        n scoped runs, as without batching
 //   n = 1                             exactly the direct path
 //   The plan's acceptance criterion, "<= 1 scoped run + <= 1 recheck per window", is asserted on
@@ -612,15 +650,25 @@ export interface BatchCoordinator {
 
 /**
  * Where a member stands; B9's table maps each phase to what an abort settles it with.
- *   window   waiting in a window (W5);
- *   run      union planning or the union run (B5 steps 2-4);
- *   queued   waiting for its own run, or holding its outcome until the flaky taint (B5 steps 5-7);
- *   own-run  its own run is running: the executor kills it and reports (B9);
- *   recheck  waiting for its recheck (B8).
+ *   window        waiting in a window (W5);
+ *   run           union planning or the union run (B5 steps 2-4);
+ *   own-wait      queued for its own run (B5.5);
+ *   own-run       its own run is running: the executor kills it and reports (B9);
+ *   held          its outcome is known but a union failure is still unexplained (B5.7);
+ *   recheck-wait  its outcome is final and it waits for its recheck turn (B5.8);
+ *   recheck       its recheck is running (B8).
  */
-type MemberPhase = "window" | "run" | "queued" | "own-run" | "recheck";
+type MemberPhase = "window" | "run" | "own-wait" | "own-run" | "held" | "recheck-wait" | "recheck";
 
 type RanOutcome = Extract<ScopedOutcome, { readonly kind: "ran" }>;
+
+/** A member whose final outcome waits for a recheck at a captured reference (B5.8). */
+interface Ready {
+  readonly scoped: RanOutcome;
+  readonly reference: DispatchReference;
+  /** referenceKey(reference): the group and the reuse key (B8.2, B8.6). */
+  readonly key: string;
+}
 
 interface Member {
   readonly request: TestsPassRequest;
@@ -636,7 +684,9 @@ interface Member {
   batch: Batch | undefined;
   /** The member's scoped outcome once known (B5 steps 4-7). */
   scoped: ScopedOutcome | undefined;
-  /** B9: its remaining() when its recheck started, reported if it aborts while waiting for it. */
+  /** Set in phase recheck-wait (B5.8). */
+  ready: Ready | undefined;
+  /** B9: its remaining() when its recheck started, reported if it aborts while it runs. */
   recheckBoundMs: number;
   readonly resolve: (run: TestsPassRun) => void;
   readonly onAbort: () => void;
@@ -666,6 +716,14 @@ interface Batch {
   closing: Promise<void> | undefined;
   /** When the last member settled (B11 sweep). */
   settledAt: number | undefined;
+  /** B7.5: the failing ids of a "ran" union; empty when the union was green or did not run. */
+  unionIds: readonly string[];
+  /** B7.5: union ids some finished own run or static derivation reproduces (it only grows). */
+  readonly reproduced: Set<string>;
+  /** B5.7: no taint can change a member's outcome anymore. */
+  final: boolean;
+  /** B8.6: recheck outcomes that hold for any member at the same reference, by referenceKey. */
+  readonly rechecked: Map<string, RecheckOutcome[]>;
 }
 
 function message(e: unknown): string {
@@ -688,17 +746,6 @@ function needsRecheck(scoped: ScopedOutcome): scoped is RanOutcome {
 /** Deadline order (B5.5, B8.3): the least remaining first, then arrival order. */
 function byDeadline(a: Member, b: Member): number {
   return a.request.deadline.remaining() - b.request.deadline.remaining() || a.seq - b.seq;
-}
-
-/** A member that takes part in the recheck step (B8), with its final scoped outcome. */
-interface Candidate {
-  readonly m: Member;
-  readonly scoped: RanOutcome;
-  readonly reference: DispatchReference;
-}
-
-function byCandidateDeadline(a: Candidate, b: Candidate): number {
-  return byDeadline(a.m, b.m);
 }
 
 /**
@@ -793,19 +840,19 @@ export function createBatchCoordinator(options: BatchCoordinatorOptions = {}): B
       case "run":
         settle(m, abortedRun(BATCH_REASONS.run));
         return;
-      case "queued":
+      case "own-wait":
         settle(m, abortedRun(BATCH_REASONS.attribution));
         return;
       case "own-run":
         // The executor kills the run on the member's signal and reports it (runOwn settles).
         return;
+      case "held":
+      case "recheck-wait":
+        // QA-2.2-3: its outcome is known, so it is never reported as a bare abort.
+        if (m.batch !== undefined) settleLate(m.batch, m);
+        return;
       case "recheck":
-        settle(
-          m,
-          m.scoped === undefined
-            ? abortedRun(BATCH_REASONS.attribution)
-            : { scoped: m.scoped, recheck: { kind: "timed-out", boundMs: m.recheckBoundMs } },
-        );
+        if (m.ready !== undefined) settle(m, { scoped: m.ready.scoped, recheck: { kind: "timed-out", boundMs: m.recheckBoundMs } });
         return;
     }
   }
@@ -839,6 +886,7 @@ export function createBatchCoordinator(options: BatchCoordinatorOptions = {}): B
         window: undefined,
         batch: undefined,
         scoped: undefined,
+        ready: undefined,
         recheckBoundMs: 0,
         resolve,
         onAbort: () => onAbort(member),
@@ -877,12 +925,16 @@ export function createBatchCoordinator(options: BatchCoordinatorOptions = {}): B
       scope: undefined,
       closing: undefined,
       settledAt: undefined,
+      unionIds: [],
+      reproduced: new Set(),
+      final: false,
+      rechecked: new Map(),
     };
     for (const m of members) {
       m.window = undefined;
       m.batch = b;
       // B5.1: a batch of one runs the member's own spec at once.
-      m.phase = members.length === 1 ? "own-run" : "run";
+      m.phase = members.length === 1 ? "own-wait" : "run";
     }
     running.add(b);
     void runBatch(b);
@@ -908,10 +960,9 @@ export function createBatchCoordinator(options: BatchCoordinatorOptions = {}): B
 
   async function runSteps(b: Batch): Promise<void> {
     const first = b.members[0];
-    let own: Member[] = [];
     let unionSpec: ScopedSpec | undefined;
     if (b.members.length === 1) {
-      own = [first];
+      queueOwn([first]);
     } else {
       // Step 2.
       const planned = await planUnion(b);
@@ -920,7 +971,7 @@ export function createBatchCoordinator(options: BatchCoordinatorOptions = {}): B
         // Step 6.
         counters.splits++;
         warn("verify batch: split into own runs", { members: b.members.length, cause: planned });
-        own = queue(live(b));
+        queueOwn(live(b));
       } else {
         unionSpec = planned;
       }
@@ -933,39 +984,38 @@ export function createBatchCoordinator(options: BatchCoordinatorOptions = {}): B
     b.scope = scope;
 
     // Step 4.
-    let unionRan: RanOutcome | undefined;
     if (unionSpec !== undefined) {
       counters.unionRuns++;
       const union = await execute(scope, unionSpec, b.deadline);
       switch (union.kind) {
         case "ran":
-          unionRan = union;
-          own = attribute(b, union);
+          attribute(b, union);
           break;
         case "slot-busy":
         case "aborted":
           for (const m of live(b)) settle(m, { scoped: union, recheck: undefined });
           return;
         default:
-          own = queue(live(b));
+          queueOwn(live(b));
       }
     }
 
-    // Step 5.
-    for (const m of [...own].sort(byDeadline)) {
-      if (!m.settled) await runOwn(b, scope, m);
+    // Steps 5, 7 and 8 (QA-2.2-3): one queue under the hold, one command at a time, earliest
+    // deadline first. A member's recheck runs as soon as its outcome is final, before the own runs
+    // of members with more time left; nothing waits for a step it does not need.
+    for (;;) {
+      advance(b);
+      const next = live(b)
+        .filter((m) => m.phase === "own-wait" || m.phase === "recheck-wait")
+        .sort(byDeadline)[0];
+      if (next === undefined) return;
+      if (next.phase === "own-wait") await runOwn(b, scope, next);
+      else await recheckGroup(b, scope, next);
     }
-
-    // Step 7.
-    if (unionRan !== undefined && unionRan.result.failingIds.length > 0) taint(b, unionRan);
-
-    // Steps 8 and 9.
-    await rechecks(b, scope);
   }
 
-  function queue(members: Member[]): Member[] {
-    for (const m of members) m.phase = "queued";
-    return members;
+  function queueOwn(members: readonly Member[]): void {
+    for (const m of members) m.phase = "own-wait";
   }
 
   /** B6 and the step-2 consistency checks. Returns the union spec, or the cause of a split. */
@@ -996,55 +1046,100 @@ export function createBatchCoordinator(options: BatchCoordinatorOptions = {}): B
   }
 
   /**
-   * B7 for every live member after a "ran" union, with the union's per-file counts (P1). A member
-   * marked own-run runs its own spec (B5.5: mode B, or a confirmation run). A derived member
-   * settles at once when the union is green, since there is nothing to taint (B5.8); otherwise it
-   * holds its outcome until the flaky taint (B5.7).
+   * B7 for every member after a "ran" union, with the union's per-file counts (P1). A member
+   * marked own-run queues for its own spec (B5.5: mode B, or a confirmation run); a derived member
+   * holds its outcome until it is final (B5.7). QA-2.2-3 (c): static attribution is exact, so the
+   * ids derived for a member that already left still count as reproduced.
    */
-  function attribute(b: Batch, union: RanOutcome): Member[] {
-    const own: Member[] = [];
+  function attribute(b: Batch, union: RanOutcome): void {
     const n = b.members.length;
-    const green = union.result.failingIds.length === 0;
-    for (const m of live(b)) {
+    b.unionIds = union.result.failingIds;
+    for (const m of b.members) {
       const a = attributeUnion(union.result, union.result.testsByFile, m.spec, platform);
       if (a.kind === "own-run") {
-        m.phase = "queued";
-        own.push(m);
+        if (!m.settled) m.phase = "own-wait";
         continue;
       }
+      for (const id of a.result.failingIds) b.reproduced.add(id);
+      if (m.settled) continue;
       // B7.4: the member's own spec, its plan notes and the batch note.
-      const scoped: RanOutcome = {
-        kind: "ran",
-        result: a.result,
-        exitCode: a.exitCode,
-        spec: m.spec,
-        notes: [...m.spec.notes, `batched: 1 run for ${n} requests`],
-      };
-      m.scoped = scoped;
-      if (green) settle(m, { scoped, recheck: undefined });
-      else m.phase = "queued";
+      m.scoped = { kind: "ran", result: a.result, exitCode: a.exitCode, spec: m.spec, notes: [...m.spec.notes, `batched: 1 run for ${n} requests`] };
+      m.phase = "held";
     }
-    return own;
+  }
+
+  /** B7.5: the union failing ids that no finished own run or static derivation reproduces yet. */
+  function outstanding(b: Batch): string[] {
+    return b.unionIds.filter((id) => !b.reproduced.has(id));
+  }
+
+  /**
+   * B5.7 and B5.8 (QA-2.2-3). The batch is final once every union failing id is reproduced, or once
+   * no own run is left (then the flaky taint is applied, once). Every held member of a final batch
+   * is then released: settled, or queued for its recheck.
+   */
+  function advance(b: Batch): void {
+    if (!b.final) {
+      const open = outstanding(b);
+      if (open.length > 0) {
+        if (b.members.some((m) => !m.settled && (m.phase === "own-wait" || m.phase === "own-run"))) return;
+        taint(b, open);
+      }
+      b.final = true;
+    }
+    for (const m of live(b)) if (m.phase === "held") release(b, m);
   }
 
   /**
    * B7.5 (B-G2): union failures that no member's final outcome reproduces make every member's
    * "ran" result incomplete, so none of them can pass on the strength of the batch.
    */
-  function taint(b: Batch, union: RanOutcome): void {
-    const reproduced = new Set<string>();
-    for (const m of b.members) {
-      const s = m.scoped;
-      if (s?.kind === "ran") for (const id of s.result.failingIds) reproduced.add(id);
-    }
-    const unreproduced = union.result.failingIds.filter((id) => !reproduced.has(id));
-    if (unreproduced.length === 0) return;
+  function taint(b: Batch, unreproduced: readonly string[]): void {
     counters.taints++;
     warn("verify batch: a batched run failure was not reproduced by any request's own run", { ids: unreproduced });
     for (const m of live(b)) {
       const s = m.scoped;
       if (s?.kind === "ran") m.scoped = { ...s, result: taintUnreproduced(s.result, unreproduced) };
     }
+  }
+
+  /** B5.8: a final outcome settles unless it needs a recheck that nothing in the batch answers yet. */
+  function release(b: Batch, m: Member): void {
+    const scoped = m.scoped;
+    if (scoped === undefined || !needsRecheck(scoped)) {
+      settle(m, scoped === undefined ? errorRun("verification batch produced no outcome") : { scoped, recheck: undefined });
+      return;
+    }
+    const decision = referenceDecision(m);
+    if ("decided" in decision) {
+      settle(m, { scoped, recheck: decision.decided });
+      return;
+    }
+    const key = referenceKey(decision.reference);
+    const reused = reuse(b, key, scoped, m);
+    if (reused !== undefined) {
+      settle(m, { scoped, recheck: reused });
+      return;
+    }
+    m.ready = { scoped, reference: decision.reference, key };
+    m.phase = "recheck-wait";
+  }
+
+  /**
+   * B9 (QA-2.2-3): a member whose deadline ends once its outcome is known gets that outcome, never
+   * a bare abort. While a union failure is still unexplained the outcome is made incomplete with
+   * those ids (never a pass), and a recheck it needs becomes its reference decision, else
+   * skipped-deadline, as alone below the threshold.
+   */
+  function settleLate(b: Batch, m: Member): void {
+    const s = m.scoped;
+    if (s === undefined) {
+      settle(m, abortedRun(BATCH_REASONS.attribution));
+      return;
+    }
+    const open = b.final ? [] : outstanding(b);
+    const scoped = s.kind === "ran" && open.length > 0 ? { ...s, result: taintUnreproduced(s.result, open) } : s;
+    settle(m, { scoped, recheck: needsRecheck(scoped) ? lateRecheck(m) : undefined });
   }
 
   /** B5.5: the member's own spec under its own deadline; the outcome is its scoped outcome, verbatim. */
@@ -1054,16 +1149,14 @@ export function createBatchCoordinator(options: BatchCoordinatorOptions = {}): B
     const link = linkDeadline(m.request.deadline, b.deadline.signal);
     const out = await execute(scope, m.spec, link.deadline);
     link.unlink();
+    // B7.5: a finished run is evidence even when its member has already left.
+    if (out.kind === "ran") for (const id of out.result.failingIds) b.reproduced.add(id);
     if (m.settled) return;
     m.scoped = out;
-    if (out.kind !== "ran") {
-      settle(m, { scoped: out, recheck: undefined });
-    } else if (m.request.deadline.signal.aborted) {
-      // Its deadline ended during its own run: it waits for nothing more, as alone (B-G4).
-      settle(m, { scoped: out, recheck: needsRecheck(out) ? lateRecheck(m) : undefined });
-    } else {
-      m.phase = "queued";
-    }
+    if (out.kind !== "ran") settle(m, { scoped: out, recheck: undefined });
+    // Its deadline ended during its own run: it waits for nothing more, as alone (B-G4).
+    else if (m.request.deadline.signal.aborted) settleLate(b, m);
+    else m.phase = "held";
   }
 
   // -- rechecks (B8) ---------------------------------------------------------------------------
@@ -1097,87 +1190,97 @@ export function createBatchCoordinator(options: BatchCoordinatorOptions = {}): B
     return true;
   }
 
-  async function rechecks(b: Batch, scope: VerificationScope): Promise<void> {
-    // B8.2: one group per distinct reference.
-    const groups = new Map<string, Candidate[]>();
-    for (const m of live(b)) {
-      const scoped = m.scoped;
-      if (scoped === undefined) {
-        settle(m, errorRun("verification batch produced no outcome"));
-        continue;
-      }
-      if (!needsRecheck(scoped)) {
-        settle(m, { scoped, recheck: undefined });
-        continue;
-      }
-      const decision = referenceDecision(m);
-      if ("decided" in decision) {
-        settle(m, { scoped, recheck: decision.decided });
-        continue;
-      }
-      m.phase = "recheck";
-      m.recheckBoundMs = m.request.deadline.remaining();
-      const key = referenceKey(decision.reference);
-      const group = groups.get(key) ?? [];
-      group.push({ m, scoped, reference: decision.reference });
-      groups.set(key, group);
-    }
-    // B8.3: one group at a time, the earliest deadline first.
-    const ordered = [...groups.values()].map((g) => g.sort(byCandidateDeadline)).sort((x, y) => byCandidateDeadline(x[0], y[0]));
-    for (const group of ordered) await recheckGroup(b, scope, group);
+  /**
+   * B8.6: an outcome recorded for later members at the same reference. Only outcomes that do not
+   * depend on the deadline or on a transient failure of the run that produced them are kept.
+   */
+  function remember(b: Batch, key: string, outcome: RecheckOutcome): void {
+    const kept =
+      outcome.kind === "exact" ||
+      outcome.kind === "approximate" ||
+      (outcome.kind === "unusable" && REUSABLE_CAUSES.has(outcome.cause));
+    if (!kept) return;
+    const list = b.rechecked.get(key) ?? [];
+    list.push(outcome);
+    b.rechecked.set(key, list);
   }
 
-  async function recheckGroup(b: Batch, scope: VerificationScope, group: readonly Candidate[]): Promise<void> {
-    // B8.3: a member below the threshold leaves its group, as it would alone.
-    const members = group.filter((c) => !c.m.settled && !skippedForDeadline(b, c.m, c.scoped));
-    if (members.length === 0) return;
+  /** B8.6: the member's outcome derived from a recheck already run at its reference, if one covers its files. */
+  function reuse(b: Batch, key: string, scoped: RanOutcome, m: Member): RecheckOutcome | undefined {
+    for (const done of b.rechecked.get(key) ?? []) {
+      const counts = done.kind === "exact" ? done.result?.testsByFile : undefined;
+      const derived = deriveSharedRecheck(done, counts, scoped.result.failingFiles, m.spec.cwd, platform);
+      if (derived !== "split") return derived;
+    }
+    return undefined;
+  }
+
+  /**
+   * B8.3-8.5 for the member the queue picked: it rechecks together with every member ready at
+   * this moment at the same reference (its group, earliest deadline first).
+   */
+  async function recheckGroup(b: Batch, scope: VerificationScope, lead: Member): Promise<void> {
+    const key = lead.ready?.key;
+    const group: { readonly m: Member; readonly ready: Ready }[] = [];
+    for (const m of live(b).sort(byDeadline)) {
+      const ready = m.ready;
+      if (m.phase !== "recheck-wait" || ready === undefined || ready.key !== key) continue;
+      // B8.3: a member below the threshold leaves its group, as it would alone.
+      if (!skippedForDeadline(b, m, ready.scoped)) group.push({ m, ready });
+    }
+    if (group.length === 0) return;
     // B8.4.
-    if (members.length === 1) {
-      await recheckOne(b, scope, members[0]);
+    if (group.length === 1) {
+      await recheckOne(b, scope, group[0].m, group[0].ready);
       return;
     }
     // B8.5: one recheck over the union of the group's failing files, bounded by Rg.
     const seen = new Set<string>();
     const files: string[] = [];
-    for (const c of members) {
-      for (const f of c.scoped.result.failingFiles) {
+    for (const { ready } of group) {
+      for (const f of ready.scoped.result.failingFiles) {
         const k = fold(f, platform);
         if (seen.has(k)) continue;
         seen.add(k);
         files.push(f);
       }
     }
-    const first = members[0];
-    const rg = createBatchDeadline(members.map((c) => c.m.request.deadline));
+    const first = group[0];
+    const rg = createBatchDeadline(group.map((c) => c.m.request.deadline));
     b.group = rg;
-    for (const c of members) c.m.recheckBoundMs = c.m.request.deadline.remaining();
+    for (const { m } of group) {
+      m.phase = "recheck";
+      m.recheckBoundMs = m.request.deadline.remaining();
+    }
     counters.rechecks++;
-    const shared = await recheck(scope, first.m.request, first.reference, files, rg);
+    const shared = await recheck(scope, first.m.request, first.ready.reference, files, rg);
     b.group = undefined;
     rg.dispose();
+    remember(b, first.ready.key, shared);
     const counts = shared.kind === "exact" ? shared.result?.testsByFile : undefined;
-    const split: Candidate[] = [];
-    for (const c of members) {
+    const split: { readonly m: Member; readonly ready: Ready }[] = [];
+    for (const c of group) {
       if (c.m.settled) continue;
-      const derived = deriveSharedRecheck(shared, counts, c.scoped.result.failingFiles, c.m.spec.cwd, platform);
+      const derived = deriveSharedRecheck(shared, counts, c.ready.scoped.result.failingFiles, c.m.spec.cwd, platform);
       if (derived === "split") split.push(c);
-      else settle(c.m, { scoped: c.scoped, recheck: derived });
+      else settle(c.m, { scoped: c.ready.scoped, recheck: derived });
     }
     if (split.length === 0) return;
     warn("verify batch: a shared recheck split into own rechecks", { members: split.length, shared: shared.kind });
-    for (const c of split.sort(byCandidateDeadline)) await recheckOne(b, scope, c);
+    for (const c of split.sort((x, y) => byDeadline(x.m, y.m))) await recheckOne(b, scope, c.m, c.ready);
   }
 
   /** B8.4: the direct path, under the member's own deadline. */
-  async function recheckOne(b: Batch, scope: VerificationScope, c: Candidate): Promise<void> {
-    const { m, scoped, reference } = c;
-    if (m.settled || skippedForDeadline(b, m, scoped)) return;
+  async function recheckOne(b: Batch, scope: VerificationScope, m: Member, ready: Ready): Promise<void> {
+    if (m.settled || skippedForDeadline(b, m, ready.scoped)) return;
+    m.phase = "recheck";
     m.recheckBoundMs = m.request.deadline.remaining();
     counters.rechecks++;
     const link = linkDeadline(m.request.deadline, b.deadline.signal);
-    const out = await recheck(scope, m.request, reference, scoped.result.failingFiles, link.deadline);
+    const out = await recheck(scope, m.request, ready.reference, ready.scoped.result.failingFiles, link.deadline);
     link.unlink();
-    settle(m, { scoped, recheck: out });
+    remember(b, ready.key, out);
+    settle(m, { scoped: ready.scoped, recheck: out });
   }
 
   // -- seams (B-G5: a throwing seam becomes a fail-closed outcome) ------------------------------
@@ -1528,6 +1631,13 @@ const REFERENCE_LEVEL_CAUSES: ReadonlySet<string> = new Set([
   "runner-unsupported",
   "error",
 ]);
+
+/**
+ * B8.6: unusable causes a later member at the same reference may reuse. "materialize-failed" is
+ * left out (an aborted materialize reports it, so it can be the deadline of the member that ran
+ * it), and so is "error" (a transient executor failure).
+ */
+const REUSABLE_CAUSES: ReadonlySet<string> = new Set(["reference-vanished", "unreproduced-inputs", "runner-unsupported"]);
 
 /**
  * B8.5: one member's RecheckOutcome, derived from a recheck shared by its reference group, or

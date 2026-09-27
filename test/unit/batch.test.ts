@@ -1218,7 +1218,8 @@ describe("createBatchCoordinator: windows and the union run", () => {
     await vi.advanceTimersByTimeAsync(WINDOW);
     await Promise.all(outs);
     await flush();
-    expect(calls.events).toEqual(["open 0", "execute 0", "execute 0", "execute 0", "execute 0", "recheck 0", "close 0"]);
+    // QA-2.2-3: b's recheck runs as soon as b's outcome is final, before c's own run.
+    expect(calls.events).toEqual(["open 0", "execute 0", "execute 0", "execute 0", "recheck 0", "execute 0", "close 0"]);
     await c.dispose();
   });
 
@@ -1440,6 +1441,33 @@ describe("createBatchCoordinator: attribution and rechecks", () => {
   const sharedFile = (file: string): Model => ({
     related: Object.fromEntries([..."abcd"].map((x) => [`src/${x}.ts`, [`test/${x}.test.ts`, file]])),
   });
+  /** a and b share a pre-existing failure; only b's own run reproduces b's new failure, so a is held until then. */
+  const heldModel: Model = {
+    ...sharedFile("test/common.test.ts"),
+    failing: { "test/common.test.ts": ["old"], "test/b.test.ts": ["new"] },
+    atRef: { "test/common.test.ts": ["old"], "test/b.test.ts": [] },
+  };
+  /** A deadline that aborts itself at expiry, as the gate's withTimeout does. */
+  function expiringDeadline(budgetMs: number): TestDeadline {
+    const d = liveDeadline(budgetMs);
+    const t = setTimeout(() => d.abort(), budgetMs);
+    d.signal.addEventListener("abort", () => clearTimeout(t), { once: true });
+    return d;
+  }
+  /** A step that takes `ms` of (fake) time, or ends early with `killed` when its signal aborts. */
+  function takes<T>(ms: number, deadline: Deadline, done: () => T, killed: T): Promise<T> {
+    return new Promise<T>((resolve) => {
+      const onAbort = () => {
+        clearTimeout(t);
+        resolve(killed);
+      };
+      const t = setTimeout(() => {
+        deadline.signal.removeEventListener("abort", onAbort);
+        resolve(done());
+      }, ms);
+      deadline.signal.addEventListener("abort", onAbort, { once: true });
+    });
+  }
 
   it("a union failure in one member's file fails only that member: 1 + n runs (mode B), outcomes as direct", async () => {
     const model: Model = { ...MODEL, failing: { "test/b.test.ts": ["breaks"] }, atRef: { "test/b.test.ts": [] } };
@@ -1458,7 +1486,7 @@ describe("createBatchCoordinator: attribution and rechecks", () => {
     expect(stats).toMatchObject({ unionRuns: 1, ownRuns: 3, rechecks: 1, taints: 0, splits: 0 });
   });
 
-  it("a failing file related to two members: both are rechecked, through one shared recheck", async () => {
+  it("a failing file related to two members: both are rechecked, through one recheck the second reuses (B8.6)", async () => {
     const model: Model = { ...sharedFile("test/shared.test.ts"), failing: { "test/shared.test.ts": ["new"] }, atRef: { "test/shared.test.ts": [] } };
     const { calls, runtime } = harness({
       ...model,
@@ -1473,7 +1501,8 @@ describe("createBatchCoordinator: attribution and rechecks", () => {
       absentFiles: [],
       notes: ["rechecked at the reference"],
     };
-    expect(runs.map((r) => r.recheck)).toEqual([exact, exact, undefined]);
+    // The first member's recheck is its own, verbatim; the second derives from it without a spawn.
+    expect(runs.map((r) => r.recheck)).toEqual([recheckModel(model, "npx vitest run", ROOT, [at("test/shared.test.ts")]), exact, undefined]);
     expect(runs.map((r) => ran(r).result.failingIds)).toEqual([["test/shared.test.ts > new"], ["test/shared.test.ts > new"], []]);
     expect(stats).toMatchObject({ unionRuns: 1, ownRuns: 3, rechecks: 1 });
   });
@@ -1483,7 +1512,8 @@ describe("createBatchCoordinator: attribution and rechecks", () => {
     const { calls, runtime } = harness(model);
     const { runs, stats } = await batch(runtime, [..."abcd"].map((x) => req([`src/${x}.ts`])));
     expect(calls.rechecks).toHaveLength(1);
-    for (const run of runs) {
+    expect(runs[0]?.recheck).toEqual(recheckModel(model, "npx vitest run", ROOT, [at("test/common.test.ts")]));
+    for (const run of runs.slice(1)) {
       expect(run.recheck).toEqual({
         kind: "exact",
         result: {
@@ -1500,7 +1530,7 @@ describe("createBatchCoordinator: attribution and rechecks", () => {
       });
     }
     expect(stats).toMatchObject({ unionRuns: 1, ownRuns: 4, rechecks: 1 });
-    expect(calls.events).toEqual(["open 0", ...Array.from({ length: 5 }, () => "execute 0"), "recheck 0", "close 0"]);
+    expect(calls.events).toEqual(["open 0", "execute 0", "execute 0", "recheck 0", "execute 0", "execute 0", "execute 0", "close 0"]);
   });
 
   it("distinct references get one recheck each", async () => {
@@ -1738,7 +1768,8 @@ describe("createBatchCoordinator: attribution and rechecks", () => {
   });
 
   it("an abort while waiting for a shared recheck gets timed-out; when all abort, the recheck's signal aborts", async () => {
-    const model: Model = { ...sharedFile("test/common.test.ts"), failing: { "test/common.test.ts": ["old"] }, atRef: { "test/common.test.ts": ["old"] } };
+    // a holds its outcome until b's own run reproduces b's failure (B5.7); both are then ready together and share one recheck.
+    const model = heldModel;
     const gate = deferred<void>();
     const { calls, runtime } = harness(model, {
       rechecker: async (_ref, files) => {
@@ -1796,6 +1827,184 @@ describe("createBatchCoordinator: attribution and rechecks", () => {
     expect(await Promise.all(outs)).toEqual([aborted(BATCH_REASONS.disposed), aborted(BATCH_REASONS.disposed)]);
     expect(calls.rechecks[0]?.deadline.signal.aborted).toBe(true);
     expect(calls.closes).toEqual([0]);
+  });
+
+  it("QA-2.2-3, the plan case: a pre-existing failure shared by 5 requests under default-like budgets passes with the note, as alone", async () => {
+    const RUN_MS = 15_000;
+    const GATE_MS = 90_000;
+    const model: Model = {
+      related: Object.fromEntries([..."abcde"].map((x) => [`src/${x}.ts`, [`test/${x}.test.ts`, "test/common.test.ts"]])),
+      failing: { "test/common.test.ts": ["old"] },
+      atRef: { "test/common.test.ts": ["old"] },
+    };
+    const options = (): HarnessOptions => ({
+      execute: (spec, deadline) => takes<ScopedOutcome>(RUN_MS, deadline, () => ranModel(model, spec), { kind: "aborted", reason: BATCH_REASONS.run }),
+      rechecker: (_ref, files, deadline) =>
+        takes<RecheckOutcome>(RUN_MS, deadline, () => recheckModel(model, "npx vitest run", ROOT, files), { kind: "timed-out", boundMs: RUN_MS }),
+      runtime: { recheckMinRemainingMs: 10_000 },
+    });
+
+    // Alone, each request is one run and one recheck: 30 s of its 90 s, a pass with the note.
+    const solo = harness(model, options());
+    const cs = createBatchCoordinator({ platform: "linux" });
+    const alone = cs.hook(solo.runtime)(req(["src/e.ts"], { deadline: expiringDeadline(GATE_MS) }));
+    await vi.advanceTimersByTimeAsync(GATE_MS);
+    expect(judgeStandIn(await alone)).toMatchObject({ verdict: "pass", preexisting: ["test/common.test.ts > old"] });
+    await cs.dispose();
+
+    // Batched: 1 union run + 5 own runs (mode B) + 1 recheck, 15 s each, under one hold.
+    const { calls, runtime } = harness(model, options());
+    const c = createBatchCoordinator({ platform: "linux" });
+    const hook = c.hook(runtime);
+    const t0 = Date.now();
+    const settledAt: number[] = [];
+    const outs = [..."abcde"].map((x, i) =>
+      hook(req([`src/${x}.ts`], { deadline: expiringDeadline(GATE_MS) })).then((r) => {
+        settledAt[i] = Date.now() - t0;
+        return r;
+      }),
+    );
+    await vi.advanceTimersByTimeAsync(GATE_MS + WINDOW);
+    const verdicts = (await Promise.all(outs)).map(judgeStandIn);
+    // The first member no longer waits for every other member's own run: it rechecks right after its
+    // own, and the later members reuse that recheck (one spawn). Before QA-2.2-3 every member held its
+    // outcome until all 1 + 5 runs had ended (90.1 s) and was then aborted: 0 passes.
+    expect(verdicts.slice(0, 3).map((v) => v.verdict)).toEqual(["pass", "pass", "pass"]);
+    for (const v of verdicts.slice(0, 3)) expect(v.preexisting).toEqual(["test/common.test.ts > old"]);
+    expect(settledAt.slice(0, 3)).toEqual([WINDOW + 3 * RUN_MS, WINDOW + 4 * RUN_MS, WINDOW + 5 * RUN_MS]);
+    // The members whose own runs cannot fit in the 90 s any more are unverifiable, never a false pass.
+    expect(verdicts.slice(3).map((v) => v.verdict)).toEqual(["unverifiable", "unverifiable"]);
+    expect(calls.rechecks).toHaveLength(1);
+    expect(calls.opens).toHaveLength(1);
+    await c.dispose();
+  });
+
+  it("QA-2.2-3: own runs and rechecks interleave earliest deadline first; a reused recheck settles before the next run", async () => {
+    const model: Model = { ...sharedFile("test/common.test.ts"), failing: { "test/common.test.ts": ["old"] }, atRef: { "test/common.test.ts": ["old"] } };
+    const pendingAtRun: number[] = [];
+    const holder: { c?: ReturnType<typeof createBatchCoordinator> } = {};
+    const { calls, runtime } = harness(model, {
+      execute: (spec) => {
+        pendingAtRun.push(holder.c?.stats().pendingRequests ?? -1);
+        return ranModel(model, spec);
+      },
+    });
+    const c = createBatchCoordinator({ platform: "linux" });
+    holder.c = c;
+    const hook = c.hook(runtime);
+    const outs = [
+      hook(req(["src/a.ts"], { deadline: liveDeadline(60_000) })),
+      hook(req(["src/b.ts"], { deadline: liveDeadline(30_000) })),
+      hook(req(["src/c.ts"], { deadline: liveDeadline(45_000) })),
+    ];
+    await vi.advanceTimersByTimeAsync(WINDOW);
+    const runs = await Promise.all(outs);
+    expect(calls.executes.slice(1).map((e) => e.spec.inputs)).toEqual([[at("src/b.ts")], [at("src/c.ts")], [at("src/a.ts")]]);
+    expect(calls.events).toEqual(["open 0", "execute 0", "execute 0", "recheck 0", "execute 0", "execute 0", "close 0"]);
+    // b settled (its recheck) before c's own run started; c settled (reuse) before a's.
+    expect(pendingAtRun).toEqual([3, 3, 2, 1]);
+    expect(runs.map((r) => r.recheck?.kind)).toEqual(["exact", "exact", "exact"]);
+    await c.dispose();
+  });
+
+  it("QA-2.2-3: an abort while holding a known outcome settles with that outcome, made incomplete while a union failure is unexplained", async () => {
+    const gate = deferred<void>();
+    const { calls, runtime } = harness(heldModel, {
+      execute: async (spec, _d, n) => {
+        if (n === 2) await gate.promise;
+        return ranModel(heldModel, spec);
+      },
+    });
+    const c = createBatchCoordinator({ platform: "linux" });
+    const hook = c.hook(runtime);
+    const a = req(["src/a.ts"]);
+    const outs = [hook(a), hook(req(["src/b.ts"]))];
+    await vi.advanceTimersByTimeAsync(WINDOW);
+    expect(calls.executes).toHaveLength(3);
+    a.deadline.abort();
+    const ra = await outs[0];
+    expect(ra?.recheck).toEqual({ kind: "skipped-deadline", remainingMs: 0 });
+    expect(ran(ra ?? aborted(""))).toMatchObject({
+      result: {
+        failingIds: ["test/common.test.ts > old"],
+        complete: false,
+        note: "batched run failure not reproduced by any request's own run: test/b.test.ts > new",
+      },
+    });
+    expect(judgeStandIn(ra ?? aborted("")).verdict).toBe("unverifiable");
+    gate.resolve();
+    const rb = await outs[1];
+    expect(ran(rb ?? aborted("")).result).toMatchObject({ complete: true, failingIds: ["test/b.test.ts > new", "test/common.test.ts > old"] });
+    expect(rb?.recheck?.kind).toBe("exact");
+    expect(c.stats().taints).toBe(0);
+    await c.dispose();
+  });
+
+  it("QA-2.2-3: an abort while waiting for its recheck turn keeps its outcome, with skipped-deadline", async () => {
+    const model: Model = { failing: { "tests/test_a.py": ["t"], "tests/test_b.py": ["u"] } };
+    const gate = deferred<void>();
+    const unsupported: RecheckOutcome = { kind: "unusable", cause: "runner-unsupported", reason: "pytest imports the live tree" };
+    const { calls, runtime } = harness(model, {
+      rechecker: async () => {
+        await gate.promise;
+        return unsupported;
+      },
+    });
+    const c = createBatchCoordinator({ platform: "linux" });
+    const hook = c.hook(runtime);
+    const b = req(["tests/test_b.py"], { command: "pytest", reference: { kind: "captured", reference: { ...REF, commit: "c2" } } });
+    const outs = [hook(req(["tests/test_a.py"], { command: "pytest" })), hook(b)];
+    await vi.advanceTimersByTimeAsync(WINDOW);
+    expect(calls.executes).toHaveLength(1);
+    expect(calls.rechecks).toHaveLength(1);
+    b.deadline.abort();
+    const rb = await outs[1];
+    expect(rb).toMatchObject({ scoped: { kind: "ran", result: { failingIds: ["tests/test_b.py::u"], complete: true } }, recheck: { kind: "skipped-deadline", remainingMs: 0 } });
+    gate.resolve();
+    expect((await outs[0])?.recheck).toEqual(unsupported);
+    expect(calls.rechecks).toHaveLength(1);
+    await c.dispose();
+  });
+
+  it("QA-2.2-3 (c): pytest: a member that left during the union run does not taint the others", async () => {
+    const model: Model = { failing: { "tests/test_c.py": ["t"] } };
+    const gate = deferred<void>();
+    const warn = vi.fn();
+    const { runtime } = harness(model, {
+      execute: async (spec) => {
+        await gate.promise;
+        return ranModel(model, spec);
+      },
+    });
+    const c = createBatchCoordinator({ platform: "linux", logger: { warn } });
+    const hook = c.hook(runtime);
+    const gone = req(["tests/test_c.py"], { command: "pytest" });
+    const outs = ["a", "b"].map((x) => hook(req([`tests/test_${x}.py`], { command: "pytest" })));
+    const pc = hook(gone);
+    await vi.advanceTimersByTimeAsync(WINDOW);
+    gone.deadline.abort();
+    expect(await pc).toEqual(aborted(BATCH_REASONS.run));
+    gate.resolve();
+    for (const run of await Promise.all(outs)) {
+      expect(ran(run).result).toMatchObject({ failingIds: [], complete: true, total: 2 });
+      expect(judgeStandIn(run).verdict).toBe("pass");
+    }
+    expect(c.stats().taints).toBe(0);
+    expect(warn).not.toHaveBeenCalled();
+    await c.dispose();
+  });
+
+  it("B8.6: only outcomes that hold for any member are reused; a deadline-bound one is not", async () => {
+    const model: Model = { ...sharedFile("test/common.test.ts"), failing: { "test/common.test.ts": ["old"] }, atRef: { "test/common.test.ts": ["old"] } };
+    const outcomes: RecheckOutcome[] = [
+      { kind: "unusable", cause: "materialize-failed", reason: "aborted" },
+      { kind: "approximate", inexactReasons: [{ cause: "dependency-drift", path: "" }] },
+    ];
+    const { calls, runtime } = harness(model, { rechecker: (_r, _f, _d, n) => outcomes[n] ?? { kind: "timed-out", boundMs: 1 } });
+    const { runs } = await batch(runtime, [req(["src/a.ts"]), req(["src/b.ts"]), req(["src/c.ts"])]);
+    // a's materialize-failed is not reused: b rechecks, and c reuses b's approximate.
+    expect(runs.map((r) => r.recheck)).toEqual([outcomes[0], outcomes[1], outcomes[1]]);
+    expect(calls.rechecks).toHaveLength(2);
   });
 });
 
