@@ -184,3 +184,175 @@ Tests (`test/unit/reference.test.ts`, 21 cases) use real git repos under `mkdtem
 with `tmpdir` injected as a sibling `tmp ä dir`, so all paths contain spaces and non-ASCII characters. The
 ArgvSeam is a test-local `execFile` helper. `afterEach` asserts that exactly one worktree remains and that
 there are no `omr-ref-*` dirs in the injected tmp.
+
+## QA findings (Phase 1.5 review, `[tier:heavy]` CAP:none)
+
+Scope: `git diff 754296c..HEAD` (12213b6, bf7961c, 59d60b9). The phase's own test file passes (21/21, 40.95 s,
+`npx vitest run --maxWorkers=2 test/unit/reference.test.ts`). All repros ran on the same host (win32, Node v24.21.0,
+git 2.51.0.windows.1; effective `core.autocrlf=input`: system `true`, global `input`) under a fresh
+`%TEMP%\omr-qa15`. The harness imported `src/verify/reference.ts` directly through Node type stripping and used a
+production-like ArgvSeam: on abort or timeout it runs `taskkill /T /F`, the tree kill that `runArgv` (1.2) provides.
+`tmpdir` was always injected in its **8.3 short form** (`C:\Users\MARQUI~1\...`). Sandbox removed afterwards (links
+unlinked first; 0 reparse points left).
+
+Severity: High = user-visible damage to the repository; Medium = a wrong verdict, a leftover in the user's repo, or
+a data-deletion path that depends on a runtime contract; Low = hardening or test gap.
+
+### QA-1.5-1 — High — an aborted capture can leave a stale `.git/index.lock` in the user's repository
+- `src/verify/reference.ts:939-943,953`: `git stash create` runs with the capture budget's signal, so an abort or
+  timeout tree-kills it. It takes `.git/index.lock` unconditionally to refresh the index (D2, `:121-127`). A process
+  killed while holding the lock never removes it. The header's claim "An abort mid-capture leaves nothing but such
+  unreferenced objects" (`:128-129`) is false.
+- Repro: 20 000 tracked files made stat-dirty (`utimes`), `git stash create` tree-killed after 40…1300 ms.
+  **9 of 10 runs left `.git/index.lock`**. After each, the producer's next `git add a.txt` failed with
+  `fatal: Unable to create '…/.git/index.lock': File exists.` Every git write in the repo stays broken until the
+  lock is removed by hand.
+- The abort test (`test/unit/reference.test.ts:179-191`) aborts only after `stash create` has returned, so it never
+  kills git mid-run.
+- Fix: run `git stash create` against a **private index copy**. Read `.git/index` with `fs.readFile`, write the
+  copy under the tmp root, and pass `env: { GIT_INDEX_FILE: <copy> }` (the ExecOptions seam has `env`); delete the
+  copy afterwards. Measured: the same tree SHA as a plain `stash create` (`privateIndexSameTree: true`), and a kill
+  can then only strand a lock on the copy. In addition, or as an alternative, do not pass the caller's abort signal
+  to this single call (hard timeout only; the result is discarded if the caller has aborted). Add a test that kills
+  `stash create` mid-run through a tree-kill seam and asserts that `.git/index.lock` is absent.
+
+### QA-1.5-2 — Medium — capture and materialize contend for the user's `index.lock` (D2 understated)
+- `:953` (`stash create`, mandatory lock) and `:1188` (drift `git diff`, which refreshes the index).
+- Repro: 120 producer `git add` runs against a loop of captures (`stash create`) on a 3 000-file repo.
+  **27/120 producer `git add` calls failed** (`Unable to create '…index.lock': File exists`) and 32 captures failed.
+  Baseline without captures: 0/120. With the private-index variant of QA-1.5-1: **0/120 and 0 capture failures**.
+- The drift `git diff --name-only … <commit> --` rewrote `.git/index` after a stat-only change
+  (`indexRewritten: true`). With `git --no-optional-locks diff …` it did not (`false`). D2's "same class as
+  `git status`" does not hold: status's refresh is an optional lock and is skipped when the lock is busy, whereas
+  `stash create` needs the lock and fails.
+- Fix: the private index from QA-1.5-1, plus `--no-optional-locks` on every read-only git call in capture,
+  materialize and GC. Update D2 accordingly.
+
+### QA-1.5-3 — Medium — `git worktree remove --force` is still the recursive deleter (TOCTOU after the sweep)
+- `:879-890`: the sweep proves the tree link-free, then `git worktree remove --force` recursively deletes an
+  **existing** dir. Git for Windows follows junctions (Spike D method 5), so any link that appears between the
+  sweep and the end of git's recursion makes git delete the link **target's contents**. Only the contract "call only
+  after the recheck process tree exited" stands in the way. QA-1.5-4 shows that GC can break that contract.
+- Repro: a seam hook created one junction `packages/late-link → victim` right before `git worktree remove` ran.
+  Result: `victim/pkg/sentinel.txt` **GONE**. On the same shape, `fs.rm(dir, {recursive, force})` left the victim
+  intact (`real data`).
+- Also: the sweep's containment check is lexical (`:831`). If a real dir is swapped for a junction between `lstat`
+  and `readdir`, the sweep walks into the target and unlinks links in the live `node_modules` (analysis, same race
+  class; not reproduced).
+- Fix: reorder to sweep → `assertSafeRefDir` + `lstat` → `fs.rm(dir)` (Spike D SAFE #5) → and only when the dir is
+  gone, `git worktree remove --force <dir>` to drop the admin entry. That call does no recursion (it is today's
+  step 5, measured in 1.5.1). Git then never deletes a tree. Keep the sweep: `engines` is `node >=20`, and fs.rm's
+  non-following of junctions is proven only on v24.21.0. Add a test that injects a junction just before the
+  removal and asserts that the target survives.
+
+### QA-1.5-4 — Medium — GC can remove a live reference
+- `:678`: `ACTIVE` is module-local. `:1307-1308`: `pid === ownPid` without `ACTIVE` membership counts as stale, and
+  `age > 1 h` counts as stale **even when the owner is alive**.
+- Repro: `reference.ts` imported twice in one process (as when the plugin is loaded from two install paths).
+  Instance A materialized a reference. `gcStaleReferences` from A kept it (`kept: 1`); **from B it removed it**
+  (`removed: 1`, `liveRefDirExists: false`). The node_modules sentinels survived.
+- Consequences: a recheck in progress loses its tree mid-run, so a reference-side failure appears that the tree
+  itself did not cause. It also reopens the QA-1.5-3 window while the owner's runner is still alive. The same
+  applies across processes to a live reference older than 1 h by dir mtime.
+- Fix: keep `ACTIVE` on `globalThis` (`Symbol.for("omr.reference.active")`). Treat `pid === ownPid` as stale only
+  when the dir is also old. For an alive owner, do not use mtime age alone: use a heartbeat marker touched while the
+  handle is in use, or the owner's process start time. 2.1 must classify "reference vanished" as `unverifiable`.
+
+### QA-1.5-5 — Medium — an abort during `git worktree add` leaves a permanently locked admin entry
+- `git worktree add` locks the new entry with reason `initializing` until the checkout finishes. Tree-killed
+  mid-checkout, the lock stays. `:886,:907` then fail, and GC keeps `locked` entries forever (`:1333`).
+- Repro: a slow smudge filter (`sleep 6; cat`) with the materialize signal aborted at 2 s. Result `aborted`, dir
+  removed, but the warnings read `cannot remove a locked working tree, lock reason: initializing` and
+  `git worktree list --porcelain` still shows the `omr-ref-…` entry as `locked initializing`. GC with the owner dead
+  and `now + 10 h`: **kept**. The user's repo keeps a registered worktree (this breaks the §148 check "no stale
+  omr-ref-* worktrees").
+- Fix: only for an R3-valid `omr-ref-*` entry whose lock reason is exactly `initializing`, and only when it is our
+  own abandon or the owner is dead: run `git worktree unlock <dir>`, then the normal pipeline. Leave every other
+  lock reason alone. Add a test with a slow smudge filter.
+
+### QA-1.5-6 — Medium — `exact: true` while the tracked content differs from the dispatch tree
+- Exactness (`:55-76`, `:1232`) covers untracked files and drift since dispatch, but not two gaps between the live
+  tree and the checkout of the stash commit:
+  - (a) EOL conversion on checkout. With `core.autocrlf=true` (the Git for Windows system default), live `"x\ny\n"`
+    became `"x\r\ny\r\n"` at the reference. With `input` (this host), a dirty tracked file saved with CRLF
+    (`"m2\r\nn2\r\n"`) became `"m2\nn2\n"`. **Both `exact: true`**. The same applies to `text`/`eol`/`filter`
+    attributes.
+  - (b) Index flags. With `--assume-unchanged` and `--skip-worktree` files edited locally, live `v2-local`/`w2-local`
+    became `v1`/`w1` at the reference, with **`exact: true`, `inexactReasons: []`**. Neither `stash create` nor the
+    drift `git diff` sees such edits.
+- Any byte difference can make a test fail only at the reference. That reads as "pre-existing" and excuses a
+  failure the producer introduced, which §1.5-7 forbids. The tests pin `core.autocrlf=false` (`test:102`), so they
+  cannot see (a).
+- Fix: (b) mark the reference inexact (`index-flags`) when `git ls-files -v` shows any lowercase tag
+  (assume-unchanged) or `S` (skip-worktree). (a) At capture, record the sha256 of the live bytes of every tracked
+  path that differs from HEAD, and at materialize compare them with the checked-out bytes. Then either compare
+  clean files too whenever a conversion is configured (`core.autocrlf`≠false, or any `text`/`eol`/`filter`
+  attribute) or mark such references inexact (`checkout-conversion`). Add tests with `core.autocrlf=true` and
+  assume-unchanged.
+
+### QA-1.5-7 — Medium — `exact` ignores ignored inputs present at dispatch (`.env`, generated files) — deferred by plan (2.1)
+- `:1147-1148` and `:82-86`: ignored entries only go to `unreproduced`, and `exact` stays true. The test asserts
+  exactly this (`test:228-232`: `exact === true` with `.env` in `unreproduced`). A test that reads settings from an
+  ignored `.env` fails at the reference with an assertion error, not a collection/setup error, so §1.5-8 does not
+  catch it and the failure is excused.
+- Fix: state in the header that `exact` is necessary but not sufficient for an excuse. The policy is 2.1's: a
+  reference-side failure must not excuse while `unreproduced` holds anything outside a small inert allowlist
+  (`coverage/`, logs, OS files). Env files and generated sources must never be on it.
+
+### QA-1.5-8 — Low — D9 hook suppression is bypassable by committed content
+- `:1081`: `core.hooksPath=<dir>/.omr-no-hooks` points **inside the worktree**, so the checkout can create it.
+- Repro: control first. A plain `git worktree add` ran `.git/hooks/post-checkout`; materialize correctly did not.
+  But a committed `.omr-no-hooks/post-checkout` **ran during materialize**
+  (`committed /c/Users/…/omr-ref-31548-1d4722dad301e0d9`). Impact is limited, since the recheck runs repository
+  code anyway. Still, the header claim (`:155-157`, D9) is false, and the hook runs outside the recheck's controls
+  (slot, priority, budget).
+- Fix: point `core.hooksPath` at a path that is outside the worktree and never created (for example
+  `<tmp root>/<ref dir name>.nohooks`). Add a test with a committed `.omr-no-hooks/post-checkout`.
+
+### QA-1.5-9 — Low — test gaps in the cleanup and guard coverage
+- (a) The "file held open" test (`test:292-303`) never produces EBUSY. A Node `fsp.open` handle does not block
+  deletion: dispose finished in 281 ms with no warnings. A child process whose cwd is inside the reference does
+  block it: `git worktree remove` failed (`Permission denied`), and **dispose resolved only after the holder
+  exited** (45.5 s and 60.5 s for holders that lived 45 s and 60 s). A standalone `fs.rm` with the same options
+  threw EBUSY after 10.8 s; the cause of the longer in-module wait is unverified. So the plan's "EBUSY → retried,
+  then logged" path is untested, and dispose latency depends on how long the holder lives. Use a child-process cwd
+  holder and assert that the warning is logged and that dispose resolves within a bound.
+- (b) There are no unit tests for `assertSafeRefDir` or `isStrictlyInside` (`:635-673`, R3). Missing cases: 8.3 vs
+  long form, case, UNC, filesystem root, nested dirs, dot segments, a prefix sibling (`Temp2`), `/`-separated
+  input. The suite only injects a realpath'd long-form tmp (`test:96`), never `os.tmpdir()`'s 8.3 form on this
+  host. (The repros above did use the 8.3 form: dirs were created in long form and GC matched git's long-form
+  listing.)
+- (c) The capture abort test does not kill git mid-run (see QA-1.5-1). (d) There is no D9 test (see QA-1.5-8).
+- Positive: a **mutation check** confirms that the key tests catch the dangerous regressions. With dispose
+  mutated to skip steps 1+2 (unlink and sweep), the KEY SAFETY sentinels (root and nested) were **GONE** and the
+  extra-link target was **GONE**. With only the sweep skipped, the KEY sentinels survived but the extra-link target
+  was GONE. So `test:241-258` and `test:260-272` both fail on those mutations.
+
+### QA-1.5-10 — Low — temp-dir exhaustion and POSIX exposure window — partly deferred by plan (2.1)
+- `MAX_UNTRACKED_*` (`:580-581`) bound only the untracked copy. Every materialize checks out the full tracked tree.
+  Nothing in 1.5 caps concurrent references, and GC runs only at plugin start. A dir left by failed disposes (see
+  QA-1.5-5 and QA-1.5-9) waits for the next start.
+- Deferred to 2.1: materialize only inside the S3 slot, and call GC before each materialize.
+- In 1.5: `chmod(dir, 0o700)` runs after the checkout (`:1087`). In a shared `/tmp`, the tracked and dirty content
+  sits in a umask-default (typically 0755) dir until then. Fix: `mkdir(dir, 0o700)` first, then
+  `git worktree add` into the empty dir (git accepts an existing empty dir). An injected or relocated win32 TEMP
+  (for example `C:\Temp`) inherits broader ACLs than `%LOCALAPPDATA%\Temp`: document it.
+
+### Checked with no finding
+- `reference.ts` imports only `node:fs/promises`, `node:crypto`, `node:os` and `node:path` (`:422-425`), plus type-only
+  imports. No argv contains `prune`, `clean`, `reset`, `checkout`, `update-ref`, `gc` or any `stash` subcommand
+  other than `create`.
+- R1/R2: every `unlink` is preceded by `lstat` (`:870-873`, `:832-836`). Every recursive removal (`:886`, `:897`,
+  `:907`) is preceded by `assertSafeRefDir` plus a real-dir `lstat`, and runs only after a successful sweep.
+  materialize never removes a dir it did not create (`:1075`).
+- GC candidates need the basename pattern **and** a parent equal to a tmp root (`:1332`, `:1372`). Orphans of
+  other repositories are skipped by their `gitdir:` line (`:1396`). Look-alikes and user worktrees are kept
+  (`test:371-403`). A user worktree deliberately named `omr-ref-<pid>-<16hex>` directly under TEMP would be
+  collected. That is accepted by the naming contract; optional hardening is to also require `detached` in the
+  porcelain entry.
+- Intent-to-add entries: `git stash create` fails (`Entry 'ita.js' not uptodate. Cannot merge.`), so capture
+  returns `undefined`. This is a safe refusal, but S2 is unavailable while any `git add -N` entry exists.
+- `core.fsmonitor=true`: dispose succeeded; the daemon only watched the main repository.
+- Untracked copy: the hashed buffer is the written buffer, and `wx` never writes through a link (`:1119-1136`).
+- Case-only renames under `core.ignorecase=true` are invisible to git on both sides (analysis, not reproduced; no
+  exactness impact on case-insensitive filesystems).
