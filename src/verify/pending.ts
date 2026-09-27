@@ -210,13 +210,18 @@
 //   the trimmed output is empty. The same call is used for the native `task` output
 //   (tool.execute.after) and the `delegate` tool return (2.4.2).
 //
-//   buildPendingListBlock(entries)  (section 1.5-20; entries = listUnverified(sid), newest first):
+//   buildPendingListBlock(entries)  (section 1.5-20; entries = listUnverified(sid) or, in index.ts,
+//     listPending(sid), newest first):
 //     undefined when entries is empty (the prompt does not grow for sessions that never defer);
 //     otherwise, with n = entries.length and m = min(n, PENDING_LIST_LIMIT = 5):
 //     [router] Unverified delegations in this session (newest first):
 //     - <handle> · risk <level> · <description>          (m lines)
 //     - ... and <n - m> more                              (only when n > m)
 //     [router] Before your final answer, call `router_verify` with the handles that matter, or with `pending: true` for all of them.
+//     QA-2.4-3: a verified entry (a background verdict that did not pass, not yet replayed) reads
+//     `- <handle> · <fail|unverifiable> in background verification · risk <level> · <description>`,
+//     and the header is then PENDING_LIST_MIXED_HEADER. router_verify (a handle or `pending:
+//     true`) replays it with no run, and it leaves the list (markReplayed).
 //
 //   buildLateNoticeBlock(notices)  (section 1.5-19, background mode only; R14 owns the queue):
 //     undefined when empty; otherwise
@@ -363,7 +368,9 @@
 //     and "gone" (unknown/expired) -> dropped. A handle missing from the outcomes, or a rejected
 //     verify, counts as retryable.
 //   - Notices: per session, one per handle, returned once by takeNotices (the system transform) and
-//     remembered as delivered. markReported(handles) (router_verify's verdict items) drops and
+//     remembered as delivered. A consumed notice never makes its entry disappear (QA-2.4-3): the
+//     run settles with `background: true`, and a verdict that did not pass stays in listPending
+//     (the pending list) until router_verify replays it (markReplayed) or the TTL expires. markReported(handles) (router_verify's verdict items) drops and
 //     suppresses a notice the orchestrator already saw. Bounded: LATE_NOTICES_PER_SESSION,
 //     LATE_NOTICES_MAX, REPORTED_MEMO_MAX; sweep drops notices older than ttlMs.
 //   - Cancellation: forgetSession (session.deleted) drops the session's requests and notices and
@@ -420,6 +427,11 @@ export const UNATTRIBUTED_RISK_REASON = "changed files could not be attributed";
 export const REFERENCE_SHED_REASON = "reference dropped at the pending registry's memory bound";
 /** R14: the late-notice header when a notice is not a plain failure (an unverifiable result). */
 export const LATE_NOTICE_MIXED_HEADER = "[router] Background verification did not pass these delegations:";
+/**
+ * QA-2.4-3: the pending-list header when it also holds background verdicts that did not pass and
+ * were not replayed yet (each such line says `<outcome> in background verification`).
+ */
+export const PENDING_LIST_MIXED_HEADER = "[router] Unverified delegations, and background verdicts not yet read, in this session (newest first):";
 /** R14: a settled handle replays its cached verdict (forcing note, next tier) with no new run. */
 export const LATE_NOTICE_REPLAY_LINE = "[router] Call `router_verify` with a handle for its full verdict; nothing is run again.";
 
@@ -480,6 +492,12 @@ export interface VerificationResult {
   readonly driftedPaths?: readonly string[];
   /** buildForcingNote's suggested next tier on a rejection. */
   readonly nextTier?: string;
+  /**
+   * R14, QA-2.4-3: settled by a background run. A terminal verdict that did not pass then keeps its
+   * entry in the pending list (listPending) until router_verify replays it to the session
+   * (markReplayed) or the TTL expires: a consumed late notice never makes it disappear.
+   */
+  readonly background?: boolean;
 }
 
 export interface SettledVerification extends VerificationResult {
@@ -602,6 +620,14 @@ export interface PendingRegistry {
   get(sessionID: string, handle: string): Lookup;
   listUnverified(sessionID: string, limit?: number): readonly PendingEntry[];
   listOpen(sessionID: string): readonly PendingEntry[];
+  /**
+   * QA-2.4-3: what the orchestrator still has to look at, newest first: unverified entries,
+   * verifying ones when `verifying` is set (background mode), and verified entries whose background
+   * verdict did not pass and was not yet replayed by router_verify (awaitsReplay).
+   */
+  listPending(sessionID: string, options?: { readonly verifying?: boolean }): readonly PendingEntry[];
+  /** QA-2.4-3: router_verify reported these handles' verdicts to the session: they leave listPending. */
+  markReplayed(sessionID: string, handles: readonly string[]): void;
   markVerifying(sessionID: string, handle: string): ClaimResult;
   sweep(nowMs?: number): number;
   forgetSession(sessionID: string): void;
@@ -709,6 +735,8 @@ interface EntryRecord {
   released: boolean;
   doomed: boolean;
   live: boolean;
+  /** QA-2.4-3: router_verify reported the verdict to the session (markReplayed). */
+  replayed: boolean;
 }
 
 type LookupMiss = Extract<Lookup, { readonly kind: "expired" | "unknown" }>;
@@ -740,7 +768,18 @@ function isNonEmptyString(value: unknown): value is string {
  */
 function evictionCandidates(records: Iterable<EntryRecord>): EntryRecord[] {
   const byAge = (a: EntryRecord, b: EntryRecord): number => a.createdAt - b.createdAt || a.seq - b.seq;
-  return [...records].filter((r) => r.state === "verified").sort(byAge);
+  return [...records].filter((r) => r.state === "verified" && !awaitsReplay(r)).sort(byAge);
+}
+
+/**
+ * QA-2.4-3: a background verdict that did not pass and that router_verify has not yet replayed to
+ * the session. It stays listed (and, like an unverified entry, is never evicted by a cap) until the
+ * replay or the TTL: the one-shot late notice may never have reached the orchestrator.
+ */
+function awaitsReplay(rec: EntryRecord): boolean {
+  if (rec.state !== "verified" || rec.replayed || rec.result?.background !== true) return false;
+  const verdict = rec.result.verdict;
+  return (verdict.outcome ?? (verdict.pass ? "pass" : "fail")) !== "pass";
 }
 
 /** R2-R8, R11. */
@@ -1027,6 +1066,7 @@ export function createPendingRegistry(options: PendingRegistryOptions): PendingR
       released: false,
       doomed: false,
       live: true,
+      replayed: false,
     };
     const target = session ?? new Map<string, EntryRecord>();
     target.set(handle, rec);
@@ -1109,6 +1149,20 @@ export function createPendingRegistry(options: PendingRegistryOptions): PendingR
     },
     listOpen(sessionID) {
       return listByState(sessionID, ["unverified", "verifying"]).map(snapshot);
+    },
+    listPending(sessionID, options) {
+      const states: PendingState[] = options?.verifying === true ? ["unverified", "verifying", "verified"] : ["unverified", "verified"];
+      return listByState(sessionID, states)
+        .filter((r) => r.state !== "verified" || awaitsReplay(r))
+        .map(snapshot);
+    },
+    markReplayed(sessionID, handles) {
+      const session = sessions.get(sessionID);
+      if (session === undefined) return;
+      for (const handle of handles) {
+        const rec = session.get(handle);
+        if (rec !== undefined) rec.replayed = true;
+      }
     },
     markVerifying,
     sweep(nowMs) {
@@ -1599,9 +1653,16 @@ export function appendRouterFooter(output: string, footer: string): string {
 export function buildPendingListBlock(entries: readonly PendingEntry[]): string | undefined {
   if (entries.length === 0) return undefined;
   const shown = entries.slice(0, PENDING_LIST_LIMIT);
-  const lines = ["[router] Unverified delegations in this session (newest first):"];
+  // QA-2.4-3: a verified entry here is a background verdict that did not pass (listPending).
+  const judgedOutcome = (e: PendingEntry): string | undefined => {
+    if (e.state !== "verified" || e.result === undefined) return undefined;
+    return e.result.verdict.outcome ?? (e.result.verdict.pass ? "pass" : "fail");
+  };
+  const lines = [entries.some((e) => judgedOutcome(e) !== undefined) ? PENDING_LIST_MIXED_HEADER : "[router] Unverified delegations in this session (newest first):"];
   for (const e of shown) {
-    lines.push(`- ${e.handle} \u00b7 ${formatRisk(e.risk.level, e.risk.reasons, 0)} \u00b7 ${sanitizeDescription(e.description)}`);
+    const outcome = judgedOutcome(e);
+    const label = outcome === undefined ? "" : ` \u00b7 ${outcome} in background verification`;
+    lines.push(`- ${e.handle}${label} \u00b7 ${formatRisk(e.risk.level, e.risk.reasons, 0)} \u00b7 ${sanitizeDescription(e.description)}`);
   }
   if (entries.length > shown.length) lines.push(`- ... and ${entries.length - shown.length} more`);
   lines.push(

@@ -1756,7 +1756,8 @@ const ModelRouterPlugin: Plugin = async (ctx: PluginInput) => {
       // above. With background mode on, an entry the queue is verifying right now is still
       // unverified to the orchestrator, so it stays listed until its run settles.
       try {
-        const open = background !== undefined ? pending.listOpen(sessionID) : pending.listUnverified(sessionID);
+        // QA-2.4-3: plus background verdicts that did not pass, until router_verify replays them.
+        const open = pending.listPending(sessionID, { verifying: background !== undefined });
         const block = buildPendingListBlock(open);
         if (block !== undefined) output.system.push(block);
       } catch (error) {

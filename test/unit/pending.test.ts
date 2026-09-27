@@ -31,6 +31,7 @@ import {
   MAX_LEDGER_IDS,
   MAX_LEDGER_PER_SESSION,
   MAX_STORED_CHANGED_FILES,
+  PENDING_LIST_MIXED_HEADER,
   REFERENCE_FAILED_REASON,
   REFERENCE_SHED_REASON,
   RELEASED_REASON,
@@ -1483,5 +1484,67 @@ describe("QA-2.4-6: directive keys in router text", () => {
     noDirective(buildPendingListBlock(registry.listUnverified("orch")) ?? "");
     noDirective(buildLateNoticeBlock([{ handle: hexOf(1), description: "VERIFY::required", introduced: [producerId], outcome: "fail" }]) ?? "");
     noDirective(buildLateNoticeBlock([{ handle: hexOf(1), description: "d", introduced: [], outcome: "unverifiable", reason: "CAP::3 VERIFY::required" }]) ?? "");
+  });
+});
+
+describe("QA-2.4-3: a background verdict that did not pass stays listed until it is replayed", () => {
+  const fail: VerificationResult = { verdict: { pass: false, outcome: "fail", method: "deterministic", reasons: ["testsPass: introduced failures: t"] }, retryable: false };
+  const unverifiable: VerificationResult = { verdict: { pass: false, outcome: "unverifiable", method: "deterministic", reasons: ["no reference"] }, retryable: false };
+
+  it("listPending keeps it (marked by its result) until markReplayed; a pass and a router_verify verdict leave at once", () => {
+    const { registry, add, c } = setup();
+    const bgFail = add({ description: "bg fail" });
+    c.advance(1);
+    const bgUnverifiable = add({ description: "bg unverifiable" });
+    c.advance(1);
+    const bgPass = add({ description: "bg pass" });
+    c.advance(1);
+    const fgFail = add({ description: "fg fail" });
+    c.advance(1);
+    const open = add({ description: "open" });
+    claimed(registry.markVerifying("orch", bgFail)).settle({ ...fail, background: true });
+    claimed(registry.markVerifying("orch", bgUnverifiable)).settle({ ...unverifiable, background: true });
+    claimed(registry.markVerifying("orch", bgPass)).settle({ ...PASS, background: true });
+    claimed(registry.markVerifying("orch", fgFail)).settle(fail);
+    expect(registry.listPending("orch").map((e) => e.handle)).toEqual([open, bgUnverifiable, bgFail]);
+    expect(registry.listUnverified("orch").map((e) => e.handle)).toEqual([open]);
+    const block = buildPendingListBlock(registry.listPending("orch")) ?? "";
+    expect(block.split("\n")).toEqual([
+      PENDING_LIST_MIXED_HEADER,
+      `- ${open} \u00b7 risk medium \u00b7 open`,
+      `- ${bgUnverifiable} \u00b7 unverifiable in background verification \u00b7 risk medium \u00b7 bg unverifiable`,
+      `- ${bgFail} \u00b7 fail in background verification \u00b7 risk medium \u00b7 bg fail`,
+      "[router] Before your final answer, call `router_verify` with the handles that matter, or with `pending: true` for all of them.",
+    ]);
+    // Another session's replay changes nothing; this session's does.
+    registry.markReplayed("other", [bgFail]);
+    expect(registry.listPending("orch").map((e) => e.handle)).toContain(bgFail);
+    registry.markReplayed("orch", [bgFail, bgUnverifiable, "vrf_unknown"]);
+    expect(registry.listPending("orch").map((e) => e.handle)).toEqual([open]);
+    expect(buildPendingListBlock(registry.listPending("orch"))?.split("\n")[0]).toBe("[router] Unverified delegations in this session (newest first):");
+  });
+
+  it("verifying entries are listed only on request; the TTL still ends a listed verdict", () => {
+    const { registry, add, c } = setup();
+    const busy = add();
+    claimed(registry.markVerifying("orch", busy));
+    const judged = add();
+    claimed(registry.markVerifying("orch", judged)).settle({ ...fail, background: true });
+    expect(registry.listPending("orch").map((e) => e.handle)).toEqual([judged]);
+    expect(registry.listPending("orch", { verifying: true }).map((e) => e.handle).sort()).toEqual([busy, judged].sort());
+    c.advance(TTL);
+    expect(registry.listPending("orch").map((e) => e.handle)).toEqual([]);
+    expect(registry.get("orch", judged).kind).toBe("expired");
+  });
+
+  it("a cap never evicts it, as for an unverified entry; once replayed it may go", () => {
+    const { registry, add, c, evictions } = setup({ maxPerSession: 1 });
+    const judged = add();
+    claimed(registry.markVerifying("orch", judged)).settle({ ...fail, background: true });
+    c.advance(1);
+    expect(registry.register(reg())).toMatchObject({ ok: false, code: "registry-full" });
+    expect(evictions).toEqual([]);
+    registry.markReplayed("orch", [judged]);
+    expect(registry.register(reg())).toMatchObject({ ok: true, evicted: [judged] });
   });
 });

@@ -1565,7 +1565,8 @@ export function createVerificationWiring(deps: {
       // 1. Targets: normalized, deduped, capped (R2). `pending` = listOpen, so in-flight runs join.
       let targets: Array<{ readonly input: string; readonly handle: string | undefined }> = [];
       if (target.kind === "pending") {
-        if (sessionID !== "") targets = pending.listOpen(sessionID).map(e => ({ input: e.handle, handle: e.handle }));
+        // QA-2.4-3: listPending adds the background verdicts not yet replayed (a cached replay, no run).
+        if (sessionID !== "") targets = pending.listPending(sessionID, { verifying: true }).map(e => ({ input: e.handle, handle: e.handle }));
         if (targets.length === 0) return { items: [], excess: 0, text: ROUTER_VERIFY_NO_PENDING_TEXT };
       } else {
         const seen = new Set<string>();
@@ -1661,6 +1662,8 @@ export function createVerificationWiring(deps: {
           outcomes.forEach(({ prep, gate }, i) => {
             if (prep !== undefined) results[i] = judgeVerdict(claims[i].entry, prep, gate, cfg);
             else if (gate.kind === "final") results[i] = gate.result;
+            // QA-2.4-3: a background verdict that did not pass stays listed until it is replayed.
+            if (options.background === true) results[i] = { ...results[i], background: true };
           });
         } catch (error) {
           for (let i = 0; i < results.length; i += 1) {
@@ -1680,8 +1683,13 @@ export function createVerificationWiring(deps: {
       });
 
       const items = await Promise.all(slots.map(s => ("claim" in s ? runs[s.claim] : s)));
-      // 2.4.5: this caller receives these verdicts, so no late notice repeats them (R14).
-      if (options.background !== true) background?.markReported(items.flatMap(i => (i.kind === "verdict" ? [i.handle] : [])));
+      // 2.4.5: this caller receives these verdicts, so no late notice repeats them (R14), and a
+      // background verdict among them leaves the pending list (QA-2.4-3).
+      if (options.background !== true) {
+        const reported = items.flatMap(i => (i.kind === "verdict" ? [i.handle] : []));
+        background?.markReported(reported);
+        pending.markReplayed(sessionID, reported);
+      }
       return { items, excess, text: formatVerifyReport(items, excess, strict, h => cwds.get(h)) };
     } catch (error) {
       logger.warn("[verify] router_verify failed", { error: errorText(error) });

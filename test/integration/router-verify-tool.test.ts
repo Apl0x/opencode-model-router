@@ -37,6 +37,8 @@ import {
 import {
   buildLateNoticeBlock,
   EXPIRED_HANDLE_TEXT,
+  LATE_NOTICE_MIXED_HEADER,
+  PENDING_LIST_MIXED_HEADER,
   MAX_HANDLES_PER_CALL,
   UNKNOWN_HANDLE_TEXT,
   type BackgroundQueue,
@@ -1284,9 +1286,11 @@ describe("the router_verify tool (2.4.3b)", () => {
     const first = await system();
     const late = first.find(s => s.startsWith("[router] Background verification found introduced failures:"));
     expect(late).toContain(`- ${h} \u00b7 work a \u00b7 failing: `);
-    expect(first.some(s => s.startsWith("[router] Unverified delegations"))).toBe(false);
-    // Delivered once.
+    // QA-2.4-3: the entry stays listed with its result until router_verify replays it.
+    expect(first.find(s => s.startsWith(PENDING_LIST_MIXED_HEADER))).toContain(`- ${h} \u00b7 fail in background verification \u00b7 `);
+    // The notice itself is delivered once.
     expect((await system()).some(s => s.includes("Background verification"))).toBe(false);
+    await routerVerify(hooks).execute({ handles: [h] }, { sessionID: "orch" });
 
     // A deferred native task is queued by the plugin, and session.deleted drops it.
     const prompt = `Implement it.\n[acceptance]\ncheck: testsPass command="npm test"\n[/acceptance]`;
@@ -1304,5 +1308,44 @@ describe("the router_verify tool (2.4.3b)", () => {
     const dispose = vi.spyOn(queue, "dispose");
     await hooks.dispose();
     expect(dispose).toHaveBeenCalled();
+  });
+
+  it("QA-2.4-3: a background verdict that did not pass stays listed after its notice is read, until router_verify replays it", async () => {
+    writeOverrides({ background: true });
+    exactReference();
+    state.failing = { a: ["t2"] };
+    const { hooks } = await makePlugin();
+    const queue = plugin.wiring?.background;
+    if (queue === undefined) throw new Error("background: true built no queue");
+    const system = async (): Promise<string[]> => {
+      const output = { system: [] as string[] };
+      await hooks["experimental.chat.system.transform"]({ sessionID: "orch", model: { providerID: "p", modelID: "m" } }, output);
+      return output.system;
+    };
+    const failed = await register(registry(), "a");
+    // No reference: failures there are unverifiable (terminal), which is noticed and listed too.
+    const noRef = await register(registry(), "b", { reference: Promise.resolve(NONE) });
+    state.failing = { a: ["t2"], b: ["t1"] };
+    const green = await register(registry(), "c");
+    for (const [h, x] of [[failed, "a"], [noRef, "b"], [green, "c"]] as const) queue.enqueue({ sessionID: "orch", handle: h, files: [src(x)] });
+    await queue.whenIdle();
+    // The transform reads the notices, and that model request then fails: nobody saw them.
+    const lost = await system();
+    expect(lost.some(s => s.startsWith(LATE_NOTICE_MIXED_HEADER))).toBe(true);
+    // The next request still lists both, marked with their result; a pass is not listed.
+    const again = await system();
+    expect(again.some(s => s.includes("Background verification"))).toBe(false);
+    const list = again.find(s => s.startsWith(PENDING_LIST_MIXED_HEADER)) ?? "";
+    expect(list).toContain(`- ${failed} \u00b7 fail in background verification \u00b7 `);
+    expect(list).toContain(`- ${noRef} \u00b7 unverifiable in background verification \u00b7 `);
+    expect(list).not.toContain(green);
+    expect(await system()).toContain(list);
+    // router_verify pending: true replays them from the cache (no run) and they leave the list.
+    const runs = state.runs.length;
+    const out = await routerVerify(hooks).execute({ pending: true }, { sessionID: "orch" });
+    expect(out).toContain(`- ${failed} \u00b7 work a \u00b7 fail (cached verdict; nothing was run)`);
+    expect(out).toContain(`- ${noRef} \u00b7 work b \u00b7 unverifiable (cached verdict; nothing was run)`);
+    expect(state.runs.length).toBe(runs);
+    expect((await system()).some(s => s.startsWith("[router] Unverified delegations"))).toBe(false);
   });
 });
