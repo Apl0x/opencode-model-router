@@ -591,7 +591,9 @@
 //     total = numTotalTests, when it is a number.
 //     For each suite s:
 //       rel    = P.relative(spec.cwd, s.name) with "/" separators. s.name is absolute, with
-//                forward slashes in vitest and backslashes in jest.
+//                forward slashes in vitest and backslashes in jest. QA-1.3-35: computed by
+//                prefix when s.name lies plainly below spec.cwd (same result; Bun's
+//                path.win32.relative is about 13 times slower than node's), else P.relative.
 //       failed = the assertionResults with status "failed".
 //       For each a in failed: id = `${rel} > ${[...a.ancestorTitles, a.title].join(" > ")}`.
 //         This is the same form vitest prints in text ("FAIL test/str.test.js > str > bad").
@@ -635,6 +637,8 @@
 //       green. A FAILING case with classname="" is unmapped (below), so it is never a pass. Any
 //       other <error> (fixture setup or teardown) marks a failing test.
 //     - <skipped> is not a failure.
+//     - QA-1.3-35: a case with no <failure>/<error> only counts toward total; its attributes are
+//       not decoded. Each input's cwd-relative id prefix is computed once.
 //     Module mapping. For each spec input f:
 //       dotted(f) = its gitRoot-relative path without ".py", with "/" replaced by ".".
 //       The candidates are the segment-suffixes of dotted(f), kept in a map (first input wins).
@@ -3907,7 +3911,7 @@ function parseJestJson(ctx: Ctx, spec: ScopedSpec, text: string, code: number): 
   let collectionError = typeof v.numRuntimeErrorTestSuites === "number" && v.numRuntimeErrorTestSuites > 0;
   for (const s of v.testResults.filter(isRecord)) {
     if (typeof s.name !== "string") continue;
-    const rel = P.relative(spec.cwd, s.name).replace(/\\/g, "/");
+    const rel = relSlash(ctx, spec.cwd, s.name);
     const results = Array.isArray(s.assertionResults) ? s.assertionResults.filter(isRecord) : [];
     const failed = results.filter((a) => a.status === "failed");
     for (const a of failed) {
@@ -3922,6 +3926,26 @@ function parseJestJson(ctx: Ctx, spec: ScopedSpec, text: string, code: number): 
   }
   const total = typeof v.numTotalTests === "number" ? v.numTotalTests : undefined;
   return finishResult(ids, files, collectionError, total, code, undefined, code === 0);
+}
+
+/**
+ * QA-1.3-35: `P.relative(base, p)` with "/" separators, as readResult ids need it, without calling
+ * P.relative when `p` lies plainly below `base`: the same prefix (either separator; case-insensitive
+ * on win32) followed by a tail with no empty, "." or ".." segment. That tail is exactly what
+ * P.relative returns there, and it avoids Bun's path.win32.relative (about 13 times slower than
+ * node's: 20000 calls took 953 ms). Anything else goes through P.relative.
+ */
+function relSlash(ctx: Ctx, base: string, p: string): string {
+  const norm = (s: string) => (ctx.win ? s.replace(/\//g, "\\") : s);
+  const b = norm(base);
+  const q = norm(p);
+  const sep = ctx.win ? "\\" : "/";
+  const head = b.endsWith(sep) ? b : b + sep;
+  if (q.length > head.length && ctx.key(q.slice(0, head.length)) === ctx.key(head)) {
+    const tail = q.slice(head.length);
+    if (tail.split(sep).every((s) => s !== "" && s !== "." && s !== "..")) return tail.replace(/\\/g, "/");
+  }
+  return ctx.P.relative(base, p).replace(/\\/g, "/");
 }
 
 /** A test path by the G.8 JS rule: a .test/.spec file or a file under __tests__. */
@@ -3971,11 +3995,10 @@ function decodeXml(s: string): string {
  * prefixes from the longest, and testcases are found with indexOf, never a backtracking regex.
  */
 function parseJunit(ctx: Ctx, spec: ScopedSpec, text: string, code: number): RunResult | undefined {
-  const P = ctx.P;
   if (!text.includes("</testsuites>")) return undefined;
   const suffixes = new Map<string, string>();
   for (const f of spec.inputs) {
-    const segs = P.relative(spec.gitRoot, f).replace(/\\/g, "/").replace(/\.py$/, "").split("/");
+    const segs = relSlash(ctx, spec.gitRoot, f).replace(/\.py$/, "").split("/");
     for (let i = 0; i < segs.length; i++) {
       const d = segs.slice(i).join(".");
       if (!suffixes.has(d)) suffixes.set(d, f);
@@ -3990,7 +4013,16 @@ function parseJunit(ctx: Ctx, spec: ScopedSpec, text: string, code: number): Run
       d = d.slice(0, dot);
     }
   };
-  const relOf = (f: string) => P.relative(spec.cwd, f).replace(/\\/g, "/");
+  // QA-1.3-35: at most one relativisation per input file, however many cases fail in it.
+  const rels = new Map<string, string>();
+  const relOf = (f: string) => {
+    let r = rels.get(f);
+    if (r === undefined) {
+      r = relSlash(ctx, spec.cwd, f);
+      rels.set(f, r);
+    }
+    return r;
+  };
   const ids = new Set<string>();
   const files = new Set<string>();
   let collectionError = false;
@@ -3999,14 +4031,19 @@ function parseJunit(ctx: Ctx, spec: ScopedSpec, text: string, code: number): Run
   const cases = junitCases(text);
   if (!cases) return undefined;
   for (const c of cases) {
-    const attrs: Record<string, string> = {};
-    for (const a of c.attrs.matchAll(/([\w:-]+)="([^"]*)"/g)) attrs[a[1]] = decodeXml(a[2]);
-    const classname = attrs.classname ?? "";
-    const name = attrs.name ?? "";
     const body = c.body;
     // QA-1.3-22: only the collection-failure <error> marks a collection case. pytest also writes
     // classname="" for a test outside its rootdir (-c elsewhere, --rootdir), which is a real test.
     const collection = /<error\b[^>]*\bmessage="collection failure"/.test(body);
+    // QA-1.3-35: a passing case only counts; its attributes are never decoded.
+    if (!collection) {
+      total++;
+      if (!/<(?:failure|error)\b/.test(body)) continue;
+    }
+    const attrs: Record<string, string> = {};
+    for (const a of c.attrs.matchAll(/([\w:-]+)="([^"]*)"/g)) attrs[a[1]] = decodeXml(a[2]);
+    const classname = attrs.classname ?? "";
+    const name = attrs.name ?? "";
     if (collection) {
       collectionError = true;
       const target = classname || name;
@@ -4020,8 +4057,6 @@ function parseJunit(ctx: Ctx, spec: ScopedSpec, text: string, code: number): Run
       }
       continue;
     }
-    total++;
-    if (!/<(?:failure|error)\b/.test(body)) continue;
     const hit = map(classname);
     if (hit) {
       ids.add(`${relOf(hit.file)}::${[...hit.rest, name].join("::")}`);

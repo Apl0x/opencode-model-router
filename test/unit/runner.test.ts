@@ -3036,3 +3036,33 @@ describe("QA-1.3-36: executables must be files on full paths", () => {
     expect(spec(await plan({ ...host, execPath: "C:\\Program Files\\nodejs\\node.exe", pathEnv: "" }, statFs(W, true))).file).toBe("C:\\Program Files\\nodejs\\node.exe");
   });
 });
+describe("QA-1.3-35: readResult relativises by prefix when a path is plainly below the base", () => {
+  const vjson = (names: string[]) =>
+    JSON.stringify({
+      numTotalTests: names.length,
+      testResults: names.map((name) => ({ name, status: "failed", assertionResults: [{ status: "failed", ancestorTitles: ["s"], title: "t" }] })),
+    });
+  const WSPEC = (cwd: string) => mkSpec({ cwd, gitRoot: "C:\\Root", reportPath: "C:\\Temp\\omr-verify-0123abcd-0000-4000-8000-00000000abcd.json" });
+  const wread = (sp: ScopedSpec, text: string) => read(sp, { [sp.reportPath]: text }, 1, { ...WIN_HOST, tmpdir: "C:\\Temp" });
+
+  it("win32: either separator, any case, a drive root; odd paths take P.relative", async () => {
+    const r = await wread(WSPEC("C:\\Root\\proj"), vjson(["c:/root/PROJ/test/A.test.js", "C:\\Root\\proj\\x\\y.test.js", "C:\\Root\\other\\z.test.js", "C:\\Root\\proj\\a\\..\\b.test.js", "C:\\Root\\proj\\\\d.test.js", "C:\\Root\\proj"]));
+    expect(r.failingIds).toEqual(["", "../other/z.test.js > s > t", "b.test.js > s > t", "d.test.js > s > t", "test/A.test.js > s > t", "x/y.test.js > s > t"].map((x) => (x === "" ? " > s > t" : x)).sort());
+    const root = await wread(WSPEC("C:\\"), vjson(["C:\\t\\a.test.js"]));
+    expect(root.failingIds).toEqual(["t/a.test.js > s > t"]);
+  });
+
+  it("posix: prefix, a root cwd, and a sibling that only shares the prefix text", async () => {
+    const r = await read(mkSpec({ cwd: "/root/p" }), { [RPT_JSON]: vjson(["/root/p/t/a.test.js", "/root/pp/b.test.js", "/root/p/./c.test.js"]) }, 1);
+    expect(r.failingIds).toEqual(["../pp/b.test.js > s > t", "c.test.js > s > t", "t/a.test.js > s > t"]);
+    const top = await read(mkSpec({ cwd: "/" }), { [RPT_JSON]: vjson(["/x/a.test.js"]) }, 1);
+    expect(top.failingIds).toEqual(["x/a.test.js > s > t"]);
+  });
+
+  it("junit: a passing case is counted without decoding it, and relativisation is per file", async () => {
+    const cases = Array.from({ length: 5000 }, (_, i) => `<testcase classname="tests.test_m" name="ok_${i}" x="&#x110000;"/>`).join("");
+    const xml = `<testsuites>${cases}<testcase classname="tests.test_m" name="bad"><failure/></testcase></testsuites>`;
+    const sp = mkSpec({ runner: "pytest", reportPath: RPT_XML, cwd: "/root/p", gitRoot: "/root/p", inputs: ["/root/p/tests/test_m.py"], inputsAreTests: true });
+    expect(await read(sp, { [RPT_XML]: xml }, 1)).toMatchObject({ total: 5001, failingIds: ["tests/test_m.py::bad"], complete: true });
+  });
+});
