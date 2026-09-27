@@ -655,3 +655,133 @@ only major/critical are fixed). QA-2.2-15 (2) is covered anyway by the `" > "` n
     record.
   - `wiring.ts`: lines 100%, branches 91.89%. No uncovered branch lies in the changed region
     (L262, L504-545, L658-659); the uncovered arms are all in 2.1 code.
+
+## QA findings (2.2.3 wiring, round 1)
+
+Adversarial review of `git diff 70fe235..HEAD` on `vrb/p22`, restricted to `0e89ef1` (QA-2.2-11
+fix), `ae92325` (wiring) and `83dedaf` (tests), and to how the coordinator meets 2.1's gate
+pipeline. The wave-2 merge (`7b62cae`) was reviewed in phase 2.1 and is not re-reviewed. This is the
+first round on the wiring, so one more round follows the fixes.
+
+**Test run** (once, as dispatched): `npx vitest run --maxWorkers=2 test/unit/batch.test.ts
+test/integration/batch-wiring.test.ts test/unit/baseline-wiring.test.ts
+test/unit/tests-pass-pipeline.test.ts test/integration/layer2-wiring.test.ts
+test/integration/delegate-timeout.test.ts test/integration/session-lifecycle.test.ts` → Test Files 7
+passed (7), Tests 409 passed (409), 15.59 s. `npm run typecheck` is clean.
+
+**Method.** All scratch work ran in a `%TEMP%` copy of `src/` and `test/` with a junction to
+`node_modules`. The worktree was not edited, and the copy was deleted afterwards.
+
+- **Repros.** Two scratch test files drive the real `createVerificationWiring` → `buildGateDeps` →
+  `accept`. The planner, scope opener, `readResult`, judge and gate are real. The `exec`, `slot` and
+  `reference` seams are faked, as in `batch-wiring.test.ts`.
+- **R5/R6 seams.** R5 and R6 add three things:
+  - a FIFO slot with one holder (`maxConcurrentVerifications` defaults to 1 below 16 cores);
+  - vitest runs that take 1 s;
+  - an exact fake reference (`materialize` returns `exact: true` over a copy of the project), at
+    which the failing test passes.
+- **Mutants.** Each mutant was an in-place change in the copy, restored after its run.
+
+**Mutation check of the wiring tests:**
+
+| mutant | change | tests run | result |
+| --- | --- | --- | --- |
+| MW1 | wiring never builds the coordinator (`if (false && …)`) | batch-wiring | **killed**, 6 of 7 |
+| MW2 | wiring drops `...currentTree` from the runtime | batch-wiring | **killed**, 2 of 7 |
+| MB1 | batch.ts `recheck` passes `undefined` for the tree | batch-wiring + batch.test | **killed**, 2 of 165 |
+| MW3 | runtime `failureRecheck: true`, whatever the config | batch-wiring + layer2-wiring + baseline-wiring | **survives**, 58/58 |
+| MW4 | runtime `recheckMinRemainingMs: 0` | batch-wiring + layer2-wiring | **survives**, 12/12 |
+| MW5 | batch planner's searches ignore `planDeadline` | batch-wiring + layer2-wiring | **survives**, 12/12 |
+| MW6 | `sweepVerification: () => 0` | batch-wiring + layer2-wiring + session-lifecycle | **survives**, 75/75 |
+| MW7 | `disposeVerification: async () => {}` | same | **killed**, 1 of 75 |
+| MW8 | index.ts dispose no longer awaits `disposeVerification()` | batch-wiring + layer2-wiring + delegate-timeout + session-lifecycle | **survives**, 90/90 |
+| MW9 | index.ts idle sweeper list without the coordinator entry | same | **survives**, 90/90 |
+| MW10 | runtime `batchWindowMs: 1` | batch-wiring | **killed**, 1 of 7 (the dispose test only) |
+| MB3 | `referenceDecision` reads the window opener's `failureRecheck` | batch-wiring | survives 7/7 (B12 kills it, round 2) |
+
+Answer to the dispatch's question:
+- `batch-wiring.test.ts` fails when the coordinator is bypassed (MW1).
+- It fails when the tree is dropped, on either side (MW2, MB1).
+- It does **not** fail when the gate-time `failureRecheck` is ignored (MW3).
+
+The wiring is correct today: repro R2 gives batched = alone (see QA-2.2-20). But no test pins it.
+
+### Findings
+
+| id | severity | evidence | fix |
+| --- | --- | --- | --- |
+| QA-2.2-17 | **major** | **The batch spends gate budget that the direct path spends on the recheck, and the gate accepts the resulting unverifiable verdict by default. A proven introduced failure is therefore accepted when batched and rejected with `batchWindowMs: 0`.** gate.ts L78: `accepted: outcome !== "fail" && !(strictUnverifiable && caveats.length > 0)`. `strictUnverifiable` is off by default (wiring.ts L558 passes the config value). B-G1 excludes deadline expiry, and B-G2, QA-2.2-3 and QA-2.2-5 call V "toward caution". That holds for the verdict, but not for acceptance: F → V turns a rejection into an acceptance. Two things now shift the timeline. `ae92325` puts every testsPass gate behind the window (default 2000 ms), and on the mode-B path (D2) the union run comes before the own runs. **R6** (default config, one gate, no concurrency, 12 s left at testsPass, `c` introduces `test/c.test.ts > t2`, which passes at the reference): the window ends at 2021 ms and the run takes 2021-3036 ms. The recheck is then skipped (under `RECHECK_MIN_REMAINING_MS`, 10 s): **`unverifiable`, `accepted: true`**, "testsPass: gate budget exhausted before recheck; observed failures: test/c.test.ts > t2". With `batchWindowMs: 0` the run takes 5-1008 ms and the reference run 1014-2027 ms: **`fail`, `accepted: false`**, "introduced failures: test/c.test.ts > t2". Same result in 2 of 2 runs. A lone gate never benefits from the wait (B5.1: a batch of one is the direct path). **R5** (5 concurrent gates, one FIFO slot, 15.5 s budgets, `c` arrives 30 ms after the others). Batched: union 54-1064 ms, then a, b, d and e, then c's own run 5095-6105 ms, so c is **`unverifiable`, `accepted: true`**. Alone: a, b, d, e, then c 4053-5055 ms and the reference run 5060-6065 ms, so c is **`fail`, `accepted: false`**. Same in 2 of 2 runs. Exposure: a gate whose slack after its run and recheck is below the window (lone gate) or below one union run (a failing vitest/jest batch). At the default 90 s budget this needs slow suites or earlier checks that used up the budget, but nothing in the default config prevents it. The same premise underlies QA-2.2-5 (accepted in round 1): an early-settled member's next lintClean or buildPasses check can end slot-busy behind its own batch (deterministic.ts L1389, V u14, accepted), where alone it could run and fail. That path was traced in code and not executed. | Fix in 2.2.3. (a) Close a window at once when no other request can join. The wiring counts the gates in flight (index.ts brackets `prepareVerification` … the gate's `finally`, and 2.4 does the same), and the coordinator closes a window whose members cover every gate in flight. This removes R6 and QA-2.2-18. (b) Keep the window out of the recheck reserve: W3 also closes the window at once when `remaining − (closeAt − now) < recheckMinRemainingMs + the last run duration measured for the key`. (c) R5 (the mode-B union run) needs the orchestrator's decision. Either record in B-G1/B-G2 and B9 that a deadline-induced V is an acceptance under the default policy, or split to own runs when the least member's remaining is under `(n + 1) ×` the measured run duration plus `recheckMinRemainingMs`. Revisit the QA-2.2-5 acceptance with the same premise. Add R5 and R6 as wiring tests (see QA-2.2-20). |
+| QA-2.2-18 | minor | **Every lone testsPass gate now waits the full window.** R1 (real wiring, fake 0 ms runs): one gate under the default config takes 2032 ms, and 6 ms with `batchWindowMs: 0`. The verdicts are equal. B4 (W1-W6) has no early close; a window closes only at `closeAt`, at `maxBatchSize`, or by W3. The default of 2000 matches plan §1.4 (the `batchWindowMs` row: `2000`, "`0` disables batching"), and Phase 2.2's window rule ("closes at `batchWindowMs`, or earlier when a configured maximum size is reached"). So the implementation follows the plan, but the plan never priced sequential delegation. There, the window can never merge anything, and every gate of every attempt pays 2 s. Parallel producers also finish within 2 s of each other only rarely (not measured), so at this default the window mostly adds latency. | QA-2.2-17 (a), which also answers the dispatch's question: yes, a window should close early when no other request can join. Otherwise record the cost in B4 and in the plan's §1.4 row. |
+| QA-2.2-19 | minor | **With 2.1's real scope, `dispose()` is not bounded by `BATCH_STALE_GRACE_MS`, and eviction does not release the slot, contrary to the log.** `evict` → `closeScope` → 2.1's `close()`, which waits for every tracked execute (deterministic.ts L1172-1176: `while (inflight.size > 0) await Promise.allSettled([...inflight])`). `dispose()` bounds only the batch promises, then awaits `Promise.all([...closing])` with no bound (batch.ts L1518-1530). **R3** (real wiring, the union seam ignores its abort, grace shortened to 20 ms through the `timers` seam): both gates return unverifiable at 1.5 s. The warning "evicted a batch whose seam never returned; its slot is released before the seam exits" is logged. Yet `disposeVerification()` is still pending after 3000 ms, with acquires 1 and releases 0. **R4** (sweep with the clock advanced 61 s): 1 evicted, the same warning, releases 0, holds 1. index.ts L445-448 awaits `disposeVerification()` before `logger.flush()`, so plugin dispose hangs as long as the seam does. Mitigation: exec.ts force-closes the pipes `KILL_GRACE_MS` (2000 ms) after a kill (`onGrace`), so the real `runArgv` returns. The close also awaits the reference disposal; that disposal's own bound was not checked in this round. The QA-2.2-4 resolution above ("The wait is bounded by `BATCH_STALE_GRACE_MS`") does not hold once the real scope is wired in. | In `dispose()`, race the closes against the rest of the grace too, and log what is left. Correct the `evict` warning and B11: with 2.1's scope the slot stays held until the seam returns. That is the safer behaviour, so keep it. Add a wiring test with a seam that ignores its abort (R3's shape). |
+| QA-2.2-20 | minor | **The wiring tests miss the gate-time settings, the plugin hookups, rejections and deadlines.** Survivors from the table above: MW3 (`failureRecheck` ignored), MW4, MW5, MW6 (sweep a no-op), MW8 (dispose not awaited) and MW9 (sweeper entry removed). `batch-wiring.test.ts`'s `materialize` always fails, so "verdicts equal `batchWindowMs: 0`" is only ever checked on P and V: a rejection (F) and a pass with the pre-existing note are never compared through the wiring. No wiring test puts a gate under deadline pressure; R5 and R6 would have caught QA-2.2-17. **R2** shows the current wiring is right: with a captured reference and `failureRecheck: false` at the gate, batched = alone for all 3 gates. The failing gate's reason is "cannot attribute failures: failureRecheck is off … observed failures: test/b.test.ts > t1". | Add these wiring tests: R2 (gate-time `failureRecheck: false` with a captured reference), plus a config flip between two gates of one window; an exact fake reference (R5's `materialize`), so that F and P with the note are compared; the R5/R6 deadline cases; and a plugin-level check that dispose awaits the coordinator and that the idle sweeper calls `sweepVerification`. |
+| QA-2.2-21 | nit | **`batchWindowMs` is not bounded by the gate budget.** config.ts L809-818 accepts 0 to `MAX_TIMER_MS`, and `resolveVerifyBudget` (L1364) applies no clamp. `captureWaitMs` has one: it is capped at `baselineTimeoutMs` (QA-1.6-8). W3 closes a window only when a request's `remaining()` is at most the time left, so with `batchWindowMs: 60000` and `gateBudgetMs: 90000` a lone gate spends 60 s of its 90 s waiting. This takes a configuration change. | In the wiring, cap the effective window (for example at a fraction of the deadline's remaining time), or rely on QA-2.2-17 (b). Alternatively, reject `batchWindowMs >= gateBudgetMs` at load. |
+| QA-2.2-22 | nit | **The QA-2.2-5 wiring assertion depends on timing.** `holdsAtSettle.some(h => h === 1)` needs a gate's continuation to run before the batch finishes its instant fake runs and releases the hold. It failed once in 13 loaded runs, under the MB1 mutant, which cannot reach it: that test has NONE references, so no recheck runs, and MB1 passed that test in 2 more runs. The unmutated file passed 6 of 6 runs alone and 4 of 4 with `batch.test.ts` in parallel. | Hold the batch's later runs on a promise the test releases after the first gate settles, so the ordering is forced. |
+
+### Verified without a finding
+
+- **The tree (QA-2.2-8).** Each member keeps its own gate's tree (batch.ts L966), and `recheck`
+  forwards it (L1404). A shared recheck uses the first member's tree. `materialize` uses the tree
+  only for the same-repository guard, which accepts the root or its realpath (reference.ts
+  L1597-1601). Members of a group share the reference's root, and each tree's cwd is its dispatch
+  cwd, inside that root. So no verdict depends on which member's tree is used. MW2 and MB1 are
+  killed.
+- **`failureRecheck` at gate time.** The runtime takes it from `resolveVerifyBudget(getConfig())`
+  inside `buildGateDeps` (wiring.ts L496, L532), per member (batch.ts L965). The direct hook reads
+  the same budget object. R2 gives batched = alone. The test gap is QA-2.2-20.
+- **`fileKeyOfId` (from `0e89ef1` and `ae92325`).**
+  - baseline.ts L75-79 cuts at the earliest `" > "` or `"::"`, then maps `\` to `/`. That is the
+    private copy's rule plus the separator mapping.
+  - `fileKeyOf` also maps `\` to `/`, so both sides of every comparison are `/`-separated.
+  - 2.1's judge uses the same function.
+  - The QA-2.2-11 `taintable` change keeps every id of a complete union (batch.ts L1164-1168), as
+    that resolution states.
+- **The attempt-union change set and the HEAD-moved diff.** Each member's `changedFiles` comes
+  from its own `prepareVerification`. An `unavailable` change set makes the planner return
+  attribution-unavailable, which bypasses the window (B2.4), as it does on the direct path. The
+  union is planned again and checked for an equal key and an equal input set; any mismatch splits
+  into own runs.
+- **Retries.** The delegate ladder starts a retry only after the previous gate returned: its
+  `withTimeout` rejects and index.ts aborts the gate deadline. A member aborted in a window
+  leaves it (W5). So no two attempts of one dispatch can share a window.
+- **Different references.** Grouping by `referenceKey` is unchanged, and the QA-2.2-8 wiring test
+  covers two references.
+- **`testScope: "full"`.** `submit` sends it to `runtime.direct` before planning (batch.ts L1447).
+  The wiring test covers it.
+- **Planner and opener.**
+  - The direct planner and the batch planner share the same `PlannerFs` and `maxWorkers`, and
+    their searches are bound to the same gate deadline: `withCheckDeadline` passes
+    `deps.deadline` as `request.deadline`.
+  - The union uses the window opener's runtime (D6). Its budget is used only for timeouts,
+    priority and slot waits. A different worker cap or argv template changes the batch key.
+- **CLOSE_MARGIN_MS (QA-2.1-13).**
+  - Batched members never wait for a scope close: `closeScope` is `void` in `runBatch`'s
+    `finally`.
+  - A member settles on its own deadline's abort, the same instant at which the gate's
+    `withTimeout` fires (index.ts L644-660, L1171-1186). Both paths give V there.
+  - Batching adds no race here.
+- **One slot hold per batch next to the gate's other checks.**
+  - There is one `openScope` per batch (batch.ts L1068).
+  - A gate's command checks close their scope before the next check (deterministic.ts L1426), and
+    a gate waiting on its batch holds nothing.
+  - So there is no nesting and no wait cycle. QA-2.2-5's cost stands; its acceptance is
+    questioned in QA-2.2-17.
+- **The sweeper.** `() => { sweepVerification(); }` refers to a `const` declared later (index.ts
+  L340, L351-354). The idle sweeper runs only from `chat.message`, and each sweeper runs inside
+  its own `try`/`catch` (idle-sweep.ts). So there is no TDZ in practice.
+- **Timers and listeners.**
+  - Window timers are unref'd (batch.ts L851-854) and cleared on close, on leave and in
+    `dispose()`.
+  - The dispose grace timer is cleared.
+  - Member abort listeners are removed in `settle`.
+  - The coordinator is one per plugin instance, and a gate's runtime lives only as long as its
+    batch.
+  - No leak was found in the wiring, apart from the `closing` wait of QA-2.2-19.
+- **Plan §1.4.** `batchWindowMs` defaults to 2000, and `0` disables batching. This matches
+  config.ts L1364 and B2.3.
+
+**Round verdict (2.2.3 wiring, round 1).** One **major** finding, QA-2.2-17: a batched gate can
+accept an introduced failure that `batchWindowMs: 0` rejects. It reproduces on the default config
+with a single gate (R6). There are three minor findings (QA-2.2-18, QA-2.2-19, QA-2.2-20) and two
+nits (QA-2.2-21, QA-2.2-22). No false pass was found in the tree, `failureRecheck`, `fileKeyOfId`,
+reference, retry or full-scope routing. This is the first wiring round: all of these may be fixed,
+and one more round follows.
