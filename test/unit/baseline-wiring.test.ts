@@ -3,7 +3,9 @@ import { join, resolve } from "node:path";
 import { execFileSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { createVerificationWiring } from "../../src/verify/wiring";
+import { awaitBounded, createVerificationWiring, DISPOSED_MEMO_MAX, TEST_SEARCH_TIMEOUT_MS } from "../../src/verify/wiring";
+import { resolveVerifyBudget } from "../../src/router/config";
+import type { Deadline } from "../../src/verify/types";
 import { createChangedFileStore, type TreeSnapshot } from "../../src/verify/dispatch";
 import { accept } from "../../src/verify/gate";
 import { REFERENCE_NONE } from "../../src/verify/baseline";
@@ -21,24 +23,60 @@ const state = vi.hoisted(() => ({
   /** When set, the capture settles after this many (fake) ms; captureThrows rejects instead. */
   captureDelayMs: undefined as number | undefined, captureThrows: false,
   gcCalls: [] as string[], gcRejects: false,
+  /** What gcStaleReferences resolves with; gcArgv makes it spawn one git through its argv seam first. */
+  gcRemoved: [] as string[], gcArgv: false,
+  /** Replaces the snapshotTree mock when set. */
+  snapshotImpl: undefined as ((cwd: string, signal: AbortSignal) => Promise<TreeSnapshot | undefined>) | undefined,
+  /** Replaces the runArgv result when set (the call is still recorded). */
+  argvImpl: undefined as ((file: string, args: readonly string[], opts: ExecOpts) => Promise<ExecOut>) | undefined,
+  execOpts: [] as ExecOpts[],
+  /** The argv seam handed to the last captureReference call. */
+  captureArgv: undefined as ArgvFn | undefined,
+  /** The deps handed to the last createDirectTestsPassHook call. */
+  hookDeps: undefined as import("../../src/verify/deterministic").DirectTestsPassHookDeps | undefined,
+  /** The deps handed to the last createScopeOpener call (the RunnerFs, argv and exec seams). */
+  scopeDeps: undefined as import("../../src/verify/deterministic").ScopeOpenerDeps | undefined,
 }));
-vi.mock("../../src/verify/tree", () => ({ snapshotTree: async () => state.snapshot }));
+type ExecOpts = { cwd?: string; timeoutMs?: number; signal?: AbortSignal; lowPriority?: boolean; env?: Record<string, string | undefined> };
+type ExecOut = { code: number; stdout: string; stderr: string; timedOut: boolean };
+type ArgvFn = (file: string, args: readonly string[], opts?: ExecOpts) => Promise<ExecOut>;
+vi.mock("../../src/verify/tree", () => ({ snapshotTree: async (cwd: string, signal: AbortSignal) => (state.snapshotImpl ? state.snapshotImpl(cwd, signal) : state.snapshot) }));
 // G6: no process may run at dispatch time; any shell or argv spawn is recorded and fails the assertion.
 vi.mock("../../src/verify/exec", () => ({
-  runShell: async (command: string) => { state.commands.push(command); return { code: 0, stdout: "", stderr: "", timedOut: false }; },
-  runArgv: async (file: string, args: readonly string[]) => { state.commands.push([file, ...args].join(" ")); return { code: 0, stdout: "", stderr: "", timedOut: false }; },
+  runShell: async (command: string, opts: ExecOpts) => { state.commands.push(command); state.execOpts.push(opts); return { code: 0, stdout: "", stderr: "", timedOut: false }; },
+  runArgv: async (file: string, args: readonly string[], opts: ExecOpts) => {
+    state.commands.push([file, ...args].join(" ")); state.execOpts.push(opts);
+    return state.argvImpl ? state.argvImpl(file, args, opts) : { code: 0, stdout: "", stderr: "", timedOut: false };
+  },
 }));
+vi.mock("../../src/verify/deterministic", async importOriginal => {
+  const actual = await importOriginal<typeof import("../../src/verify/deterministic")>();
+  return {
+    ...actual,
+    createDirectTestsPassHook: (deps: import("../../src/verify/deterministic").DirectTestsPassHookDeps) => {
+      state.hookDeps = deps;
+      return actual.createDirectTestsPassHook(deps);
+    },
+    createScopeOpener: (deps: import("../../src/verify/deterministic").ScopeOpenerDeps) => {
+      state.scopeDeps = deps;
+      return actual.createScopeOpener(deps);
+    },
+  };
+});
 vi.mock("../../src/verify/reference", async importOriginal => ({
   ...(await importOriginal<typeof import("../../src/verify/reference")>()),
-  captureReference: (at: string, _signal: AbortSignal, deps: { timeoutMs?: number }) => new Promise((resolve, reject) => {
+  captureReference: (at: string, _signal: AbortSignal, deps: { timeoutMs?: number; argv: ArgvFn }) => new Promise((resolve, reject) => {
     state.captures.push({ cwd: at, timeoutMs: deps.timeoutMs });
+    state.captureArgv = deps.argv;
     const finish = () => (state.captureThrows ? reject(new Error("capture exploded")) : resolve(state.captureResult));
     if (state.captureDelayMs !== undefined) setTimeout(finish, state.captureDelayMs);
     else if (state.held) state.finish = finish; else finish();
   }),
-  gcStaleReferences: (root: string) => {
+  gcStaleReferences: async (root: string, deps: { argv: ArgvFn }) => {
     state.gcCalls.push(root);
-    return state.gcRejects ? Promise.reject(new Error("gc exploded")) : Promise.resolve({ removed: [], kept: [], failed: [] });
+    if (state.gcArgv) await deps.argv("git", ["worktree", "prune"], { cwd: root });
+    if (state.gcRejects) throw new Error("gc exploded");
+    return { removed: state.gcRemoved, kept: [], failed: [] };
   },
 }));
 const cwd = resolve("baseline-wiring-project");
@@ -48,6 +86,7 @@ beforeEach(() => Object.assign(state, {
   snapshot: { cwd, head: "HEAD", fingerprint: "before", dirty: true, files: [{ path: resolve(cwd, "old.ts"), status: " M" }] },
   commands: [], captures: [], captureResult: REF, held: false, finish: undefined,
   captureDelayMs: undefined, captureThrows: false, gcCalls: [], gcRejects: false,
+  gcRemoved: [], gcArgv: false, snapshotImpl: undefined, argvImpl: undefined, execOpts: [], captureArgv: undefined, hookDeps: undefined, scopeDeps: undefined,
 }));
 function harness() {
   const cfg: RouterConfig = { activePreset: "a", presets: { a: { medium: { model: "p/m" } } }, defaultTier: "medium", rules: [], enforcement: { verify: { baselineTimeoutMs: 1234 } } };
@@ -210,5 +249,252 @@ describe("dispatch reference wiring", () => {
     await begun;
     expect((await wiring.prepareVerification(store, "dispatch", "child")).reference)
       .toEqual({ kind: "none", reason: REFERENCE_NONE.contaminated });
+  });
+  it("the capture's argv seam runs at the configured priority", async () => {
+    const { cfg, wiring, store } = harness();
+    await wiring.beginVerification(store, "dispatch", undefined, dod);
+    await state.captureArgv!("git", ["rev-parse", "HEAD"], { cwd });
+    expect(state.commands).toEqual(["git rev-parse HEAD"]);
+    expect(state.execOpts[0]).toMatchObject({ cwd, lowPriority: resolveVerifyBudget(cfg).lowPriority });
+  });
+  it("a config that throws still snapshots and records why there is no reference", async () => {
+    const store = createChangedFileStore();
+    const wiring = createVerificationWiring({ client: {}, directory: cwd, getConfig: () => { throw new Error("config broke"); }, logger: { warn: () => {} } });
+    await wiring.beginVerification(store, "dispatch", undefined, dod);
+    const prepared = await wiring.prepareVerification(store, "dispatch", "child");
+    expect(prepared.reference.kind).toBe("none");
+    expect(prepared.reference.kind === "none" && prepared.reference.reason).toBe(`${REFERENCE_NONE.failed} (config broke)`);
+    expect(prepared.changeBaseline).toBe("available");
+    expect(state.captures).toEqual([]);
+  });
+});
+
+describe("bounded wait edges", () => {
+  it("awaitBounded reports settled and error outcomes", async () => {
+    expect(await awaitBounded(Promise.resolve(), 1_000)).toEqual({ kind: "settled" });
+    const error = new Error("boom");
+    expect(await awaitBounded(Promise.reject(error), 1_000)).toEqual({ kind: "error", error });
+  });
+  it("beginVerificationBounded logs a start failure and a rejected dispatch instead of throwing", async () => {
+    const warnings: string[] = [];
+    const logger = { warn: (m: string) => void warnings.push(m) };
+    const broken = createVerificationWiring({ client: {}, directory: cwd, getConfig: () => { throw new Error("config broke"); }, logger });
+    const store = createChangedFileStore();
+    await expect(broken.beginVerificationBounded(store, "d", undefined, dod)).resolves.toBeUndefined();
+    expect(warnings).toEqual(["[verify] dispatch reference capture could not start"]);
+    expect((await store.reference("d")).kind).toBe("none");
+    const { cfg } = harness();
+    const wiring = createVerificationWiring({ client: {}, directory: cwd, getConfig: () => cfg, logger });
+    const rejecting = { ...store, beginDispatch: () => Promise.reject(new Error("store broke")) };
+    await expect(wiring.beginVerificationBounded(rejecting, "d", undefined, dod)).resolves.toBeUndefined();
+    expect(warnings[1]).toBe("[verify] dispatch reference capture failed; proceeding without a reference");
+  });
+  it("the default logger is console.warn", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const wiring = createVerificationWiring({ client: {}, directory: cwd, getConfig: () => { throw new Error("config broke"); } });
+      await wiring.beginVerificationBounded(createChangedFileStore(), "d", undefined, dod);
+      expect(warn).toHaveBeenCalledWith("[verify] dispatch reference capture could not start", expect.objectContaining({ id: "d" }));
+    } finally {
+      warn.mockRestore();
+    }
+  });
+});
+
+describe("reference GC at start", () => {
+  const logs = () => {
+    const debug: string[] = []; const warn: string[] = [];
+    return { debug, warn, logger: { warn: (m: string) => void warn.push(m), debug: (m: string) => void debug.push(m) } };
+  };
+  it("is skipped without a plugin root", () => {
+    const l = logs();
+    createVerificationWiring({ client: {}, directory: "", getConfig: () => harness().cfg, logger: l.logger }).startReferenceGc();
+    expect(state.gcCalls).toEqual([]);
+    expect(l.debug).toEqual(["[verify] reference GC skipped: plugin root unknown"]);
+  });
+  it("logs removed stale dirs and runs its git at the configured priority", async () => {
+    const l = logs(); const { cfg } = harness(); state.gcRemoved = [join(cwd, "stale")]; state.gcArgv = true;
+    createVerificationWiring({ client: {}, directory: cwd, getConfig: () => cfg, logger: l.logger }).startReferenceGc();
+    await vi.waitFor(() => expect(l.debug).toEqual(["[verify] reference GC removed stale dirs"]));
+    expect(state.commands).toEqual(["git worktree prune"]);
+    expect(state.execOpts[0]).toMatchObject({ cwd, lowPriority: resolveVerifyBudget(cfg).lowPriority });
+    expect(l.warn).toEqual([]);
+  });
+  it("nothing removed logs nothing", async () => {
+    const l = logs();
+    createVerificationWiring({ client: {}, directory: cwd, getConfig: () => harness().cfg, logger: l.logger }).startReferenceGc();
+    await vi.waitFor(() => expect(state.gcCalls).toEqual([cwd]));
+    await new Promise(r => setTimeout(r, 0));
+    expect(l.debug).toEqual([]);
+  });
+  it("a config that throws is logged, not thrown", () => {
+    const l = logs();
+    const wiring = createVerificationWiring({ client: {}, directory: cwd, getConfig: () => { throw new Error("config broke"); }, logger: l.logger });
+    expect(() => wiring.startReferenceGc()).not.toThrow();
+    expect(l.warn).toEqual(["[verify] reference GC failed"]);
+    expect(state.gcCalls).toEqual([]);
+  });
+});
+
+const fakeDeadline = (remaining: number, ctl = new AbortController()): Deadline => ({
+  budgetMs: 60_000, remaining: () => remaining, bound: ms => Math.min(ms, remaining), signal: ctl.signal,
+});
+
+describe("prepareVerification edges", () => {
+  it("a snapshot that throws leaves the change baseline unavailable", async () => {
+    const { wiring, store } = harness();
+    await wiring.beginVerification(store, "dispatch", undefined, dod);
+    state.snapshotImpl = async () => { throw new Error("git broke"); };
+    const prepared = await wiring.prepareVerification(store, "dispatch", "child");
+    expect(prepared.snapshot).toBeUndefined();
+    expect(prepared.changeBaseline).toBe("unavailable");
+    expect(prepared.reference).toEqual({ kind: "captured", reference: REF });
+  });
+  it("a spent deadline takes no snapshot", async () => {
+    const { wiring, store } = harness();
+    await wiring.beginVerification(store, "dispatch", undefined, dod);
+    const snap = vi.fn(async () => state.snapshot);
+    state.snapshotImpl = snap;
+    const prepared = await wiring.prepareVerification(store, "dispatch", "child", undefined, fakeDeadline(0));
+    expect(snap).not.toHaveBeenCalled();
+    expect(prepared.snapshot).toBeUndefined();
+    expect(prepared.changeBaseline).toBe("unavailable");
+  });
+  it("a deadline abort mid-snapshot aborts the snapshot", async () => {
+    const { wiring, store } = harness();
+    let seen: AbortSignal | undefined;
+    state.snapshotImpl = (_c, signal) => new Promise((_resolve, reject) => {
+      seen = signal;
+      signal.addEventListener("abort", () => reject(new Error("aborted")), { once: true });
+    });
+    const ctl = new AbortController();
+    const pending = wiring.prepareVerification(store, "never-begun", "child", "sub", fakeDeadline(5_000, ctl));
+    await vi.waitFor(() => expect(seen).toBeDefined());
+    ctl.abort();
+    const prepared = await pending;
+    expect(seen?.aborted).toBe(true);
+    expect(prepared.snapshot).toBeUndefined();
+    expect(prepared.reference).toEqual({ kind: "none", reason: REFERENCE_NONE.untracked });
+  });
+});
+
+describe("gate seams", () => {
+  it("the exec and argv seams default to the project root and the check timeout, and forward the rest", async () => {
+    const { wiring } = harness();
+    wiring.buildGateDeps();
+    const { exec, argv } = state.scopeDeps!;
+    const signal = new AbortController().signal;
+    await exec("npm test");
+    await exec("npm test", { cwd: "elsewhere", timeoutMs: 5, signal, lowPriority: true, env: { A: "1" } });
+    await argv("git", ["status"]);
+    await argv("git", ["status"], { cwd: "elsewhere", timeoutMs: 7, signal, lowPriority: false, env: { B: "2" } });
+    expect(state.commands).toEqual(["npm test", "npm test", "git status", "git status"]);
+    expect(state.execOpts).toEqual([
+      { cwd, timeoutMs: 120_000, signal: undefined, lowPriority: undefined, env: undefined },
+      { cwd: "elsewhere", timeoutMs: 5, signal, lowPriority: true, env: { A: "1" } },
+      { cwd, timeoutMs: 120_000, signal: undefined, lowPriority: undefined, env: undefined },
+      { cwd: "elsewhere", timeoutMs: 7, signal, lowPriority: false, env: { B: "2" } },
+    ]);
+  });
+
+  it("the filesystem seam resolves relative paths against the root and tolerates ENOENT on unlink only", async () => {
+    const root = mkdtempSync(join(tmpdir(), "omr-wiring-fs-"));
+    try {
+      mkdirSync(join(root, "dir"));
+      writeFileSync(join(root, "a.txt"), "hello");
+      writeFileSync(join(root, "b.txt"), "bye");
+      const cfg = harness().cfg;
+      createVerificationWiring({ client: {}, directory: root, getConfig: () => cfg }).buildGateDeps();
+      const fs = state.scopeDeps!.fs;
+      expect(await fs.fileExists("a.txt")).toBe(true);
+      expect(await fs.fileExists(join(root, "dir"))).toBe(true);
+      expect(await fs.fileExists("missing.txt")).toBe(false);
+      expect(await fs.readFile("a.txt")).toBe("hello");
+      expect(await fs.realpath!("a.txt")).toBe(realpathSync.native(join(root, "a.txt")));
+      expect(await fs.stat!("a.txt")).toMatchObject({ isFile: true, size: 5n });
+      expect(await fs.stat!("dir")).toMatchObject({ isFile: false });
+      expect([...(await fs.readdir!("."))].sort()).toEqual(["a.txt", "b.txt", "dir"]);
+      await fs.unlink("b.txt");
+      expect(await fs.fileExists("b.txt")).toBe(false);
+      await expect(fs.unlink("b.txt")).resolves.toBeUndefined();
+      await expect(fs.unlink("dir")).rejects.toThrow();
+    } finally {
+      rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+    }
+  });
+
+  describe("git test search", () => {
+    const root = resolve("search-root");
+    const search = (deadline?: Deadline) => {
+      const { wiring } = harness();
+      wiring.buildGateDeps(undefined, undefined, undefined, deadline);
+      return state.hookDeps!.search;
+    };
+    const reply = (code: number, stdout = "", timedOut = false) => { state.argvImpl = async () => ({ code, stdout, stderr: "", timedOut }); };
+
+    it("findByName lists tracked and untracked files through git ls-files", async () => {
+      const s = search(); reply(0, "a.test.ts\0sub/b.test.ts\0");
+      expect(await s.findByName(root, ["a.test.ts", "b.test.ts"])).toEqual([resolve(root, "a.test.ts"), resolve(root, "sub/b.test.ts")]);
+      expect(state.commands).toEqual([`git --no-optional-locks -C ${root} ls-files -z --cached --others --exclude-standard -- :(glob)**/a.test.ts :(glob)**/b.test.ts`]);
+      expect(state.execOpts[0]).toMatchObject({ cwd: root, timeoutMs: TEST_SEARCH_TIMEOUT_MS });
+      expect(state.execOpts[0].signal).toBeUndefined();
+      reply(0, "");
+      expect(await s.findByName(root, ["x.test.ts"])).toEqual([]);
+    });
+    it("findByName is undefined when git fails, times out or cannot spawn", async () => {
+      const s = search();
+      reply(128); expect(await s.findByName(root, ["a.test.ts"])).toBeUndefined();
+      reply(0, "a.test.ts\0", true); expect(await s.findByName(root, ["a.test.ts"])).toBeUndefined();
+      state.argvImpl = async () => { throw new Error("spawn ENOENT"); };
+      expect(await s.findByName(root, ["a.test.ts"])).toBeUndefined();
+    });
+    it("findByContent maps git grep exit 0 to paths, 1 to no match, and anything else to undefined", async () => {
+      const s = search();
+      reply(0, "a.test.ts\0");
+      expect(await s.findByContent(root, "needle", ["*.test.ts"])).toEqual([resolve(root, "a.test.ts")]);
+      expect(state.commands[0]).toBe(`git --no-optional-locks -C ${root} grep -l -z -F --untracked -e needle -- *.test.ts`);
+      reply(1); expect(await s.findByContent(root, "needle", ["*.test.ts"])).toEqual([]);
+      reply(2); expect(await s.findByContent(root, "needle", ["*.test.ts"])).toBeUndefined();
+      reply(1, "", true); expect(await s.findByContent(root, "needle", ["*.test.ts"])).toBeUndefined();
+      state.argvImpl = async () => { throw new Error("spawn ENOENT"); };
+      expect(await s.findByContent(root, "needle", ["*.test.ts"])).toBeUndefined();
+    });
+    it("a deadline bounds each search and a spent or aborted one runs no git", async () => {
+      const ctl = new AbortController(); reply(0, "a.test.ts\0");
+      expect(await search(fakeDeadline(2_500, ctl)).findByName(root, ["a.test.ts"])).toEqual([resolve(root, "a.test.ts")]);
+      expect(state.execOpts[0]).toMatchObject({ timeoutMs: 2_500, signal: ctl.signal });
+      expect(await search(fakeDeadline(0)).findByName(root, ["a.test.ts"])).toBeUndefined();
+      ctl.abort();
+      expect(await search(fakeDeadline(2_500, ctl)).findByContent(root, "needle", ["*.ts"])).toBeUndefined();
+      expect(state.commands).toHaveLength(1);
+    });
+  });
+
+  it("the gate's grader closure dispatches through the wiring", async () => {
+    const create = vi.fn(async () => ({ data: {} }));
+    const cfg = harness().cfg;
+    const deps = createVerificationWiring({ client: { session: { create } }, directory: cwd, getConfig: () => cfg }).buildGateDeps("parent");
+    expect(await deps.checker.dispatchGrader({ tier: "medium", system: "s", prompt: "p" })).toEqual({ sessionID: "", text: "" });
+    expect(create).toHaveBeenCalledWith({ body: { parentID: "parent" } });
+  });
+});
+
+describe("child session disposal memo", () => {
+  it("evicts the oldest ids once it holds DISPOSED_MEMO_MAX", async () => {
+    const abort = vi.fn(async () => {});
+    const del = vi.fn(async () => { throw new Error("already gone"); });
+    const cfg = harness().cfg;
+    const wiring = createVerificationWiring({ client: { session: { abort, delete: del } }, directory: cwd, getConfig: () => cfg });
+    for (let i = 0; i <= DISPOSED_MEMO_MAX; i++) await wiring.disposeChildSession(`s${i}`);
+    expect(abort).toHaveBeenCalledTimes(DISPOSED_MEMO_MAX + 1);
+    await wiring.disposeChildSession(`s${DISPOSED_MEMO_MAX}`);
+    await wiring.disposeChildSession("s1");
+    expect(abort).toHaveBeenCalledTimes(DISPOSED_MEMO_MAX + 1);
+    // s0 was evicted when s512 arrived, so it is disposed again (evicting s1 in turn).
+    await wiring.disposeChildSession("s0");
+    expect(abort).toHaveBeenCalledTimes(DISPOSED_MEMO_MAX + 2);
+    await wiring.disposeChildSession("s1");
+    expect(abort).toHaveBeenCalledTimes(DISPOSED_MEMO_MAX + 3);
+    expect(del).toHaveBeenCalledTimes(DISPOSED_MEMO_MAX + 3);
   });
 });
