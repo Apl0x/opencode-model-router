@@ -13,6 +13,7 @@
  * The pure helpers below (descendantsOf, peak, seen, priorityViolations) work on the snapshots.
  */
 import { spawn, type ChildProcess } from "node:child_process";
+import os from "node:os";
 import { join } from "node:path";
 
 export interface ProcSample {
@@ -39,6 +40,29 @@ const WIN_LOW_PRIORITY_MAX = 6;
 /** POSIX nice at or above this is low priority. */
 const POSIX_LOW_NICE_MIN = 10;
 const STOP_WAIT_MS = 3000;
+
+/**
+ * The real profile and temp dirs, captured when this module loads (before any plugin instance
+ * points HOME/USERPROFILE at a fake home or a test redirects TEMP). With USERPROFILE at a fake home,
+ * powershell.exe's Get-CimInstance loop emits no snapshot at all (measured: 0 snapshots in 6 s).
+ */
+const REAL_PROFILE_ENV: Record<string, string> = (() => {
+  const home = process.env.USERPROFILE ?? process.env.HOME ?? os.userInfo().homedir;
+  const tmp = process.env.TEMP ?? process.env.TMP ?? os.tmpdir();
+  return {
+    USERPROFILE: process.env.USERPROFILE ?? home,
+    HOME: process.env.HOME ?? home,
+    APPDATA: process.env.APPDATA ?? join(home, "AppData", "Roaming"),
+    LOCALAPPDATA: process.env.LOCALAPPDATA ?? join(home, "AppData", "Local"),
+    TEMP: tmp,
+    TMP: process.env.TMP ?? tmp,
+  };
+})();
+
+/** process.env with the profile/temp keys restored to their values at module load. */
+function samplerEnv(): NodeJS.ProcessEnv {
+  return { ...process.env, ...REAL_PROFILE_ENV };
+}
 
 function windowsScript(intervalMs: number): string {
   // The stdin read is started once and polled: a raw-stream ReadAsync never blocks the loop
@@ -114,8 +138,13 @@ function parsePsLine(line: string): ProcSample | undefined {
   };
 }
 
-export function startSampler(opts?: { intervalMs?: number /* default 100 */ }): Sampler {
+export function startSampler(opts?: {
+  intervalMs?: number /* default 100 */;
+  /** The sampler child's environment; default: process.env with the real profile/temp dirs (see REAL_PROFILE_ENV). */
+  env?: NodeJS.ProcessEnv;
+}): Sampler {
   const intervalMs = Math.max(1, Math.floor(opts?.intervalMs ?? 100));
+  const env = opts?.env ?? samplerEnv();
   const isWin = process.platform === "win32";
   const snapshots: Snapshot[] = [];
   let parseErrors = 0;
@@ -131,9 +160,10 @@ export function startSampler(opts?: { intervalMs?: number /* default 100 */ }): 
     child = spawn(exe, ["-NoProfile", "-NonInteractive", "-EncodedCommand", encoded], {
       stdio: ["pipe", "pipe", "pipe"],
       windowsHide: true,
+      env,
     });
   } else {
-    child = spawn("sh", ["-c", posixScript(intervalMs)], { stdio: ["pipe", "pipe", "pipe"] });
+    child = spawn("sh", ["-c", posixScript(intervalMs)], { stdio: ["pipe", "pipe", "pipe"], env });
   }
 
   const onLine = (line: string): void => {
