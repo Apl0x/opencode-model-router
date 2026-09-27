@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { availableParallelism } from "node:os";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
@@ -276,6 +277,33 @@ describe("resolveVerifyBudget — testBaseline deprecation", () => {
     resolveVerifyBudget(cfgWith({ testBaseline: false }), { cores: 1 });
     warnDeprecatedVerifyKeys(cfgWith({ testBaseline: false }), logger);
     expect(logger.warn).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("docs consistency — CONFIG_REFERENCE.md verify table", () => {
+  const doc = readFileSync(new URL("../../docs/CONFIG_REFERENCE.md", import.meta.url), "utf-8");
+  /** Table rows as trimmed cells: `| a | b |` → ["a", "b"]. */
+  const rows = doc
+    .split(/\r?\n/)
+    .filter((line) => line.trimStart().startsWith("|"))
+    .map((line) => line.trim().replace(/^\||\|$/g, "").split(/(?<!\\)\|/).map((c) => c.trim()));
+  const render = (value: unknown): string =>
+    typeof value === "string" ? `\`"${value}"\`` : `\`${String(value)}\``;
+  const budget = resolveVerifyBudget(undefined, { cores: 16 });
+
+  for (const [key, value] of Object.entries(budget)) {
+    it(`documents ${key} with its default`, () => {
+      const row = rows.find((cells) => cells[0] === `\`${key}\``);
+      expect(row, `no table row for \`${key}\``).toBeDefined();
+      const expected =
+        key === "maxConcurrentVerifications" ? "`max(1, floor(cores / 8))`" : render(value);
+      expect(row![2]).toContain(expected);
+    });
+  }
+
+  it("marks the deprecated testBaseline key", () => {
+    const row = rows.find((cells) => cells[0] === "`testBaseline`");
+    expect(row?.join(" ")).toMatch(/Deprecated/);
   });
 });
 

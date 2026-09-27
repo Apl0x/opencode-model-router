@@ -49,6 +49,7 @@ import {
   CLAUDE_ORCHESTRATOR_PREFIX,
   CLAUDE_ANTI_NARRATION,
   assembleSystemPrompt,
+  DELEGATE_TOOL_DESCRIPTION,
 } from "./router/protocol";
 import { resolveEnforcementMode } from "./router/enforcement";
 import { createPluginLogger } from "./router/logger";
@@ -499,8 +500,7 @@ const ModelRouterPlugin: Plugin = async (ctx: PluginInput) => {
     },
     tool: {
       ...(enableDelegateTool ? { delegate: tool({
-        description:
-          "Delegate a task to a tier subagent (fast | medium | heavy). The subagent's result is INDEPENDENTLY VERIFIED (deterministic checks, or an independent grader at >= the producer tier in a fresh session) before it is returned. Returns an accepted result on PASS, or an honest 'unmet' status on FAIL — never a self-reported completion. Optionally pass an [acceptance]...[/acceptance] block to define the Definition of Done.",
+        description: DELEGATE_TOOL_DESCRIPTION,
         args: {
           task: tool.schema
             .string()
@@ -1670,7 +1670,7 @@ const ModelRouterPlugin: Plugin = async (ctx: PluginInput) => {
           "criteria: <plain-language success condition, when no deterministic check applies>",
           "deliverable: <path or short description>",
           "[/acceptance]",
-          "Prefer deterministic checks (testsPass/buildPasses/fileExists). Use a criteria line for design/explanatory tasks. Trivial read-only steps need no acceptance block.",
+          "Prefer deterministic checks (testsPass/buildPasses/fileExists). testsPass means the tests affected by the producer's changes pass (the full suite is CI's job), so prefer it over a hand-written full-suite run command. Use a criteria line for design/explanatory tasks. Trivial read-only steps need no acceptance block.",
         ].join("\n"),
         description:
           "Annotate a plan with [tier:fast/medium/heavy] delegation tags",

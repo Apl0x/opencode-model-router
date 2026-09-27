@@ -265,6 +265,19 @@ The opencode-model-router plugin registers 4 commands:
 
 ---
 
+## Router tools
+
+Besides slash commands, the plugin registers custom tools in `src/index.ts` (`tool({ … })`). The orchestrator calls these tools. Users do not.
+
+| Tool | Registered when | Arguments | Returns |
+|------|-----------------|-----------|---------|
+| `delegate` | `experimental.verifiedDelegateTool: true` or `MODEL_ROUTER_VERIFIED_DELEGATE=1` | `task` (string, required); `tier` (`fast \| medium \| heavy`, optional, defaults to the router default tier); `acceptance` (optional `[acceptance]...[/acceptance]` DoD block); `cwd` (optional; the directory used to **verify** the result, not to scope the producer) | The producer's result after independent verification: accepted on pass, an honest `unmet` status on fail. A deferred delegation instead ends with a `[router] unverified · vrf_…` footer. |
+| `router_verify` | Evaluated once at plugin start: `enforcement.verify.require` is not `"never"` **and** (the start-time enforcement mode is not `off` **or** the `delegate` tool is enabled) | Exactly one of `handles` (string array of `vrf_` handles from `[router]` footers) or `pending: true` (every still-unverified delegation of this session) | One verdict per handle: pass, fail (introduced failures and a suggested next tier) or unverifiable. Nothing is retried or escalated. One `gateBudgetMs` deadline per call. |
+
+See [CONFIG_REFERENCE.md → Deferred verification](./CONFIG_REFERENCE.md#deferred-verification) for directives, the footer and the pending list.
+
+---
+
 ## Implementation Checklist
 
 When creating a new command plugin:
