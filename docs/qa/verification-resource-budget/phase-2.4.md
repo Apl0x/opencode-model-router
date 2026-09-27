@@ -1,8 +1,8 @@
 # Phase 2.4 — Deferred verification, `router_verify`, pending list (QA notes)
 
-Branch `vrb/p24`, worktree `D:\git\omr-p24`. Task 2.4.1 (design) is done. Task 2.4.1b (implementing
-`src/verify/pending.ts` plus `test/unit/pending.test.ts`) can start now. Tasks 2.4.2–2.4.6 start
-only after 2.1 and 2.2 (through 2.2.3) are merged and their QA is clean (plan dependency graph).
+Branch `vrb/p24`, worktree `D:\git\omr-p24`. Task 2.4.1 (design) and 2.4.1b (`src/verify/pending.ts`
+plus `test/unit/pending.test.ts`) are done. 2.1 and 2.2 (through 2.2.3) are merged into this branch
+(`24008e5`, `origin/vrb/wave-2` `fdb319c`), so 2.4.2–2.4.6 can proceed.
 
 ## Pre-flight
 
@@ -90,8 +90,9 @@ Use a scratch plugin or the smoke harness:
 
 ### Gather answers (merged tree `c3ba342` = `vrb/p24` + `origin/vrb/wave-2` `fbcf456`)
 
-Line numbers are for `c3ba342`. SDK: `@opencode-ai/plugin` 1.18.18 in `node_modules`. `vrb/wave-2`
-holds 2.1 only; 2.2 is **not merged yet**, so item 6 stays open.
+Line numbers are for `c3ba342`, except for items 5, 6 and 9 and the reference-promise details,
+which were re-read on `24008e5` (`vrb/p24` + `origin/vrb/wave-2` `fdb319c`, which adds 2.2). SDK:
+`@opencode-ai/plugin` 1.18.18 in `node_modules`.
 
 1. **Tool registration.** `tool: { ...(enableDelegateTool ? { delegate: tool({ description, args,
    execute }) } : {}) }` at `src/index.ts:444-778`. Args are built with `tool.schema.string()
@@ -133,8 +134,30 @@ holds 2.1 only; 2.2 is **not merged yet**, so item 6 stays open.
      inFlight, verification, deadline)` → `withTimeout(accept(…), deadline.remaining())` →
      `unverifiableGateResult` on reject (`src/index.ts:1120-1208`; delegate `:597-686`).
      `router_verify` should reuse this sequence.
-   - The per-dispatch reference promise and its TTL live in `createChangedFileStore`
-     (`src/verify/dispatch.ts`). Not re-read for this gather; 2.4.2a must confirm them.
+   - **The per-dispatch reference promise** lives on the store's `DispatchRecord`
+     (`src/verify/dispatch.ts:127-154`).
+     - `beginDispatch(id, cwd, deps)` (`:214-260`) sets `reference` synchronously. It is
+       `deps.uncaptured` (default `none(notRequested)`) when there is no capture. Otherwise it is
+       an async wrapper that settles once and **never rejects**: `captured`, `none(contaminated)`
+       when an overlapping edit was observed while it ran, or `none(failed)` on a timeout or
+       error. The capture is bounded by `deps.timeoutMs` = `baselineTimeoutMs` (`:247`).
+     - A second `beginDispatch` for a tracked id keeps the original record (`:216-217`).
+     - `reference(id, signal?)` (`:266-280`): with no signal, or once the capture has settled,
+       it returns **the same promise object**. With a signal it races the pending capture against
+       the abort (→ `none(gateBudget)`). For an unknown or swept id it returns
+       `none(untracked)`.
+   - **Its TTL.** The record is keyed by the dispatch id in `lastTouch`. `sweep(now, ttlMs =
+     DEFAULT_IDLE_TTL_MS)` evicts every id idle for at least 1 h (`dispatch.ts:397-402`,
+     `idle-sweep.ts:1`); `reference`, `beginDispatch` and `record` refresh the stamp. `clear(id)`
+     and the sweep both go through `evict`, which **aborts the capture controller** (`:203`), so
+     an in-flight capture ends as `none(failed)`.
+   - Consequences for 2.4.2:
+     - a deferred finish registers `store.reference(dispatchID)` **with no signal** (the live
+       promise, never awaited);
+     - it must not `clear(dispatchID)` before that promise settles, because the clear would kill
+       the capture and stop the contamination tracking (`observeEdit`) that makes a late capture
+       valid (§1.5-14). It clears in the promise's `then`, which runs within `baselineTimeoutMs`;
+     - from then on the registry holds the promise for `pendingTtlMs`.
    - **Lineage precondition: holds on the normal path.**
      - `fromJudgement` copies `TestsPassJudgement.failures` onto the CheckResult
        (`deterministic.ts:1451-1460`).
@@ -142,11 +165,54 @@ holds 2.1 only; 2.2 is **not merged yet**, so item 6 stays open.
        the field is at `types.ts:24-28`).
      - `gateResult` spreads the verdict (`src/verify/gate.ts:79`), and `accept` returns it
        (`gate.ts:211`). So index.ts sees `res.verdict.failures` / `gateRes.verdict.failures`.
-     - **Caveat:** on a gate timeout, `unverifiableGateResult` builds a fresh verdict without
-       `failures` (`gate.ts:84-93`), so that path loses it. Checker verdicts never carry it.
+     - **Timeout path (corrected).** On a gate timeout or error, the caller builds the result with
+       `unverifiableGateResult(reason, dodSource, strict, completedFailures)` (`gate.ts:84-93`).
+       `completedFailures` are the free-text reasons that `deterministic.onFailure` collected
+       before the budget ran out. When there are any, they are put in front of `reasons` and the
+       outcome is **`fail`**, so an observed failure survives the timeout. Otherwise the outcome
+       is `unverifiable`. The fresh verdict has **no `failures` field** in either case, and
+       checker verdicts never carry one.
+     - **What lineage does on a timeout:** nothing.
+       - `recordRejection` needs proven-introduced **test ids**. A reason string is not one, and
+         2.4 never parses ids out of reason text. So a timed-out rejection records nothing.
+       - `findLineage` is consulted only for an accepted verdict whose `failures.preexisting` is
+         non-empty. A timed-out result is never such a pass.
+       - Residual (R13): ids proven introduced by a check that finished before the budget ran out
+         are lost to the ledger. A later native re-dispatch can then pass with 2.1's "no worse
+         than before" note.
      - Keep the lineage API.
-6. **2.2 coordinator.** It is not in the merged tree (wave-2 holds 2.1 only), so this item is open
-   until 2.2.3 merges.
+6. **2.2 coordinator** (merged in `fdb319c`).
+   - There is **one coordinator per plugin instance**. It is created in `createVerificationWiring`
+     (`src/verify/wiring.ts:273`), swept by `sweepVerification` and disposed by
+     `disposeVerification` (`:670-671`).
+   - `buildGateDeps` chooses the testsPass hook (`wiring.ts:523-547`):
+     - when `effectiveBatchWindowMs(budget) = min(batchWindowMs, floor(gateBudgetMs / 10))` is
+       greater than 0, it is `coordinator.hook(runtime)`;
+     - otherwise it is the direct 2.1 hook.
+     - Each gate hands in its own runtime, so a config reload applies to the next window.
+   - Pooling is all-or-nothing under deadline pressure (batch.ts B5.2a).
+   - **How deferred verification (`router_verify`, 2.4.3) submits gates.** It uses the same
+     wiring path as a required gate, with no second coordinator and no batch-specific call:
+     1. Create **one** `createDeadline(gateBudgetMs)` per `router_verify` call, before any
+        preparation (§1.5-13, QA-2.1-4).
+     2. For each claimed handle, build a `PreparedVerification` from the pending entry:
+        - the stored `changedFiles` (`"unavailable"` → change baseline unavailable);
+        - the stored reference promise, awaited under that deadline's signal;
+        - a fresh snapshot as `currentTree`.
+     3. Call `buildGateDeps(sessionID, inFlight, prepared_i, deadline)` and `accept(…)` for every
+        handle **concurrently**.
+     4. Each `accept` has its own gate deps, but **every** handle's testsPass request carries the
+        **same `Deadline` object**. Because they are submitted together, they meet in one window
+        of the coordinator, which gives one batch.
+     5. Wrap the whole call in `withTimeout(…, deadline.remaining())` and abort the deadline on
+        rejection, exactly like the required gate.
+   - Batch.ts supports the shared deadline explicitly:
+     - B9 (`batch.ts:394`): "one per gate or router_verify call";
+     - `settle` (`:1057-1058`): "Two members may share one Deadline (one router_verify call
+       naming several handles): it is released with the last of them";
+     - B5 step 2 (`:341`): several handles of one dispatch share one recheck reference.
+   - Nothing extends the deadline. Handles not judged when it expires settle as
+     `unverifiable` (retryable), and the batch's tree is killed through its signal.
 7. **Session deletion: yes.** The SDK defines `EventSessionDeleted { type: "session.deleted";
    properties: { info: Session } }` (`sdk/dist/gen/types.gen.d.ts:505-510`). The plugin already
    handles it at `src/index.ts:1262-1274` (`info.id` → unregister). 2.4 adds
@@ -157,8 +223,19 @@ holds 2.1 only; 2.2 is **not merged yet**, so item 6 stays open.
    `false` and 3 600 000 (`:1356-1360`), with `baselineTimeoutMs` 15 000 (`:1350`). **The QA-1.6-8
    clamp is in place:** `captureWaitMs = min(own ?? 5000, baselineTimeoutMs)` (`:1351`).
 9. **`planStaticScoping(input: StaticScopingInput): Promise<StaticScoping>`**
-   (`src/verify/runner.ts:4447`). The no-spawn guarantee was not re-read here; 2.4.2a confirms it
-   against the runner header.
+   (`src/verify/runner.ts:4465`).
+   - **No-spawn guarantee** (`runner.ts:11`): "This module plans verification commands. It never
+     spawns anything and must not import child_process." It reaches the outside only through
+     injected seams.
+   - `planStaticScoping` is `plan(input, undefined)`: `planScopedRun` without the process-backed
+     `TestSearchSeam` (O.4, `runner.ts:937-940`). So the §1.5-5 git grep and the pytest name
+     mapping never run. Gone sources that would need them are counted in `pendingSearches`.
+   - Input: `StaticScopingInput = Omit<PlanScopedRunInput, "search">` = `{ command, cwd,
+     changedFiles, budget: { maxWorkers }, cores?, fs, host? }` (`:1402-1417`).
+     - `command` is `resolveRepoCommand(check, "testsPass", undefined)`, as the gate resolves it.
+     - `cwd` is `resolveBaseDir(delegation cwd, plugin directory)`, as `accept` does.
+     - `fs` is the wiring's `fsSeam` (fs reads, realpath, stat, readdir).
+   - Output: `StaticScopable | NoAffected | Unverifiable` (`:1390-1400`).
 10. **Producer tier.**
     - `sessionStore.getTier(sessionID): string | null` (`src/router/sessions.ts:373`).
     - The native `task` path takes the tier from `input.args.subagent_type` (`src/index.ts:1106-1109`).
