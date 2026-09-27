@@ -211,6 +211,22 @@ describe("recheck helpers", () => {
     [".next/", "linux", false],
     ["coverage/lcov.info", "linux", false],
     ["", "linux", false],
+    // QA-2.1-10: anchored at the reference root, a package root, or anywhere, per pattern.
+    ["test/fixtures/logs/", "linux", false],
+    ["src/logs/", "linux", false],
+    ["logs/debug.log", "linux", false],
+    ["test/fixtures/app.log", "linux", false],
+    ["TEST/Fixtures/App.LOG", "win32", false],
+    ["sub/.vscode/", "linux", false],
+    ["packages/web/.eslintcache", "linux", false],
+    ["packages/web/.nyc_output/", "linux", true],
+    ["Packages/Web/COVERAGE/", "win32", true],
+    ["test/fixtures/coverage/", "linux", false],
+    ["packages/web/test/coverage/", "linux", false],
+    ["src/coverage/", "linux", false],
+    ["a/b/c/coverage/", "linux", false],
+    ["tests/__pycache__/", "linux", true],
+    ["test/fixtures/.DS_Store", "linux", true],
   ] as const)("isInertUnreproduced(%j, %s) = %s", (entry, platform, inert) => {
     expect(isInertUnreproduced(entry, platform)).toBe(inert);
   });
@@ -682,7 +698,7 @@ describe("scope.rechecker (T4)", () => {
     expect(bad.argv).not.toHaveBeenCalled();
     expect(bad.dispose).toHaveBeenCalledTimes(1);
 
-    const inert = setup({ materialized: { unreproduced: ["coverage/", "logs/debug.log"] } });
+    const inert = setup({ materialized: { unreproduced: ["coverage/", "logs/", "debug.log"] } });
     expect((await inert.recheck(REFERENCE, [FAIL_A], deadline(200_000))).kind).toBe("exact");
     expect(inert.argv).toHaveBeenCalledTimes(1);
   });

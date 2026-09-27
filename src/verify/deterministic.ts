@@ -743,14 +743,34 @@ export function deriveDeadline(parent: Deadline, ownMs: number, opts: DeadlineOp
 }
 
 /**
- * T4.f: `unreproduced` entries tests cannot read. Matched on the entry's last segment (a directory
- * ends in "/"), case-insensitive on win32. Additions need evidence that tests cannot read them.
+ * Where an INERT_UNREPRODUCED pattern may sit (QA-2.1-10), relative to the reference root:
+ * - "root": only at the root itself (`logs/`, `debug.log`), never deeper, so an ignored
+ *   `test/fixtures/logs/` or a `*.log` fixture a test reads is not inert;
+ * - "package": at the root or at a monorepo package root `<dir>/<pkg>/` (`packages/web/coverage/`),
+ *   and never under a test or fixture directory;
+ * - "anywhere": caches and OS metadata that tools write beside every source and no test reads.
  */
-export const INERT_UNREPRODUCED: readonly string[] = [
-  "coverage/", ".nyc_output/", "logs/", ".idea/", ".vscode/", ".pytest_cache/", "__pycache__/",
-  ".mypy_cache/", ".ruff_cache/",
-  "*.log", ".DS_Store", "Thumbs.db", "desktop.ini", ".eslintcache", "*.pyc",
-];
+export type InertScope = "root" | "package" | "anywhere";
+
+/**
+ * T4.f: `unreproduced` entries tests cannot read, each anchored by its InertScope. An entry matches
+ * a pattern exactly (a directory ends in "/"; "*.ext" matches a file name), case-insensitive on
+ * win32. Additions need evidence that tests cannot read them.
+ */
+export const INERT_UNREPRODUCED_SCOPES: Readonly<Record<string, InertScope>> = {
+  "logs/": "root", ".idea/": "root", ".vscode/": "root", "*.log": "root", ".eslintcache": "root",
+  "coverage/": "package", ".nyc_output/": "package", ".pytest_cache/": "package",
+  ".mypy_cache/": "package", ".ruff_cache/": "package",
+  "__pycache__/": "anywhere", "*.pyc": "anywhere", ".DS_Store": "anywhere", "Thumbs.db": "anywhere",
+  "desktop.ini": "anywhere",
+};
+
+export const INERT_UNREPRODUCED: readonly string[] = Object.keys(INERT_UNREPRODUCED_SCOPES);
+
+/** Directory names under which a "package" pattern is never inert: tests may read what is there. */
+const TEST_DIR_NAMES = new Set([
+  "test", "tests", "__tests__", "spec", "specs", "fixtures", "__fixtures__", "testdata", "test-data", "__snapshots__",
+]);
 
 export function isInertUnreproduced(entry: string, platform: string): boolean {
   const normalized = entry.replace(/\\/g, "/");
@@ -760,18 +780,26 @@ export function isInertUnreproduced(entry: string, platform: string): boolean {
   if (last === undefined) return false;
   const fold = (s: string): string => (platform === "win32" ? s.toLowerCase() : s);
   const name = fold(last);
-  for (const raw of INERT_UNREPRODUCED) {
+  const parents = segments.slice(0, -1).map(fold);
+  const inScope = (scope: InertScope): boolean => {
+    if (scope === "anywhere") return true;
+    if (parents.length === 0) return true;
+    return scope === "package" && parents.length === 2 && !parents.some(s => TEST_DIR_NAMES.has(s));
+  };
+  for (const [raw, scope] of Object.entries(INERT_UNREPRODUCED_SCOPES)) {
     const pattern = fold(raw);
+    let matches = false;
     if (pattern.endsWith("/")) {
-      if (isDir && `${name}/` === pattern) return true;
+      matches = isDir && `${name}/` === pattern;
     } else if (!isDir) {
       if (pattern.startsWith("*.")) {
         const ext = pattern.slice(1);
-        if (name.length > ext.length && name.endsWith(ext)) return true;
-      } else if (name === pattern) {
-        return true;
+        matches = name.length > ext.length && name.endsWith(ext);
+      } else {
+        matches = name === pattern;
       }
     }
+    if (matches && inScope(scope)) return true;
   }
   return false;
 }
