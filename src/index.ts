@@ -335,6 +335,9 @@ const ModelRouterPlugin: Plugin = async (ctx: PluginInput) => {
     () => guardStore.sweep(),
     () => trajectoryStore.sweep(),
     () => changedFileStore.sweep(),
+    // 2.2.3: the S5 batch coordinator's defensive eviction (batch.ts B11). Declared below; the
+    // sweeper only runs from chat.message, long after this factory has returned.
+    () => { sweepVerification(); },
   ]);
 
   // Layer-2's impure corner: exec, fs, and the opencode client, built once and
@@ -348,6 +351,7 @@ const ModelRouterPlugin: Plugin = async (ctx: PluginInput) => {
   const {
     graderSessions, dispatchGrader, buildGateDeps, disposeChildSession,
     beginVerificationBounded, prepareVerification, startReferenceGc,
+    sweepVerification, disposeVerification,
   } = createVerificationWiring({
     client: ctx.client,
     directory: ctx.directory,
@@ -439,6 +443,8 @@ const ModelRouterPlugin: Plugin = async (ctx: PluginInput) => {
     // that dispose is both called and awaited, so flushing here is enough.
     dispose: async () => {
       stopReferenceGc();
+      // 2.2.3: settle batched testsPass requests and kill running batches (never rejects).
+      await disposeVerification();
       await logger.flush();
     },
     tool: {

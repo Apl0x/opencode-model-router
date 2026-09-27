@@ -15,12 +15,14 @@
  */
 import { access, readdir, readFile as fsReadFile, realpath, stat, unlink } from "node:fs/promises";
 import { isAbsolute, join, resolve } from "node:path";
+import { createBatchCoordinator, type BatchCoordinatorOptions, type BatchPlanner } from "./batch";
 import {
   createDirectTestsPassHook,
   createMutexRegistry,
   createScopeOpener,
   DEFAULT_ALLOWLIST,
   isCommandAllowed,
+  RECHECK_MIN_REMAINING_MS,
   resolveRepoCommand,
 } from "./deterministic";
 import {
@@ -37,8 +39,8 @@ import type { PluginLogger } from "../router/logger";
 import { REFERENCE_NONE } from "./baseline";
 import { scrubText } from "../guard/scrub";
 import type { DoD } from "./dod";
-import type { ArgvSeam, Deadline, ExecOptions, ExecResult as SeamResult, ExecSeam, ReferenceState } from "./types";
-import type { RunnerFs, TestSearchSeam } from "./runner";
+import type { ArgvSeam, Deadline, ExecOptions, ExecResult as SeamResult, ExecSeam, ReferenceState, TestsPassHook } from "./types";
+import { planScopedRun, type RunnerFs, type TestSearchSeam } from "./runner";
 import {
   graderTimeoutMs,
   withTimeout,
@@ -191,6 +193,17 @@ export interface VerificationWiring {
    * bounds every testsPass step (T3); without it each testsPass check owns one of gateBudgetMs.
    */
   buildGateDeps(parentSessionID?: string, inFlight?: Set<string>, prepared?: PreparedVerification, deadline?: Deadline): GateDeps;
+  /**
+   * 2.2.3: the idle-TTL sweep's hook into the plugin's one S5 batch coordinator (batch.ts B11):
+   * evicts windows with no live member and batches whose seam hung past BATCH_STALE_GRACE_MS.
+   * Returns the number evicted. Never throws.
+   */
+  sweepVerification(): number;
+  /**
+   * 2.2.3: plugin dispose. Settles pending batched requests, kills running batches and awaits
+   * their scope closes (batch.ts B11). Idempotent; never rejects.
+   */
+  disposeVerification(): Promise<void>;
 }
 
 /** How a bounded wait ended (awaitBounded). */
@@ -233,6 +246,8 @@ export function createVerificationWiring(deps: {
   getConfig: () => RouterConfig;
   /** Default: console.warn, no debug output. */
   logger?: WiringLogger;
+  /** Test seams of the S5 batch coordinator (clock, timers, platform, maximum window size). */
+  batch?: Omit<BatchCoordinatorOptions, "logger">;
 }): VerificationWiring {
   const { client, directory, getConfig } = deps;
   const logger: WiringLogger = deps.logger ?? { warn: (message, extra) => console.warn(message, extra ?? "") };
@@ -240,6 +255,11 @@ export function createVerificationWiring(deps: {
   /** Child sessions already torn down; see disposeChildSession. */
   const disposed = new Set<string>();
   const mutex = createMutexRegistry();
+  /**
+   * 2.2.3: one S5 batch coordinator per plugin instance (batch.ts D6). Each gate hands it its own
+   * runtime, so a config reload reaches the next window without a new coordinator.
+   */
+  const coordinator = createBatchCoordinator({ ...deps.batch, logger });
 
   const abs = (p: string): string => (isAbsolute(p) ? p : join(directory, p));
 
@@ -481,13 +501,38 @@ export function createVerificationWiring(deps: {
       argv: argvSeam, exec: execSeam, fs: fsSeam, budget, checkTimeoutMs: CHECK_TIMEOUT_MS,
       reference: { argv: referenceArgv },
     });
-    const testsPass = createDirectTestsPassHook({
+    const currentTree = prepared?.snapshot !== undefined ? { currentTree: prepared.snapshot } : {};
+    const direct = createDirectTestsPassHook({
       openScope,
       plannerFs: fsSeam,
       search: testSearch(budget, deadline),
       budget,
-      ...(prepared?.snapshot !== undefined ? { currentTree: prepared.snapshot } : {}),
+      ...currentTree,
     });
+    // 2.2.3 (S5): with a batch window, concurrent testsPass checks of this plugin instance meet in
+    // the coordinator; the direct hook stays behind it for "full" scope and single requests (B2).
+    // The planner is the direct hook's (planScopedRun over the same PlannerFs and budget), with
+    // its git searches bound to whichever deadline the coordinator plans under (B6).
+    let testsPass: TestsPassHook = direct;
+    if (budget.batchWindowMs > 0) {
+      const plan: BatchPlanner = (input, planDeadline) => planScopedRun({
+        command: input.command,
+        cwd: input.cwd,
+        changedFiles: input.changedFiles,
+        budget: { maxWorkers: budget.maxWorkers },
+        fs: fsSeam,
+        search: testSearch(budget, planDeadline),
+      });
+      testsPass = coordinator.hook({
+        direct,
+        plan,
+        openScope,
+        batchWindowMs: budget.batchWindowMs,
+        recheckMinRemainingMs: RECHECK_MIN_REMAINING_MS,
+        failureRecheck: budget.failureRecheck,
+        ...currentTree,
+      });
+    }
     return {
       deterministic: {
         exec: execSeam,
@@ -610,5 +655,7 @@ export function createVerificationWiring(deps: {
     disposeChildSession,
     dispatchGrader,
     buildGateDeps,
+    sweepVerification: () => coordinator.sweep(),
+    disposeVerification: () => coordinator.dispose(),
   };
 }

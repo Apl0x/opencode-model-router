@@ -183,11 +183,11 @@
 //   RunResult computed from the union's) and "own-run" (the member's own planScopedRun spec runs,
 //   B5.5).
 //   Keys: fileKeyOf(spec.cwd, abs) is the id-space file key (cwd-relative, "/" separators), the
-//   construction readResult uses. idFileKey(id) is 2.1-T5's fileKeyOfId: the part before the
-//   EARLIEST " > " or "::", else the whole id (QA-2.2-11: a pytest name may contain " > ", as in
-//   tests/test_x.py::test_cmp[1 > 0], and its file is still the part before "::"). It is the only
-//   id-to-file rule in this module (7.3a, 7.5, B8.5), and stays a private copy here until 2.2.3 can
-//   import 2.1's.
+//   construction readResult uses. fileKeyOfId(id) is 2.1-T5's rule, imported from baseline.ts
+//   (2.2.3): the part before the EARLIEST " > " or "::", else the whole id, with "/" separators
+//   (QA-2.2-11: a pytest name may contain " > ", as in tests/test_x.py::test_cmp[1 > 0], and its
+//   file is still the part before "::"). It is the only id-to-file rule in this module (7.3a, 7.5,
+//   B8.5), so the batch and 2.1's judge can never key an id differently.
 //
 //   7.1 Not comparable: !U.complete, U.collectionError, or U.source !== "report" -> own-run
 //       (cause "not-comparable"). A vitest syntax error in any test file aborts `related` without
@@ -281,8 +281,10 @@
 //      RECHECK_MIN_REMAINING_MS, injected) gets { kind: "skipped-deadline", remainingMs } and
 //      leaves its group, as it would alone (2.1-T3): a member whose budget cannot fit its
 //      recheck is never passed on a guess.
-//   4. A group of one member -> scope.rechecker(command, cwd)(reference, its failingFiles, its
-//      own deadline). This is the direct path.
+//   4. A group of one member -> scope.rechecker(command, cwd, its currentTree)(reference, its
+//      failingFiles, its own deadline). This is the direct path. (QA-2.2-8, 2.2.3: every recheck
+//      forwards the requesting gate's tree snapshot, runtime.currentTree, as 2.1's direct hook
+//      does; a shared recheck forwards its first member's.)
 //   5. A group of several members:
 //        files  = the deduplicated union of their failingFiles;
 //        Rg     = a batch deadline over the group (B9);
@@ -559,6 +561,13 @@
 //             - the existing TTL sweep also calls coordinator.sweep();
 //             - plugin disposal, if the host offers one, calls dispose().
 //           batch.ts: replace the private idFileKey with 2.1's fileKeyOfId.
+//           Done (2.2.3): wiring.ts creates the coordinator in createVerificationWiring. With
+//           batchWindowMs > 0, buildGateDeps' testsPass is coordinator.hook(runtime), and 2.1's
+//           direct hook stays as runtime.direct; with batchWindowMs <= 0 the direct hook is used
+//           as is. The runtime shares the direct hook's opener, PlannerFs and budget, and adds
+//           the gate-time failureRecheck and the gate's tree (QA-2.2-8: BatchRuntime.currentTree,
+//           OpenBatchScope). index.ts's idle-TTL sweeper calls sweepVerification() (the
+//           coordinator's sweep), and plugin dispose awaits disposeVerification().
 //   2.2.3.b test/unit/batch-wiring.test.ts, with 5 concurrent testsPass gates through
 //           buildGateDeps:
 //             - the argv seam sees 1 scoped run per window (+ <= 1 recheck with a shared
@@ -570,11 +579,14 @@
 
 import { posix, win32 } from "node:path";
 import type { PluginLogger } from "../router/logger";
+import { fileKeyOfId } from "./baseline";
+import type { TreeSnapshot } from "./dispatch";
 import type { DispatchReference } from "./reference";
 import type { ChangedPath, RunResult, ScopedSpec, ScopingPlan } from "./runner";
 import type {
   Deadline,
   OpenVerificationScope,
+  Rechecker,
   RecheckOutcome,
   ScopedOutcome,
   TestsPassHook,
@@ -620,12 +632,23 @@ export type BatchPlanInput = Pick<TestsPassRequest, "command" | "cwd" | "changed
  */
 export type BatchPlanner = (input: BatchPlanInput, deadline: Deadline) => Promise<ScopingPlan>;
 
+/**
+ * A VerificationScope whose rechecker also takes the gate's current tree snapshot, as 2.1's
+ * CheckScope does (QA-2.2-8). A two-argument rechecker (any OpenVerificationScope) still fits.
+ */
+export interface BatchScope extends VerificationScope {
+  rechecker(command: string, cwd: string, currentTree?: TreeSnapshot): Rechecker;
+}
+
+/** runtime.openScope: 2.1's scope opener, or any OpenVerificationScope. */
+export type OpenBatchScope = (meta: Parameters<OpenVerificationScope>[0]) => BatchScope;
+
 /** The seams and settings of one gate (deviation D6). The window opener's values apply to its batch. */
 export interface BatchRuntime {
   /** 2.1's one-request hook, used for testScope "full" and batchWindowMs <= 0 (B2). */
   readonly direct: TestsPassHook;
   readonly plan: BatchPlanner;
-  readonly openScope: OpenVerificationScope;
+  readonly openScope: OpenBatchScope;
   /** enforcement.verify.batchWindowMs (VerifyBudget). <= 0 disables batching. */
   readonly batchWindowMs: number;
   /** 2.1's RECHECK_MIN_REMAINING_MS (B8.3), injected so this module has no runtime import of deterministic.ts. */
@@ -636,6 +659,13 @@ export interface BatchRuntime {
    * direct hook decides at the gate.
    */
   readonly failureRecheck: boolean;
+  /**
+   * QA-2.2-8 (2.2.3): the submitting gate's current tree snapshot, kept per request and forwarded
+   * to its recheck as 2.1's direct hook does (materialize's same-repository guard). A shared
+   * recheck forwards its first member's, with that member's command and cwd: every member of a
+   * group shares the reference, and so its root (B8.2). Absent: materialize gets undefined.
+   */
+  readonly currentTree?: TreeSnapshot;
 }
 
 /** Timer seam for the window timers (W1). */
@@ -713,6 +743,8 @@ interface Member {
   readonly spec: ScopedSpec;
   /** B8.1 (QA-2.2-2): the submitting gate's runtime.failureRecheck, not the window opener's. */
   readonly failureRecheck: boolean;
+  /** QA-2.2-8: the submitting gate's runtime.currentTree, forwarded to the member's recheck. */
+  readonly currentTree: TreeSnapshot | undefined;
   /** Arrival order: the tie-break of every deadline ordering. */
   readonly seq: number;
   phase: MemberPhase;
@@ -749,7 +781,7 @@ interface Batch {
   readonly deadline: BatchDeadline;
   /** Rg of the shared recheck in flight (B8.5). */
   group: BatchDeadline | undefined;
-  scope: VerificationScope | undefined;
+  scope: BatchScope | undefined;
   closing: Promise<void> | undefined;
   /** When the last member settled (B11 sweep). */
   settledAt: number | undefined;
@@ -931,6 +963,7 @@ export function createBatchCoordinator(options: BatchCoordinatorOptions = {}): B
         request,
         spec,
         failureRecheck: runtime.failureRecheck,
+        currentTree: runtime.currentTree,
         seq: arrivals++,
         phase: "window",
         settled: false,
@@ -1132,7 +1165,7 @@ export function createBatchCoordinator(options: BatchCoordinatorOptions = {}): B
     const spec = union.spec;
     if (union.result.complete || spec === undefined || !spec.inputsAreTests) return union.result.failingIds;
     const keys = new Set(spec.inputs.map((f) => fold(fileKeyOf(spec.cwd, f, platform), platform)));
-    return union.result.failingIds.filter((id) => keys.has(fold(idFileKey(id), platform)));
+    return union.result.failingIds.filter((id) => keys.has(fold(fileKeyOfId(id), platform)));
   }
 
   /** B7.5: the union failing ids that no finished own run or static derivation reproduces yet. */
@@ -1210,7 +1243,7 @@ export function createBatchCoordinator(options: BatchCoordinatorOptions = {}): B
   }
 
   /** B5.5: the member's own spec under its own deadline; the outcome is its scoped outcome, verbatim. */
-  async function runOwn(b: Batch, scope: VerificationScope, m: Member): Promise<void> {
+  async function runOwn(b: Batch, scope: BatchScope, m: Member): Promise<void> {
     m.phase = "own-run";
     counters.ownRuns++;
     const link = linkDeadline(m.request.deadline, b.deadline.signal);
@@ -1286,7 +1319,7 @@ export function createBatchCoordinator(options: BatchCoordinatorOptions = {}): B
    * B8.3-8.5 for the member the queue picked: it rechecks together with every member ready at
    * this moment at the same reference (its group, earliest deadline first).
    */
-  async function recheckGroup(b: Batch, scope: VerificationScope, lead: Member): Promise<void> {
+  async function recheckGroup(b: Batch, scope: BatchScope, lead: Member): Promise<void> {
     const key = lead.ready?.key;
     const group: { readonly m: Member; readonly ready: Ready }[] = [];
     for (const m of live(b).sort(byDeadline)) {
@@ -1320,7 +1353,7 @@ export function createBatchCoordinator(options: BatchCoordinatorOptions = {}): B
       m.recheckBoundMs = m.request.deadline.remaining();
     }
     counters.rechecks++;
-    const shared = await recheck(scope, first.m.request, first.ready.reference, files, rg);
+    const shared = await recheck(scope, first.m, first.ready.reference, files, rg);
     b.group = undefined;
     rg.dispose();
     remember(b, first.ready.key, shared);
@@ -1338,13 +1371,13 @@ export function createBatchCoordinator(options: BatchCoordinatorOptions = {}): B
   }
 
   /** B8.4: the direct path, under the member's own deadline. */
-  async function recheckOne(b: Batch, scope: VerificationScope, m: Member, ready: Ready): Promise<void> {
+  async function recheckOne(b: Batch, scope: BatchScope, m: Member, ready: Ready): Promise<void> {
     if (m.settled || skippedForDeadline(b, m, ready.scoped)) return;
     m.phase = "recheck";
     m.recheckBoundMs = m.request.deadline.remaining();
     counters.rechecks++;
     const link = linkDeadline(m.request.deadline, b.deadline.signal);
-    const out = await recheck(scope, m.request, ready.reference, ready.scoped.result.failingFiles, link.deadline);
+    const out = await recheck(scope, m, ready.reference, ready.scoped.result.failingFiles, link.deadline);
     link.unlink();
     remember(b, ready.key, out);
     settle(m, { scoped: ready.scoped, recheck: out });
@@ -1352,7 +1385,7 @@ export function createBatchCoordinator(options: BatchCoordinatorOptions = {}): B
 
   // -- seams (B-G5: a throwing seam becomes a fail-closed outcome) ------------------------------
 
-  async function execute(scope: VerificationScope, spec: ScopedSpec, deadline: Deadline): Promise<ScopedOutcome> {
+  async function execute(scope: BatchScope, spec: ScopedSpec, deadline: Deadline): Promise<ScopedOutcome> {
     try {
       return await scope.execute(spec, deadline);
     } catch (e) {
@@ -1361,14 +1394,14 @@ export function createBatchCoordinator(options: BatchCoordinatorOptions = {}): B
   }
 
   async function recheck(
-    scope: VerificationScope,
-    request: TestsPassRequest,
+    scope: BatchScope,
+    m: Member,
     reference: DispatchReference,
     files: readonly string[],
     deadline: Deadline,
   ): Promise<RecheckOutcome> {
     try {
-      return await scope.rechecker(request.command, request.cwd)(reference, files, deadline);
+      return await scope.rechecker(m.request.command, m.request.cwd, m.currentTree)(reference, files, deadline);
     } catch (e) {
       return { kind: "unusable", cause: "error", reason: `recheck failed: ${message(e)}` };
     }
@@ -1609,19 +1642,6 @@ export function fileKeyOf(cwd: string, absolutePath: string, platform: NodeJS.Pl
   return pathApi(platform).relative(cwd, absolutePath).replace(/\\/g, "/");
 }
 
-/**
- * 2.1-T5's fileKeyOfId, private until 2.2.3 can import it: the part of an id before the EARLIEST
- * " > " or "::", else the whole id (QA-2.2-11). A vitest/jest id's first separator is " > ", and a
- * pytest id's is "::", whatever its test name contains: `tests/test_x.py::test_cmp[1 > 0]` is keyed
- * `tests/test_x.py`, never `tests/test_x.py::test_cmp[1`.
- */
-function idFileKey(id: string): string {
-  const gt = id.indexOf(" > ");
-  const cc = id.indexOf("::");
-  const cut = gt < 0 ? cc : cc < 0 ? gt : Math.min(gt, cc);
-  return cut >= 0 ? id.slice(0, cut) : id;
-}
-
 /** The sum of `counts` over `keys`, matched with the platform's folding. */
 function countOver(counts: TestCounts, keys: Iterable<string>, platform: NodeJS.Platform): number {
   const folded = new Map<string, number>();
@@ -1697,7 +1717,7 @@ export function attributeUnion(
   if (!member.inputsAreTests) return { kind: "own-run", cause: "mode-b" };
   // 7.3a: static attribution by input file key.
   const own = new Set(inputKeys.map((k) => fold(k, platform)));
-  const ids = union.failingIds.filter((id) => own.has(fold(idFileKey(id), platform)));
+  const ids = union.failingIds.filter((id) => own.has(fold(fileKeyOfId(id), platform)));
   if (ids.length === 0) return staticGreen();
   const files = union.failingFiles.filter((f) => own.has(fold(fileKeyOf(member.cwd, f, platform), platform)));
   const total = counts === undefined ? union.total : countOver(counts, inputKeys, platform);
@@ -1773,7 +1793,7 @@ export function deriveSharedRecheck(
   if (full === undefined) return "split";
 
   const ranSet = new Set(ranFiles.map((k) => fold(k, platform)));
-  const failingIds = full.failingIds.filter((id) => ranSet.has(fold(idFileKey(id), platform)));
+  const failingIds = full.failingIds.filter((id) => ranSet.has(fold(fileKeyOfId(id), platform)));
   // The rerun's failingFiles are absolute paths in the reference worktree, whose cwd this module
   // does not know: each is keyed by the longest shared ran-file key it ends with.
   const allKeys = [...new Set(shared.ranFiles.map((k) => fold(k, platform)))].sort((a, b) => b.length - a.length);
