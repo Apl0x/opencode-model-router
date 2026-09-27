@@ -178,6 +178,11 @@ export const DRIFT_DIGEST_MAX_BYTES = 64 * 1024 * 1024;
 export const STATIC_SCOPING_UNFINISHED_REASON = "static scoping did not finish within the deferred-finish bound";
 /** Section 1.4 pendingTtlMs default, used when the config cannot be read at plugin start. */
 export const DEFAULT_PENDING_TTL_MS = 3_600_000;
+/**
+ * QA-2.4-9: the capture wait when the config cannot be read: section 1.4's captureWaitMs default
+ * (5000 ms), clamped to the default baselineTimeoutMs (DEFAULT_CAPTURE_TIMEOUT_MS), as config.ts does.
+ */
+export const FALLBACK_CAPTURE_WAIT_MS = Math.min(5_000, DEFAULT_CAPTURE_TIMEOUT_MS);
 
 /** What the orchestrator asked for at dispatch (directives.ts, parsed from its own prompt only). */
 export interface DispatchStart {
@@ -571,7 +576,7 @@ export interface VerificationWiring {
    * 2.4.2a: parseVerifyDirectives over `text` with the config defaults (defaultVerify,
    * captureWaitMs, baselineTimeoutMs). `text` MUST be the orchestrator's own prompt
    * (dispatchDirectiveText). Unknown values are logged. Never throws: when the config cannot be
-   * read, the mode is "required" (today's gate) and the wait 0.
+   * read, the mode is "required" (today's gate) and the wait FALLBACK_CAPTURE_WAIT_MS (QA-2.4-9).
    */
   resolveDirectives(text: string): VerifyDirectives;
   /**
@@ -1208,10 +1213,12 @@ export function createVerificationWiring(deps: {
         message => logger.warn(message),
       );
     } catch (err) {
-      // No config, no deferral: today's synchronous gate, and no wait (the gate awaits the
-      // reference under its own deadline).
+      // No config, no deferral: today's synchronous gate. QA-2.4-9: with the section 1.4 default
+      // capture wait (clamped to the default baselineTimeoutMs), as 2.1 waited: a producer started
+      // before its capture resolves contaminates it, and pre-existing failures could no longer be
+      // told apart.
       logger.warn("[verify] dispatch directives could not be resolved; verifying synchronously", { error: errorText(err) });
-      return { mode: "required", waitMs: 0, modeSource: "default", waitSource: "default" };
+      return { mode: "required", waitMs: FALLBACK_CAPTURE_WAIT_MS, modeSource: "default", waitSource: "default" };
     }
   };
 

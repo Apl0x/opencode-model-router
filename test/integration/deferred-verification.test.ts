@@ -23,6 +23,7 @@ import {
   createVerificationWiring,
   DEFERRED_FINISH_MS,
   dispatchDirectiveText,
+  FALLBACK_CAPTURE_WAIT_MS,
   hasTestsPass,
   type DeferredFinish,
 } from "../../src/verify/wiring";
@@ -208,6 +209,41 @@ describe("wiring (2.4.2a)", () => {
       expect(wiring.resolveDirectives("x").waitMs).toBe(1234);
       expect(wiring.resolveDirectives("VERIFY_WAIT:0s").waitMs).toBe(0);
       expect(wiring.resolveDirectives("VERIFY_WAIT:60s").waitMs).toBe(4000);
+    });
+
+    it("QA-2.4-9 (M8): when the verify budget cannot be resolved, the mode is required with the default 5 s capture wait", async () => {
+      const base: RouterConfig = { activePreset: "a", presets: { a: { medium: { model: "p/m" } } }, defaultTier: "medium", rules: [] };
+      // getConfig works; reading the enforcement block (resolveVerifyBudget) throws `throws` times.
+      let throws = 0;
+      const broken = Object.defineProperty(base, "enforcement", {
+        get() {
+          if (throws > 0) {
+            throws -= 1;
+            throw new Error("broken verify block");
+          }
+          return { verify: {} };
+        },
+      });
+      const warnings: string[] = [];
+      const wiring = createVerificationWiring({ client: {}, directory: root, getConfig: () => broken, logger: { warn: message => warnings.push(message) } });
+      throws = 1;
+      expect(wiring.resolveDirectives("VERIFY:deferred VERIFY_WAIT:0s")).toEqual({ mode: "required", waitMs: FALLBACK_CAPTURE_WAIT_MS, modeSource: "default", waitSource: "default" });
+      expect(FALLBACK_CAPTURE_WAIT_MS).toBe(5_000);
+      expect(warnings.some(w => w.includes("verifying synchronously"))).toBe(true);
+      // Only the directive read fails; the capture starts, and the dispatch waits for it as 2.1
+      // did: a 4 s capture is awaited in full (the old fallback, 0 ms, released it at once).
+      vi.useFakeTimers();
+      state.captureDelayMs = 4_000;
+      throws = 1;
+      let done = false;
+      const started = wiring.startDispatch(createChangedFileStore(), "d9", root, TESTS_DOD, "VERIFY_WAIT:0s", false).then(() => {
+        done = true;
+      });
+      await vi.advanceTimersByTimeAsync(3_999);
+      expect(done).toBe(false);
+      await vi.advanceTimersByTimeAsync(1);
+      await started;
+      expect(done).toBe(true);
     });
 
     it("an unknown VERIFY value is logged and ignored", () => {
