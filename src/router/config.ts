@@ -6,11 +6,12 @@ import {
   renameSync,
   writeFileSync,
 } from "node:fs";
-import { homedir } from "node:os";
+import { availableParallelism, homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseJsonc } from "./jsonc";
 import type { DelegateInstructionsPolicy } from "./instructions";
+import type { PluginLogger } from "./logger";
 
 /**
  * Filename of the optional user overrides file (global and project copies share
@@ -128,14 +129,38 @@ export interface EnforcementConfig {
     delegateTimeoutMs?: number;
     /** Reject unavailable verification. Default false; never escalates it. */
     strictUnverifiable?: boolean;
-    /** Capture/cache conservative dispatch-time test baselines. Default true. */
+    /** Deprecated: `false` maps to `failureRecheck: false` (explicit `failureRecheck` wins). No default. */
     testBaseline?: boolean;
-    /** Independent capture ceiling, including fingerprinting. Default 60000 ms. */
+    /** Bounds the whole git-only reference capture, in ms. Default 15000. */
     baselineTimeoutMs?: number;
     /** Override tier ceilings: fast 60000 / medium 180000 / heavy 600000 ms. */
     graderTimeoutMs?: number;
-    /** Ceiling for the whole acceptance gate, in ms. Default 90000. */
-    gateBudgetMs?: number };
+    /** Deadline for every synchronous verification, in ms. Default 90000. */
+    gateBudgetMs?: number;
+    /** Which tests a verification runs. Default "affected". */
+    testScope?: "affected" | "full";
+    /** Worker cap passed to runners that support one (integer >= 1). Default 2. */
+    maxWorkers?: number;
+    /** Run verification commands at below-normal priority. Default true. */
+    lowPriority?: boolean;
+    /** Machine-wide verification slots (integer >= 1). Default max(1, floor(cores / 8)). */
+    maxConcurrentVerifications?: number;
+    /** Mode for dispatches without a `VERIFY:` directive. Default "deferred". */
+    defaultVerify?: "deferred" | "required";
+    /** Longest wait for the reference capture before the producer starts, in ms (0 = never wait). Default 5000. */
+    captureWaitMs?: number;
+    /** Also run deferred verifications in the background. Default false. */
+    background?: boolean;
+    /** How long an unverified delegation stays verifiable, in ms (integer >= 1). Default 3600000. */
+    pendingTtlMs?: number;
+    /** Maximum wait for a verification slot, in ms (0 = no wait). Default 60000. */
+    slotWaitMs?: number;
+    /** Coalescing window, in ms (0 = no batching). Default 2000. */
+    batchWindowMs?: number;
+    /** Capture a reference and recheck scoped failures against it. Default true. */
+    failureRecheck?: boolean;
+    /** Budget for the reference re-run, in ms (integer >= 1). Default 60000. */
+    recheckTimeoutMs?: number };
   escalate?: { floorTier?: string | null; ladder?: string[]; maxAttemptsPerTier?: number; maxTotalAttempts?: number; costCeiling?: { base?: string; multiple?: number } };
   proportional?: { trivialBypass?: boolean; trivialClassifier?: string };
 }
@@ -744,6 +769,8 @@ function validateEnforcement(obj: Record<string, unknown>): void {
         "graderTimeoutMs",
         "gateBudgetMs",
         "baselineTimeoutMs",
+        "pendingTtlMs",
+        "recheckTimeoutMs",
       ] as const) {
         const value = verify[key];
         if (value !== undefined) {
@@ -753,6 +780,45 @@ function validateEnforcement(obj: Record<string, unknown>): void {
             );
           }
         }
+      }
+      // Waits/windows where 0 is meaningful ("no wait", "no batching").
+      for (const key of ["captureWaitMs", "slotWaitMs", "batchWindowMs"] as const) {
+        const value = verify[key];
+        if (value !== undefined && (!Number.isInteger(value) || (value as number) < 0)) {
+          throw new Error(
+            `tiers.json: enforcement.verify.${key} must be an integer >= 0 (milliseconds)`,
+          );
+        }
+      }
+      for (const key of ["maxWorkers", "maxConcurrentVerifications"] as const) {
+        const value = verify[key];
+        if (value !== undefined && (!Number.isInteger(value) || (value as number) < 1)) {
+          throw new Error(`tiers.json: enforcement.verify.${key} must be an integer >= 1`);
+        }
+      }
+      for (const key of ["lowPriority", "background", "failureRecheck"] as const) {
+        const value = verify[key];
+        if (value !== undefined && typeof value !== "boolean") {
+          throw new Error(`tiers.json: enforcement.verify.${key} must be a boolean`);
+        }
+      }
+      if (
+        verify.testScope !== undefined &&
+        verify.testScope !== "affected" &&
+        verify.testScope !== "full"
+      ) {
+        throw new Error(
+          'tiers.json: enforcement.verify.testScope must be "affected" or "full"',
+        );
+      }
+      if (
+        verify.defaultVerify !== undefined &&
+        verify.defaultVerify !== "deferred" &&
+        verify.defaultVerify !== "required"
+      ) {
+        throw new Error(
+          'tiers.json: enforcement.verify.defaultVerify must be "deferred" or "required"',
+        );
       }
       if (
         verify.requireExplicitDoD !== undefined &&
@@ -1168,4 +1234,85 @@ export function normalizeEnforcement(
   e: EnforcementConfig | undefined,
 ): { mode: "off" | "advisory" | "enforced" } {
   return { mode: e?.mode ?? "advisory" };
+}
+
+/** Fully defaulted verification budget (§1.4). */
+export interface VerifyBudget {
+  testScope: "affected" | "full";
+  maxWorkers: number;
+  lowPriority: boolean;
+  maxConcurrentVerifications: number;
+  defaultVerify: "deferred" | "required";
+  captureWaitMs: number;
+  background: boolean;
+  pendingTtlMs: number;
+  slotWaitMs: number;
+  batchWindowMs: number;
+  failureRecheck: boolean;
+  recheckTimeoutMs: number;
+  baselineTimeoutMs: number;
+  gateBudgetMs: number;
+}
+
+export interface ResolveVerifyBudgetOptions {
+  /** Core count; defaults to `os.availableParallelism()`. Injected by tests. */
+  cores?: number;
+  /** Receives the one-time `testBaseline` deprecation warning. */
+  logger?: PluginLogger;
+}
+
+let warnedTestBaselineDeprecated = false;
+
+/** Test-only: re-arm the once-per-process `testBaseline` deprecation warning. */
+export function resetVerifyBudgetWarnings(): void {
+  warnedTestBaselineDeprecated = false;
+}
+
+/**
+ * The single place verification-budget defaults are applied. Pure apart from
+ * the once-per-process deprecation warning. Reads own properties only, so a
+ * value inherited through a prototype is never applied.
+ */
+export function resolveVerifyBudget(
+  cfg: RouterConfig | undefined,
+  opts: ResolveVerifyBudgetOptions = {},
+): VerifyBudget {
+  const raw = cfg?.enforcement?.verify;
+  const v: Record<string, unknown> = isPlainObject(raw) ? raw : {};
+  const own = <T>(key: string): T | undefined =>
+    Object.prototype.hasOwnProperty.call(v, key) && v[key] !== undefined
+      ? (v[key] as T)
+      : undefined;
+
+  const testBaseline = own<boolean>("testBaseline");
+  if (testBaseline !== undefined && !warnedTestBaselineDeprecated && opts.logger) {
+    warnedTestBaselineDeprecated = true;
+    opts.logger.warn(
+      "enforcement.verify.testBaseline is deprecated; use enforcement.verify.failureRecheck",
+      { key: "testBaseline" },
+    );
+  }
+  const failureRecheck =
+    own<boolean>("failureRecheck") ?? (testBaseline === false ? false : true);
+
+  const cores = opts.cores ?? availableParallelism();
+  const coreCount = Number.isFinite(cores) && cores >= 1 ? Math.floor(cores) : 1;
+
+  return {
+    testScope: own<"affected" | "full">("testScope") ?? "affected",
+    maxWorkers: own<number>("maxWorkers") ?? 2,
+    lowPriority: own<boolean>("lowPriority") ?? true,
+    maxConcurrentVerifications:
+      own<number>("maxConcurrentVerifications") ?? Math.max(1, Math.floor(coreCount / 8)),
+    defaultVerify: own<"deferred" | "required">("defaultVerify") ?? "deferred",
+    captureWaitMs: own<number>("captureWaitMs") ?? 5000,
+    background: own<boolean>("background") ?? false,
+    pendingTtlMs: own<number>("pendingTtlMs") ?? 3_600_000,
+    slotWaitMs: own<number>("slotWaitMs") ?? 60_000,
+    batchWindowMs: own<number>("batchWindowMs") ?? 2000,
+    failureRecheck,
+    recheckTimeoutMs: own<number>("recheckTimeoutMs") ?? 60_000,
+    baselineTimeoutMs: own<number>("baselineTimeoutMs") ?? 15_000,
+    gateBudgetMs: own<number>("gateBudgetMs") ?? 90_000,
+  };
 }
