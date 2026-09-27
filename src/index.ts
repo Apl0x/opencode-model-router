@@ -594,7 +594,21 @@ const ModelRouterPlugin: Plugin = async (ctx: PluginInput) => {
                 producerText = "";
               }
 
-              const verification = await prepareVerification(changedFileStore, baselineID, producerSid, args.cwd);
+              const { gateBudgetMs } = resolveVerifyBudget(activeCfg);
+              // One deadline per gate invocation: every step inside the gate
+              // is bounded by it, and it is aborted (killing any spawned
+              // tree) when the gate's own withTimeout rejects. It exists
+              // before prepareVerification (T2 P0, QA-2.1-4), so the grade
+              // snapshot and the wait for a pending reference count against
+              // gateBudgetMs too.
+              const gateDeadline = createDeadline(gateBudgetMs);
+              let verification;
+              try {
+                verification = await prepareVerification(changedFileStore, baselineID, producerSid, args.cwd, gateDeadline);
+              } catch (error) {
+                gateDeadline.dispose();
+                throw error;
+              }
               const artefact = {
                 changedFiles: verification.changedFiles,
                 changeBaseline: verification.changeBaseline,
@@ -604,14 +618,9 @@ const ModelRouterPlugin: Plugin = async (ctx: PluginInput) => {
                 producerTier: tier,
               };
 
-              const { gateBudgetMs } = resolveVerifyBudget(activeCfg);
               // Grader sessions opened by THIS accept() call, and only those.
               const gateGraderSessions = new Set<string>();
               const completedFailures: string[] = [];
-              // One deadline per gate invocation: every step inside the gate
-              // is bounded by it, and it is aborted (killing any spawned
-              // tree) when the gate's own withTimeout rejects.
-              const gateDeadline = createDeadline(gateBudgetMs);
               const gateDeps = buildGateDeps(toolCtx?.sessionID, gateGraderSessions, verification, gateDeadline);
               gateDeps.deterministic.onFailure = reason => completedFailures.push(reason);
               let gateRes;
@@ -637,7 +646,8 @@ const ModelRouterPlugin: Plugin = async (ctx: PluginInput) => {
                         artefact,
                         gateDeps,
                       ),
-                      gateBudgetMs,
+                      // What preparation left of the gate budget (QA-2.1-4).
+                      gateDeadline.remaining(),
                       "verification gate",
                     );
               } catch (error) {
@@ -1102,7 +1112,20 @@ const ModelRouterPlugin: Plugin = async (ctx: PluginInput) => {
               description: input?.args?.description,
             });
             const dispatchID = `task:${input.sessionID}:${input.callID}`;
-            const verification = await prepareVerification(changedFileStore, dispatchID, childSessionID ?? "", input?.args?.cwd);
+            // Same bound as the delegate gate: one deadline per invocation,
+            // a withTimeout ceiling, and abort-on-reject so a hung check or
+            // grader cannot hold the after-hook (and its process tree) open.
+            // The deadline exists before prepareVerification (T2 P0,
+            // QA-2.1-4), so preparation counts against gateBudgetMs.
+            const { gateBudgetMs } = resolveVerifyBudget(cfg);
+            const gateDeadline = createDeadline(gateBudgetMs);
+            let verification;
+            try {
+              verification = await prepareVerification(changedFileStore, dispatchID, childSessionID ?? "", input?.args?.cwd, gateDeadline);
+            } catch (error) {
+              gateDeadline.dispose();
+              throw error;
+            }
             const artefact = {
               changedFiles: verification.changedFiles,
               changeBaseline: verification.changeBaseline,
@@ -1127,18 +1150,14 @@ const ModelRouterPlugin: Plugin = async (ctx: PluginInput) => {
               dod.kind === "checker" &&
               artefact.changedFiles.length === 0
             ) {
+              gateDeadline.dispose();
               if (childSessionID) changedFileStore.clear(childSessionID);
               changedFileStore.clear(dispatchID);
               return;
             }
 
-            // Same bound as the delegate gate: one deadline per invocation,
-            // a withTimeout ceiling, and abort-on-reject so a hung check or
-            // grader cannot hold the after-hook (and its process tree) open.
-            const { gateBudgetMs } = resolveVerifyBudget(cfg);
             const gateGraderSessions = new Set<string>();
             const completedFailures: string[] = [];
-            const gateDeadline = createDeadline(gateBudgetMs);
             const gateDeps = buildGateDeps(undefined, gateGraderSessions, verification, gateDeadline);
             gateDeps.deterministic.onFailure = reason => completedFailures.push(reason);
             let res;
@@ -1159,7 +1178,8 @@ const ModelRouterPlugin: Plugin = async (ctx: PluginInput) => {
                   artefact,
                   gateDeps,
                 ),
-                gateBudgetMs,
+                // What preparation left of the gate budget (QA-2.1-4).
+                gateDeadline.remaining(),
                 "verification gate",
               );
             } catch (error) {

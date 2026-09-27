@@ -23,7 +23,14 @@ import { invalidateConfigCache } from "../../src/router/config";
 // These tests isolate model/gate clocks. The temp directories are not Git
 // checkouts; model the unavailable snapshot without introducing real processes
 // into a fake-timer test (which would make grader start times wall-clock dependent).
-vi.mock("../../src/verify/tree", () => ({ snapshotTree: async () => undefined }));
+// `treeDelay.ms` > 0 makes the (fake-timer) snapshot take that long, to model a slow P0 preparation.
+const treeDelay = vi.hoisted(() => ({ ms: 0 }));
+vi.mock("../../src/verify/tree", () => ({
+  snapshotTree: () =>
+    treeDelay.ms > 0
+      ? new Promise<undefined>((resolve) => setTimeout(() => resolve(undefined), treeDelay.ms))
+      : Promise.resolve(undefined),
+}));
 // Record every gate deadline the plugin creates (the real implementation still runs).
 const createdDeadlines = vi.hoisted(() => [] as Array<{ budgetMs: number; signal: AbortSignal }>);
 vi.mock("../../src/verify/deterministic", async (importOriginal) => {
@@ -562,5 +569,49 @@ describe("delegate time-boxes (fake timers)", () => {
     expect(createdDeadlines).toHaveLength(1);
     expect(createdDeadlines[0]!.budgetMs).toBe(2000);
     expect(createdDeadlines[0]!.signal.aborted).toBe(true);
+  });
+
+  it("QA-2.1-4: preparation time counts against gateBudgetMs (native task gate)", async () => {
+    process.env.MODEL_ROUTER_ENFORCE = "1";
+    writeOverrides(dir, { gateBudgetMs: 2000, graderTimeoutMs: 600000, strictUnverifiable: true });
+    createdDeadlines.length = 0;
+    treeDelay.ms = 1500;
+    try {
+      const rec = newRecorder();
+      const hooks: any = await ModelRouterPlugin(
+        makeCtx(dir, rec, {
+          producer: () => Promise.resolve(textReply("unused")),
+          grader: () => never(),
+        }) as any,
+      );
+      const input = {
+        tool: "task",
+        sessionID: "orch",
+        callID: "call-prep",
+        args: { subagent_type: "fast", prompt: `Do the thing.\n${ACCEPTANCE}` },
+      };
+      const output = {
+        output: "<task_result>\nDONE: did the thing.\n</task_result>",
+        metadata: { sessionId: "child-prep" },
+      };
+
+      let settled = false;
+      const pending = hooks["tool.execute.after"](input, output).then(() => {
+        settled = true;
+      });
+      // The deadline exists before the 1500 ms snapshot starts ...
+      await vi.advanceTimersByTimeAsync(10);
+      expect(createdDeadlines).toHaveLength(1);
+      await vi.advanceTimersByTimeAsync(1989);
+      expect(settled).toBe(false);
+      // ... so the gate ends at 2000 ms from its start, not 1500 + 2000 ms.
+      await vi.advanceTimersByTimeAsync(100);
+      expect(settled).toBe(true);
+      await pending;
+      expect(output.output).toContain("verification gate timed out after 2000ms");
+      expect(createdDeadlines[0]!.signal.aborted).toBe(true);
+    } finally {
+      treeDelay.ms = 0;
+    }
   });
 });
