@@ -526,7 +526,7 @@ export function resolveRepoCommand(
 // -----------------------------------------------------------------------------------------------
 // T9. WAVE-1 HANDOFFS (verified against docs/qa/verification-resource-budget/phase-1.*.md)
 //
-//   1.1  wiring.ts `baselineTimeoutMs ?? 60000` and the two testBaseline === false reads ->
+//   1.1  wiring.ts `baselineTimeoutMs ?? 60000` and the two reads of the deprecated dispatch-time baseline key ->
 //        resolveVerifyBudget(cfg).baselineTimeoutMs / .failureRecheck (2.1.3). index.ts: drop
 //        the DEFAULT_GATE_BUDGET_MS import and read resolveVerifyBudget(cfg).gateBudgetMs
 //        (2.1.5c). timeout.ts:37 is outside 2.1's write-set and stays. tiers.json: remove
@@ -624,7 +624,7 @@ export function resolveRepoCommand(
 //   2.1.6b  test/unit/baseline-wiring.test.ts: read-only dispatch (no reference, no command);
 //           implementation dispatch (a reference, zero test commands); bounded capture wait (2 s
 //           -> 2 s, 20 s -> 5 s and still usable); contamination; a throwing capture; retry reuses
-//           the first reference; failureRecheck false (and testBaseline false): no capture, no
+//           the first reference; failureRecheck false (or the deprecated dispatch-time baseline key false): no capture, no
 //           worktree ever.
 //   2.1.6c  test/unit/tests-pass-pipeline.test.ts: the plan's deadline cases (5 s budget cuts a
 //           60 s slot wait; 8 s left skips the recheck; no step outlives the deadline, by seam
