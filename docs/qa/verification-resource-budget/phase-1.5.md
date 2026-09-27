@@ -553,3 +553,85 @@ fail with ENOENT, because `utimes` creates nothing. The remaining deletion path 
 - QA-1.5-10 (2.1 part): materialize only inside the S3 slot, and run GC before each materialize (which makes
   QA-1.5-11 matter more).
 - QA-1.5-4 (2.1 part): "reference vanished → unverifiable" (the backstop for the heartbeat residual above).
+
+## QA re-review (round 3)
+
+Scope: `git diff 09fe057..cb02f64` (f693e13, 7f6ff3e, 9a0c3a5, 9790b41, cb02f64). Line numbers refer to
+`src/verify/reference.ts` at cb02f64. `npx vitest run --maxWorkers=2 test/unit/reference.test.ts`: **45/45 passed**,
+100.57 s. Host: win32, Node v24.21.0, git 2.51.0.windows.1, Bun 1.3.14; system `core.autocrlf=true`, global `input`;
+Windows UI culture pt-BR, with `LANG`, `LC_ALL` and `LANGUAGE` unset. The installed Git for Windows ships no message
+catalogs (`mingw64/share/locale` is absent). The repros ran under `%TEMP%\omr-qa15r3`. They imported the real
+`reference.ts` (Node through type stripping, Bun natively), with repo and tmp paths that contain spaces and non-ASCII
+characters, and `tmpdir` injected in its 8.3 form. The ArgvSeam called `spawn` without a shell, like `runArgv` on
+origin/vrb/p12 (`src/verify/exec.ts:112-142`): env merged over `process.env`, `taskkill /T /F` on abort or timeout,
+resolved on `close`. The fallback ran against a real **git 2.32.0.windows.2** (MinGit). Every junction target was a
+sentinel dir inside the sandbox. `git worktree remove [--force]` ran against a reference with junctions only behind a
+guard that realpath'd every link into the sandbox, as the unit test does, and git refused both. Cleanup: 0 reparse
+points and 0 extra worktrees in the 17 sandbox repos, sandbox deleted with `fs.rmSync` (`gone true`), and no
+`omr-ref-*` or `omr-nohooks-*` dir in TEMP.
+
+### Resolutions: verification
+| Finding | Status | Evidence |
+|---|---|---|
+| QA-1.5-11 | **Verified** | `:995-1007` is the only retry loop; fs.rm runs with `maxRetries: 0` (`:1238`); the GC deadline is set at `:1870` and step 4 is skipped at `:1246-1249`. A READY-gated holder at depth 1/2/3 (Node): `dispose()` took **3 137 / 3 142 / 3 170 ms** (round 2: 11.1 s at depth 1, 66.2 s at depth 2). GC with the default budget while the dir was held took 3 270 / 3 252 / 3 255 ms (6 fs.rm attempts). GC with `timeoutMs: 1_500` took **850 / 862 / 846 ms** (4 attempts; the next 800 ms sleep would cross the deadline). GC after the release removed the dir in about 300 ms. Bun: 3 140 / 3 146 / 3 154 ms, GC 3 275 / 3 268 / 3 922 ms, and 835 / 836 / 1 028 ms with the 1.5 s budget. Sentinels `keep me` in every run. Documented residual (`:493-497`): once step 4 has started, its three git calls (list, unlock, remove) each keep `CLEANUP_GIT_TIMEOUT_MS`. |
+| QA-1.5-12 | **Verified** (GC edge → QA-1.5-15) | **S1** (Node and Bun): the add argv is `--detach --lock --reason <reason> <dir> <commit>` with env `{ LC_ALL: "C" }`. `.git/worktrees/<name>/locked` holds the reason plus `\n`. The porcelain line `locked <reason>` is byte-equal to `referenceLockReason(pid)`: git trims the file on read and C-quotes only control characters, `"`, `\` and non-ASCII bytes, none of which the reason contains. `remove`, `remove --force` (with and without LC_ALL) and `move` exit 128 with `cannot remove [move] a locked working tree, lock reason: …`. A second `lock` is refused, and `prune -n -v` prints nothing. The links stay links, and the sentinels read `keep me`. Dispose took 193 ms (Bun 186 ms) with no warnings: `worktree list`, then `unlock`, then `remove --force`. **Crash (S2):** an owner that exits without dispose (a Node process, and a Bun process) leaves the entry `locked <reason>`, and `git worktree list` shows `locked`. A GC from another process removed it in 307 / 377 ms, with the sentinels intact. **Source** (`builtin/worktree.c` v2.51.0): `add_worktree` writes `opts->keep_locked` into `locked` before the checkout, writes `_("initializing")` only without `--lock`, and unlinks `locked` when the add fails. `remove` and `move` refuse unless `force >= 2`. **git 2.32 (S8):** the first add exits 129 with ``error: unknown option `reason'`` and the dir still empty. The module logs one warning, the unlocked add succeeds, and the reference is exact with 2 links. Dispose is clean. An abort mid-checkout in fallback mode (3 s smudge filter) saw the lock `initializing`, returned `aborted`, and left no entry and no dir. **Locale:** not testable here, because there are no catalogs. With pt-BR UI, `LANG=pt_BR.UTF-8` or `LANGUAGE=pt_BR`, git's messages were still English. `LC_ALL=C` is passed on both add calls (recorded by the seam). |
+| QA-1.5-13 | **Verified** (gap → QA-1.5-16; cost → QA-1.5-17) | **S6a:** with `*.txt text=auto` and `git status` clean, the path `dir ü/sp ace テスト.txt` is flagged under its exact name, and the reference bytes are `"u\r\n"`. **S6b:** a seam replaced the `ls-files --eol -z` output with crafted records: paths containing a tab, a newline, spaces and non-ASCII characters, a path starting with `w/`, an empty `w/`, an `attr/` with a space (`text eol=crlf`), and a record without a tab. Exactly the four differing paths were flagged, the malformed record was skipped, and equal classes were not flagged. The parser (`:1025-1034`) matches `ls-files.c`'s `i/%-5s w/%-5s attr/%-17s\t` prefix. **S6c:** 150 differing paths give 100 path reasons plus `""`. **S9c:** an abort during step 7b returned `aborted`, and cleanup left nothing. |
+| QA-1.5-14 | **Verified** | `holdCwd` resolves only on the child's `READY` line. **S5:** 15/15 READY-gated holders blocked a following `fs.rm` (`EBUSY`), as did every held run in S4 (Node 3/3, Bun 3/3) and B1. The old spawn-event race did not recur in 15 spawn-gated runs (0 lost). It is timing-dependent, and the READY gate removes it by construction. |
+
+### Bun 1.3.14 (plugin runtime) vs Node
+| Check | Node v24.21.0 | Bun 1.3.14 |
+|---|---|---|
+| `fs.symlink(target, link, "junction")` | ok | ok |
+| `lstat(junction)`: `isSymbolicLink()` / `isDirectory()` | true / false | true / false |
+| `readlink` / `realpath` of a junction; `realpath` of the 8.3 tmp | target as given / long form, no `\\?\` prefix / long form | same |
+| `fs.unlink(junction)` | link gone, target `keep me` | same |
+| `fs.rm(junction, { recursive, force })` | link gone, target `keep me` | same |
+| `fs.rm(dir, { recursive, force })` with a junction at depth 2 | dir gone, target `keep me` | same |
+| One `fs.rm` attempt, cwd holder in `dir/packages/a` | `EBUSY`, syscall `rmdir`, on the held dir, 2 ms; the top-level file removed, the held subtree kept | `EBUSY`, syscall `rm`, on the top dir, 2 ms; the held dir's contents removed, the top-level file kept (different order, same code, which is in `TRANSIENT_FS_CODES`) |
+| `fs.rmdir(held dir)` | `EBUSY` | `EBUSY` |
+| `process.kill(pid, 0)`: own / parent / dead / System (4) / unused | ok / ok / `ESRCH` / `EPERM` / `ESRCH` | same codes (different message text) |
+| `AbortSignal.any` + `timeout`, `utimes` on a dir, `setInterval().unref`, `mkdir` EEXIST, `writeFile` `wx` EEXIST, `lstat` ENOENT | as expected | same |
+| Module end to end (S1): lock reason through `spawn` argv quoting, links, user remove refused, dispose | see QA-1.5-12 | identical results |
+| Held dir at depth 1/2/3 (S4), partial failures (S9) | see above | identical outcomes |
+| Heartbeat (B2): `heartbeatMs: 200`, dir backdated 120 min | — | mtime 63 ms old after 700 ms; the process exited with an undisposed handle (whole run 2.98 s); a Node GC then collected the leftover |
+
+The two Bun unknowns under OPEN RISKS are answered on win32: Bun's `fs.rm` does not follow junctions, and it reports
+`EBUSY` for a held dir. POSIX was not tested.
+
+### Data-loss review (priority #1)
+The paths exercised under both runtimes were: normal dispose; crash, then GC from another process; the fallback refused
+on a non-empty dir (S9a); a failure after the links exist (drift diff fails, S9b); an abort in step 7b (S9c); `worktree
+unlock` failing in dispose (S9d: dir gone, entry left locked, collected by the same process's next GC); `worktree list`
+failing in dispose (S9e: `remove --force` on the locked entry fails harmlessly, then GC collects it); and a holder at
+depth 1 to 3 (S4). In every case the sentinels read `keep me` and the user's `.git/index` was byte-identical (S9). After
+the last GC, no omr entry and no dir remained. The lock is lifted only after lstat shows the dir is gone (`:1250-1267`).
+Git's `add_worktree` registers `atexit(remove_junk)`, which recursively deletes the worktree dir after a failed add.
+The dir holds no link at that point, because links are created after the add, so this is no exposure. Inherent residual,
+not a finding: git's refusal message ends with `use 'remove -f -f' to override or unlock first`, and `-f -f` would
+bypass the lock and empty the junction targets. The reason text itself says `do not force-remove`.
+
+### New findings
+| ID | Severity | Evidence | Fix |
+|---|---|---|---|
+| QA-1.5-15 | Low | **GC never collects a locked omr entry whose dir is missing while the PID in its name is alive (PID reuse).** `:1925`: `collect = released(keys) \|\| !isAlive(pid) \|\| (stats !== undefined && age > 1 h)`. For a missing dir and an alive PID, nothing ever becomes true, and there is no age bound (a dir that exists ages out through its heartbeat). **S3**, with the GC process's own PID standing in for a reused PID: locked omr, alive, dir missing → **kept**, both at `now` and at `now + 30 days`. Controls: unlocked, alive, dir missing → removed; locked omr, dead, dir missing → removed; locked omr, alive, dir present with a 2 h old heartbeat → removed. Ways to get there: an owner killed between its fs.rm and its unlock; a dispose whose step 4 fails (S9d/S9e) by an owner that exits before its own next GC; or a temp cleaner that deletes a crashed leftover. Because of the lock, `git worktree prune` never drops the entry either. It stays as a locked entry in the user's `git worktree list` until that unrelated process exits. There is no data risk, since the dir is gone. | Collect a missing-dir entry with the omr reason whatever the owner's liveness. The race with an alive owner between its fs.rm and its unlock is benign: both sides only unlock or remove an entry whose dir is gone, and the loser logs a warning (S9d/S9e show that path is harmless). Update section 11 step 2. Add a GC test: omr-locked entry, dir missing, `isAlive` true → removed. |
+| QA-1.5-16 | Medium | **A clean file that is edited after capture skips every conversion check.** `:1780` excludes the drift set (`changed`) from step 7b, and `ref.tracked` holds only paths that were dirty at capture. The files the producer edits after dispatch, which is the usual recheck situation, are exactly the drift set. **S6d:** `.gitattributes` `a.txt text eol=crlf`, and `a.txt` = `"a0\n"` with `git status` clean at dispatch (`tracked` = {}). The producer edits `a.txt` between capture and materialize. The reference's `a.txt` is `"a0\r\n"` (`ls-files --eol` at dir: `i/lf w/crlf attr/text eol=crlf`), yet the result is **`exact: true, inexactReasons: []`**. A test at the reference that reads `a.txt` sees CRLF where the dispatch tree had LF. A failure that the reference itself causes can then excuse one the producer introduced (§1.5-7). With `* text=auto` on win32, other clean files usually flag the reference anyway. The gap is exact when the attribute matches only producer-edited files. | For a path in `changed` that is not in `ref.tracked`, add `checkout-conversion` when the reference's own `w/` class differs from its `i/` class: the checkout converted it, and the dispatch bytes are unknown. `parseEolList` must keep `i/` as well. Add a test: a clean file under `eol=crlf`, edited between capture and materialize → inexact for that path. |
+| QA-1.5-17 | Low | **Step 7b reads the whole tree twice, even when no conversion is configured.** `git ls-files --eol` reads every blob and every working file. **S7**, 20 000 tracked files (~0.9 KB each): each call took **3.7-4.2 s** (plain `ls-files -z`: 69 ms). Step 7b took 7.6-7.8 s of a 20.0-22.7 s materialize, and 15 s of budget remained when it started. This was the same with **no attributes at all**, where no conversion is possible. With 2 000 files plus 200 MB of binaries: 1.9 s per call, so step 7b took 3.9 s of 6.1 s. Bigger or binary-heavy trees exhaust the 30 s budget. The step then adds `""`, so S2 never excuses in such repos. That outcome is safe, but it makes S2 useless there. | Limit the listing to paths that can convert: `git ls-files --eol -z -- ':(attr:text)' ':(attr:text=auto)' ':(attr:eol=crlf)' ':(attr:eol=lf)'` (also `crlf` if the legacy attribute should count). Measured: **95 ms** on the attribute-free 20k repo (0 records) against 4 228 ms, and the same 20 001 records on the `* text=auto` repo. Attr pathspec magic needs git >= 2.13. |
+
+Open non-deferred findings: QA-1.5-15 (Low), QA-1.5-16 (Medium), QA-1.5-17 (Low). Phase 1.5 QA is **not** clean.
+
+### Checked with no finding
+- `runArgv` (origin/vrb/p12 `src/verify/exec.ts:112-142`) spawns argv without a shell and merges env over
+  `process.env`. The seam used here does the same, so the reason reaches git as a single argv element under Node and
+  under Bun (S1).
+- `ADD_LOCK_UNSUPPORTED` (`:834`) matches real git 2.32 stderr. git 2.51 prints unknown options in the same form. A
+  false match would need `unknown option … reason/lock` in stderr from another cause. Even then, the dir-empty check
+  aborts instead of retrying (S9a).
+- `withRetry`: at most 5 retries (about 3.1 s of backoff), and the deadline is checked before each sleep.
+- Step 7b's 100-path cap and its `""` fallback (S6c, and the unit test with a failing `--eol` call).
+
+### Deferred by plan (unchanged)
+- QA-1.5-7: the excuse policy for ignored inputs (2.1 wiring).
+- QA-1.5-10 (2.1 part): materialize only inside the S3 slot, and run GC before each materialize.
+- QA-1.5-4 (2.1 part): "reference vanished → unverifiable".
+- POSIX: the 1.5.3 key safety test on POSIX CI (dir symlinks, `fs.rm`, `git worktree remove`). Not testable on this host.
+- Bun smoke (3.1): the win32 answers are above. POSIX Bun and the plugin's real load path remain with 3.1.
