@@ -647,3 +647,107 @@ Checked, no finding:
 Status: **not clean.** Open: QA-1.3-29 and QA-1.3-33 (major); QA-1.3-30, -31, -32, -34 and -37 (minor); QA-1.3-35 and -36 (nit).
 
 Cleanup: the 5 junctions in `<W>` (`vlink` and the `node_modules`/`.venv` links into `D:\git\omr-p13` and `%TEMP%\omr-spikeC`) were removed with `rmdir` first. The check found 0 reparse points left, and then `<W>` was deleted, including the uv venvs. The link targets are intact. `%TEMP%\bun-node-0d9b296af`, which this review's `bun --bun run` probe created at 02:00, was removed. The check afterwards found 0 `omr-verify-*` files in `%TEMP%` and no processes referring to `omr-qa13r3`. The Spike C fixtures were not modified.
+
+### Resolutions (round 3)
+
+Gates after the last fix: `npx vitest run --maxWorkers=2 --coverage --coverage.include=src/verify/runner.ts test/unit/runner.test.ts test/unit/deterministic.test.ts`
+gave `Test Files 2 passed (2)`, `Tests 680 passed (680)`, and runner.ts coverage of 99.51% statements, 97.78% branches (1632/1669), 100% functions
+and 99.86% lines. `npm run typecheck` was clean. runner.ts still imports no `child_process`.
+Contract changes are additive: `S6Code` gains `config-too-large`; `PlannerFs` gains the optional `stat` (new exported `FileStat`);
+`DetectedRunner` and `PytestFacts` gain the optional `pythonFiles`; `CONFIG_SIZE_LIMIT` and `DEFAULT_PYTHON_FILES` are exported.
+2.1 should pass `stat` as `fs.promises.stat(p, { bigint: true })` mapped to `{ isFile, size, dev, ino }`, next to the native realpath.
+Real-runner checks: runner.ts (and the a43b87e copy, as "before") was driven under bun 1.3.14 from `%TEMP%\omr-fix13r3`. The planners used the
+real fs (native realpath, bigint stat) and a search seam backed by `git ls-files` / `git grep`. Specs were spawned with `spawnSync(file, args,
+{shell: false})`, and every run went through `readResult`. Runners: pytest 9.1.1 + xdist 3.8.0 (the Spike C venv, by junction), jest 30.5.2 and
+vitest 4.1.11 (Spike C `node_modules`, by junction), npm 12.0.2. Cleanup: the 7 junctions were removed with `rmdir` first (0 reparse points
+left), then the directory; the Spike C venv and `node_modules` are intact. The `%TEMP%\bun-node-0d9b296af` that the `bun --bun run` probe
+created was removed. The final check found 0 `omr-verify-*` files, 0 `bun-node-*` directories and no process referring to the scratch
+directory.
+
+- QA-1.3-29 Resolution: 5920ea5 — The vitest/jest setup-file trigger is a superset of 1.6's risk.ts rule again (G.7). By name, case-insensitive,
+  with a JS/TS extension, it covers `*.setup.*`, every risk.ts basename (`setup-jest`, `jest-setup`, `vitest-setup` and `global-teardown` included),
+  `(jest|vitest|test|tests)[._-]?(setup|teardown)*`, `setup(Tests|Jest|Vitest|Env|AfterEnv|Files|FilesAfterEnv)` and
+  `global[._-]?(setup|teardown)*`. A bare `setup.*` or `teardown.*` counts below a `test`, `tests`, `spec`, `specs`, `testing`, `jest`, `vitest` or
+  `__tests__` directory. Test files stay inputs; `src/setup.ts`, `SetupWizard.tsx` and `src/setupEnvironment.ts` stay application code. By
+  reference (G.7a), the string literals of `setupFiles`, `setupFilesAfterEnv`, `globalSetup` and `globalTeardown` are triggers too. They are read
+  from `vitest.config.*`/`vite.config.*` or `jest.config.*`/package.json (`"jest"` key), in every directory from runnerCwd up to gitRoot and
+  in the `--config` file, and resolved against the config's directory, runnerCwd or `<rootDir>`. A reference without an extension also
+  matches `<ref>.<ext>` and `<ref>/index.<ext>`. The section P entry that e7546e2 added is gone. The only thing left is a setup file under an
+  unconventional name that a config names through a non-literal expression (P, forceRerunTriggers entry). Real jest 30.5.2:
+  `setupFilesAfterEnv: ['<rootDir>/<f>']` in a committed jest.config.js, and `<f>` changed to `throw new Error('setup broke')`, for `<f>` =
+  `jest-setup.js`, `test/setup.js`, `jest.setupAfterEnv.js` and the unconventional `src/testing/bootstrap.js`. Before (a43b87e), each gave
+  `exit=0 total=0 failingIds=[] collectionError=false complete=true`, a false pass. After, each gave
+  `{"unverifiable":true,"code":"config-changed","reason":"config file changed: <f>"}`. The user's own jest gave `exit=1 ● Test suite failed
+  to run … setup broke` for all four.
+- QA-1.3-30 Resolution: 8b59bd6 — F.1 step 3 skips Bun's temporary node three ways: a PATH directory named `bun-node-<hex>`, a realpath to
+  `bun`/`bun.exe` (posix symlink), or the same `dev`+`ino` as `host.execPath` through the new optional `PlannerFs.stat` (the win32 hard link).
+  An ino of 0 proves nothing. An `execPath` inside a `bun-node-<hex>` directory is not node even when named `node.exe` (`bun --bun run`).
+  Real check under `bun --bun run`, where `fsutil hardlink list` showed `bun-node-0d9b296af\node.exe` as a link of `.bun\bin\bun.exe`: before,
+  `spec.file=C:\Users\MARQUI~1\AppData\Local\Temp\bun-node-0d9b296af\node.exe`; after, `spec.file=C:\Users\Marquinho\scoop\apps\nodejs-lts\current\node.exe`.
+  A hard link to bun.exe named `<scratch>\hl\node.exe`, first on PATH, was taken before and skipped by identity after.
+- QA-1.3-31 Resolution: b846870 — ini lines split the way iniconfig splits them: on the first `=` unless the name before it contains `:`,
+  otherwise on the first `:`, with whitespace optional. The TOML reader is now one pass over the lines. It skips every value whole (strings,
+  multi-line strings, nested arrays, inline tables), so a header inside a string is not a header. It compares header and key parts decoded,
+  so `"add\u006fpts"` and `[tool."py\u0074est".ini_options]` are plain names and are read. A quoted `"addopts"` under the right table is read
+  too, where round 2 made it S6. A quoted part whose escapes do not decode is S6 `unsupported pytest argument "<raw key>" in <file>`. So is
+  a second occurrence of a key in any pytest table. Dotted keys, inline tables and array tables stay S6 as in QA-1.3-20. Real pytest 9.1.1
+  with the `WORKERS<=2` probe: `addopts:-n 3` in pytest.ini gave `exit=1 failingIds=["tests/test_workers.py::test_workers"]` before and
+  `exit=0 total=1 complete=true` after. `[tool."py\u0074est".ini_options]` + `"add\u006fpts" = "-n 3"` gave the same pair. The user's own pytest
+  failed with `WORKERS=3` both times. All six QA shapes are unit tests.
+- QA-1.3-32 Resolution: da34ecb — `.npmrc` keys are read the way npm's `ini` parser reads them: a BOM, quotes around the key (JSON-decoded,
+  so `"work\u0073pace"` is `workspace`), a key without `=` (`workspaces` alone is true), an unquoted key cut at the first unescaped `;` or
+  `#`, and a trailing `[]`. Real npm 12.0.2 reported an active workspace (`ENOWORKSPACES` from `npm config get`) for `"work\u0073pace"=`,
+  `workspace;note=`, bare `workspaces`, a BOM before `workspace=`, and `'workspace' =`. It reported none for `work\;space=`, and the parser
+  agrees on all six. The workspace check also runs for the `npx` launcher, from runnerCwd, in commands and inside any package script. npx is
+  npm exec, which honours the same config and runs in the workspace's directory (QA evidence). `npx vitest run` with `workspace=` is now
+  S6 `unsupported command "npm workspace" in <.npmrc>`, where it was a false pass. `vitest run`, `pnpm exec vitest` and `yarn test` still plan.
+- QA-1.3-33 Resolution: b846870 — pytest's `python_files` is read from the configs every release line picks. It is also read from the
+  common ancestor of the path arguments, and from every `-o python_files=` in the command, addopts and `PYTEST_ADDOPTS`. The result is the
+  union: a line whose config sets none, or that finds no config, adds the default `test_*.py *_test.py` (`DetectedRunner.pythonFiles`).
+  Changed `.py` files are classified with pytest's `fnmatch_ex` rule, using a linear-time fnmatch matcher: basename for a pattern without a
+  separator, whole path otherwise, case-folded on win32. The `findByName` names come from the basename patterns with exactly one `*`. A
+  literal such as `tests.py` names nothing and skips the search. The stem-search globs follow the patterns, and content hits are
+  re-checked against them. An unreadable value (not a string or array of strings, an unterminated quote, a dotted or inline spelling) is S6
+  `unsupported pytest argument "python_files" in <file>`, unless the command line overrides it with `-o`. Real pytest 9.1.1 with the
+  pytest-django setting `python_files = tests.py test_*.py *_tests.py` and `pkg/tests.py` broken: before,
+  `{"noAffected":true,"note":"no affected tests: no test files map to the changed modules"}`; after, the inputs were `pkg/str_tests.py` and
+  `pkg/tests.py`, with `exit=1 total=2 failingIds=["pkg/tests.py::test_up"] complete=true`. The user's own pytest gave `1 failed, 1 passed`.
+  **Plan amendment to section 1.5-3 (plan L279):** the affected set is the changed test files by pytest's `python_files` (default
+  `test_*.py`/`*_test.py`), plus the files `python_files` names for a changed module's stem. It is not the fixed `test_<stem>.py`/`<stem>_test.py`
+  pair. 3.2 must add a pytest-django fixture (`python_files = tests.py test_*.py *_tests.py`).
+- QA-1.3-34 Resolution: b846870 — Every config file the planners parse goes through one per-call cache: pytest configs, `.npmrc` (da34ecb),
+  and the vitest/jest/Playwright configs (5920ea5). Each file is read once and parsed once per reading. None is parsed above
+  `CONFIG_SIZE_LIMIT` (1 MiB): beyond it, S6 `config-too-large`, "config file too large to read: <path> (limit 1048576 bytes)". That holds
+  even for a file pytest would skip after reading it, such as a pyproject.toml without a pytest table in a parent directory. With
+  `PlannerFs.stat` the size is checked before the read. A 1 MiB pyproject.toml of `a=1` lines (the worst line shape) plans in well under
+  3 s under coverage (unit test). Real 100 MB pyproject.toml with 1 KB lines, `planStaticScoping` under bun: before 617 ms (RSS 276 MB);
+  after 88 ms without stat and 6 ms with stat (RSS 148 MB), both S6 `config-too-large`. A unit test checks that detection, the spec-time
+  lookup and the three release lines read the file once.
+- QA-1.3-35 Resolution: 34fd11d — readResult computes cwd-relative ids by prefix when a path lies plainly below the base: the same prefix
+  with either separator, case-folded on win32, and a tail with no empty, `.` or `..` segment. That is exactly what `P.relative` returns
+  there; anything else still uses `P.relative`. parseJunit relativises each input once and decodes attributes only for failing and
+  collection cases. Under bun 1.3.14 with win32 paths, 700 inputs × 20000 failing cases went from 1150 ms to 155 ms, and 200000 passing
+  cases from 645 ms to 67 ms, with identical results.
+- QA-1.3-36 Resolution: 8b59bd6 — On win32, PATH entries (node, pytest, uv) and `host.nodePath` need a drive (`C:\`) or a UNC host. A
+  root-relative `\Users\…` entry is skipped; as a `nodePath` it is S6 `node path is not absolute`. With `stat`, a directory named `node.exe`
+  or `pytest.exe` (PATH or `.venv`) is skipped, a `nodePath` must be an existing file (S6 `node path is not a file: <p>`), and an `execPath`
+  named node must exist before it is used. Without `stat` behaviour is unchanged (fail-closed at spawn). Real fs: a directory
+  `<scratch>\nd\node.exe` first on PATH, and a drive-less `\Users\…\nx` holding a real node.exe, were both returned before and both skipped
+  after (`spec.file=…\nodejs-lts\current\node.exe`).
+- QA-1.3-37 Resolution: 5920ea5 — Fixed rather than accepted. A changed test file is not an input, with the note `playwright test file
+  excluded by the <runner> config, not run: <rel>`, only when both of these hold (G.8a). First, it lies in a Playwright testDir:
+  `playwright.config.*` from runnerCwd up to gitRoot, where testDir is its literal, the config's directory when absent, or `<dir>/e2e` when
+  not a literal. Second, the runner's own config statically excludes it: vitest `exclude`/`--exclude` of the forms `X/**`, `X/**/*` or either
+  after `**/`, or a jest `testPathIgnorePatterns` literal made only of word characters and `. / : -` that is a substring of the path. The
+  exclusion is read only from the one file the runner loads: the last `--config`, else runnerCwd's single `vitest.config.*` (before
+  `vite.config.*`), or `jest.config.*` (before package.json). It is never read with a `projects`/`workspace` key, a
+  `vitest.workspace`/`vitest.projects` file, vitest `--root`/`--dir`, or jest `--rootDir`/`--testPathIgnorePatterns`. Anything else stays
+  an input, and the zero-test guard keeps it unverifiable. The heuristic in the dispatch (testDir alone) was not taken: a testDir shared
+  with vitest and split by a Playwright `testMatch` would drop real vitest tests (a false pass). Residual (P): an `X/**` literal under
+  `coverage.exclude` also counts, but only for a file inside a Playwright testDir. Real vitest 4.1.11, create-vue shape
+  (`exclude: [...configDefaults.exclude, 'e2e/**']`, playwright `testDir: './e2e'`): before, `exit=0 total=0 complete=false note=vitest ran
+  no tests although a test file was passed`; after, `{"noAffected":true,…}`, and with `src/math.js` also changed, `inputs=[src/math.js]`,
+  `exit=0 total=1 complete=true`. The user's own `vitest run` gave `Test Files 1 passed (1)`.
+- QA-1.3-16, QA-1.3-17: deferred by plan to 2.1, unchanged. 3.1 and 3.2 (additions to the round-3 list): a jest fixture with
+  `setupFilesAfterEnv` under a conventional and an unconventional name, the six QA-1.3-31 shapes, the pytest-django `python_files` fixture,
+  the create-vue Playwright layout, and one spec launched from inside opencode under Bun, to check the PATH node (QA-1.3-30).
