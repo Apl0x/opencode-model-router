@@ -819,3 +819,68 @@ POSIX smoke (3.1). Accepted open risk: QA-1.5-19.
 - Resolution: f460311 — QA-1.5-23: `runGit` no longer searches the whole stderr for the marker. `stdoutTruncated` walks the trailing block of whole-line notes that p12's `runArgv` appends after git's stderr (`/^\[(stdout|stderr) truncated at (\d+) chars\]$/`). It honours the stdout note only there, and only when `stdout.length` is `n` or `n-1` (p12 drops half of a surrogate pair). The `-z` trailing-NUL check is unchanged. Regression test (real git): a committed `[stdout truncated at 1 chars].txt` under `*.txt text eol=crlf`, dirtied with LF before capture and again before materialize. Capture returns a reference, and materialize reports the path. On f460311 with the old `reference.ts`, the test fails. Both QA-1.5-21 truncation variants still pass.
 - Resolution: 7b0d45f — QA-1.5-24: section 3 step 2 and OPEN RISKS now record the scale limit. At the default 10 M-char cap, capture's `ls-files --stage` overflows first (~95-150k tracked paths), so such a repository gets no reference (fail closed → unverifiable recheck). The `""` fallback of step 7b applies only when the `--eol` listing alone overflows. The QA-1.5-21 resolution text above is corrected to match. A per-call `maxBuffer` for the listing calls is left to 2.1.
 - Verification: `npx vitest run --maxWorkers=2 test/unit/reference.test.ts` on 7b0d45f: **54/54 passed** (120.4 s). `npm run typecheck` clean. TEMP has no `omr-ref-*` or `omr-nohooks-*` dirs.
+
+## QA re-review (round 7)
+
+Scope: the round-6 fixes f460311 (QA-1.5-23), 7b0d45f (QA-1.5-24) and a6c7cb9 (resolution notes), plus every defect
+that `git diff 0424ab7..a6c7cb9` introduces (`src/verify/reference.ts`, `test/unit/reference.test.ts`, this file).
+Code cleared in rounds 1-6 was not re-audited. Host: win32, Git 2.51.0.windows.1, Node 24.21.0.
+
+Method: `exec.ts` and `types.ts` were taken from `vrb/p12` at 2f5089d with `git show` into `%TEMP%\omr-qa15r7`
+(blobs `6372caa`, `e5b2e2f`; nothing in omr-p12 was modified). Node scratch scripts, using Node's type stripping,
+fed results of the **real p12 `runArgv`** into `TRUNCATION_NOTE` + `stdoutTruncated`. Both were extracted verbatim at
+run time from `git show HEAD:src/verify/reference.ts` (a6c7cb9). The 0424ab7 regex
+(`/\[stdout truncated at \d+ chars\]/`, "old" below) was evaluated on the same results. The children were
+`node -e` with controlled stdout/stderr (S*), plus real git in two scratch repos with `* text eol=crlf` and LF
+content (G*, F*).
+
+### p12 output format (2f5089d), as read
+- `capture()` (`exec.ts:397-417`): when a stream is cut, it keeps `limit` chars, or `limit-1` if the last kept char
+  is a high surrogate. So a cut stdout is always `n` or `n-1` chars long. The streams are decoded with `setEncoding("utf8")`,
+  so a chunk never ends in half a pair.
+- `finish` (`exec.ts:245-255`) builds stderr in this order: git's stderr (possibly cut mid-line), then `String(error)`,
+  then each note on its own line. A `\n` is inserted if stderr does not already end in one, and every note ends in
+  `\n`. The stdout and stderr truncation notes are pushed last (`:252-253`), after every other note
+  (`low priority not applied`, `orphan sweep …`, `killed …`, `output streams force-closed …`, `:214-322`). Notes
+  pushed after `settled` are never appended. So the truncation notes are always the final one or two lines, LF-only,
+  whatever line endings git uses.
+- `ExecOptions` at 2f5089d still has no `maxBuffer`, so the seam always prints the integer default
+  (`10485760`).
+
+### Resolutions: verification
+| Finding | Status | Evidence |
+|---|---|---|
+| QA-1.5-23 | **Verified** | **Code:** `stdoutTruncated` (`:1128-1140`) matches the resolution. It splits on `\n`, drops one trailing empty element, walks up while lines match `TRUNCATION_NOTE` (`:1119`, anchored, no `m` flag, so a trailing `\r` never matches), and the first stdout note decides via `length ∈ {n, n-1}`. D8 (`:618-624`) and the `runGit` JSDoc (`:1142-1149`) describe this correctly. `runGit` (`:1161-1163`) is otherwise unchanged. **A real truncation is never suppressed** (the false-exact direction). The format above puts the stdout note in the trailing block, with at most the stderr note after it. Real runs, all `true`: S1 CRLF git stderr → `"warn\r\n[stdout truncated at 10 chars]\n"`. S2 a lone trailing CR → `"warn\r\n[stdout …]\n"`. S3 no final newline. S10 both streams cut, CRLF stderr cut mid-line → `"x\r\nx\r\nx\r\nx\n[stdout truncated at 10 chars]\n[stderr truncated at 10 chars]\n"`. G1 `ls-files -z` at cap 50 with empty git stderr. **G2** the step-7 `diff --name-only -z --no-renames --no-ext-diff <commit> --` with 40 dirty files at cap 50 → `"warning: in the working copy of 'f00.txt', LF will\n[stdout truncated at 50 chars]\n[stderr truncated at 50 chars]\n"`. **G3** `ls-files --stage` (not `-z`, so the note is its only guard) with `GIT_TRACE=1` at cap 1000: two trace lines are kept and only the stdout note is present. S6′/S6″/S7′ have a whole forged note as the child's last stderr line (`[stdout truncated at 3 chars]`, `[stdout truncated at 40 chars]\r\n`, `[stderr truncated at 99 chars]`), followed by a real cut at 40. S8 surrogates at cap 11 → length 10, and at cap 12 → length 12. S12 cap 0. Git's stderr in G2-G4 contained no `\r`. **Forging from the repository:** a committed file named exactly `[stdout truncated at 31 chars]` (a name the length check cannot help with), dirtied with LF. The step-7 listing is then exactly 31 chars both with and without `-z`, under `core.quotePath=true` and `false`, and `stash create` was run too. Git puts the name inside `warning: in the working copy of '…', LF will be replaced by CRLF the next time Git touches it`, so the last line is never a bare note. Result: new `false`, old `true` in all 5 runs. So the scenario of the new test fails on the old predicate, as the resolution says (the mutation build itself was not repeated). A forged note counts only if the child's last stderr line is exactly the note, LF-terminated, and the stdout length matches: S5 → `true`, S11 (a stderr cut right after a forged line, length match) → `true`, S5b (length 12 vs 10) → `false`, S4 (CRLF-terminated) → `false`, S7″ (two forged notes, length mismatch) → `false`. Each of these is a failed call, i.e. fail-closed (no reference, `abandon`, or `""`), never exact. Git's path-quoting messages end in fixed text after the quoted path, so a newline in a file name (POSIX) cannot make a bare note the last line. This is reasoned from the message format and was not run on POSIX. Controls: S9 (only stderr cut) → `false`, S14 (no cut) → `false`. The test at `test/unit/reference.test.ts:839-857` passes on a6c7cb9. |
+| QA-1.5-24 | **Verified** (one wrong detail, inherited from the round-6 finding text → QA-1.5-26) | Section 3 step 2 (`:145-150`), OPEN RISKS (`:663-670`) and the corrected QA-1.5-21 resolution agree with each other and with the code. Capture's `ls-files --stage` (`:1394`, no `-z`) fails as a whole, and capture's `git` helper returns undefined on code -1 (round 6). **Measured per-entry widths** (header + terminator, 40 tracked files, 4 attribute settings): `ls-files --stage -z` = **51** in every case. Without `-z`, as capture calls it, the path is quoted, so an entry is at least that long. `ls-files --eol -z` = **40**, or **41** under `text=auto eol=crlf`. 10,485,760 / (51+60) = 94.5k and 10,485,760 / (51+20) = 147.7k, so "~95-150k (path length 60-20)" holds for SHA-1. The 75 + path figure for SHA-256 is right (64-hex id). |
+
+### New findings
+| ID | Severity | Evidence | Fix |
+|---|---|---|---|
+| QA-1.5-25 | Info (latent; deferred to 2.1) | **A non-integer per-call `maxBuffer` would silently disable truncation detection for the non-`-z` calls.** The new OPEN RISKS entry (`:669-670`) suggests that 2.1 pass a per-call `maxBuffer` through the seam. p12 prints the limit with `${limit}` without rounding (`exec.ts:164`, `:252`). A computed value such as `entries * 1.5` therefore prints as `[stdout truncated at 10.5 chars]`, which `(\d+)` does not match. S13 (real `runArgv`, cap 10.5): stdout is cut to 10 chars, and `stdoutTruncated` returns **`false`** (the old regex also misses it). The `-z` NUL check still catches most cuts of `-z` listings. But capture's `ls-files --stage` (`:1394`), `stash create` and `rev-parse` are not `-z`, and the note is their only guard: a cut `--stage` listing would be read as complete, so the gitlink check would run on part of the index. Unreachable today, because `ExecOptions` at 2f5089d has no `maxBuffer`. Round 6 recorded this case as unreachable, but the new text recommends the change that makes it reachable. | When 2.1 adds a per-call `maxBuffer`, pass integers only (`Math.floor` at the seam or at the call site), or widen the note pattern. Put the constraint next to the suggestion in OPEN RISKS. Owner: 2.1. |
+| QA-1.5-26 | Info (docs; non-blocking) | **One of the two listed causes of an `--eol`-only overflow cannot occur.** `:668-669` says the `""` fallback applies when the `--eol` listing alone overflows, due to "an index grown after capture, long `attr/` fields". Git pads `attr/` to 17 chars, and the longest value, `text=auto eol=crlf`, is 18. So an `--eol -z` entry costs 40-41 + path, against 51 + path (or more, with quoting) for `--stage` (measured above). For the same index `--eol` is always at least 10 chars per entry shorter. Only an index that grew between capture and materialize reaches the `""` fallback first. The wrong clause comes from the round-6 QA-1.5-24 text above ("or to long `attr/` fields"), and 7b0d45f copied it. The ~95-150k range is also the SHA-1 range; under SHA-256 (75 + path) it is ~78-110k. | Drop "long `attr/` fields" from `:669`. Optionally add the SHA-256 range. |
+
+### Checked with no finding
+- `lines[i] ?? ""`, `Number(note[2])`, and the default `10485760` against `(\d+)`: correct. A blank line after the
+  notes would stop the walk, but p12 never emits one (`exec.ts:254`).
+- The `-z` NUL check and `cut && result.code === 0` are unchanged. A non-zero code is already a failure.
+- Test-coverage nit, not a finding: the QA-1.5-23 test uses `N = 1`, which differs from every stdout length in its
+  scenario. So it would still pass if either the anchoring or the length check were removed alone. F1/F2 above
+  (N = the listing's own length, 31) show that the anchoring alone rejects git's warnings. Both mechanisms only
+  affect the fail-closed direction.
+- Nit: the `runGit` JSDoc line `:1148` is 92 chars, past the ~80-char wrap of the rest of the block.
+- Scratch expectation error, recorded for transparency. The first G4 run (`stash create`, cap 20) expected `false`,
+  but the 41-char stash id was cut too, so both notes were present and `true` was correct. The re-run at cap 60
+  kept stdout whole (41) and returned `false`.
+
+### Verification and cleanup
+- `npx vitest run --maxWorkers=2 test/unit/reference.test.ts` (a6c7cb9): **54/54 passed** (140.6 s).
+  `npm run typecheck`: exit 0, no diagnostics.
+- Scratch `%TEMP%\omr-qa15r7`: no junction was created, because Node ran `exec.ts` directly (0 reparse points
+  before deletion). It was then deleted (`scratch exists: False`). TEMP has no `omr-ref-*` or `omr-nohooks-*`
+  dirs, and `git worktree list` shows the 10 pre-existing worktrees.
+
+Open non-deferred findings: none. QA-1.5-26 is an Info doc correction and is optional. Phase 1.5 QA is **clean**.
+
+Deferred by plan: QA-1.5-7; QA-1.5-10 and QA-1.5-4 (2.1 parts); QA-1.5-25 (2.1, with the per-call `maxBuffer`);
+the POSIX key safety test and the Bun POSIX smoke (3.1). Accepted open risk: QA-1.5-19.
+
