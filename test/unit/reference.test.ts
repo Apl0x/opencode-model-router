@@ -580,6 +580,48 @@ describe("materialize / dispose", { timeout: 60_000 }, () => {
     }
   });
 
+  it("QA-1.5-8: neither the repository's nor a committed `.omr-no-hooks` post-checkout hook runs during materialize", async () => {
+    const marker = join(base, "hook-ran.txt");
+    const hook = (tag: string) => `#!/bin/sh\necho ${tag} >> "$OMR_HOOK_MARKER"\n`;
+    await fsp.mkdir(join(repo, ".omr-no-hooks"));
+    await fsp.writeFile(join(repo, ".omr-no-hooks", "post-checkout"), hook("committed"), { mode: 0o755 });
+    await git(repo, "add", ".omr-no-hooks/post-checkout");
+    await git(repo, "update-index", "--chmod=+x", ".omr-no-hooks/post-checkout");
+    await git(repo, "commit", "-q", "-m", "hook");
+    await fsp.mkdir(join(repo, ".git", "hooks"), { recursive: true });
+    await fsp.writeFile(join(repo, ".git", "hooks", "post-checkout"), hook("repo"), { mode: 0o755 });
+    const withMarker: CaptureDeps["argv"] = (file, args, opts) =>
+      argv(file, args, { ...opts, env: { ...opts?.env, OMR_HOOK_MARKER: marker } });
+    const addControl = async (wt: string, ...config: string[]) => {
+      const result = await withMarker("git", [...config, "worktree", "add", "-q", "--detach", wt, "HEAD"], { cwd: repo, timeoutMs: 30_000 });
+      expect(result.code).toBe(0);
+      await git(repo, "worktree", "remove", "--force", wt);
+    };
+    // Controls: hooks do run here; the repository's hook, and the committed one under the former D9 path.
+    await addControl(join(base, "control repo"));
+    const formerD9 = join(base, "control d9");
+    await addControl(formerD9, "-c", `core.hooksPath=${join(formerD9, ".omr-no-hooks")}`);
+    expect((await fsp.readFile(marker, "utf8")).split(/\s+/).filter(Boolean)).toEqual(["repo", "committed"]);
+    await fsp.rm(marker);
+
+    let hooksPath = "";
+    const recording: CaptureDeps["argv"] = (file, args, opts) => {
+      const config = args.find((arg) => arg.startsWith("core.hooksPath="));
+      if (config) hooksPath = config.slice("core.hooksPath=".length);
+      return withMarker(file, args, opts);
+    };
+    const handle = await mat(await capture(), { argv: recording });
+    try {
+      expect(await exists(join(handle.dir, ".omr-no-hooks", "post-checkout"))).toBe(true);
+      expect(await exists(marker)).toBe(false);
+      expect(hooksPath.toLowerCase().startsWith(handle.dir.toLowerCase())).toBe(false);
+      expect(join(hooksPath, "..").toLowerCase()).toBe(tmp.toLowerCase());
+      expect(await exists(hooksPath)).toBe(false);
+    } finally {
+      await handle.dispose();
+    }
+  });
+
   it("commit-missing -> ok:false", async () => {
     const ref = await capture();
     const result = await materialize({ ...ref, commit: "0".repeat(40) }, undefined, new AbortController().signal, deps());

@@ -219,11 +219,14 @@
 //      ok:false "unsafe-path" and nothing is cleaned up. On POSIX,
 //      chmod(dir, 0o700) follows, so the mode is exact whatever the umask.
 //      The dir is private BEFORE git writes the first tracked byte into it.
-//   3. `git -c core.hooksPath=<dir>/.omr-no-hooks -c advice.detachedHead=false
-//      worktree add --detach <dir> <commit>` (cwd: root, env LC_ALL=C so the
-//      "initializing" lock reason stays untranslated). Git accepts the
-//      existing empty dir. The hooks path does not exist, so post-checkout
-//      hooks (repository code) never run. Clean/smudge filters such as LFS
+//   3. `git -c core.hooksPath=<tmp>/omr-nohooks-<16 random hex>
+//      -c advice.detachedHead=false worktree add --detach <dir> <commit>`
+//      (cwd: root, env LC_ALL=C so the "initializing" lock reason stays
+//      untranslated). Git accepts the existing empty dir. The hooks path is
+//      checked to be absent and is never created, and it lies OUTSIDE the
+//      worktree, so post-checkout hooks (repository code) never run
+//      (QA-1.5-8: the former `<dir>/.omr-no-hooks` was inside the worktree,
+//      and a committed `.omr-no-hooks/post-checkout` ran during materialize). Clean/smudge filters such as LFS
 //      still run, within the budget. Failure returns ok:false
 //      "worktree-add-failed". Once the worktree exists, its HEAD pins the
 //      commit against gc (Spike E).
@@ -531,7 +534,8 @@
 //      identical, so no call site changes. They are not exported, to avoid a
 //      second exported ArgvSeam; tests can type the seam as CaptureDeps["argv"].
 //   D9 Hooks are disabled for `git worktree add` (core.hooksPath points at a
-//      path that does not exist).
+//      random path in the tmp root that does not exist and lies outside the
+//      worktree, so the checkout cannot create it; QA-1.5-8).
 //
 // ----------------------------------------------------------------------------
 // OPEN RISKS  (not solvable in this module; owners named)
@@ -1422,10 +1426,14 @@ export async function materialize(
     }, deps.heartbeatMs ?? HEARTBEAT_INTERVAL_MS);
     heartbeat.unref();
     if (platform !== "win32") await fs.chmod(dir, 0o700); // exact mode, whatever the umask
-    // 3. Hooks disabled (D9). LC_ALL=C keeps the "initializing" lock reason untranslated,
-    //    so an abort mid-checkout leaves a lock that cleanup recognises (QA-1.5-5).
+    // 3. Hooks disabled (D9): core.hooksPath names a fresh random path in the tmp root,
+    //    outside the worktree, so no committed content can create it (QA-1.5-8).
+    //    LC_ALL=C keeps the "initializing" lock reason untranslated, so an abort
+    //    mid-checkout leaves a lock that cleanup recognises (QA-1.5-5).
+    const noHooks = p.join(realTmp, `omr-nohooks-${randomBytes(8).toString("hex")}`);
+    if (await lstatOrMissing(fs, noHooks)) return await abandon("unsafe-path", `${noHooks} already exists`);
     const added = budget.spent() ? undefined : await runGit(deps.argv, [
-      "-c", `core.hooksPath=${p.join(dir, ".omr-no-hooks")}`,
+      "-c", `core.hooksPath=${noHooks}`,
       "-c", "advice.detachedHead=false",
       "worktree", "add", "--detach", dir, ref.commit,
     ], { cwd: root, timeoutMs: budget.remaining(), signal: budget.signal, env: { LC_ALL: "C" } });
