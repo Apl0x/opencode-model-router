@@ -319,6 +319,10 @@ plus the "no orphans after" margin) and whether the promise had resolved.
   (QA-1.2-7).
 - **Contrast on Windows:** non-detached children sit in libuv's kill-on-close job, so opencode exit
   kills them (see the `early-exit-plain` observation in QA-1.2-1).
+  - **Corrected by QA-1.2-18:** the job holds only the processes libuv spawned itself (it allows
+    silent breakaway), so opencode exit killed the direct child (`cmd.exe`) but not the tree below
+    it. Windows now has the same exit hook (`taskkill /T` of each direct child that has not
+    exited); see the round-3 resolutions.
 - **Status:** the `detached` flag predates this phase (it is in the `754296c` context lines), but
   the plan puts this case in this phase's QA focus.
 - **Fix:**
@@ -841,3 +845,104 @@ under **Bun 1.3.14**, not Node.
   - Add to the G4 known limits that on Windows, host exit reaches descendants only through the
     exit hook (after QA-1.2-18), and that already-exited children remain under limit (a).
 - **deferred by plan (2.1):** QA-1.2-13, unchanged.
+
+### Round-3 resolutions
+
+- **QA-1.2-17 — Resolution: b3fda67.**
+  - **Code.** On win32, `runArgv` refuses a target that matches `/\.(cmd|bat)[. ]*$/i` before
+    anything is spawned, under any runtime and with or without `lowPriority`. It resolves
+    `{ code: 1, stdout: "", stderr: "exec failed: Error: spawn EINVAL (batch files must run
+    through runShell)", timedOut: false }`, Node's own result plus the reason. The JSDoc now says
+    why: Node refuses the spawn, but Bun runs the file through cmd.exe.
+  - **Bare names.** A bare name is not matched. The runtime resolves it with `.com` and `.exe`
+    only: a bare `probe` beside `probe.cmd` is ENOENT under node and bun. The argv adapters pass
+    absolute `.js`/`.exe` targets.
+  - **Bun repro** (bun 1.3.14 and node v24.21.0, the argument `"&echo INJECTED&"`, a batch file
+    that writes a marker):
+    - Before the fix, bun ran `probe.cmd`, `PROBE.CMD`, `probe.bat` and a cwd-relative
+      `probe.cmd` through cmd.exe. Each wrote the marker and printed `probe-ran` and `INJECTED`.
+    - Also before the fix, bun ran `probe.cmd  ` (trailing spaces), exit 0. For `probe.cmd.`,
+      cmd.exe started and printed `INJECTED`, although it could not find the batch file.
+    - After the fix, all 7 spellings give the refusal above under both runtimes: no marker and
+      no `INJECTED`.
+    - `probe.cmd::$DATA` and `probe.bat::$DATA` are ENOENT under both runtimes, before and after
+      the fix, so no batch file runs.
+  - **Test.** The old `.cmd` test is replaced. The new test covers 7 absolute spellings and a
+    cwd-relative one, each with `lowPriority` false and true. It asserts the exact result, which
+    also tells the refusal apart from Node's bare EINVAL, and that the marker file was never
+    written.
+- **QA-1.2-18 — Resolution: 78c71dd (tracking order: 0ec7ec5).**
+  - **Tracking.** One `tracked` set and one lazy `process.once("exit", killTrackedProcesses)`
+    serve both platforms.
+    - POSIX is unchanged: process groups, untracked on settle or when seen empty at `exit`.
+    - On Windows, each direct child is tracked from spawn until its `exit`. Until then libuv holds
+      its handle, so the PID cannot be recycled. The child is not untracked on settle: one that
+      outlived the grace is exactly what the hook must end.
+    - It is tracked after the priority call, so nothing new sits between the spawn and
+      `setPriority`.
+  - **The hook on Windows.** It makes one `spawnSync(taskkill, ["/pid", a, "/pid", b, …, "/T",
+    "/F"], { windowsHide: true, stdio: "ignore", timeout: 2000 })` call. The hook therefore delays
+    exit by at most 2 s however many runs are in flight.
+  - **Comments.** The `exec.ts` header and the QA-1.2-6 contrast above are corrected.
+  - **Hardening.** `taskkill.exe`, for the hook and for the live-child kill, and `powershell.exe`
+    now start by their absolute `%SystemRoot%\System32` path. libuv looks a bare name up in the
+    working directory before PATH, and that directory is the user's project. Measured: with a copy
+    of `node.exe` named `whoami.exe` in the cwd, `spawnSync("whoami", …, { cwd })` ran the copy.
+  - **Tests.**
+    - The hook test now runs on both platforms. On Windows it goes through `runShell`: cmd.exe,
+      then node, then a grandchild. It asserts that the middle process and the grandchild are dead
+      and that there is one listener.
+    - A new Windows test starts `test/fixtures/exec/host.mjs exit-mid-run` in its own node. The
+      host imports `exec.ts`, starts that `runShell` and calls `process.exit(0)`. The test asserts
+      the middle process and the grandchild are dead within 3 s.
+    - The host needs Node's type stripping, so the test is skipped on Node 20. The in-process hook
+      test still runs there.
+    - With the Windows branch of the hook disabled, both tests fail. The in-process test times
+      out, and the host test gives `expected false to be true` (the middle process was alive).
+  - **Repro.** The host was launched from pwsh, the way opencode is.
+    - With the hook disabled, the middle process and the grandchild were alive after the host
+      exited, under both node and bun.
+    - With the hook, both were dead at the host's exit: node ×1, bun ×2.
+    - A bun host started from a node parent lost its tree even without the hook, presumably
+      through the parent's job. The 3.1 Bun smoke should therefore not start the bun host from
+      node, or it passes vacuously.
+- **QA-1.2-19 — Resolution: 0ec7ec5.**
+  - **Two causes held the host.**
+    - When the run settles with its sweep still in flight, `finish` now calls `sweeper.unref()`:
+      `ps.unref()` plus `unref` on the stdin and stdout sockets, where the runtime has it.
+    - That alone did not help. The kill ended the sweeper's stdin with `end("kill\n")`, and a
+      pending pipe shutdown kept the loop alive: on Windows libuv flushes the pipe, and the flush
+      waits for the reader (from libuv's source, not re-read here). The kill now `write`s the line.
+      `ReadLine` needs only the newline, and the sweeper's exit closes the pipe. `dispose()` still
+      ends stdin and then kills the sweeper.
+  - **Measurements.** The table gives the time from the result to the host's exit, with a sweeper
+    that hangs:
+
+    | Runtime and sweeper stand-in | Before the fix | Unref only, stdin still ended | Write only, no unref | Fixed |
+    |---|---|---|---|---|
+    | node, node stand-in | — | 28015 ms (test failed) | 28014 ms | 15 ms |
+    | bun, `bun build --compile` `hang.exe` | 28042 ms | — | — | 30 ms |
+
+    The stand-in or `hang.exe` was dead after the host exited in every run: as a direct child, it
+    sits in libuv's job.
+  - **Test.** A Windows test (also type stripping) runs `host.mjs hung-sweeper`.
+    - The host wraps `spawn` through `syncBuiltinESMExports` so the sweeper is a node stand-in
+      that ignores its arguments and stdin. Bun ignores that wrapper, so the bun repro passes
+      `hang.exe` instead.
+    - The test asserts a `timedOut` result with the force-closed note, that the host exits less
+      than 5 s after the result, and that the stand-in is dead within 3 s.
+- **QA-1.2-20 — owned by phase 1.3: see QA-1.3-18** (`docs/qa/verification-resource-budget/phase-1.3.md`
+  on `vrb/p13`). The runner must not default to `process.execPath`. It should resolve an absolute
+  `node`/`node.exe` from absolute PATH entries, and report `runner-not-installed "node"` when
+  there is none. `exec.ts` does not use `process.execPath`. The plan wording stays deferred to 3.2
+  (above).
+- **Runs.**
+  - `npx vitest run --maxWorkers=2 test/unit/exec.test.ts`: 38 passed, 1 skipped (the POSIX-only
+    `nice` case), 39 in total, in two consecutive runs on the final code. `npm run typecheck` is
+    clean.
+  - Load flake. During the work, 42 node processes from other agents held the CPU at 100 %.
+    Under that load, "runs grandchildren of runShell below normal priority" failed once, and two
+    other `lowPriority` runs hit their 20 s deadline (`expected 1 to be 3`). The tests passed in
+    isolation and in every run once the load dropped. The two deadline hits match below-normal
+    priority starved by normal-priority load (the QA-1.2-14 conditions). The priority test's own
+    message was not captured.
