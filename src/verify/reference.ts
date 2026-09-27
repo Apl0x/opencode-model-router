@@ -191,7 +191,8 @@
 //      chmod(dir, 0o700) follows, so the mode is exact whatever the umask.
 //      The dir is private BEFORE git writes the first tracked byte into it.
 //   3. `git -c core.hooksPath=<dir>/.omr-no-hooks -c advice.detachedHead=false
-//      worktree add --detach <dir> <commit>` (cwd: root). Git accepts the
+//      worktree add --detach <dir> <commit>` (cwd: root, env LC_ALL=C so the
+//      "initializing" lock reason stays untranslated). Git accepts the
 //      existing empty dir. The hooks path does not exist, so post-checkout
 //      hooks (repository code) never run. Clean/smudge filters such as LFS
 //      still run, within the budget. Failure returns ok:false
@@ -306,6 +307,15 @@
 //      is never run (D5). Residual race: a dir recreated between that lstat
 //      and git's own check would be deleted by git; only this module creates
 //      omr-ref names, under an in-use entry.
+//      A locked entry makes `remove --force` fail. `git worktree add` locks
+//      the new entry with the reason "initializing" until its checkout ends,
+//      so a tree kill mid-checkout leaves that lock forever (QA-1.5-5). If
+//      the entry's lock reason is exactly INITIALIZING_LOCK_REASON, and the
+//      caller allows it (materialize's own cleanup; GC for a dead owner or a
+//      dir this process released), `git worktree unlock <dir>` runs first.
+//      Any other lock reason is someone else's: warn, keep the entry. Our
+//      own `worktree add` runs with LC_ALL=C, so its reason is never
+//      translated.
 //   0. (Before step 1) stop the heartbeat (section 11).
 //   5. Remove dir from ACTIVE. If any step failed, add it to RELEASED, so
 //      that this process's next GC collects it without waiting for the age
@@ -334,6 +344,8 @@
 //      win32. It must be a direct child: never the tmp root itself, never
 //      deeper, and never under a tmp root that is a filesystem root.
 //   R4 Banned in this module: `git worktree remove` on a dir that exists,
+//      `git worktree unlock` of anything but an R3-valid omr-ref entry whose
+//      lock reason is exactly "initializing" (section 6 step 4),
 //      `git worktree prune`, `git clean`, any `git stash` other than `create`,
 //      `git reset/checkout/update-ref/gc`, fs.rm on a path that fails R2, any
 //      shell, and importing child_process.
@@ -397,8 +409,11 @@
 //      non-existent location".
 //   2. An entry is a candidate only if its basename matches REF_DIR_PATTERN
 //      and its parent is a tmp root (R3). Everything else is never touched:
-//      the main worktree and every user worktree. `locked` entries are kept.
-//      A dir in the in-use set (ACTIVE) is kept. ACTIVE lives on globalThis
+//      the main worktree and every user worktree. `locked` entries are kept,
+//      except a lock with reason INITIALIZING_LOCK_REASON whose owner is dead
+//      or whose dir this process released: that one is unlocked and removed
+//      through section 6 (QA-1.5-5; an alive owner may still be checking
+//      out). A dir in the in-use set (ACTIVE) is kept. ACTIVE lives on globalThis
 //      under Symbol.for("omr.reference.active"), so every copy of this module
 //      in the process shares it (QA-1.5-4: the plugin loaded from two install
 //      paths; before, the second copy's GC removed the first copy's live
@@ -667,6 +682,8 @@ export interface GcReport {
 export const REF_DIR_PREFIX = "omr-ref-";
 /** omr-ref-<owner pid>-<16 lowercase hex>. Anything else is never removed. */
 export const REF_DIR_PATTERN = /^omr-ref-(\d{1,10})-([0-9a-f]{16})$/;
+/** Lock reason `git worktree add` writes until its checkout ends (untranslated: our add runs with LC_ALL=C). */
+export const INITIALIZING_LOCK_REASON = "initializing";
 export const STALE_REFERENCE_AGE_MS = 60 * 60 * 1000;
 /** A live reference dir's mtime is refreshed this often, far below STALE_REFERENCE_AGE_MS (QA-1.5-4). */
 export const HEARTBEAT_INTERVAL_MS = 5 * 60 * 1000;
@@ -977,11 +994,22 @@ async function sweepLinks(ctx: CleanupContext, dir: string): Promise<string | un
   return undefined;
 }
 
-async function isRegistered(ctx: CleanupContext, dir: string): Promise<boolean | undefined> {
+/** dir's admin entry; null when not registered, undefined when the list failed. */
+async function registeredEntry(ctx: CleanupContext, dir: string): Promise<WorktreeEntry | null | undefined> {
   const list = await runGit(ctx.argv, ["worktree", "list", "--porcelain"], { cwd: ctx.root, timeoutMs: CLEANUP_GIT_TIMEOUT_MS });
   if (!list || list.code !== 0) return undefined;
   const wanted = comparable(dir, ctx.platform);
-  return parseWorktreeList(list.stdout).some((entry) => comparable(entry.path, ctx.platform) === wanted);
+  return parseWorktreeList(list.stdout).find((entry) => comparable(entry.path, ctx.platform) === wanted) ?? null;
+}
+
+interface RemoveOptions {
+  /** Run step 4 (drop the admin entry); false for capture scratch dirs and unregistered orphans. */
+  readonly git: boolean;
+  /**
+   * Section 6 step 4 (QA-1.5-5): the entry may be unlocked when its lock reason is
+   * exactly INITIALIZING_LOCK_REASON. Only for our own abandon or a dead owner.
+   */
+  readonly unlockInitializing: boolean;
 }
 
 /**
@@ -992,7 +1020,7 @@ async function removeReferenceDir(
   ctx: CleanupContext,
   dir: string,
   links: readonly string[],
-  git: boolean,
+  opts: RemoveOptions,
 ): Promise<boolean> {
   try {
     // 1. Recorded links, newest first. R1: lstat, then single-entry unlink only.
@@ -1025,9 +1053,23 @@ async function removeReferenceDir(
     }
     // 4. Only now that the dir is gone: drop the admin entry with
     //    `git worktree remove --force`, which then deletes no tree. Never prune (D5).
-    if (git && (await isRegistered(ctx, dir)) !== false) {
+    const entry = opts.git ? await registeredEntry(ctx, dir) : null;
+    if (entry !== null) {
       assertSafeRefDir(dir, ctx.tmpRoots, ctx.platform);
       if (await lstatOrMissing(ctx.fs, dir)) return leftInPlace(ctx, dir, "dir reappeared before admin-entry removal");
+      if (entry?.locked) {
+        // A tree-killed `git worktree add` leaves its "initializing" lock behind (QA-1.5-5).
+        // Every other lock reason belongs to someone else and is respected.
+        if (!opts.unlockInitializing || entry.lockReason !== INITIALIZING_LOCK_REASON) {
+          ctx.logger?.warn("reference worktree admin entry left registered: locked", { dir, reason: entry.lockReason });
+          return false;
+        }
+        const unlocked = await runGit(ctx.argv, ["worktree", "unlock", dir], { cwd: ctx.root, timeoutMs: CLEANUP_GIT_TIMEOUT_MS });
+        if (!unlocked || unlocked.code !== 0) {
+          ctx.logger?.warn("reference worktree admin entry left locked", { dir, stderr: unlocked?.stderr.trim() });
+          return false;
+        }
+      }
       const removed = await runGit(ctx.argv, ["worktree", "remove", "--force", dir], { cwd: ctx.root, timeoutMs: CLEANUP_GIT_TIMEOUT_MS });
       if (!removed || removed.code !== 0) {
         ctx.logger?.warn("reference worktree admin entry left registered", { dir, stderr: removed?.stderr.trim() });
@@ -1173,7 +1215,7 @@ async function withPrivateIndex<T>(
     try {
       if (created) {
         const ctx: CleanupContext = { argv: env.argv, fs: env.fs, root: env.root, tmpRoots, platform: env.platform, logger: env.logger };
-        if (!(await removeReferenceDir(ctx, scratch, [], false))) RELEASED.add(key);
+        if (!(await removeReferenceDir(ctx, scratch, [], { git: false, unlockInitializing: false }))) RELEASED.add(key);
       }
     } finally {
       ACTIVE.delete(key);
@@ -1242,7 +1284,8 @@ export async function materialize(
     if (!dir) return;
     const key = comparable(dir, platform);
     try {
-      if (ctx && !(await removeReferenceDir(ctx, dir, links, true))) RELEASED.add(key);
+      // Our own dir: an "initializing" lock can only be from our own aborted worktree add.
+      if (ctx && !(await removeReferenceDir(ctx, dir, links, { git: true, unlockInitializing: true }))) RELEASED.add(key);
     } finally {
       ACTIVE.delete(key);
     }
@@ -1300,12 +1343,13 @@ export async function materialize(
     }, deps.heartbeatMs ?? HEARTBEAT_INTERVAL_MS);
     heartbeat.unref();
     if (platform !== "win32") await fs.chmod(dir, 0o700); // exact mode, whatever the umask
-    // 3. Hooks disabled (D9).
-    const added = await git([
+    // 3. Hooks disabled (D9). LC_ALL=C keeps the "initializing" lock reason untranslated,
+    //    so an abort mid-checkout leaves a lock that cleanup recognises (QA-1.5-5).
+    const added = budget.spent() ? undefined : await runGit(deps.argv, [
       "-c", `core.hooksPath=${p.join(dir, ".omr-no-hooks")}`,
       "-c", "advice.detachedHead=false",
       "worktree", "add", "--detach", dir, ref.commit,
-    ]);
+    ], { cwd: root, timeoutMs: budget.remaining(), signal: budget.signal, env: { LC_ALL: "C" } });
     if (budget.spent()) return await abandon("aborted", "aborted during git worktree add");
     if (!added || added.code !== 0) return await abandon("worktree-add-failed", added?.stderr.trim() ?? "");
 
@@ -1488,6 +1532,8 @@ export async function materialize(
 interface WorktreeEntry {
   path: string;
   locked: boolean;
+  /** The text after "locked " ("" for a bare `locked` line); a C-quoted reason stays quoted and so never matches. */
+  lockReason?: string;
   prunable: boolean;
 }
 
@@ -1500,6 +1546,7 @@ function parseWorktreeList(stdout: string): WorktreeEntry[] {
       entries.push(current);
     } else if (current && (line === "locked" || line.startsWith("locked "))) {
       current.locked = true;
+      current.lockReason = line.slice("locked ".length);
     } else if (current && (line === "prunable" || line.startsWith("prunable "))) {
       current.prunable = true;
     }
@@ -1569,7 +1616,11 @@ async function gcInner(
     if (!parsed || !isSafe(dir)) continue;
     const key = comparable(dir, platform);
     const keys = [key];
-    if (entry.locked || ACTIVE.has(key)) {
+    // QA-1.5-5: an "initializing" lock left by a killed `git worktree add` is ours to lift,
+    // but only once no add can still be running: our own released dir, or a dead owner.
+    const unlockInitializing =
+      entry.locked && entry.lockReason === INITIALIZING_LOCK_REASON && (released(keys) || !isAlive(parsed.pid));
+    if ((entry.locked && !unlockInitializing) || ACTIVE.has(key)) {
       report.kept.push(dir);
       continue;
     }
@@ -1577,7 +1628,7 @@ async function gcInner(
       report.kept.push(dir);
       continue;
     }
-    if (await removeReferenceDir(ctx, dir, [], true)) {
+    if (await removeReferenceDir(ctx, dir, [], { git: true, unlockInitializing })) {
       collected(keys);
       report.removed.push(dir);
     } else {
@@ -1639,7 +1690,7 @@ async function gcInner(
         const target = p.resolve(dir, match[1]);
         if (!gitDirs.some((g) => isStrictlyInside(target, g, platform))) continue; // another repository's orphan
       }
-      if (await removeReferenceDir(ctx, dir, [], false)) {
+      if (await removeReferenceDir(ctx, dir, [], { git: false, unlockInitializing: false })) {
         collected(keys);
         report.removed.push(dir);
       } else {

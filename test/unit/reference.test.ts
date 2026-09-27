@@ -569,6 +569,37 @@ describe("materialize / dispose", { timeout: 60_000 }, () => {
     expect(await refDirsIn(tmp)).toEqual([]);
     expect(await worktreeCount(repo)).toBe(1);
   });
+
+  it("QA-1.5-5: an abort mid-checkout (slow smudge filter) leaves no locked admin entry", async () => {
+    await fsp.writeFile(join(repo, ".gitattributes"), "slow.txt filter=slow\n");
+    await fsp.writeFile(join(repo, "slow.txt"), "slow\n");
+    await git(repo, "add", ".gitattributes", "slow.txt");
+    await git(repo, "commit", "-q", "-m", "slow");
+    const ref = await capture();
+    // Short: the MSYS `sleep` escapes `taskkill /T` and holds git's stderr until it exits.
+    await git(repo, "config", "filter.slow.smudge", "sleep 3; cat");
+    const admin = join(repo, ".git", "worktrees");
+    const controller = new AbortController();
+    let lockSeen = false;
+    const aborting: CaptureDeps["argv"] = async (file, args, opts) => {
+      if (!(args.includes("worktree") && args.includes("add"))) return argv(file, args, opts);
+      const running = argv(file, args, opts);
+      lockSeen = await waitFor(async () => {
+        if (!(await exists(admin))) return false;
+        for (const name of await fsp.readdir(admin)) if (await exists(join(admin, name, "locked"))) return true;
+        return false;
+      }, 15_000);
+      controller.abort(); // tree-kills `git worktree add` in the middle of its checkout
+      return running;
+    };
+    const result = await materialize(ref, undefined, controller.signal, deps({ argv: aborting }));
+    expect(lockSeen).toBe(true);
+    expect(result).toMatchObject({ ok: false, reason: "aborted" });
+    expect(await git(repo, "worktree", "list", "--porcelain")).not.toContain("omr-ref-");
+    expect(await worktreeCount(repo)).toBe(1);
+    expect(await refDirsIn(tmp)).toEqual([]);
+    expect(warnings).toEqual([]);
+  });
 });
 
 describe("gcStaleReferences", { timeout: 60_000 }, () => {
@@ -612,6 +643,35 @@ describe("gcStaleReferences", { timeout: 60_000 }, () => {
     // Test cleanup of the kept worktrees (not the module under test).
     for (const wt of [live, ownFresh, lookalike, userWt]) await git(repo, "worktree", "remove", "--force", wt);
     await fsp.rm(plainLookalike, { recursive: true });
+  });
+
+  it("QA-1.5-5: GC lifts only an 'initializing' lock, and only for a dead owner", async () => {
+    const DEAD = 111111;
+    const LIVE = 222222;
+    const deadInit = join(tmp, `omr-ref-${DEAD}-00000000000000c1`);
+    const liveInit = join(tmp, `omr-ref-${LIVE}-00000000000000c2`);
+    const deadOther = join(tmp, `omr-ref-${DEAD}-00000000000000c3`);
+    for (const wt of [deadInit, liveInit, deadOther]) await git(repo, "worktree", "add", "-q", "--detach", wt, "HEAD");
+    await git(repo, "worktree", "lock", "--reason", "initializing", deadInit);
+    await git(repo, "worktree", "lock", "--reason", "initializing", liveInit); // an add may still be running
+    await git(repo, "worktree", "lock", "--reason", "on a usb stick", deadOther); // someone else's lock
+
+    const report = await gcStaleReferences(repo, deps({ isAlive: (pid) => pid === LIVE }));
+    const lower = (dirs: readonly string[]) => dirs.map((d) => d.toLowerCase()).sort();
+    expect(lower(report.removed)).toEqual(lower([deadInit]));
+    expect(lower(report.kept)).toEqual(lower([liveInit, deadOther]));
+    expect(report.failed).toEqual([]);
+    expect(await exists(deadInit)).toBe(false);
+    for (const kept of [liveInit, deadOther]) expect(await exists(kept)).toBe(true);
+    const list = await git(repo, "worktree", "list", "--porcelain");
+    expect(list).not.toContain("00000000000000c1");
+    expect(list).toContain("on a usb stick");
+
+    // Test cleanup of the kept worktrees (not the module under test).
+    for (const wt of [liveInit, deadOther]) {
+      await git(repo, "worktree", "unlock", wt);
+      await git(repo, "worktree", "remove", "--force", wt);
+    }
   });
 
   it("QA-1.5-4: a second copy of the module (two install paths) keeps the first copy's live reference", async () => {
