@@ -514,8 +514,14 @@
 //      an extension also matches <ref>.<ext> and <ref>/index.<ext>. QA-1.3-45: a key's value is
 //      the whole expression up to the next "," or ";" at depth 0 or the bracket that closes the
 //      object, and every string literal in it counts: 'x', [...defaults, 'x'],
-//      require.resolve('x'), path.resolve(__dirname, 'x'), c ? 'x' : 'y'. Each such file is a
-//      trigger. A value with no literal names nothing; the name rule above still applies (P).
+//      require.resolve('x'), path.resolve(__dirname, 'x'), c ? 'x' : 'y'. QA-1.3-50: in a
+//      call, each run of lone literal arguments is also joined with "/": after the call's start
+//      or __dirname, import.meta.dirname or process.cwd() it resolves like a literal
+//      (path.join(__dirname, 'src', 'testing', 'boot.js') is src/testing/boot.js); after any
+//      other argument (path.join(ROOT, 'testing', 'boot.js'), path.join(__dirname, 'src', dir,
+//      'boot.js')) it is a path tail, taken after its last "..", and every file whose path ends
+//      with it counts. Each such file is a trigger. A value with no literal names nothing; the
+//      name rule above still applies (P).
 //      QA-1.3-41: jest's inline JSON `--config '{...}'` (a
 //      value that starts with "{" and ends with "}", jest's own test) is the config itself: it
 //      is parsed with JSON.parse (S6 unsupported-argument when it does not parse), rooted at
@@ -942,7 +948,8 @@
 //     config-driven tests). vitest adds setupFiles to them (QA-1.3-15 evidence; globalSetup is
 //     not verified). Setup files are triggers by name (G.7) and by static reference (G.7a); what
 //     remains is a setup file under an unconventional name that a config names only through a
-//     non-literal expression (a variable, a computed path), or that a project config outside
+//     non-literal expression whose last segment is not a literal either (a variable holding the
+//     whole path, a template with ${}), or that a project config outside
 //     the file's own directory chain names (packages/a's config naming ../../shared/boot.js).
 //     Such a change is not verified by either runner: jest's related graph does not see it, and
 //     vitest does not rerun a project's setupFiles either (QA-1.3-44: `vitest related` ran 0
@@ -3650,17 +3657,45 @@ const CONFIG_KEY_RE = /(?<![\w$])["']?(setupFiles|setupFilesAfterEnv|globalSetup
  * literal value maps to []. Comments are skipped; a template literal with `${` is not static, and
  * an unterminated string ends the value. One forward pass: the key search resumes after each
  * scanned value, so the cost stays linear.
+ * QA-1.3-50: a call's literal arguments are also joined with "/", run by run, so
+ * `path.join(__dirname, 'src', 'testing', 'boot.js')` yields "src/testing/boot.js". A run that
+ * starts the call or follows a path base (PATH_BASES) resolves like any literal (`lits`); a run
+ * after any other argument (a variable, another call) is a path tail (`floating`).
  */
 const isQuote = (c: string | undefined): boolean => c === '"' || c === "'" || c === "`";
 
-function configLiterals(text: string): Map<string, string[]> {
-  const out = new Map<string, string[]>();
+/** QA-1.3-50: call arguments that stand for a directory the config's references resolve against (the config's, runnerCwd). */
+const PATH_BASES: ReadonlySet<string> = new Set(["__dirname", "import.meta.dirname", "process.cwd()"]);
+
+/** One argument of a call, from `start` to `end`: a lone static string (`lit`), or anything else (`other`). */
+interface CallArg {
+  readonly start: number;
+  end?: number;
+  lit?: string;
+  other: boolean;
+}
+
+interface ConfigLits {
+  /** Each key's string literals, and the joined runs of literal call arguments that resolve like them. */
+  readonly lits: Map<string, string[]>;
+  /** QA-1.3-50: each key's joined runs of literal call arguments after an argument the scan cannot resolve. */
+  readonly floating: Map<string, string[]>;
+}
+
+function configLiterals(text: string): ConfigLits {
+  const lits = new Map<string, string[]>();
+  const floating = new Map<string, string[]>();
   const re = new RegExp(CONFIG_KEY_RE.source, "g");
   for (let m = re.exec(text); m; m = re.exec(text)) {
-    const vals = out.get(m[1]) ?? [];
-    out.set(m[1], vals);
+    const vals = lits.get(m[1]) ?? [];
+    lits.set(m[1], vals);
+    const floats = floating.get(m[1]) ?? [];
+    floating.set(m[1], floats);
+    // One entry per open bracket: a call's arguments for "(", undefined for "[" and "{".
+    const frames: (CallArg[] | undefined)[] = [];
+    const arg = (): CallArg | undefined => frames.at(-1)?.at(-1);
     let i = m.index + m[0].length;
-    for (let depth = 0; i < text.length; ) {
+    while (i < text.length) {
       const c = text[i];
       if (isQuote(c)) {
         let v = "";
@@ -3668,7 +3703,11 @@ function configLiterals(text: string): Map<string, string[]> {
         for (; j < text.length && text[j] !== c && !(text[j] === "\n" && c !== "`"); j++) v += text[j] === "\\" ? (text[++j] ?? "") : text[j];
         i = j + 1;
         if (text[j] !== c) break;
-        if (!(c === "`" && v.includes("${"))) vals.push(v);
+        const a = arg();
+        const staticText = !(c === "`" && v.includes("${"));
+        if (staticText) vals.push(v);
+        if (a && staticText && a.lit === undefined && !a.other) a.lit = v;
+        else if (a) a.other = true;
       } else if (text.startsWith("//", i)) {
         const nl = text.indexOf("\n", i);
         i = nl < 0 ? text.length : nl;
@@ -3676,19 +3715,74 @@ function configLiterals(text: string): Map<string, string[]> {
         const end = text.indexOf("*/", i + 2);
         i = end < 0 ? text.length : end + 2;
       } else if (c === "(" || c === "[" || c === "{") {
-        depth++;
+        const a = arg();
+        if (a) a.other = true;
+        frames.push(c === "(" ? [{ start: i + 1, other: false }] : undefined);
         i++;
       } else if (c === ")" || c === "]" || c === "}") {
-        if (depth === 0) break;
-        depth--;
+        if (frames.length === 0) break;
+        const args = frames.pop();
+        if (args) {
+          args[args.length - 1].end = i;
+          joinCallArgs(text, args, vals, floats);
+        }
         i++;
-      } else if ((c === "," || c === ";") && depth === 0) {
+      } else if ((c === "," || c === ";") && frames.length === 0) {
         break;
-      } else i++;
+      } else {
+        const args = frames.at(-1);
+        if (c === "," && args) {
+          args[args.length - 1].end = i;
+          args.push({ start: i + 1, other: false });
+        } else if (!/\s/.test(c)) {
+          const a = arg();
+          if (a) a.other = true;
+        }
+        i++;
+      }
     }
     re.lastIndex = Math.max(re.lastIndex, i);
   }
-  return out;
+  return { lits, floating };
+}
+
+/** QA-1.3-50: each run of lone literal arguments of one call, "/"-joined, into `vals` (after the call's start or a PATH_BASES argument) or `floats`. */
+function joinCallArgs(text: string, args: readonly CallArg[], vals: string[], floats: string[]): void {
+  let run: string[] = [];
+  let anchored = true;
+  const flush = () => {
+    if (run.length > (anchored ? 1 : 0)) (anchored ? vals : floats).push(run.join("/"));
+    run = [];
+  };
+  for (const a of args) {
+    if (a.lit !== undefined && !a.other) {
+      run.push(a.lit);
+      continue;
+    }
+    flush();
+    const raw = text.slice(a.start, a.end).replace(/\s+/g, "");
+    // An empty argument (`f()`, a trailing comma) changes nothing.
+    if (raw !== "") anchored = PATH_BASES.has(raw);
+  }
+  flush();
+}
+
+/**
+ * QA-1.3-50: the path tail a floating reference names: its segments after the last "..", "<...>"
+ * or drive-like one ("" and "." dropped), "/"-joined; undefined when none is left.
+ */
+function pathTail(v: string): string | undefined {
+  const segs = v.split(/[\\/]+/).filter((s) => s !== "" && s !== ".");
+  let k = segs.length;
+  while (k > 0 && segs[k - 1] !== ".." && !/[<:]/.test(segs[k - 1])) k--;
+  return k === segs.length ? undefined : segs.slice(k).join("/");
+}
+
+/** QA-1.3-50: some tail of `p` ("c", "b/c", "a/b/c" for .../a/b/c), as a key, is in `tails`. */
+function hasTail(ctx: Ctx, tails: ReadonlySet<string>, p: string): boolean {
+  const segs = ctx.key(p).split(/[\\/]+/);
+  for (let k = segs.length - 1; k >= 1; k--) if (tails.has(segs.slice(k).join("/"))) return true;
+  return false;
 }
 
 /** What the vitest/jest configs say statically (G.7a, QA-1.3-29). */
@@ -3697,6 +3791,8 @@ interface JsConfigFacts {
   readonly setupKeys: ReadonlySet<string>;
   /** The same for references without an extension, which jest resolves (compared without the extension, or as a directory index). */
   readonly setupStems: ReadonlySet<string>;
+  /** QA-1.3-50: path tails ("testing/boot.js") of references built on an argument the scan cannot resolve; any file ending with one counts. */
+  readonly setupTails: ReadonlySet<string>;
 }
 
 /**
@@ -3744,6 +3840,7 @@ async function jsConfigFacts(
   const cliRoot = kind === "jest" ? jestCliRootDir(det) : undefined;
   const setupKeys = new Set<string>();
   const setupStems = new Set<string>();
+  const setupTails = new Set<string>();
   const trailing = ctx.win ? /[\\/]+$/ : /\/+$/;
   // The last segment of a reference; "", ".", "..", "<rootDir>" or a drive only resolve to know.
   const wanted = (v: string): boolean => {
@@ -3754,11 +3851,21 @@ async function jsConfigFacts(
   // QA-1.3-42: path resolution is the cost (about 12 us a call under Bun on win32), so it is
   // bounded per plan: distinct wanted references times bases, plus the rootDir literals.
   let budget = SETUP_REF_LIMIT;
-  const addRefs = (lits: ReadonlyMap<string, readonly string[]>, dir: string, where: string): Unverifiable | undefined => {
+  const usable = (v: string) => v.trim() !== "" && !/[*?{}]/.test(v) && wanted(v);
+  const addRefs = (lits: ReadonlyMap<string, readonly string[]>, dir: string, where: string, floating?: ReadonlyMap<string, readonly string[]>): Unverifiable | undefined => {
     const refs = new Set<string>();
+    const tails = new Set<string>();
     for (const key of SETUP_KEYS) {
-      for (const v of lits.get(key) ?? []) if (v.trim() !== "" && !/[*?{}]/.test(v) && wanted(v)) refs.add(v);
+      for (const v of lits.get(key) ?? []) if (usable(v)) refs.add(v);
+      for (const v of floating?.get(key) ?? []) {
+        const t = pathTail(v);
+        if (t !== undefined && usable(t)) tails.add(ctx.key(t));
+      }
     }
+    // QA-1.3-50: a tail costs one set entry, and a suffix check per changed file.
+    budget -= tails.size;
+    if (budget < 0) return s6("config-too-large", `too many setup references in ${where} (limit ${SETUP_REF_LIMIT})`);
+    for (const t of tails) setupTails.add(t);
     if (refs.size === 0) return undefined;
     const rootLits = [...new Set(lits.get(kind === "jest" ? "rootDir" : "root"))];
     const fixed = kind === "jest" ? (cliRoot === undefined ? [] : [P.resolve(det.runnerCwd, cliRoot)]) : [det.runnerCwd];
@@ -3780,7 +3887,7 @@ async function jsConfigFacts(
     const t = await readConfigText(ctx, fs, file);
     if (t === "too-large") return tooLarge(file);
     if (t === "unreadable") continue;
-    const lits = configLiterals(t.text);
+    const { lits, floating } = configLiterals(t.text);
     if (P.extname(file) === ".json") {
       // QA-1.3-46: jest-config reads a JSON config as parseJson(stripJsonComments(text)). One that
       // still does not parse fails the user's run; package.json is the exception, because jest's
@@ -3791,14 +3898,14 @@ async function jsConfigFacts(
       }
       for (const [k, vs] of jsonLiterals(parsed)) lits.set(k, [...(lits.get(k) ?? []), ...vs]);
     }
-    const bad = addRefs(lits, P.dirname(file), file);
+    const bad = addRefs(lits, P.dirname(file), file, floating);
     if (bad) return bad;
   }
   for (const c of det.inlineConfigs ?? []) {
     const bad = addRefs(jsonLiterals(parseJson(c)), det.runnerCwd, "the inline jest --config");
     if (bad) return bad;
   }
-  return { setupKeys, setupStems };
+  return { setupKeys, setupStems, setupTails };
 }
 
 /** QA-1.3-45: the last jest `--rootDir` in the kept arguments; jest-config's setFromArgv puts it over every config's rootDir. */
@@ -3847,7 +3954,11 @@ function isReferencedSetup(ctx: Ctx, facts: JsConfigFacts, abs: string): boolean
   if (facts.setupKeys.has(ctx.key(abs))) return true;
   const ext = ctx.P.extname(abs);
   const stem = ext === "" ? abs : abs.slice(0, -ext.length);
-  return facts.setupStems.has(ctx.key(stem)) || (ctx.P.basename(stem) === "index" && facts.setupStems.has(ctx.key(ctx.P.dirname(abs))));
+  const index = ctx.P.basename(stem) === "index";
+  if (facts.setupStems.has(ctx.key(stem)) || (index && facts.setupStems.has(ctx.key(ctx.P.dirname(abs))))) return true;
+  // QA-1.3-50: a tail names the file with its extension, without it, or as a directory index.
+  const T = facts.setupTails;
+  return T.size > 0 && (hasTail(ctx, T, abs) || hasTail(ctx, T, stem) || (index && hasTail(ctx, T, ctx.P.dirname(abs))));
 }
 
 

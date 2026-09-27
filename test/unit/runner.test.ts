@@ -3578,3 +3578,51 @@ describe("QA-1.3-49: a package pyproject.toml without a pytest table", () => {
     expectS6(await planPy(files, "pytest", ["tests/test_a.py"]), "unsupported-argument", "unsupported pytest config for the scoped inputs: /r/tests/pytest.ini instead of /r/pytest.toml");
   });
 });
+
+describe("QA-1.3-50: a path built from several literals in one call", () => {
+  const BOOT = "src/testing/bootstrap.js";
+  const plan = (command: string, cfg: string, cfgName = "jest.config.js", extra: Record<string, string> = {}) =>
+    planScopedRun(input({ command, files: jsRepo({}, { [`/r/${BOOT}`]: "", "/r/src/a.js": "", [`/r/${cfgName}`]: cfg, ...extra }), changedFiles: changed(BOOT) }));
+
+  it.each([
+    "module.exports = { globalSetup: path.join(__dirname, 'src', 'testing', 'bootstrap.js') };",
+    "module.exports = { globalSetup: path.resolve(__dirname, 'src/testing', 'bootstrap.js') };",
+    "module.exports = { setupFiles: [path.join(process.cwd(), 'src', 'testing', 'bootstrap')] };",
+    "module.exports = { globalSetup: path.join(__dirname, /* dir */ 'src', 'testing', 'bootstrap.js',) };",
+    "module.exports = { globalSetup: path.resolve('src', 'testing', 'bootstrap.js') };",
+    "export default { globalSetup: path.join(import.meta.dirname, 'src', 'testing', 'bootstrap.js') };",
+  ])("anchored: %s", async (cfg) => {
+    expectS6(await plan("jest", cfg), "config-changed", `config file changed: ${BOOT}`);
+  });
+
+  it.each([
+    "module.exports = { globalSetup: path.join(ROOT, 'testing', 'bootstrap.js') };",
+    "module.exports = { globalSetup: path.join(here(), '..', 'testing', 'bootstrap.js') };",
+    "module.exports = { globalSetup: path.join(__dirname, 'src', dir, 'bootstrap.js') };",
+    "module.exports = { globalSetup: path.join(`${root}`, '<rootDir>', 'testing', 'bootstrap') };",
+  ])("floating, matched by the path tail: %s", async (cfg) => {
+    expectS6(await plan("jest", cfg), "config-changed", `config file changed: ${BOOT}`);
+  });
+
+  it("vitest: setupFiles joined the same way, and a directory index", async () => {
+    const cfg = "export default { test: { setupFiles: [path.resolve(__dirname, 'src', 'testing', 'bootstrap.js')] } };";
+    expectS6(await plan("vitest", cfg, "vitest.config.mjs"), "config-changed", `config file changed: ${BOOT}`);
+    const idx = "export default { test: { setupFiles: [path.resolve(base, 'src', 'boot')] } };";
+    const r = await planScopedRun(input({ files: jsRepo({}, { "/r/src/boot/index.js": "", "/r/vitest.config.mjs": idx }), changedFiles: changed("src/boot/index.js") }));
+    expectS6(r, "config-changed", "config file changed: src/boot/index.js");
+  });
+
+  it.each([
+    "module.exports = { globalSetup: path.join(ROOT, 'other', 'bootstrap.js') };",
+    "module.exports = { globalSetup: path.join(__dirname, 'lib', 'bootstrap.js') };",
+    "module.exports = { setupFiles: ['src', 'testing/bootstrap.js'] };",
+    "module.exports = { globalSetup: path.join(ROOT, '..'), setupFiles: f() };",
+  ])("no false trigger: %s", async (cfg) => {
+    expect(spec(await plan("jest", cfg)).inputs).toEqual([`/r/${BOOT}`]);
+  });
+
+  it("floating tails count against SETUP_REF_LIMIT", async () => {
+    const calls = Array.from({ length: SETUP_REF_LIMIT + 1 }, (_, i) => `path.join(x, 'd${i}', 'bootstrap.js')`).join(", ");
+    expectS6(await plan("jest", `module.exports = { setupFiles: [${calls}] };`), "config-too-large", `too many setup references in /r/jest.config.js (limit ${SETUP_REF_LIMIT})`);
+  });
+});
