@@ -1214,3 +1214,9 @@ Code that round 1 cleared was not re-audited.
 (QA-2.4-23). Under the owner's rule, only **QA-2.4-17** must be fixed. The fix is one line and is
 already mutation-checked against the existing tests (N30); it needs the S10 test. Every other
 round-1 finding is resolved, or deferred by plan (QA-2.4-7, -15, -16).
+
+## Round-2 resolutions
+
+- **QA-2.4-17** Resolution: fixed in `fbe9d7a`. `verifyHandles` passes only terminal verdicts (`kind: "verdict"` and not `result.retryable`) to `background.markReported` and `pending.markReplayed` (N30). Test: RV "QA-2.4-17" (S10: a cancelled `router_verify` call, then a background run that fails the handle; the late notice is shown and the entry stays listed). Proof: failed with only `src/` stashed (no notice), passes with it.
+- **QA-2.4-18..22**: accepted per owner rule (post-round-2: only major/critical are fixed).
+- **QA-2.4-23**: noted for 3.1/3.2 (8.3 short-path plugin dir).
