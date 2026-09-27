@@ -182,7 +182,6 @@ function run(file: string, args: string[], shell: boolean, opts: RunOptions, nic
       return;
     }
     const pid = child.pid;
-    if (pid) track(pid);
     if (opts.lowPriority && isWin && pid) {
       // Windows low priority (Spike A, docs/qa/verification-resource-budget/phase-1.2.md):
       // lower the direct child right after spawn; descendants inherit the class
@@ -199,6 +198,8 @@ function run(file: string, args: string[], shell: boolean, opts: RunOptions, nic
         notes.push(`[low priority not applied: ${String(e)}]`);
       }
     }
+    // After the priority call, which must follow the spawn as closely as possible.
+    if (pid) track(pid);
     // A StringDecoder per stream, so a multi-byte character split across two
     // chunks is not turned into U+FFFD.
     child.stdout?.setEncoding("utf8");
@@ -219,8 +220,10 @@ function run(file: string, args: string[], shell: boolean, opts: RunOptions, nic
       // Windows keeps the child tracked until its `exit`: one that outlived
       // the grace is exactly what the exit hook must still end.
       if (!isWin && pid) untrack(pid);
-      // A sweep that is killing must finish; one that is only armed is released.
-      if (sweeper && !sweepPending) sweeper.dispose();
+      // A sweep that is killing must finish, but must not keep opencode alive
+      // (QA-1.2-19); one that is only armed is released.
+      if (sweeper && sweepPending) sweeper.unref();
+      else sweeper?.dispose();
       let finalCode = killed ? code || 1 : code ?? 1;
       let stderr = err.text;
       if (niceTarget && !killed && (code === 126 || code === 127) && stderr.startsWith("nice:")) {
@@ -471,6 +474,16 @@ interface Sweeper {
   kill(done: (pids: number[], unavailable?: string) => void): void;
   /** Release the pins without killing anything. */
   dispose(): void;
+  /**
+   * The run settled while the kill is in flight: let the sweeper finish, but
+   * stop it (its process handle and pipes) from keeping opencode alive.
+   */
+  unref(): void;
+}
+
+/** Node's child pipes are `net.Socket`s with `unref`; another runtime's may lack it. */
+function unrefStream(stream: object | null): void {
+  if (stream && "unref" in stream && typeof stream.unref === "function") stream.unref();
 }
 
 let powershell = DEFAULT_POWERSHELL;
@@ -589,15 +602,26 @@ function armSweeper(pid: number, spawnedAt: number, exitedAt: number): Sweeper {
         sweeperProcess.kill();
         report();
       }, SWEEP_TIMEOUT_MS);
-      // A settled run must not keep opencode alive for a hung sweeper; the
-      // sweeper itself is a non-detached child and dies with opencode (libuv job).
+      // With `unref()` below, a hung sweeper never keeps opencode alive after
+      // the run settled (QA-1.2-19). Being a direct child, it sits in libuv's
+      // kill-on-close job and dies with opencode.
       limit.unref();
-      sweeperProcess.stdin?.end("kill\n");
+      // Written, not ended: ending a Windows pipe makes libuv flush it
+      // (FlushFileBuffers), which blocks until the sweeper reads, and that
+      // pending shutdown would keep opencode alive however much is unref'd
+      // (QA-1.2-19). The sweeper's exit closes the pipe.
+      sweeperProcess.stdin?.write("kill\n");
     },
     dispose() {
       if (ended || !ps) return;
       ps.stdin?.end();
       ps.kill();
+    },
+    unref() {
+      if (ended || !ps) return;
+      ps.unref();
+      unrefStream(ps.stdin);
+      unrefStream(ps.stdout);
     },
   };
 }

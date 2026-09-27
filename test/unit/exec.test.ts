@@ -359,12 +359,14 @@ function startHost(args: string[]) {
   let stderr = "";
   child.stdout.setEncoding("utf8");
   child.stderr.setEncoding("utf8");
+  /** The first stdout line and when it arrived; "" when the host ended without one. */
   const firstLine = new Promise<{ line: string; at: number }>((resolve) => {
     child.stdout.on("data", (s: string) => {
       stdout += s;
       const end = stdout.indexOf("\n");
       if (end >= 0) resolve({ line: stdout.slice(0, end), at: Date.now() });
     });
+    child.on("close", () => resolve({ line: "", at: Date.now() }));
   });
   child.stderr.on("data", (s: string) => { stderr += s; });
   const exited = new Promise<{ code: number | null; stdout: string; stderr: string; at: number }>((resolve) => {
@@ -373,6 +375,7 @@ function startHost(args: string[]) {
   return {
     firstLine,
     exited,
+    stderr: () => stderr,
     /** Cleanup: end the host if a failed assertion left it running. */
     kill: () => { if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL"); },
   };
@@ -553,6 +556,32 @@ describe("process lifecycle around the direct child's exit", () => {
       if (existsSync(f.pidFile)) killIfAlive(f.grandchild(), f.middle());
     }
   }, 30000);
+
+  it.runIf(isWin && typeStripping)("a sweep still in flight when the run settles does not keep the host alive (QA-1.2-19, Windows-only: the sweeper; needs Node type stripping)", async () => {
+    const t = tree("early-exit");
+    const h = startHost(["hung-sweeper", t.dir]);
+    let standIn = 0;
+    try {
+      const first = await h.firstLine;
+      expect(first.line, h.stderr()).not.toBe("");
+      const out = JSON.parse(first.line) as { result: { timedOut: boolean; stderr: string }; sweeper: number | null };
+      standIn = out.sweeper ?? 0;
+      expect(standIn).toBeGreaterThan(0);
+      // The hung sweep killed nothing, so the kill grace settled the run.
+      expect(out.result.timedOut).toBe(true);
+      expect(out.result.stderr).toMatch(/output streams force-closed/);
+      const exited = await h.exited;
+      expect(exited.code).toBe(0);
+      // Before QA-1.2-19 the host stayed up until SWEEP_TIMEOUT_MS (30 s) ended the sweeper.
+      expect(exited.at - first.at).toBeLessThan(5000);
+      // Nor did the sweeper outlive the host: a direct child, it dies with libuv's job.
+      expect(await waitForExit(standIn, 3000)).toBe(true);
+    } finally {
+      h.kill();
+      killIfAlive(standIn);
+      await t.release();
+    }
+  }, 60000);
 });
 
 describe("lowPriority", () => {
