@@ -220,19 +220,41 @@
 //     S6      --co --collect-only --fixtures --fixtures-per-test --markers --setup-plan
 //             --setup-only --version -V -h --help --tx --rsyncdir   (--tx starts xdist workers
 //             that no -n caps)
-//     xdist evidence (DetectedRunner.xdist). It is true when either of these holds, and
-//     "-p no:xdist" is absent:
-//       - the user args contain a CAP entry or --dist;
-//       - XDIST_RE (below) matches the pytest config text or host.pytestAddopts.
-//     "pytest config text" is every one of pytest.ini, pyproject.toml, tox.ini and setup.cfg that
-//     exists in the nearest directory, from runnerCwd up to gitRoot, holding any of them.
-//       XDIST_RE       = /(?:^|[\s"'\[,=])(?:-n|--numprocesses|--maxprocesses|--dist)(?=[\s"'=,\]]|\d|$)/m
-//       XDIST_VALUE_RE = /(?:-n|--numprocesses|--maxprocesses)(?:\s*=\s*|\s+|["']\s*,\s*["'])?["']?(\d+|auto|logical)\b/
-//     When the command sets no cap, the config value (XDIST_VALUE_RE) is the user cap, so a
-//     config "-n 1" is never raised. covInConfig is true when
-//     /(?:^|[\s"'\[,=])--cov(?=[=\s"',\]]|$)/m matches the config text or host.pytestAddopts.
-//     A false match can only add "-n N" without xdist, which gives pytest exit 4, then
-//     readResult complete=false, then unverifiable: never a false pass.
+//     xdist evidence (QA-1.3-3). pytest reads options from three places, in this order, and the
+//     last cap wins: the config file's addopts, PYTEST_ADDOPTS, the command. The adapter reads
+//     all three the way pytest does:
+//       - Config file (pytest 9 findpaths): the -c/--config-file file alone, when given (read
+//         by its extension, always accepted). Otherwise walk from the start directory up to the
+//         FILESYSTEM ROOT (not gitRoot: pytest does not stop there) and, in each directory,
+//         take the first of pytest.toml, .pytest.toml, pytest.ini, .pytest.ini, pyproject.toml,
+//         tox.ini, setup.cfg that pytest accepts: pytest.toml/.pytest.toml ([pytest] table) and
+//         pytest.ini/.pytest.ini ([pytest] section) always, even empty; pyproject.toml only
+//         with a [tool.pytest.ini_options] or [tool.pytest] table; tox.ini only with [pytest];
+//         setup.cfg only with [tool:pytest]. --rootdir does not change this search.
+//         `-o addopts=<v>` / `--override-ini addopts=<v>` replaces the file's addopts.
+//         ini files follow iniconfig (column-0 [section], "key = v" or "key: v", indented
+//         continuation lines, # and ; comment lines). TOML addopts is a basic, literal or
+//         multi-line string, or an array of strings. A string is split with C.1. Anything else
+//         (a bare value, a bad escape, an unterminated quote) -> S6 unsupported-argument
+//         `unsupported pytest argument "addopts" in <file>`. An unreadable file is noted and
+//         skipped.
+//       - PYTEST_ADDOPTS: host.pytestAddopts and the cross-env value (C.3). Both are scanned for
+//         evidence; the cap comes from the value the spawn will see (cross-env wins).
+//       - The command (D.1).
+//     Each addopts source goes through D.1 with the pytest table in "addopts" mode: a positional
+//     -> S6 unsupported-argument `... "<p>" in addopts of <file>` / `in PYTEST_ADDOPTS` /
+//     `in -o addopts`, because pytest would collect it on top of the inputs (QA-1.3-13). An
+//     unknown option followed by a non-option token takes it as its value, unless that token
+//     names an existing path (S6). Either reading is safe: a missing path makes pytest exit 4.
+//     xdist = (a CAP entry or --dist in any source) and no "-p no:xdist" in any source.
+//     covInConfig = a --cov option in the config or PYTEST_ADDOPTS. userWorkers = the last cap
+//     over config, PYTEST_ADDOPTS and the command, so a config "-n 1" is never raised.
+//     Start directory: runnerCwd at detection (pytest with no file arguments). The spec redoes
+//     the lookup from the common ancestor of its inputs (pytest's rootdir/inifile rule for file
+//     arguments), from DetectedRunner.pytestFacts, so tests/unit/pytest.ini counts for inputs
+//     under tests/unit. A false xdist match can only add "-n N" without xdist: pytest exit 4,
+//     readResult complete=false, unverifiable, never a false pass. Residual (P): a conftest.py
+//     or plugin that adds -n through a hook.
 //
 //   D.5 eslint (lint scoping, K)
 //     DROP 0  --fix --fix-dry-run
@@ -631,8 +653,9 @@
 //      program. The package.json that supplied the script is a config trigger, so a producer
 //      that rewrites the script gets S6 instead of a run of its own command.
 //   7. Paths that leave gitRoot are dropped, and PATH entries must be absolute. Outside gitRoot,
-//      the module reads only the runner's own package under node_modules and executables on
-//      absolute PATH entries.
+//      the module reads only the runner's own package under node_modules, executables on
+//      absolute PATH entries, and the pytest config candidates pytest itself would read above
+//      gitRoot (D.4).
 //   8. The adapter-owned flags appear exactly once, because D removes user copies: the worker
 //      cap, reporter, outputFile, passWithNoTests, run, the coverage switch, junitxml,
 //      -p no:cacheprovider and --maxfail=0.
@@ -677,6 +700,8 @@
 //   - Custom vitest forceRerunTriggers in the user's config cannot be read statically and can
 //     make `related` run every file. This is an accepted residual risk (plan section 5,
 //     config-driven tests).
+//   - A conftest.py or plugin hook (pytest_load_initial_conftests, pytest_cmdline_main) that
+//     adds -n cannot be seen statically; the appended "-n N" only lands when D.4 found xdist.
 //   - Tokenizing: npm on Windows (cmd.exe) does not treat '...' as quotes, while C.1 applies
 //     POSIX rules everywhere.
 //   - A vitest `run <absolute path>` filter may also select a longer name with the same prefix
@@ -913,6 +938,22 @@ export interface DetectedRunner {
   /** pytest: pytest-cov options found in the pytest config (D.4). Always false for vitest/jest. */
   readonly covInConfig: boolean;
   readonly notes: readonly string[];
+  /** pytest: what the command itself says, so each spec can redo the config lookup from its inputs (D.4). */
+  readonly pytestFacts?: PytestFacts;
+}
+
+/** The pytest command's own worker, xdist and config facts (D.4, QA-1.3-3). */
+export interface PytestFacts {
+  /** The raw value of the last cap token on the command line. */
+  readonly cap?: string;
+  /** The command has a cap entry or --dist. */
+  readonly xdist: boolean;
+  /** The command has "-p no:xdist". */
+  readonly noXdist: boolean;
+  /** -c / --config-file, absolute and canonical: pytest reads only this file. */
+  readonly configFile?: string;
+  /** The value of `-o addopts=<v>` / `--override-ini addopts=<v>`: it replaces the config's addopts. */
+  readonly overrideAddopts?: string;
 }
 
 /** What resolveEntry needs. DetectedRunner satisfies it. */
@@ -1569,18 +1610,41 @@ interface ArgResult {
   readonly pathScopes: string[];
   readonly noXdist: boolean;
   readonly xdistArg: boolean;
+  /** pytest: a --cov option was seen (D.4). */
+  readonly cov: boolean;
+  /** The raw values of the config-file options (D.1 config values). */
+  readonly configs: string[];
+  /** pytest: the value of `-o addopts=<v>`. */
+  readonly overrideAddopts: string | undefined;
   readonly notes: string[];
 }
 
+interface ArgOptions {
+  /**
+   * The tokens come from addopts or PYTEST_ADDOPTS (D.4, QA-1.3-13): a positional -> S6, and an
+   * unknown option's next token is taken as its value unless it names an existing path (S6).
+   */
+  readonly addopts?: { readonly exists: (abs: string) => Promise<boolean> };
+}
+
+/** The options whose value is a config file (D.1 config values, QA-1.3-5). */
+const CONFIG_OPTIONS: Record<ToolKind, readonly string[]> = {
+  vitest: ["--config", "-c"],
+  jest: ["--config", "-c"],
+  pytest: ["-c", "--config-file"],
+  eslint: ["-c", "--config"],
+};
+
 /** D.1 for vitest, jest, pytest and eslint. */
-function processArgs(
+async function processArgs(
   ctx: Ctx,
   kind: ToolKind,
   input: readonly string[],
   where: string,
   runnerCwd: string,
   gitRoot: string,
-): ArgResult | Unverifiable {
+  opts: ArgOptions = {},
+): Promise<ArgResult | Unverifiable> {
   const table = ARG_TABLES[kind];
   const camel = kind === "vitest" || kind === "jest";
   const args = [...input];
@@ -1588,9 +1652,12 @@ function processArgs(
   const notes = new Set<string>();
   const filters: string[] = [];
   const pathScopes: string[] = [];
+  const configs: string[] = [];
   let capRaw: string | undefined;
   let noXdist = false;
   let xdistArg = false;
+  let cov = false;
+  let overrideAddopts: string | undefined;
   let firstPositional = true;
   const badArg = (t: string) => s6("unsupported-argument", `unsupported ${kind} argument "${t}" in ${where}`);
 
@@ -1634,6 +1701,12 @@ function processArgs(
       i += values.length;
       if (m.entry.note) notes.add(m.entry.note);
       if (m.name === "--dist") xdistArg = true;
+      if (m.name === "--cov") cov = true;
+      const value = m.inline ? m.value : values[0];
+      if (value !== undefined && CONFIG_OPTIONS[kind].includes(m.name)) configs.push(value);
+      if (kind === "pytest" && (m.name === "-o" || m.name === "--override-ini") && value?.startsWith("addopts=")) {
+        overrideAddopts = value.slice("addopts=".length);
+      }
       switch (m.entry.action) {
         case "drop":
           break;
@@ -1670,9 +1743,17 @@ function processArgs(
         kept.push(t);
         continue;
       }
+      if (opts.addopts) {
+        // Either reading is safe: a path is S6 here, and a missing path makes pytest exit 4.
+        if (await opts.addopts.exists(ctx.P.resolve(runnerCwd, next))) return badArg(next);
+        kept.push(t, next);
+        i++;
+        continue;
+      }
       return s6("ambiguous-option", `ambiguous ${kind} option "${t}" in ${where}: cannot tell whether "${next}" is its value`);
     }
-    // Positional.
+    // Positional. In addopts it would widen the run to a directory or file (QA-1.3-13).
+    if (opts.addopts) return badArg(t);
     const first = firstPositional;
     firstPositional = false;
     if (kind === "vitest") {
@@ -1696,32 +1777,274 @@ function processArgs(
     userWorkers = parseCap(kind, capRaw);
     if (!userWorkers) notes.add(`invalid worker cap "${capRaw}" ignored`);
   }
-  return { kept, capRaw, userWorkers, pathScopes, noXdist, xdistArg, notes: [...notes] };
+  return { kept, capRaw, userWorkers, pathScopes, noXdist, xdistArg, cov, configs, overrideAddopts, notes: [...notes] };
 }
 
-const XDIST_RE = /(?:^|[\s"'[,=])(?:-n|--numprocesses|--maxprocesses|--dist)(?=[\s"'=,\]]|\d|$)/m;
-const XDIST_VALUE_RE = /(?:-n|--numprocesses|--maxprocesses)(?:\s*=\s*|\s+|["']\s*,\s*["'])?["']?(\d+|auto|logical)\b/;
-const COV_RE = /(?:^|[\s"'[,=])--cov(?=[=\s"',\]]|$)/m;
-const PYTEST_CONFIG_FILES = ["pytest.ini", "pyproject.toml", "tox.ini", "setup.cfg"];
+// ---------------------------------------------------------------------------------------------
+// D.4 pytest configuration (QA-1.3-3, QA-1.3-13)
+// ---------------------------------------------------------------------------------------------
 
-/** D.4: the pytest config text of the nearest directory holding any config file. */
-async function readPytestConfig(ctx: Ctx, fs: FsSeam, runnerCwd: string, gitRoot: string, notes: string[]): Promise<string> {
-  for (const d of ancestors(ctx, runnerCwd, gitRoot)) {
-    const texts: string[] = [];
-    let found = false;
-    for (const f of PYTEST_CONFIG_FILES) {
-      const p = ctx.P.join(d, f);
-      if (!(await fs.fileExists(p))) continue;
-      found = true;
-      try {
-        texts.push(await fs.readFile(p));
-      } catch {
-        notes.push(`unreadable pytest config ignored: ${p}`);
-      }
-    }
-    if (found) return texts.join("\n");
+/** pytest 9's inifile names, in its search order (_pytest/config/findpaths.py locate_config). */
+const PYTEST_CONFIG_NAMES = ["pytest.toml", ".pytest.toml", "pytest.ini", ".pytest.ini", "pyproject.toml", "tox.ini", "setup.cfg"];
+
+/** undefined: not a pytest config (pytest skips it). "bad": addopts present but not understood. */
+type ConfigParse = { readonly addopts?: readonly string[] } | "bad" | undefined;
+
+/** One config file by pytest's per-format rules. `explicit` (-c) files always count. */
+function parsePytestConfig(ctx: Ctx, file: string, text: string, explicit: boolean): ConfigParse {
+  const base = ctx.P.basename(file);
+  if (ctx.P.extname(base) === ".toml") {
+    const own = base === "pytest.toml" || base === ".pytest.toml";
+    const r = tomlAddopts(text, own ? ["pytest"] : ["tool.pytest.ini_options", "tool.pytest"]);
+    if (r === "bad") return "bad";
+    if (!r.found && !own && !explicit) return undefined;
+    return r.addopts === undefined ? {} : { addopts: r.addopts };
   }
-  return "";
+  const r = iniAddopts(text, ctx.P.extname(base) === ".cfg" ? "tool:pytest" : "pytest");
+  if (!r.found && base !== "pytest.ini" && base !== ".pytest.ini" && !explicit) return undefined;
+  if (r.addopts === undefined) return {};
+  const tokens = tokenize(r.addopts.replace(/\r?\n/g, " "));
+  return tokens ? { addopts: tokens } : "bad";
+}
+
+/** iniconfig rules: `[section]` at column 0, `key = value` or `key: value`, indented continuation lines, # and ; comment lines. */
+function iniAddopts(text: string, section: string): { found: boolean; addopts?: string } {
+  let current: string | undefined;
+  let found = false;
+  let key: string | undefined;
+  let value: string | undefined;
+  for (const line of text.split(/\r\n|\r|\n/)) {
+    if (/^\s*[#;]/.test(line) || line.trim() === "") continue;
+    if (line.startsWith("[")) {
+      const head = line.replace(/[#;].*$/, "").trimEnd();
+      current = head.endsWith("]") ? head.slice(1, -1) : undefined;
+      if (current === section) found = true;
+      key = undefined;
+    } else if (/^\s/.test(line)) {
+      if (current === section && key === "addopts") value = `${value ?? ""}\n${line.trim()}`;
+    } else {
+      const kv = /^([^=:]+?)\s*(?:=|:\s)\s*(.*)$/.exec(line);
+      key = kv?.[1].trim();
+      if (kv && current === section && key === "addopts") value = kv[2].trim();
+    }
+  }
+  return value === undefined ? { found } : { found, addopts: value };
+}
+
+/** The addopts of the first matching TOML table: a string (tokenized like pytest's shlex) or an array. */
+function tomlAddopts(text: string, tables: readonly string[]): { found: boolean; addopts?: readonly string[] } | "bad" {
+  const headers = [...text.matchAll(/^[ \t]*(\[\[?)([^\]\n]*)\]\]?[ \t]*(?:#[^\n]*)?\r?$/gm)];
+  let found = false;
+  for (let h = 0; h < headers.length; h++) {
+    const m = headers[h];
+    if (m[1] === "[[" || !tables.includes(m[2].replace(/[\s"']/g, ""))) continue;
+    found = true;
+    const from = (m.index ?? 0) + m[0].length;
+    const body = text.slice(from, h + 1 < headers.length ? headers[h + 1].index : text.length);
+    const key = /^[ \t]*addopts[ \t]*=[ \t]*/m.exec(body);
+    if (!key) continue;
+    const v = tomlValue(body.slice(key.index + key[0].length));
+    if (v === undefined) return "bad";
+    if (typeof v !== "string") return { found, addopts: v };
+    const tokens = tokenize(v.replace(/\r?\n/g, " "));
+    return tokens ? { found, addopts: tokens } : "bad";
+  }
+  return { found };
+}
+
+const TOML_ESCAPES: Readonly<Record<string, string>> = { '"': '"', "\\": "\\", n: "\n", t: "\t", r: "\r", b: "\b", f: "\f" };
+
+/** A TOML string or array of strings at the start of `s`; undefined for anything else. */
+function tomlValue(s: string): string | string[] | undefined {
+  if (s.startsWith('"""') || s.startsWith("'''")) {
+    const q = s.slice(0, 3);
+    const end = s.indexOf(q, 3);
+    if (end < 0) return undefined;
+    const raw = s.slice(3, end).replace(/^\r?\n/, "");
+    return q === '"""' && raw.includes("\\") ? undefined : raw;
+  }
+  if (s.startsWith('"') || s.startsWith("'")) return tomlString(s, 0)?.value;
+  if (!s.startsWith("[")) return undefined;
+  const out: string[] = [];
+  let i = 1;
+  for (;;) {
+    i += /^(?:[\s,]|#[^\n]*)*/.exec(s.slice(i))?.[0].length ?? 0;
+    if (s[i] === "]") return out;
+    const str = tomlString(s, i);
+    if (!str) return undefined;
+    out.push(str.value);
+    i = str.end;
+  }
+}
+
+/** A single-line TOML basic ("...") or literal ('...') string starting at s[i]. */
+function tomlString(s: string, i: number): { value: string; end: number } | undefined {
+  if (s[i] === "'") {
+    const end = s.indexOf("'", i + 1);
+    if (end < 0 || s.slice(i + 1, end).includes("\n")) return undefined;
+    return { value: s.slice(i + 1, end), end: end + 1 };
+  }
+  if (s[i] !== '"') return undefined;
+  let value = "";
+  for (let j = i + 1; j < s.length; j++) {
+    const c = s[j];
+    if (c === '"') return { value, end: j + 1 };
+    if (c === "\n") return undefined;
+    if (c !== "\\") {
+      value += c;
+      continue;
+    }
+    const n = s[j + 1] ?? "";
+    const simple = Object.hasOwn(TOML_ESCAPES, n) ? TOML_ESCAPES[n] : undefined;
+    if (simple !== undefined) {
+      value += simple;
+      j++;
+      continue;
+    }
+    const len = n === "u" ? 4 : n === "U" ? 8 : 0;
+    const hex = s.slice(j + 2, j + 2 + len);
+    const cp = len > 0 && hex.length === len && /^[0-9a-fA-F]+$/.test(hex) ? Number.parseInt(hex, 16) : -1;
+    if (!isXmlCodePoint(cp)) return undefined;
+    value += String.fromCodePoint(cp);
+    j += 1 + len;
+  }
+  return undefined;
+}
+
+interface PytestConfig {
+  readonly path: string;
+  readonly addopts?: readonly string[];
+}
+
+/**
+ * pytest's inifile selection: the -c file alone, or the first accepted file walking from `start`
+ * up to the filesystem root (above gitRoot too, as pytest does). An unreadable file is noted and
+ * skipped.
+ */
+async function findPytestConfig(
+  ctx: Ctx,
+  fs: FsSeam,
+  explicit: string | undefined,
+  start: string,
+  notes: string[],
+): Promise<PytestConfig | Unverifiable | undefined> {
+  const load = async (p: string, isExplicit: boolean): Promise<ConfigParse | "unreadable"> => {
+    let text: string;
+    try {
+      text = await fs.readFile(p);
+    } catch {
+      notes.push(`unreadable pytest config ignored: ${p}`);
+      return "unreadable";
+    }
+    return parsePytestConfig(ctx, p, text, isExplicit);
+  };
+  const bad = (p: string) => s6("unsupported-argument", `unsupported pytest argument "addopts" in ${p}`);
+  if (explicit !== undefined) {
+    const r = await load(explicit, true);
+    if (r === "bad") return bad(explicit);
+    return r === "unreadable" ? undefined : { path: explicit, ...r };
+  }
+  let d = start;
+  for (;;) {
+    for (const name of PYTEST_CONFIG_NAMES) {
+      const p = ctx.P.join(d, name);
+      if (!(await fs.fileExists(p))) continue;
+      const r = await load(p, false);
+      if (r === "bad") return bad(p);
+      if (r !== undefined && r !== "unreadable") return { path: p, ...r };
+    }
+    const up = ctx.P.dirname(d);
+    if (up === d) return undefined;
+    d = up;
+  }
+}
+
+interface PytestEvidence {
+  readonly xdist: boolean;
+  readonly covInConfig: boolean;
+  readonly userWorkers?: UserWorkerCap;
+}
+
+/**
+ * D.4: xdist, cov and the user cap from every source pytest reads, in pytest's order (config
+ * addopts, then PYTEST_ADDOPTS, then the command; the last cap wins). Both the cross-env and the
+ * host PYTEST_ADDOPTS are scanned for evidence; the cap comes from the one the spawn will see.
+ */
+async function pytestEvidence(
+  ctx: Ctx,
+  fs: FsSeam,
+  facts: PytestFacts,
+  env: Readonly<Record<string, string>>,
+  start: string,
+  runnerCwd: string,
+  gitRoot: string,
+  notes: string[],
+): Promise<PytestEvidence | Unverifiable> {
+  const sources: { where: string; text?: string; tokens?: readonly string[]; capWins: boolean }[] = [];
+  if (facts.overrideAddopts !== undefined) {
+    sources.push({ where: "-o addopts", text: facts.overrideAddopts, capWins: true });
+  } else {
+    const cfg = await findPytestConfig(ctx, fs, facts.configFile, start, notes);
+    if (cfg !== undefined && isS6(cfg)) return cfg;
+    if (cfg?.addopts) sources.push({ where: `addopts of ${cfg.path}`, tokens: cfg.addopts, capWins: true });
+  }
+  const crossEnv = Object.hasOwn(env, "PYTEST_ADDOPTS");
+  if (ctx.host.pytestAddopts !== "") sources.push({ where: "PYTEST_ADDOPTS", text: ctx.host.pytestAddopts, capWins: !crossEnv });
+  if (crossEnv) sources.push({ where: "PYTEST_ADDOPTS", text: env.PYTEST_ADDOPTS, capWins: true });
+
+  let capRaw: string | undefined;
+  let xdist = facts.xdist;
+  let noXdist = facts.noXdist;
+  let cov = false;
+  const exists = (p: string) => fs.fileExists(p);
+  for (const src of sources) {
+    const tokens = src.tokens ?? tokenize(src.text ?? "");
+    if (!tokens) return s6("unterminated-quote", `unterminated quote in ${src.where}`);
+    const r = await processArgs(ctx, "pytest", tokens, src.where, runnerCwd, gitRoot, { addopts: { exists } });
+    if (isS6(r)) return r;
+    xdist ||= r.xdistArg;
+    noXdist ||= r.noXdist;
+    cov ||= r.cov;
+    if (src.capWins && r.capRaw !== undefined) capRaw = r.capRaw;
+    for (const n of r.notes) if (n.startsWith("invalid worker cap") && !notes.includes(n)) notes.push(n);
+  }
+  if (facts.cap !== undefined) capRaw = facts.cap;
+  const userWorkers = capRaw === undefined ? undefined : parseCap("pytest", capRaw);
+  return { xdist: xdist && !noXdist, covInConfig: cov, ...(userWorkers ? { userWorkers } : {}) };
+}
+
+/** The directory pytest starts its inifile search from: the common ancestor of the file arguments. */
+function commonDir(ctx: Ctx, files: readonly string[]): string {
+  let dir = ctx.P.dirname(files[0]);
+  for (const f of files) {
+    while (!isInside(ctx, dir, f)) {
+      const up = ctx.P.dirname(dir);
+      if (up === dir) break;
+      dir = up;
+    }
+  }
+  return dir;
+}
+
+/** D.4 at spec time (QA-1.3-3c): pytest picks its config from the inputs, so redo the lookup there. */
+async function pytestAtInputs(
+  ctx: Ctx,
+  fs: FsSeam,
+  det: DetectedRunner,
+  F: readonly string[],
+  runnerCwd: string,
+  notes: string[],
+): Promise<PytestEvidence | Unverifiable | undefined> {
+  if (det.kind !== "pytest") return undefined;
+  const facts = det.pytestFacts ?? { xdist: det.xdist, noXdist: false };
+  const own: string[] = [];
+  const ev = await pytestEvidence(ctx, fs, facts, det.env, commonDir(ctx, F), runnerCwd, det.gitRoot, own);
+  if (isS6(ev)) return ev;
+  for (const n of own) if (!notes.includes(n)) notes.push(n);
+  if (det.pytestFacts) return ev;
+  // A DetectedRunner built elsewhere: never lose what it already knew.
+  const userWorkers = ev.userWorkers ?? det.userWorkers;
+  return { xdist: ev.xdist || det.xdist, covInConfig: ev.covInConfig || det.covInConfig, ...(userWorkers ? { userWorkers } : {}) };
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1800,7 +2123,7 @@ async function detectImpl<K extends ToolKind>(
 
 async function finishDetection<K extends ToolKind>(
   ctx: Ctx,
-  fs: FsSeam,
+  fs: PlannerFs,
   kind: K,
   launcher: Launcher,
   source: CommandSource,
@@ -1811,21 +2134,28 @@ async function finishDetection<K extends ToolKind>(
   where: string,
   notes: string[],
 ): Promise<Detected<K> | Unverifiable> {
-  const a = processArgs(ctx, kind, args, where, runnerCwd, gitRoot);
+  const a = await processArgs(ctx, kind, args, where, runnerCwd, gitRoot);
   if (isS6(a)) return a;
   const allNotes = [...notes, ...a.notes];
+  const pathScopes = await Promise.all(a.pathScopes.map((p) => realOf(ctx, fs, p)));
+  const configFiles = await Promise.all(a.configs.map((c) => realOf(ctx, fs, ctx.P.resolve(runnerCwd, stripWinPrefix(ctx, c)))));
   let userWorkers = a.userWorkers;
   let xdist = false;
   let covInConfig = false;
+  let pytestFacts: PytestFacts | undefined;
   if (kind === "pytest") {
-    const cfg = await readPytestConfig(ctx, fs, runnerCwd, gitRoot, allNotes);
-    const addopts = ctx.host.pytestAddopts;
-    xdist = !a.noXdist && (a.xdistArg || XDIST_RE.test(cfg) || XDIST_RE.test(addopts));
-    covInConfig = COV_RE.test(cfg) || COV_RE.test(addopts);
-    if (a.capRaw === undefined) {
-      const m = XDIST_VALUE_RE.exec(cfg) ?? XDIST_VALUE_RE.exec(addopts);
-      if (m) userWorkers = parseCap("pytest", m[1]);
-    }
+    const configFile = configFiles.at(-1);
+    pytestFacts = {
+      xdist: a.xdistArg,
+      noXdist: a.noXdist,
+      ...(a.capRaw !== undefined ? { cap: a.capRaw } : {}),
+      ...(configFile !== undefined ? { configFile } : {}),
+      ...(a.overrideAddopts !== undefined ? { overrideAddopts: a.overrideAddopts } : {}),
+    };
+    // Detection has no inputs yet: start where pytest would with no file arguments.
+    const ev = await pytestEvidence(ctx, fs, pytestFacts, env, runnerCwd, runnerCwd, gitRoot, allNotes);
+    if (isS6(ev)) return ev;
+    ({ xdist, covInConfig, userWorkers } = ev);
   }
   return {
     kind,
@@ -1836,10 +2166,11 @@ async function finishDetection<K extends ToolKind>(
     env,
     keptArgs: a.kept,
     ...(userWorkers ? { userWorkers } : {}),
-    pathScopes: a.pathScopes,
+    pathScopes,
     xdist,
     covInConfig,
     notes: allNotes,
+    ...(pytestFacts ? { pytestFacts } : {}),
   };
 }
 
@@ -2133,7 +2464,9 @@ async function classify(
   if (isS6(pre)) return pre;
   const F = [...inputs.entries()].sort(byKey).map(([, v]) => v);
   const allNotes = [...notes, ...pre.notes];
-  return buildSpec(ctx, det, pre.entry, F, input.budget, input.cores, allNotes, "related", det.runnerCwd, gitRoot, !fs.realpath);
+  const py = await pytestAtInputs(ctx, fs, det, F, det.runnerCwd, allNotes);
+  if (py !== undefined && isS6(py)) return py;
+  return buildSpec(ctx, det, pre.entry, F, input.budget, input.cores, allNotes, "related", det.runnerCwd, gitRoot, !fs.realpath, py);
 }
 
 /** H, N.4 (QA-1.3-11): the tmpdir must be absolute and must not be inside gitRoot, lexically or after realpath. */
@@ -2188,9 +2521,12 @@ function buildSpec(
   cwd: string,
   gitRoot: string,
   lexical: boolean,
+  py: PytestEvidence | undefined,
 ): ScopedSpec | Unverifiable {
   const C = inputCores ?? ctx.host.cores;
-  const N = effectiveWorkers(det.userWorkers, budget, C);
+  const xdist = py ? py.xdist : det.xdist;
+  const covInConfig = py ? py.covInConfig : det.covInConfig;
+  const N = effectiveWorkers(py ? py.userWorkers : det.userWorkers, budget, C);
   const E = entry.prefix;
   const K = det.keptArgs;
   const R = ctx.P.join(ctx.P.resolve(ctx.host.tmpdir), `omr-verify-${ctx.host.randomId()}.${det.kind === "pytest" ? "xml" : "json"}`);
@@ -2206,12 +2542,12 @@ function buildSpec(
   } else {
     args = [
       ...E, ...K, "-q", "-p", "no:cacheprovider", `--junitxml=${R}`, "--maxfail=0",
-      ...(det.xdist ? ["-n", String(N)] : []),
-      ...(det.covInConfig ? ["--no-cov"] : []),
+      ...(xdist ? ["-n", String(N)] : []),
+      ...(covInConfig ? ["--no-cov"] : []),
       "--", ...F,
     ];
     env.PYTEST_XDIST_AUTO_NUM_WORKERS = String(N >= 1 ? N : effectiveWorkers({ auto: true }, budget, C));
-    workers = det.xdist ? N : null;
+    workers = xdist ? N : null;
   }
   if (commandLineLength(ctx, entry.file, args) > MAX_ARGV_CHARS) {
     return s6("argv-too-long", `too many inputs for one command line: ${F.length} files`);
@@ -2312,7 +2648,9 @@ export async function planRerun(
     notes.push(...r.notes);
   }
   const F = [...inputs.entries()].sort(byKey).map(([, v]) => v);
-  return buildSpec(ctx, runner, entry, F, budget, deps.cores, notes, "rerun", absCwd, gitRoot, !deps.fs.realpath);
+  const py = await pytestAtInputs(ctx, deps.fs, runner, F, absCwd, notes);
+  if (py !== undefined && isS6(py)) return py;
+  return buildSpec(ctx, runner, entry, F, budget, deps.cores, notes, "rerun", absCwd, gitRoot, !deps.fs.realpath, py);
 }
 
 /** 1.3.2.f: parse the report (or fall back to observeTests) and always delete the report file (I, N.4). */

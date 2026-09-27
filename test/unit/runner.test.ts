@@ -1875,3 +1875,151 @@ describe("QA-1.3-6: package-manager location options are S6", () => {
     expect((await detect("pnpm test -- --dir x", jsRepo({ test: "vitest" }))).keptArgs).toEqual(["--dir", "x"]);
   });
 });
+
+describe("QA-1.3-3a/c: every xdist source is found, so the cap always lands", () => {
+  const T = { "/r/tests/test_a.py": "" };
+  const nArgs = (s: ScopedSpec) => s.args.slice(s.args.indexOf("-n"), s.args.indexOf("-n") + 2);
+  const plan = async (command: string, files: Record<string, string>, host: Partial<RunnerHost> = { ...POSIX_HOST, pathEnv: "/usr/bin" }) =>
+    spec(await planScopedRun(input({ command, files: pyRepo({ ...T, ...files }), host, changedFiles: changed("tests/test_a.py") })));
+
+  it("(a) cross-env PYTEST_ADDOPTS in a script", async () => {
+    const files = pyRepo({ ...T, "/r/package.json": JSON.stringify({ scripts: { test: 'cross-env PYTEST_ADDOPTS="-n 3" pytest' } }) });
+    const d = await detect("npm test", files);
+    expect(d).toMatchObject({ xdist: true, userWorkers: { count: 3 } });
+    const s = spec(await planScopedRun(input({ command: "npm test", files, changedFiles: changed("tests/test_a.py") })));
+    expect(nArgs(s)).toEqual(["-n", "2"]);
+    expect(s.env.PYTEST_ADDOPTS).toBe("-n 3");
+  });
+
+  it("(a) the cross-env value replaces the host one for the cap; both count as evidence", async () => {
+    const host = { ...POSIX_HOST, pytestAddopts: "-n 6 --cov" };
+    expect(await detect('cross-env PYTEST_ADDOPTS="-n 1" pytest', pyRepo(), host)).toMatchObject({ xdist: true, covInConfig: true, userWorkers: { count: 1 } });
+    expect(await detect("cross-env PYTEST_ADDOPTS= pytest", pyRepo(), { ...POSIX_HOST, pytestAddopts: "-p no:xdist" })).toMatchObject({ xdist: false });
+  });
+
+  it.each([
+    ["/r/.pytest.ini", "[pytest]\naddopts = -n 3\n"],
+    ["/r/pytest.toml", '[pytest]\naddopts = ["-n", "3"]\n'],
+    ["/r/.pytest.toml", "[pytest]\naddopts = '-n 3'\n"],
+    ["/r/pyproject.toml", '[tool.pytest]\naddopts = ["-n", "3"]\n'],
+    ["/r/pyproject.toml", '[ "tool" . pytest . ini_options ] # c\naddopts = """\n-n 3\n"""\n'],
+    ["/r/pyproject.toml", "[tool.pytest.ini_options]\naddopts = '''-n 3'''\n"],
+    ["/r/pyproject.toml", '[tool.pytest.ini_options]\naddopts = [\n  "-n", # workers\n  \'3\',\n]\n'],
+    ["/r/pyproject.toml", '[tool.pytest.ini_options]\naddopts = "-n \\u0033 -k \\"a b\\" -m \\t\\\\x"\n'],
+    ["/r/tox.ini", "[tox]\nenv = py\n[pytest]\n; comment\naddopts =\n    -n 3\n    --cov\n"],
+    ["/r/setup.cfg", "[metadata]\nname = x\n[tool:pytest] # c\naddopts: -n 3\n"],
+    ["/pytest.ini", "[pytest]\naddopts = -n 3\n"],
+  ])("(c) %s is read the way pytest reads it", async (f, text) => {
+    const d = await detect("pytest", pyRepo({ [f]: text }));
+    expect(d).toMatchObject({ xdist: true, userWorkers: { count: 3 } });
+    expect(nArgs(await plan("pytest", { [f]: text }))).toEqual(["-n", "2"]);
+  });
+
+  it("(c) files pytest skips do not stop the search", async () => {
+    const files = pyRepo({
+      "/r/sub/pyproject.toml": "[project]\nname = 'x'\n[[tool.pytest.ini_options]]\n",
+      "/r/sub/tox.ini": "[tox]\n[testenv]\ncommands = pytest -n 9\n",
+      "/r/sub/setup.cfg": "[metadata]\n",
+      "/r/pytest.ini": "[pytest]\naddopts = -n 3\n",
+    });
+    expect(await detect("pytest", files, POSIX_HOST, "/r/sub")).toMatchObject({ xdist: true, userWorkers: { count: 3 } });
+  });
+
+  it("(c) the first accepted file in a directory wins, even an empty pytest.ini", async () => {
+    expect(await detect("pytest", pyRepo({ "/r/pytest.toml": "[pytest]\n", "/r/pytest.ini": "[pytest]\naddopts = -n 3\n" }))).toMatchObject({ xdist: false });
+    expect(await detect("pytest", pyRepo({ "/r/pytest.ini": "", "/r/tox.ini": "[pytest]\naddopts = -n 3\n" }))).toMatchObject({ xdist: false });
+  });
+
+  it("(c) -c / --config-file: only that file, in its format", async () => {
+    const files = { "/r/cfg/unit.ini": "[pytest]\naddopts = -n 3\n", "/r/cfg/unit.toml": "[tool.pytest.ini_options]\naddopts = '-n 4'\n", "/r/pytest.ini": "[pytest]\n" };
+    expect(await detect("pytest -c cfg/unit.ini", pyRepo(files))).toMatchObject({ xdist: true, userWorkers: { count: 3 } });
+    expect(await detect("pytest --config-file=cfg/unit.toml", pyRepo(files))).toMatchObject({ xdist: true, userWorkers: { count: 4 } });
+    expect(await detect("pytest -c cfg/missing.ini", pyRepo(files))).toMatchObject({ xdist: false });
+    expect((await detect("pytest -c cfg/unit.ini", pyRepo({}), POSIX_HOST)).pytestFacts).toMatchObject({ configFile: "/r/cfg/unit.ini" });
+  });
+
+  it("(c) -o addopts replaces the config's addopts", async () => {
+    const files = pyRepo({ "/r/pytest.ini": "[pytest]\naddopts = -n 3\n" });
+    expect(await detect('pytest -o "addopts=-n 4"', files)).toMatchObject({ xdist: true, userWorkers: { count: 4 } });
+    expect(await detect("pytest -o addopts=", files)).toMatchObject({ xdist: false });
+    expect(await detect("pytest --override-ini=addopts=--cov", files)).toMatchObject({ xdist: false, covInConfig: true });
+  });
+
+  it("(c) at spec time the lookup starts from the inputs, like pytest", async () => {
+    const files = { "/r/pyproject.toml": "[tool.pytest.ini_options]\naddopts = '-q'\n", "/r/tests/unit/pytest.ini": "[pytest]\naddopts = -n 3\n", "/r/tests/unit/test_u.py": "" };
+    expect(await detect("pytest", pyRepo(files))).toMatchObject({ xdist: false });
+    const s = spec(await planScopedRun(input({ command: "pytest", files: pyRepo(files), changedFiles: changed("tests/unit/test_u.py") })));
+    expect(nArgs(s)).toEqual(["-n", "2"]);
+    expect(s.workers).toBe(2);
+    const det = await detect("pytest", pyRepo(files));
+    const r = spec(await planRerun(det, ["/r/tests/unit/test_u.py"], "/r", { maxWorkers: 2 }, { fs: memFs(pyRepo(files)), host: { ...POSIX_HOST, pathEnv: "/usr/bin" } }));
+    expect(nArgs(r)).toEqual(["-n", "2"]);
+  });
+
+  it("(c) a DetectedRunner without pytestFacts keeps what it knew", async () => {
+    const { pytestFacts: _f, ...det } = await detect("pytest -n 1 --dist load", pyRepo(T));
+    const r = spec(await planRerun({ ...det, covInConfig: true }, ["/r/tests/test_a.py"], "/r", { maxWorkers: 2 }, { fs: memFs(pyRepo(T)), host: { ...POSIX_HOST, pathEnv: "/usr/bin" } }));
+    expect(nArgs(r)).toEqual(["-n", "1"]);
+    expect(r.args).toContain("--no-cov");
+    const bare = spec(await planRerun({ ...det, xdist: false }, ["/r/tests/test_a.py"], "/r", { maxWorkers: 2 }, { fs: memFs(pyRepo(T)), host: { ...POSIX_HOST, pathEnv: "/usr/bin" } }));
+    expect(bare.workers).toBeNull();
+  });
+
+  it("(c) unreadable config notes are not repeated at spec time", async () => {
+    const files = pyRepo({ ...T, "/r/tox.ini": "x" });
+    const s = spec(await planScopedRun(input({ command: "pytest", fs: memFs(files, false, {}, ["/r/tox.ini"]), changedFiles: changed("tests/test_a.py") })));
+    expect(s.notes.filter((n) => n.startsWith("unreadable pytest config"))).toEqual(["unreadable pytest config ignored: /r/tox.ini"]);
+  });
+
+  it.each([
+    ["/r/pyproject.toml", "[tool.pytest.ini_options]\naddopts = -n 3\n"],
+    ["/r/pyproject.toml", '[tool.pytest.ini_options]\naddopts = "-n 3\n'],
+    ["/r/pyproject.toml", '[tool.pytest.ini_options]\naddopts = "-n 3'],
+    ["/r/pyproject.toml", '[tool.pytest.ini_options]\naddopts = """-n \\\n 3"""\n'],
+    ["/r/pyproject.toml", "[tool.pytest.ini_options]\naddopts = '''-n 3\n"],
+    ["/r/pyproject.toml", "[tool.pytest.ini_options]\naddopts = [ 3 ]\n"],
+    ["/r/pyproject.toml", '[tool.pytest.ini_options]\naddopts = "\\q"\n'],
+    ["/r/pyproject.toml", '[tool.pytest.ini_options]\naddopts = "\\u12"\n'],
+    ["/r/pyproject.toml", '[tool.pytest.ini_options]\naddopts = "\\uD800"\n'],
+    ["/r/pyproject.toml", "[tool.pytest.ini_options]\naddopts = 'a\nb'\n"],
+    ["/r/pyproject.toml", "[tool.pytest.ini_options]\naddopts = \"-k 'x\"\n"],
+    ["/r/pytest.ini", "[pytest]\naddopts = -k \"x\n"],
+  ])("(c) addopts the adapter cannot read -> S6 (%s)", async (f, text) => {
+    expectS6(await detectRunner("pytest", "/r", memFs(pyRepo({ [f]: text })), POSIX_HOST), "unsupported-argument", `unsupported pytest argument "addopts" in ${f}`);
+  });
+
+  it("(c) a table without addopts, and an ini key without a value, are simply empty", async () => {
+    expect(await detect("pytest", pyRepo({ "/r/pyproject.toml": "[tool.pytest.ini_options]\nminversion = '6'\n[tool.other]\naddopts = '-n 9'\n" }))).toMatchObject({ xdist: false });
+    expect(await detect("pytest", pyRepo({ "/r/pytest.ini": "[pytest]\nnot a key line\n  -n 9\n[other]\naddopts = -n 9\n" }))).toMatchObject({ xdist: false });
+  });
+});
+
+describe("QA-1.3-13: a positional in addopts or PYTEST_ADDOPTS is S6", () => {
+  it.each([
+    [{ "/r/pytest.ini": "[pytest]\naddopts = tests\n" }, "", "tests", "addopts of /r/pytest.ini"],
+    [{ "/r/pytest.ini": "[pytest]\naddopts = --foo data.txt\n", "/r/data.txt": "" }, "", "data.txt", "addopts of /r/pytest.ini"],
+    [{}, "-q tests/", "tests/", "PYTEST_ADDOPTS"],
+  ])("%j with PYTEST_ADDOPTS %j -> S6 naming %s", async (files, env, token, where) => {
+    const r = await detectRunner("pytest", "/r", memFs(pyRepo(files)), { ...POSIX_HOST, pytestAddopts: env });
+    expectS6(r, "unsupported-argument", `unsupported pytest argument "${token}" in ${where}`);
+  });
+
+  it("an unknown option's value that names no file is kept as a value", async () => {
+    expect(await detect("pytest", pyRepo({ "/r/pytest.ini": "[pytest]\naddopts = --reruns 2 --doctest-modules -ra\n" }))).toMatchObject({ xdist: false });
+  });
+
+  it("cross-env PYTEST_ADDOPTS and -o addopts are checked too; unterminated quotes are S6", async () => {
+    await detectS6('cross-env PYTEST_ADDOPTS="tests" pytest', "unsupported-argument", 'unsupported pytest argument "tests" in PYTEST_ADDOPTS', pyRepo());
+    await detectS6('pytest -o "addopts=tests"', "unsupported-argument", 'unsupported pytest argument "tests" in -o addopts', pyRepo());
+    await detectS6(`pytest -o "addopts=-k 'x"`, "unterminated-quote", "unterminated quote in -o addopts", pyRepo());
+    expectS6(await detectRunner("pytest", "/r", memFs(pyRepo()), { ...POSIX_HOST, pytestAddopts: '-k "x' }), "unterminated-quote", "unterminated quote in PYTEST_ADDOPTS");
+  });
+
+  it("the spec-time lookup applies the same rule", async () => {
+    const files = { "/r/tests/unit/pytest.ini": "[pytest]\naddopts = more_tests\n", "/r/tests/unit/test_u.py": "" };
+    expect(await detect("pytest", pyRepo(files))).toMatchObject({ xdist: false });
+    expectS6(await planScopedRun(input({ command: "pytest", files: pyRepo(files), changedFiles: changed("tests/unit/test_u.py") })), "unsupported-argument");
+    const det = await detect("pytest", pyRepo(files));
+    expectS6(await planRerun(det, ["/r/tests/unit/test_u.py"], "/r", { maxWorkers: 2 }, { fs: memFs(pyRepo(files)), host: { ...POSIX_HOST, pathEnv: "/usr/bin" } }), "unsupported-argument");
+  });
+});
