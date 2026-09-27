@@ -9,9 +9,26 @@
  * and the "aborted" baseline keeps every core busy until the suite finishes on
  * its own. On a timeout or abort this kills the whole tree instead: `taskkill
  * /T` on Windows, the process group on POSIX.
+ *
+ * Lifecycle guarantees (G4, docs/qa/verification-resource-budget/phase-1.2.md):
+ * - The promise always resolves, never rejects, and settles at most
+ *   KILL_GRACE_MS after a kill even when a descendant that escaped the kill
+ *   still holds the output pipes (they are then force-closed).
+ * - A deadline or abort that arrives after the direct child exited still
+ *   reaches what it left running (POSIX: its process group; Windows: a
+ *   creation-time-bounded sweep of its children, see `armSweeper`), without
+ *   ever signalling a PID that may have been recycled.
+ * - `timedOut` is true exactly when the deadline or abort had to end something
+ *   (the command, a descendant it left running, or the held pipes). An abort
+ *   that finds nothing left running is a no-op: the natural result stands.
+ * - POSIX process groups still running when opencode exits are killed from one
+ *   `process.once("exit")` hook. Death by an unhandled signal (the host's
+ *   SIGTERM/SIGHUP policy) skips `exit` hooks and remains opencode's concern.
+ *   On Windows, non-detached children sit in libuv's kill-on-close job.
  */
 import { execFile, spawn, type ChildProcess } from "node:child_process";
 import { constants as osConstants, setPriority } from "node:os";
+import { join } from "node:path";
 import type { ArgvSeam, ExecOptions, ExecSeam } from "./types";
 
 export interface ShellResult {
@@ -40,8 +57,16 @@ export interface RunOptions extends ExecOptions {
 }
 
 export const DEFAULT_TIMEOUT_MS = 120_000;
+/** After a kill, the longest the result waits for the output pipes to close. */
+export const KILL_GRACE_MS = 2000;
 const MAX_TIMER_MS = 2 ** 31 - 1;
 const DEFAULT_MAX_BUFFER = 10 * 1024 * 1024;
+/** Windows: pipes still open this long after the child exited arm the orphan sweeper. */
+const SWEEP_ARM_MS = 200;
+/** Windows: the most the sweeper's kill phase may take before it is abandoned. */
+const SWEEP_TIMEOUT_MS = 5000;
+/** Windows: clock tolerance between Date.now() and the kernel's creation times. */
+const SWEEP_CLOCK_SLACK_MS = 50;
 
 const isWin = process.platform === "win32";
 
@@ -83,9 +108,23 @@ function run(file: string, args: string[], shell: boolean, opts: RunOptions, nic
     const out = capture(limit);
     const err = capture(limit);
     const notes: string[] = [];
+    let killRequested = false;
+    /** The deadline or abort ended something: the command, a leftover descendant or the pipes. */
     let killed = false;
     let exited = false;
+    let exitCode: number | null = null;
+    let exitedAt = 0;
+    let closed = false;
+    let closeCode: number | null = null;
     let settled = false;
+    let groupGone = false;
+    let sweeper: Sweeper | undefined;
+    let swept = false;
+    let sweepPending = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let grace: ReturnType<typeof setTimeout> | undefined;
+    let armTimer: ReturnType<typeof setTimeout> | undefined;
+    const spawnedAt = Date.now();
     let child: ChildProcess;
     try {
       child = spawn(file, args, {
@@ -103,7 +142,7 @@ function run(file: string, args: string[], shell: boolean, opts: RunOptions, nic
     }
     const pid = child.pid;
     if (!isWin && pid) trackGroup(pid);
-    if (opts.lowPriority && isWin && child.pid) {
+    if (opts.lowPriority && isWin && pid) {
       // Windows low priority (Spike A, docs/qa/verification-resource-budget/phase-1.2.md):
       // lower the direct child right after spawn; descendants inherit the class
       // when they are created. The `start /BELOWNORMAL` wrapper was rejected
@@ -113,7 +152,7 @@ function run(file: string, args: string[], shell: boolean, opts: RunOptions, nic
       // this line, before the child has even loaded its runtime, so in practice
       // no grandchild exists yet — but it is not a guarantee.
       try {
-        setPriority(child.pid, osConstants.priority.PRIORITY_BELOW_NORMAL);
+        setPriority(pid, osConstants.priority.PRIORITY_BELOW_NORMAL);
       } catch (e) {
         // The child may already have exited; the run itself is unaffected.
         notes.push(`[low priority not applied: ${String(e)}]`);
@@ -129,24 +168,16 @@ function run(file: string, args: string[], shell: boolean, opts: RunOptions, nic
     child.stdout?.on("data", (s: string) => out.push(s));
     child.stderr?.on("data", (s: string) => err.push(s));
 
-    const kill = () => {
-      if (killed || settled) return;
-      killed = true;
-      // After the direct child exited its PID may be recycled by Windows, so a
-      // `taskkill /T` on it could hit an unrelated tree. POSIX still signals
-      // the group: a group id is not reused while any member is alive.
-      if (exited && isWin) return;
-      killTree(child);
-    };
-    const timer = deadline === undefined ? undefined : setTimeout(kill, deadline);
-    opts.signal?.addEventListener("abort", kill, { once: true });
-
     const finish = (code: number | null, error?: unknown) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      clearTimeout(grace);
+      clearTimeout(armTimer);
       opts.signal?.removeEventListener("abort", kill);
       if (!isWin && pid) untrackGroup(pid);
+      // A sweep that is killing must finish; one that is only armed is released.
+      if (sweeper && !sweepPending) sweeper.dispose();
       let finalCode = killed ? code || 1 : code ?? 1;
       let stderr = err.text;
       if (niceTarget && !killed && (code === 126 || code === 127) && stderr.startsWith("nice:")) {
@@ -160,9 +191,95 @@ function run(file: string, args: string[], shell: boolean, opts: RunOptions, nic
       for (const note of notes) stderr += `${stderr && !stderr.endsWith("\n") ? "\n" : ""}${note}\n`;
       resolve({ code: finalCode, stdout: out.text, stderr, timedOut: killed });
     };
-    child.on("exit", () => { exited = true; });
-    child.on("error", (err) => finish(1, err));
-    child.on("close", (code) => finish(code));
+
+    const onSwept = (pids: number[]) => {
+      sweepPending = false;
+      if (pids.length > 0) {
+        killed = true;
+        notes.push(`[killed ${pids.length} process tree(s) left running by the exited command: pid ${pids.join(", ")}]`);
+      }
+      if (closed) finish(closeCode);
+    };
+    /** Windows only: kill what the exited child left running (at most once per run). */
+    const sweep = () => {
+      if (swept || !pid) return;
+      swept = true;
+      sweeper ??= armSweeper(pid, spawnedAt, exitedAt);
+      sweepPending = true;
+      sweeper.kill(onSwept);
+    };
+
+    const onGrace = () => {
+      if (settled) return;
+      if (!closed) {
+        // Something that survived the kill still holds the pipes: stop waiting
+        // for it so neither the run nor its slot outlives the deadline.
+        child.stdout?.destroy();
+        child.stderr?.destroy();
+        if (!exited) child.kill("SIGKILL");
+        killed = true;
+        const holder = exited ? "a descendant still held them" : "the process did not exit";
+        notes.push(`[output streams force-closed ${KILL_GRACE_MS} ms after the kill: ${holder}]`);
+      }
+      finish(closed ? closeCode : exitCode);
+    };
+
+    const kill = () => {
+      if (killRequested || settled) return;
+      killRequested = true;
+      grace = setTimeout(onGrace, KILL_GRACE_MS);
+      grace.unref();
+      if (!exited) {
+        // Also taken when the OS already ended the child but libuv has not
+        // delivered `exit` yet: indistinguishable here, so it counts as a kill.
+        killed = true;
+        killTree(child);
+        return;
+      }
+      // The direct child already exited, so its PID may be recycled: never
+      // `taskkill` it. Only what it left running can remain.
+      if (isWin) {
+        sweep();
+      } else if (pid && !groupGone && signalGroup(pid, "SIGKILL")) {
+        // A group id is not reused while any member is alive, and `groupGone`
+        // stops us once the group was seen empty.
+        killed = true;
+        notes.push("[killed the process group left running by the exited command]");
+      }
+    };
+
+    if (deadline !== undefined) timer = setTimeout(kill, deadline);
+    opts.signal?.addEventListener("abort", kill, { once: true });
+
+    child.on("exit", (code) => {
+      exited = true;
+      exitCode = code;
+      exitedAt = Date.now();
+      if (!isWin && pid && !groupAlive(pid)) {
+        groupGone = true;
+        untrackGroup(pid);
+      }
+      if (isWin && pid) {
+        // Pipes still open shortly after exit mean a descendant holds them.
+        // Arm the sweeper now (pinning its candidates) so a later deadline or
+        // abort does not pay PowerShell's startup inside the G4 window; a kill
+        // that raced the exit (taskkill found no process) is completed here too.
+        armTimer = setTimeout(() => {
+          if (closed || settled) return;
+          if (killRequested) sweep();
+          else sweeper ??= armSweeper(pid, spawnedAt, exitedAt);
+        }, SWEEP_ARM_MS);
+      }
+    });
+    child.on("error", (e) => finish(1, e));
+    child.on("close", (code) => {
+      closed = true;
+      closeCode = code;
+      clearTimeout(armTimer);
+      // A sweep in flight decides whether the kill ended anything.
+      if (sweepPending) return;
+      finish(code);
+    });
   });
 }
 
@@ -229,8 +346,9 @@ function killTree(child: ChildProcess): void {
     return;
   }
   if (isWin) {
-    execFile("taskkill", ["/pid", String(pid), "/T", "/F"], { windowsHide: true }, (err) => {
-      // taskkill fails when the tree already exited; the direct kill is then a no-op.
+    execFile("taskkill", ["/pid", String(pid), "/T", "/F"], { windowsHide: true, timeout: SWEEP_TIMEOUT_MS }, (err) => {
+      // taskkill fails when the child exited meanwhile; the direct kill is then
+      // a no-op and the exit handler sweeps what it left running.
       if (err) child.kill();
     });
     return;
@@ -241,10 +359,7 @@ function killTree(child: ChildProcess): void {
 
 // POSIX: detached children lead their own process group and session, so a
 // terminal hang-up or Ctrl-C that ends opencode never reaches them. Groups of
-// runs still in flight are killed when opencode exits. Death by an unhandled
-// signal (the host's SIGTERM/SIGHUP policy) skips `exit` hooks and remains
-// opencode's concern. On Windows, non-detached children sit in libuv's
-// kill-on-close job instead.
+// runs still in flight are killed when opencode exits.
 const liveGroups = new Set<number>();
 let exitHookInstalled = false;
 
@@ -272,4 +387,119 @@ function signalGroup(pgid: number, signal: NodeJS.Signals): boolean {
   } catch {
     return false;
   }
+}
+
+function groupAlive(pgid: number): boolean {
+  try {
+    process.kill(-pgid, 0);
+    return true;
+  } catch (e) {
+    return (e as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
+interface Sweeper {
+  /** Kill the pinned trees; `done` receives the root PIDs taskkill ended. Never throws. */
+  kill(done: (pids: number[]) => void): void;
+  /** Release the pins without killing anything. */
+  dispose(): void;
+}
+
+const POWERSHELL = process.env.SystemRoot
+  ? join(process.env.SystemRoot, "System32", "WindowsPowerShell", "v1.0", "powershell.exe")
+  : "powershell.exe";
+
+/**
+ * Windows: find and kill what an exited child left running, without ever
+ * targeting a recycled PID (QA-1.2-1). `taskkill /T` on the dead PID finds
+ * nothing, and a recycled PID must never be targeted, so the processes are
+ * found by their creation time instead:
+ *
+ * 1. Roots are processes whose ParentProcessId is the child's PID and whose
+ *    creation time lies in [spawnedAt, exitedAt] (± clock slack). The child's
+ *    PID stays bound to the child until libuv closes its handle, just before
+ *    `exit` is emitted, so a process with that parent created in the window
+ *    was created by the child; the children of a later owner of the PID are
+ *    created after `exitedAt` and are excluded.
+ * 2. Each root is pinned by an open handle and its start time re-checked, so
+ *    its own PID cannot be recycled between the query and the kill.
+ * 3. On `kill`, each live root is ended with `taskkill /T /F` (its tree). A
+ *    pinned root that exited meanwhile is swept the same way, using its exact
+ *    lifetime as the window.
+ *
+ * Descendants whose parent died before being pinned (a detached grandchild of
+ * a short-lived middle process) cannot be attributed safely; the kill grace
+ * period bounds the run in that case.
+ *
+ * The sweeper is Windows PowerShell 5.1 (always installed; pwsh 7 is not, and
+ * wmic is gone from current Windows 11) at normal priority, spawned directly —
+ * not through `run` — with its own kill timeout; every failure degrades to
+ * "nothing killed". The script is passed with single quotes only, so Node's
+ * argument quoting cannot alter it.
+ */
+function armSweeper(pid: number, spawnedAt: number, exitedAt: number): Sweeper {
+  const from = Math.floor(spawnedAt - SWEEP_CLOCK_SLACK_MS);
+  const to = Math.ceil(exitedAt + SWEEP_CLOCK_SLACK_MS);
+  const script = [
+    "$ErrorActionPreference = 'Stop'",
+    "function Ms($d) { ([DateTimeOffset]$d).ToUnixTimeMilliseconds() }",
+    "function Pin($ppid, $from, $to) { foreach ($c in @(Get-CimInstance -ClassName Win32_Process -Filter ('ParentProcessId=' + $ppid))) { try { $t = Ms $c.CreationDate; if ($t -ge $from -and $t -le $to) { $p = [Diagnostics.Process]::GetProcessById([int]$c.ProcessId); $null = $p.Handle; $s = Ms $p.StartTime; if ($s -ge $from -and $s -le $to) { $p } } } catch { $null = $_ } } }",
+    "function Stop-Trees($roots) { foreach ($p in $roots) { if (-not $p.HasExited) { & taskkill.exe /pid $p.Id /T /F *> $null; if ($LASTEXITCODE -eq 0) { [Console]::Out.WriteLine([string]$p.Id) } } else { Stop-Trees @(Pin $p.Id (Ms $p.StartTime) (Ms $p.ExitTime)) } } }",
+    `$roots = @(Pin ${pid} ${from} ${to})`,
+    "if ($roots.Count -eq 0) { exit 0 }",
+    "if ([Console]::In.ReadLine() -eq 'kill') { Stop-Trees $roots }",
+  ].join("; ");
+  let output = "";
+  let ended = false;
+  const waiters: Array<() => void> = [];
+  const end = () => {
+    if (ended) return;
+    ended = true;
+    for (const w of waiters.splice(0)) w();
+  };
+  const killedPids = () => output.split(/\r?\n/).filter((l) => /^\d+$/.test(l)).map(Number);
+  let ps: ChildProcess | undefined;
+  try {
+    ps = spawn(POWERSHELL, ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], {
+      windowsHide: true,
+      stdio: ["pipe", "pipe", "ignore"],
+    });
+    ps.stdout?.setEncoding("utf8");
+    ps.stdout?.on("data", (s: string) => { output += s; });
+    // EPIPE: the sweeper exited before reading (it found nothing to pin).
+    ps.stdin?.on("error", end);
+    ps.on("error", end);
+    ps.on("close", end);
+  } catch {
+    ps = undefined;
+    end();
+  }
+  return {
+    kill(done) {
+      let called = false;
+      let limit: ReturnType<typeof setTimeout> | undefined;
+      const report = () => {
+        if (called) return;
+        called = true;
+        clearTimeout(limit);
+        done(killedPids());
+      };
+      if (ended || !ps) {
+        report();
+        return;
+      }
+      const sweeperProcess = ps;
+      waiters.push(report);
+      limit = setTimeout(() => {
+        sweeperProcess.kill();
+        report();
+      }, SWEEP_TIMEOUT_MS);
+      sweeperProcess.stdin?.end("kill\n");
+    },
+    dispose() {
+      if (ended || !ps) return;
+      ps.stdin?.end();
+      ps.kill();
+    },
+  };
 }

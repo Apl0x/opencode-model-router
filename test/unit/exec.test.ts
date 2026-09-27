@@ -1,10 +1,11 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { execFileSync } from "node:child_process";
 import { getEventListeners } from "node:events";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { runArgv, runShell } from "../../src/verify/exec";
+import { fileURLToPath } from "node:url";
+import { KILL_GRACE_MS, runArgv, runShell } from "../../src/verify/exec";
 
 // Real processes, no mocks: the defect this guards against only exists in how
 // the OS tears a process tree down, which a fake child_process cannot model.
@@ -275,7 +276,121 @@ describe("timeoutMs", () => {
   }, 20000);
 });
 
-describe("process lifecycle", () => {
+const TREE = fileURLToPath(new URL("../fixtures/exec/tree.cjs", import.meta.url));
+
+/** A test/fixtures/exec/tree.cjs run: argv for runArgv plus its PID files. */
+function tree(mode: "early-exit" | "unreachable" | "broken-tree") {
+  const dir = scratch();
+  const file = (name: string) => join(dir, `${name}.pid`);
+  return {
+    dir,
+    args: [TREE, mode, dir],
+    file,
+    pid: (name: "child" | "middle" | "holder") => Number(readFileSync(file(name), "utf8")),
+    /**
+     * The direct child is gone and the run has seen its `exit`. The OS reports
+     * the death before libuv delivers `exit` (up to a loop iteration later);
+     * an abort in that gap still counts as ending a running command.
+     */
+    async childExited(): Promise<boolean> {
+      const gone = await waitForExit(Number(readFileSync(file("child"), "utf8")));
+      await new Promise(r => setTimeout(r, 300));
+      return gone;
+    },
+    /** Let the holder end on its own (it polls for the file), then make sure it did. */
+    async release(): Promise<void> {
+      writeFileSync(join(dir, "release"), "");
+      if (!existsSync(file("holder"))) return;
+      const holder = Number(readFileSync(file("holder"), "utf8"));
+      if (!(await waitForExit(holder))) process.kill(holder);
+    },
+  };
+}
+
+describe("process lifecycle around the direct child's exit", () => {
+  // The holder inherits the run's stdout/stderr, so `close` cannot fire while it lives.
+
+  it("a deadline after the direct child exited kills what it left running within 3 s (QA-1.2-1, G4)", async () => {
+    const t = tree("early-exit");
+    const start = Date.now();
+    try {
+      const r = await runArgv(process.execPath, t.args, { cwd: tmpdir(), timeoutMs: 3000 });
+      expect(alive(t.pid("holder"))).toBe(false);
+      expect(Date.now() - start).toBeLessThan(3000 + 3000);
+      // The direct child exited 0, but the deadline had to end its leftovers.
+      expect(r).toMatchObject({ code: 1, timedOut: true });
+      expect(r.stderr).toMatch(/left running by the exited command/);
+    } finally {
+      await t.release();
+    }
+  }, 30000);
+
+  it("an abort between the child's exit and the pipes closing kills the leftovers, not the exited PID (QA-1.2-1, QA-1.2-10)", async () => {
+    const t = tree("early-exit");
+    const controller = new AbortController();
+    const pending = runArgv(process.execPath, t.args, { cwd: tmpdir(), timeoutMs: 30000, signal: controller.signal });
+    try {
+      await waitForFile(t.file("holder"));
+      expect(await t.childExited()).toBe(true);
+      const holder = t.pid("holder");
+      expect(alive(holder)).toBe(true);
+      const abortedAt = Date.now();
+      controller.abort();
+      const r = await pending;
+      expect(alive(holder)).toBe(false);
+      expect(Date.now() - abortedAt).toBeLessThan(3000);
+      expect(r).toMatchObject({ code: 1, timedOut: true });
+      expect(r.stderr).toMatch(/left running by the exited command/);
+    } finally {
+      await t.release();
+      await pending;
+    }
+  }, 30000);
+
+  it("an abort after the child exited is a no-op when nothing it started is reachable (QA-1.2-10)", async () => {
+    const t = tree("unreachable");
+    const controller = new AbortController();
+    const pending = runArgv(process.execPath, t.args, { cwd: tmpdir(), timeoutMs: 30000, signal: controller.signal });
+    try {
+      await waitForFile(t.file("holder"));
+      expect(await t.childExited()).toBe(true);
+      controller.abort();
+      // The pipe holder now ends on its own, well inside the kill grace period.
+      writeFileSync(join(t.dir, "release"), "");
+      const r = await pending;
+      expect(r).toEqual({ code: 0, stdout: "", stderr: "", timedOut: false });
+    } finally {
+      await t.release();
+      await pending;
+    }
+  }, 30000);
+
+  it("resolves one grace period after the kill when an unreachable descendant still holds the pipes (QA-1.2-2)", async () => {
+    const t = tree("broken-tree");
+    const controller = new AbortController();
+    const pending = runArgv(process.execPath, t.args, { cwd: tmpdir(), timeoutMs: 30000, signal: controller.signal });
+    try {
+      await waitForFile(t.file("holder"));
+      // Its parent is gone, so neither taskkill /T nor the process group reaches it.
+      expect(await waitForExit(t.pid("middle"))).toBe(true);
+      const abortedAt = Date.now();
+      controller.abort();
+      const r = await pending;
+      const elapsed = Date.now() - abortedAt;
+      expect(elapsed).toBeGreaterThanOrEqual(KILL_GRACE_MS - 100);
+      expect(elapsed).toBeLessThan(KILL_GRACE_MS + 2000);
+      expect(r.timedOut).toBe(true);
+      expect(r.code).not.toBe(0);
+      expect(r.stderr).toMatch(/output streams force-closed \d+ ms after the kill: a descendant still held them/);
+      expect(alive(t.pid("child"))).toBe(false);
+      // Documented residual: a descendant whose parent died cannot be attributed safely.
+      expect(alive(t.pid("holder"))).toBe(true);
+    } finally {
+      await t.release();
+      await pending;
+    }
+  }, 30000);
+
   it.runIf(!isWin)("kills live process groups from a single process 'exit' hook (POSIX-only: detached groups escape a hang-up; Windows children die with libuv's job)", async () => {
     const f = forkingFixture();
     const pending = runArgv(process.execPath, [f.script, f.pidFile], { cwd: f.dir, timeoutMs: 30000 });
