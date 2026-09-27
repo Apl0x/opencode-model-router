@@ -9,7 +9,7 @@
  * machine-wide verification slot and the reference worktrees are isolated from other runs.
  */
 import { lstat, mkdir, mkdtemp, readdir, rm, unlink } from "node:fs/promises";
-import { readFileSync, realpathSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import os from "node:os";
 import { join } from "node:path";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
@@ -183,8 +183,10 @@ async function removeTree(dir: string): Promise<void> {
 
 beforeAll(async () => {
   if (!e2eEnabled()) return;
-  // realpath: os.tmpdir() can be an 8.3 short spelling (C:\Users\ABCDEF~1\...) on Windows.
-  root = realpathSync.native(await mkdtemp(join(os.tmpdir(), "omr-e2e-")));
+  // The raw os.tmpdir() on purpose: on Windows it is often an 8.3 short path
+  // (C:\Users\ABCDEF~1\...), and the plugin directory, TEMP and the reference worktrees must all
+  // work under that spelling (E2E-2).
+  root = await mkdtemp(join(os.tmpdir(), "omr-e2e-"));
   await mkdir(join(root, "repos"), { recursive: true });
   await mkdir(join(root, "tmp"), { recursive: true });
   await mkdir(join(root, "home"), { recursive: true });
@@ -287,13 +289,10 @@ for (const r of RUNNERS) {
 
     for (const s of SCENARIOS) {
       for (const mode of ["required", "deferred"] as Mode[]) {
-        // BLOCKED (product bug, reported; not weakened): pytest static scoping maps no test to an
-        // edited app/modNN.py although tests/test_modNN_*.py import it ("from app.modNN import"),
-        // so a real introduced failure is accepted with "no affected tests: no test files map to
-        // the changed modules" (src/verify/runner.ts:4249). Re-enable once scoping is fixed.
-        const blocked = r.name === "pytest-app" && s.key !== "green" && s.key !== "docs" && s.key !== "config";
-        const test = blocked ? it.skip : it;
-        test(`${s.title} [${mode}] -> ${s.expected(r)}`, async () => {
+        // E2E-1 (fixed): pytest static scoping used to map an edited app/modNN.py to no test,
+        // although tests/test_modNN_*.py import it, so a real introduced failure was accepted with
+        // "no affected tests: no test files map to the changed modules". It now maps the importers.
+        it(`${s.title} [${mode}] -> ${s.expected(r)}`, async () => {
           const base = s.preexisting ? basePre : basePlain;
           repo.git("reset", "-q", "--hard", base);
           repo.git("clean", "-q", "-fd", "-e", "node_modules", "-e", ".venv");
@@ -318,6 +317,15 @@ for (const r of RUNNERS) {
 
           const exp = s.expected(r);
           assertVerdict(verdictText, exp, r, mode);
+          // E2E-1: the source-edit scenarios must run the edited module's tests, never pass as
+          // "nothing to run" (the green control passed that way before the fix).
+          if (s.key !== "docs" && s.key !== "config") expect(verdictText).not.toMatch(/no affected tests/);
+          if (r.recheckUnsupported && exp === "unverifiable" && s.key !== "config") {
+            // No recheck (approved deviation 5), so the failure cannot be attributed; the scoped
+            // run must still have run the mapped tests and observed the failing ids.
+            const observed = /observed failures: ([^\n]*)/.exec(verdictText)?.[1] ?? "";
+            expect(observed).toContain(s.key === "preexisting" ? r.preexistingId : r.introducedId);
+          }
           if (s.key === "config") expect(verdictText).toContain(`config-changed): config file changed: ${r.configFile}`);
           if (s.key === "pre-and-introduced" && exp === "rejected") {
             // Only the introduced id is presented as introduced.
