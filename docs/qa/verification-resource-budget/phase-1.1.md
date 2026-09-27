@@ -83,7 +83,7 @@ scratch script that imports `src/router/config.ts`. The script is outside the re
      throws. No existing test passes a non-object `verify` (`rg "verify: null" test` only matches
      this file).
 
-   - Resolution: OPEN (blocked) — the fix needs `test/unit/config.validate.test.ts:196-201` ("permissive skip", which pins `verify: "x"` as accepted) to be flipped, and that file is outside this dispatch's edit scope. Attempted and reverted; not committed.
+   - Resolution: c63361a — `validateEnforcement` now requires `isPlainObject(enforcement.verify)` (`tiers.json: enforcement.verify must be an object`); tests reject `null`, `"x"`, `5`, `[]` and a `verify: null` override through `deepMerge`. `config.validate.test.ts` permissive-skip test split so `verify` now throws (`escalate`/`perTier` unchanged); deliberate deviation from Phase 1.1 acceptance 'existing config tests pass unchanged', approved by orchestrator because QA-1.1-1 shows a null override wipes bundled defaults.
 
 2. **QA-1.1-2 — minor — no upper bound on millisecond and count keys: a huge budget becomes an
    immediately-expiring one.** `src/router/config.ts:767-798`.
