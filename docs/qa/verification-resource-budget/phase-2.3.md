@@ -89,3 +89,24 @@ text, prompt sizes were re-measured with a script, and the scoped tests and type
   - QA-2.3-3 is model-facing text whose only example of required mode silently gives deferred mode.
 - **Fix now:** each minor is a one- or two-sentence doc change. This is round 1, so they can be fixed before the owner's round-2 rule applies.
 - **Tests and typecheck:** green.
+
+## Round-1 resolutions
+
+- QA-2.3-1 — Resolution: `2e4ed81` — README no longer promises that every delegation is verified; deferral is stated.
+- QA-2.3-2 — Resolution: `c34df3e` — `failureRecheck: false` documented as making every scoped failure `unverifiable`, never a fail.
+- QA-2.3-3 — Resolution: `2e4ed81` — the delegate description (now the exported `DELEGATE_TOOL_DESCRIPTION` in `protocol.ts`) shows the literal `VERIFY:required`, and the protocol line explains how to fill it in.
+- QA-2.3-4 — Resolution: `c34df3e` — the deferred synchronous cost now includes the `VERIFY_WAIT` dispatch wait plus up to 2 s at return.
+- QA-2.3-5 — Resolution: `c34df3e` — CHANGELOG moves both keys out of *Added*, records the `baselineTimeoutMs` change and moves the `gateBudgetMs` note out of *Deprecations*.
+- QA-2.3-6 — Resolution: `c34df3e` — every deferral condition is listed, including the unattributed change set at risk `high`.
+- QA-2.3-7 — Resolution: `2e4ed81` — model-facing text says a DoD with `testsPass` defers all of its checks.
+- QA-2.3-8 — Resolution: `c34df3e` — the 8.3 limit names `ctx.directory` and states that every reference rerun is unplannable.
+- QA-2.3-9 — Resolution: `c34df3e` — the four missing Windows limits are added to VERIFICATION.md and the ADR.
+- QA-2.3-10 — Resolution: `2e4ed81` — the protocol says entries stay listed until verified or expired, and that a missing entry does not mean verified.
+- QA-2.3-11 — Resolution: `2e4ed81` — the allowlist line includes pytest and `uv run pytest`; prompt sizes are now 6,189 characters enforcement-on with a 2,179-character DoD section.
+- QA-2.3-12 — Resolution: `c34df3e` — drift is documented as turning a pass into `unverifiable`.
+- QA-2.3-13 — Resolution: `c34df3e` — directives are documented as read from `prompt`, falling back to `description` only when `prompt` is blank (`dispatchDirectiveText`).
+- QA-2.3-14 — Resolution: `c34df3e` — the ADR 0002 mutex line is marked as superseded in part by ADR 0003.
+- QA-2.3-15 — Resolution: `c34df3e` — the `router_verify` registration condition is stated and evaluated at plugin start.
+- QA-2.3-16 — info, no action.
+- QA-2.3-17 — info, no action.
+- Follow-up (QA-2.3-5 leftover) — Resolution: `92eca0e` — CONFIG_REFERENCE and ADR 0003 no longer list the `gateBudgetMs` `tiers.json` change under *Deprecations*.
