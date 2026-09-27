@@ -670,6 +670,46 @@ describe("materialize / dispose", { timeout: 60_000 }, () => {
     }
   });
 
+  it("QA-1.5-13: a CLEAN file whose checkout changes its eol class (`* text=auto`, `eol=crlf`) -> inexact for that path", async () => {
+    const variants: Array<[string, string[]]> = [
+      // core.autocrlf=false, core.eol unset: native eol, CRLF on win32 (QA's repro), LF elsewhere.
+      ["* text=auto\n", isWin ? [".gitattributes", ".gitignore", "a.txt", "b.txt", "package.json", "packages/a/index.js"] : []],
+      ["*.txt text eol=crlf\n", ["a.txt", "b.txt"]],
+      ["* text=auto eol=lf\n", []], // control: an LF checkout of LF files is exact
+    ];
+    for (const [attributes, expected] of variants) {
+      await fsp.writeFile(join(repo, ".gitattributes"), attributes);
+      await git(repo, "add", ".gitattributes");
+      await git(repo, "commit", "-q", "-m", `attributes ${attributes.trim()}`);
+      expect(await git(repo, "status", "--porcelain")).toBe(""); // clean: the gap QA-1.5-6a left open
+      const ref = await capture();
+      expect(ref.tracked.size).toBe(0);
+      const handle = await mat(ref);
+      try {
+        const conversions = handle.inexactReasons.filter((r) => r.cause === "checkout-conversion").map((r) => r.path);
+        expect([attributes, conversions]).toEqual([attributes, expected]);
+        expect(handle.exact).toBe(expected.length === 0);
+        const bytes = await fsp.readFile(join(handle.dir, "a.txt"), "utf8");
+        expect([attributes, bytes]).toEqual([attributes, expected.includes("a.txt") ? "a0\r\n" : "a0\n"]);
+        expect(await fsp.readFile(join(repo, "a.txt"), "utf8")).toBe("a0\n");
+      } finally {
+        await handle.dispose();
+      }
+    }
+  });
+
+  it("QA-1.5-13: an eol comparison that cannot run makes the reference approximate, not failed", async () => {
+    const failing: CaptureDeps["argv"] = async (file, args, opts) =>
+      args.includes("--eol") ? { code: 128, stdout: "", stderr: "fatal: simulated", timedOut: false } : argv(file, args, opts);
+    const handle = await mat(await capture(), { argv: failing });
+    try {
+      expect(handle.exact).toBe(false);
+      expect(handle.inexactReasons).toEqual([{ cause: "checkout-conversion", path: "" }]);
+    } finally {
+      await handle.dispose();
+    }
+  });
+
   it("QA-1.5-6b: assume-unchanged / skip-worktree entries -> inexact index-flags", async () => {
     await git(repo, "update-index", "--assume-unchanged", "b.txt");
     await git(repo, "update-index", "--skip-worktree", "packages/a/index.js");

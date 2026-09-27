@@ -81,11 +81,21 @@
 //       reference can differ from the live tree byte for byte: with
 //       core.autocrlf=true live "x\n" became "x\r\n"; with input, a dirty
 //       CRLF file became LF; `text`/`eol`/`filter` attributes do the same.
-//       Two checks: core.autocrlf set to anything but false (true, input,
+//       Three checks: core.autocrlf set to anything but false (true, input,
 //       yes, on, 1) at materialize adds "checkout-conversion" with path ""
-//       (it also affects files git reports as clean); and every entry of
+//       (it also affects files git reports as clean); every entry of
 //       `tracked` must hash equal to the checked-out file, otherwise
-//       "checkout-conversion" with that path.
+//       "checkout-conversion" with that path; and, for files git reports as
+//       CLEAN (QA-1.5-13), the working-tree eol class (`w/` column of
+//       `git ls-files --eol -z`: lf, crlf, mixed, none, -text) must be the
+//       same in root and dir for every tracked path that is neither in
+//       `tracked` nor changed since the commit (section 4 step 7b). QA's
+//       repro: `* text=auto`, core.autocrlf=false, core.eol unset (native
+//       CRLF on win32), live "a0\n" and `git status` clean; the reference got
+//       "a0\r\n" while exact stayed true. LF files under text=auto are common
+//       on win32 (e.g. Prettier's default endOfLine: lf). Each differing path
+//       adds "checkout-conversion" for it, up to MAX_CONVERSION_REASONS, then
+//       one "" reason.
 //   (f) No index entry is assume-unchanged or skip-worktree at capture
 //       (QA-1.5-6b). Git skips such entries, so neither stash create nor the
 //       drift diff sees a local edit to them (live "v2-local" became "v1" at
@@ -281,6 +291,18 @@
 //      (QA-1.5-2), and re-measured while fixing it, it STILL did so under
 //      --no-optional-locks: its closing refresh_index_quietly() takes the
 //      index lock whenever it is free, whatever GIT_OPTIONAL_LOCKS says.
+//   7b. Clean-file conversion (section 2e, QA-1.5-13), skipped when a ""
+//      "checkout-conversion" reason (core.autocrlf) is already recorded:
+//      `git ls-files --eol -z` at root and at dir (two calls, each reading
+//      every tracked file). A path in both lists, not in ref.tracked and not
+//      in the drift set of step 7, whose `w/` class differs adds
+//      "checkout-conversion" for it. The drift set is excluded because a
+//      file edited after capture differs by content, not by conversion (a
+//      normalizing diff hides exactly the conversion case, so what it does
+//      not list is clean). This is the last step, so these calls get the
+//      remaining budget with the caller's signal only: a budget that runs out
+//      here, or a failing call, adds "" instead of failing materialize; a
+//      caller abort returns ok:false "aborted".
 //   8. Return { ok: true, reference: { dir, exact, inexactReasons,
 //      unreproduced, links, toRefPath, dispose } }. toRefPath(p) maps an
 //      absolute live path under root to the same relative path under dir, or
@@ -599,14 +621,14 @@
 //   - node_modules content generated from repository files (e.g. a Prisma
 //     client) reflects the live tree; check (c) only catches manifest and
 //     lockfile drift.
-//   - Checkout conversion of files git reports as CLEAN is detected only
-//     through core.autocrlf (section 2e). Under a `text`/`eol`/`filter`
-//     attribute with core.autocrlf=false, a clean file whose live bytes are
-//     not what checkout would write (e.g. saved with LF under
-//     `text eol=crlf`, which git normalizes and so does not report) still
+//   - Checkout conversion of files git reports as CLEAN is detected through
+//     core.autocrlf and the eol-class comparison (section 2e, QA-1.5-13), so
+//     `text`/`eol` attributes are covered. What remains is a `filter` (or
+//     `ident`, `working-tree-encoding`) whose smudge output differs from the
+//     live bytes while keeping the eol class: such a clean file still
 //     differs at the reference while exact stays true. Hashing every tracked
 //     file at capture would close this, at a cost the capture budget cannot
-//     bound. Dirty files are always compared.
+//     bound. Dirty files are always compared byte for byte.
 //   - An ignored file that tests need (.env, generated code) is absent at the
 //     reference. The recheck must classify the resulting failure as a setup
 //     failure (§1.5-8). `unreproduced` supports that decision but cannot make
@@ -823,6 +845,8 @@ export const TRANSIENT_FS_CODES: ReadonlySet<string> = new Set(["EBUSY", "EPERM"
 export const MAX_UNTRACKED_FILES = 5_000;
 export const MAX_UNTRACKED_BYTES = 64 * 1024 * 1024;
 export const MAX_SWEEP_ENTRIES = 500_000;
+/** Per-path "checkout-conversion" reasons from the eol comparison (section 2e); beyond it, one "" reason. */
+export const MAX_CONVERSION_REASONS = 100;
 /** Marker value for an untracked symbolic link (not a sha256, so it never matches a file hash). */
 export const UNTRACKED_SYMLINK = "symlink";
 /** Basenames whose drift between commit and the live tree makes a linked node_modules stale (section 2c). */
@@ -991,6 +1015,22 @@ function isSafeRelPath(rel: string, platform: NodeJS.Platform): boolean {
 
 function splitZ(stdout: string): string[] {
   return stdout.split("\0").filter((entry) => entry.length > 0);
+}
+
+/**
+ * `git ls-files --eol -z` -> path -> working-tree eol class (the `w/` column: lf, crlf,
+ * mixed, none, -text, or "" for a missing or non-regular file). Each record is
+ * "i/%-5s w/%-5s attr/%-17s\t<path>" (git's ls-files.c); only the path follows the tab.
+ */
+function parseEolList(stdout: string): Map<string, string> {
+  const result = new Map<string, string>();
+  for (const record of splitZ(stdout)) {
+    const tab = record.indexOf("\t");
+    if (tab < 0) continue;
+    const match = /(?:^|\s)w\/(\S*)/.exec(record.slice(0, tab));
+    if (match) result.set(record.slice(tab + 1), match[1] ?? "");
+  }
+  return result;
 }
 
 function stripNewline(stdout: string): string {
@@ -1713,6 +1753,35 @@ export async function materialize(
       const prefix = fold(rel) + "/";
       if (changedSorted.some((c) => fold(c) === fold(rel) || fold(c).startsWith(prefix))) {
         reasons.push({ cause: "workspace-link-drift", path: rel });
+      }
+    }
+
+    // 7b. Clean-file checkout conversion (section 2e, QA-1.5-13): the working-tree eol class
+    //     of every tracked path that is neither hashed above (ref.tracked) nor changed since
+    //     the commit must be the same in root and dir. Skipped when a repository-wide
+    //     conversion reason (core.autocrlf) already makes the reference approximate.
+    const conversion = (path: string) => {
+      if (!reasons.some((r) => r.cause === "checkout-conversion" && r.path === path)) reasons.push({ cause: "checkout-conversion", path });
+    };
+    if (!reasons.some((r) => r.cause === "checkout-conversion" && r.path === "")) {
+      // The caller's signal, not the budget's: this is the last step, so a spent budget
+      // leaves the reference approximate ("" reason) instead of failing it.
+      const eolClasses = async (cwd: string) => {
+        const listed = await runGit(deps.argv, ["ls-files", "--eol", "-z"], { cwd, timeoutMs: budget.remaining(), signal });
+        return listed && listed.code === 0 ? parseEolList(listed.stdout) : undefined;
+      };
+      const liveEol = await eolClasses(root);
+      const refEol = liveEol ? await eolClasses(dir) : undefined;
+      if (signal.aborted) return await abandon("aborted", "aborted during the eol comparison");
+      if (!liveEol || !refEol) {
+        conversion(""); // not compared: budget spent or git failed
+      } else {
+        const differing = [...refEol]
+          .filter(([rel, w]) => !ref.tracked.has(rel) && !changed.has(rel) && liveEol.has(rel) && liveEol.get(rel) !== w)
+          .map(([rel]) => rel)
+          .sort(byCodeUnit);
+        for (const rel of differing.slice(0, MAX_CONVERSION_REASONS)) conversion(rel);
+        if (differing.length > MAX_CONVERSION_REASONS) conversion("");
       }
     }
 
