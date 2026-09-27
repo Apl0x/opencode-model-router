@@ -371,6 +371,7 @@ describe("captureReference", { timeout: 60_000 }, () => {
     for (const args of calls) expect(args[0]).toBe("--no-optional-locks");
     expect(Buffer.compare(await fsp.readFile(userIndex), indexBefore)).toBe(0);
   });
+
 });
 
 describe("materialize / dispose", { timeout: 60_000 }, () => {
@@ -780,6 +781,36 @@ describe("materialize / dispose", { timeout: 60_000 }, () => {
       expect(handle.inexactReasons).toEqual([{ cause: "checkout-conversion", path: "" }]);
     } finally {
       await handle.dispose();
+    }
+  });
+
+  it("QA-1.5-21: a truncated `ls-files --eol -z` listing (p12 maxBuffer cut, exit 0) is never exact", async () => {
+    await fsp.writeFile(join(repo, ".gitattributes"), "*.txt text eol=crlf\n");
+    await git(repo, "add", ".gitattributes");
+    await git(repo, "commit", "-q", "-m", "eol");
+    // Untruncated, a.txt and b.txt are reported (the QA-1.5-18 test above); a cut before a.txt hid both.
+    const variants: Array<[string, (stdout: string) => { stdout: string; note: boolean }]> = [
+      // p12's runArgv: stdout cut at a record boundary (still ends in NUL), code kept, note in stderr.
+      ["note", (s) => ({ stdout: s.slice(0, s.lastIndexOf("\0", s.indexOf("\ta.txt")) + 1), note: true })],
+      // A -z listing cut mid-record without any note: it does not end in NUL.
+      ["no trailing NUL", (s) => ({ stdout: s.slice(0, s.indexOf("\ta.txt") - 5), note: false })],
+    ];
+    for (const [name, cut] of variants) {
+      const truncating: CaptureDeps["argv"] = async (file, args, opts) => {
+        const result = await argv(file, args, opts);
+        if (!args.includes("--eol") || result.code !== 0) return result;
+        expect(result.stdout).toContain("\ta.txt\0");
+        const { stdout, note } = cut(result.stdout);
+        const stderr = note ? `${result.stderr}\n[stdout truncated at ${stdout.length} chars]` : result.stderr;
+        return { ...result, code: 0, stdout, stderr };
+      };
+      const handle = await mat(await capture(), { argv: truncating });
+      try {
+        expect([name, handle.exact]).toEqual([name, false]);
+        expect([name, handle.inexactReasons]).toEqual([name, [{ cause: "checkout-conversion", path: "" }]]);
+      } finally {
+        await handle.dispose();
+      }
     }
   });
 
