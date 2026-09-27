@@ -852,7 +852,7 @@ owns no timer. The contract is header section R14.
 |---|---|
 | **Acceptance 1:** N parallel delegations, default config, spawn no verification process | DV "acceptance: 50 parallel deferred delegations with background off build no queue, spawn no test process, take no slot, and each carries the footer" |
 | Acceptance 1: at most `VERIFY_WAIT` added to dispatch latency | DV wiring "a capture that resolves after 20 s under VERIFY_WAIT:5s releases the dispatch at 5 s", "VERIFY_WAIT:0s releases the dispatch at once", "a capture that resolves at 2 s under a 5 s wait releases the dispatch at 2 s"; DV plugin "VERIFY_WAIT:5s with a capture that takes 20 s: the producer starts at 5 s" |
-| Acceptance 1: 0 ms added to result latency (the only wait is the git-only snapshot, cut at 2 s) | DV plugin "result latency: a deferred return waits for nothing but the git-only snapshot, cut at DEFERRED_FINISH_MS"; DV plugin "VERIFY_WAIT:0s with a capture that never settles: …the result is not held"; DV wiring "a capture still in flight at return counts as no reference…", "a snapshot slower than DEFERRED_FINISH_MS -> unavailable…" |
+| Acceptance 1: result latency (QA-2.4-11: **not** 0 ms; the deferred finish costs a git-only snapshot, the commit diff, static scoping and the drift digests, all bounded by `DEFERRED_FINISH_MS` = 2 s; measured about 0.4–0.5 s on a 3-file repo, S1: 379 ms node, 478 ms Bun, against 3.2 s for the required gate) | DV plugin "result latency: a deferred return waits for nothing but the git-only snapshot, cut at DEFERRED_FINISH_MS"; DV plugin "VERIFY_WAIT:0s with a capture that never settles: …the result is not held"; DV wiring "a capture still in flight at return counts as no reference…", "a snapshot slower than DEFERRED_FINISH_MS -> unavailable…" |
 | **Acceptance 2:** every deferred result carries the footer and is never labelled accepted or verified | DV "acceptance: 50 parallel…" (each of the 50 outputs); DV "default deferred: returns at once with the footer…"; DV wiring "registers the delegation and returns the footer…"; PU footer label-rule tests |
 | Default deferred, zero cost (zero spawns, no slot, git-only capture) | DV "default deferred: returns at once with the footer; zero test spawns, no slot, a pending entry"; DV "acceptance: 50 parallel…" (`acquireSlot` spy = 0) |
 | Latency (20 s capture with a 5 s wait → 5 s; 0 → 0; 2 s → 2 s) | DV wiring "VERIFY_WAIT bounds the capture wait (section 1.5-14)" (three cases, fake timers) |
@@ -909,13 +909,21 @@ and commit-diff error paths, and some 2.4.2/2.4.3 defensive and error branches.
   - reword the `delegate` tool description, which still says "INDEPENDENTLY VERIFIED … before it
     is returned" (see the 2.4.2 follow-ups);
   - document `background` and its restart-to-apply rule;
-  - update `COMMAND_REFERENCE_INDEX.md`.
+  - update `COMMAND_REFERENCE_INDEX.md`;
+  - ADR note (QA-2.4-11): acceptance criterion 1's "0 ms added to result latency" is not met as
+    written. A deferred return waits for a git-only finish (tree snapshot, commit diff, static
+    scoping and, since QA-2.4-8, the drift digests), bounded by `DEFERRED_FINISH_MS` = 2 s. It
+    measured about 0.4–0.5 s on a 3-file repo (S1: 379 ms node, 478 ms Bun), against 3.2 s for the
+    required gate. Record the deviation and the bound.
 - **3.1** (live checks):
   - Spike F (a), (b) and (d);
   - 3.1.2.h: with `background: true`, an introduced failure in a deferred delegation reaches the
     orchestrator as one late notice, verbatim through the host; with `background: false`, nothing
     runs;
-  - slot contention between a background run and a required gate (residual above);
+  - slot contention between a background run and a required gate: resolved in-process by
+    QA-2.4-5 (foreground precedence); 3.1 measures it live, including another opencode instance;
+  - benchmark (QA-2.4-11): the deferred after-hook latency on a real repository of realistic
+    size, against the 2 s `DEFERRED_FINISH_MS` bound, next to the required gate's latency;
   - the optional `experimental.primary_tools` hardening.
 
 ## Task breakdown
