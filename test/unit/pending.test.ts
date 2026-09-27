@@ -798,7 +798,7 @@ describe("lineage (R11)", () => {
 
   it("buildLineageCaveat is verbatim and caps ids at 10", () => {
     expect(buildLineageCaveat({ label: "vrf_a", ids: ["t1", "t2"] })).toBe(
-      "t1, t2 failed after vrf_a in this session and still fail; the reference of this delegation already contained that change, so pre-existing cannot be told apart from not fixed",
+      "t1, t2 failed after vrf_a in this session and still fail; that change may still be present in the reference of this delegation, so pre-existing cannot be told apart from not fixed",
     );
     const ids = Array.from({ length: 12 }, (_, i) => `t${i}`);
     expect(buildLineageCaveat({ label: "dispatch d1", ids })).toMatch(/^t0, .*t9 \(\+2 more\) failed after dispatch d1 /);

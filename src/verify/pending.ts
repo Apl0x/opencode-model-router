@@ -276,9 +276,10 @@
 //     of the same session and root with landedAt <= dispatchedAt whose introduced ids intersect
 //     `preexisting`: { label, ids } (ids in `preexisting` order). A record never matches its own
 //     delegation (its landedAt is after its dispatchedAt).
-//   - buildLineageCaveat(match): "<ids> failed after <label> in this session and still fail; the
-//     reference of this delegation already contained that change, so pre-existing cannot be told
-//     apart from not fixed". <ids> as in 2.1 T7 (at most 10, then " (+<k> more)").
+//   - buildLineageCaveat(match): "<ids> failed after <label> in this session and still fail; that
+//     change may still be present in the reference of this delegation, so pre-existing cannot be
+//     told apart from not fixed". <ids> as in 2.1 T7 (at most 10, then " (+<k> more)"). "May":
+//     the ledger matches by id and root only, and the change may have been reverted (QA-2.4-13).
 //   - Precondition (2.4 pre-flight): the merged 2.1 must expose TestsPassJudgement.failures on the
 //     gate result that 2.4 code sees. If it does not, 2.4 does not edit 2.1-owned internals: it
 //     deletes recordRejection/findLineage/buildLineageCaveat from this file (no dead code) and the
@@ -1652,11 +1653,14 @@ export function driftedPaths(before: FileDigests, after: FileDigests): string[] 
   return out.sort();
 }
 
-/** R11. */
+/**
+ * R11. The ledger matches by test id and root only, so the earlier change may have been reverted
+ * since: the caveat says it "may still be present", never that it is (QA-2.4-13).
+ */
 export function buildLineageCaveat(match: LineageMatch): string {
   return (
     `${formatIds(match.ids, LATE_NOTICE_MAX_IDS)} failed after ${sanitizeInline(match.label)} in this session and still fail; ` +
-    "the reference of this delegation already contained that change, so pre-existing cannot be told apart from not fixed"
+    "that change may still be present in the reference of this delegation, so pre-existing cannot be told apart from not fixed"
   );
 }
 
