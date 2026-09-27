@@ -21,8 +21,10 @@
 //   This module never imports node:child_process. Every git run goes through
 //   the injected ArgvSeam (task 1.2.2 contract), which provides the timeout,
 //   the abort signal and the process-tree kill. Until runArgv (1.2) is merged,
-//   the 1.5.3 tests inject a local execFile-based helper defined inside the
-//   test file only.
+//   the 1.5.3 tests inject a local spawn-based helper defined inside the test
+//   file only (env merged over process.env, tree kill on abort or timeout,
+//   resolved after the process closed). Contract relied on by cleanup: a
+//   seam call resolves only after the process tree has exited.
 //
 // ----------------------------------------------------------------------------
 // 1. WHAT THE REFERENCE CONTAINS  (DispatchReference)
@@ -226,10 +228,10 @@
 //      checked to be absent and is never created, and it lies OUTSIDE the
 //      worktree, so post-checkout hooks (repository code) never run
 //      (QA-1.5-8: the former `<dir>/.omr-no-hooks` was inside the worktree,
-//      and a committed `.omr-no-hooks/post-checkout` ran during materialize). Clean/smudge filters such as LFS
-//      still run, within the budget. Failure returns ok:false
-//      "worktree-add-failed". Once the worktree exists, its HEAD pins the
-//      commit against gc (Spike E).
+//      and a committed `.omr-no-hooks/post-checkout` ran during
+//      materialize). Clean/smudge filters such as LFS still run, within the
+//      budget. Failure returns ok:false "worktree-add-failed". Once the
+//      worktree exists, its HEAD pins the commit against gc (Spike E).
 //   3b. Byte-exactness (section 2e/2f): start from ref.captureReasons; run
 //      `git config --get core.autocrlf` (cwd: root); then, for each
 //      [rel, hash] of ref.tracked in sorted order, lstat and hash dir/rel.
@@ -450,11 +452,11 @@
 //      except a lock with reason INITIALIZING_LOCK_REASON whose owner is dead
 //      or whose dir this process released: that one is unlocked and removed
 //      through section 6 (QA-1.5-5; an alive owner may still be checking
-//      out). A dir in the in-use set (ACTIVE) is kept. ACTIVE lives on globalThis
-//      under Symbol.for("omr.reference.active"), so every copy of this module
-//      in the process shares it (QA-1.5-4: the plugin loaded from two install
-//      paths; before, the second copy's GC removed the first copy's live
-//      reference).
+//      out). A dir in the in-use set (ACTIVE) is kept. ACTIVE lives on
+//      globalThis under Symbol.for("omr.reference.active"), so every copy of
+//      this module in the process shares it (QA-1.5-4: the plugin loaded
+//      from two install paths; before, the second copy's GC removed the
+//      first copy's live reference).
 //   3. A candidate is stale if any of these holds:
 //      - its dir is missing (prunable);
 //      - it is in RELEASED (Symbol.for("omr.reference.released")): a dir
@@ -482,6 +484,9 @@
 //      only if it is stale AND it either has no `.git` file or its `gitdir:`
 //      line resolves inside root's .git directory. Orphans of other
 //      repositories are left alone. This limits temp-dir exhaustion (D7).
+//      Capture's private-index scratch dirs (section 3 step 4) and a
+//      reference dir that crashed before `git worktree add` registered it
+//      are such orphans without a `.git` file.
 //   6. The report lists removed, kept and failed dirs; failures are also
 //      logged.
 //
