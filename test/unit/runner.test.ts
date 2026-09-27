@@ -13,6 +13,8 @@ import {
   planStaticScoping,
   resolveEntry,
   REPORT_NAME_RE,
+  CONFIG_SIZE_LIMIT,
+  DEFAULT_PYTHON_FILES,
   SEARCH_LIMIT,
   STEM_MATCH_LIMIT,
   JS_TEST_GLOBS,
@@ -2268,14 +2270,11 @@ describe("QA-1.3-20: TOML spellings of addopts the parser does not read fail clo
   it.each([
     ["/r/pyproject.toml", 'tool.pytest.ini_options.addopts = "-n 3"\n'],
     ["/r/pyproject.toml", '[tool]\npytest.ini_options.addopts = "-n 3"\n'],
-    ["/r/pyproject.toml", '[tool.pytest.ini_options]\n"addopts" = "-n 3"\n'],
-    ["/r/pyproject.toml", "[tool.pytest.ini_options]\n'addopts' = '-n 3'\n"],
     ["/r/pyproject.toml", '[tool.pytest]\nini_options = { addopts = "-n 3" }\n'],
     ["/r/pyproject.toml", '[tool]\npytest = { ini_options = { addopts = "-n 3" } }\n'],
     ["/r/pyproject.toml", 'tool = { pytest = { addopts = ["-n", "3"] } }\n'],
     ["/r/pyproject.toml", '[project]\nname = "x"\n[tool . "pytest"]\n"ini_options" . addopts = "-n 3"\n'],
     ["/r/pyproject.toml", '[[tool.pytest.ini_options]]\naddopts = "-n 3"\n'],
-    ["/r/pytest.toml", '[pytest]\n"addopts" = ["-n", "3"]\n'],
     ["/r/pytest.toml", 'pytest.addopts = ["-n", "3"]\n'],
   ])("%s %j -> S6", async (f, text) => {
     expectS6(await detectRunner("pytest", "/r", memFs(pyRepo({ [f]: text })), POSIX_HOST), "unsupported-argument", `unsupported pytest argument "addopts" in ${f}`);
@@ -2517,5 +2516,239 @@ describe("QA-1.3-27: planStaticScoping runs the spec-time pytest config lookup",
     });
     expect(await st({ command: "pytest", fs, changedFiles: changed("src/m.py") })).toEqual({ scopable: true, runner: "pytest", pendingSearches: 1, notes: [] });
     expect(await st({ files: jsRepo({}, { "/r/src/a.ts": "" }), changedFiles: changed("src/a.ts") })).toEqual({ scopable: true, runner: "vitest", pendingSearches: 0, notes: [] });
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// QA round 3 (docs/qa/verification-resource-budget/phase-1.3.md, QA-1.3-29..37)
+// ---------------------------------------------------------------------------------------------
+
+/** The "-n <N>" the adapter appended, or [] when it appended none. */
+function xdistArgs(s: ScopedSpec): string[] {
+  const i = s.args.indexOf("-n");
+  return i < 0 ? [] : s.args.slice(i, i + 2);
+}
+
+describe("QA-1.3-31: iniconfig's key:value and decoded TOML keys reach the worker cap", () => {
+  const planPy = (files: Record<string, string>, command = "pytest") =>
+    planScopedRun(input({ command, files: pyRepo({ "/r/tests/test_a.py": "", ...files }), changedFiles: changed("tests/test_a.py") }));
+
+  it.each([
+    ["/r/pytest.ini", "[pytest]\naddopts:-n 3\n"],
+    ["/r/tox.ini", "[pytest]\naddopts:-n 3\n"],
+    ["/r/setup.cfg", "[tool:pytest]\naddopts:-n 3\n"],
+    ["/r/pytest.ini", "[pytest]\naddopts: -o x=y -n 3\n"],
+    ["/r/pytest.ini", "[pytest]\naddopts =-n 3\n"],
+    ["/r/pyproject.toml", '[tool.pytest.ini_options]\n"add\\u006fpts" = "-n 3"\n'],
+    ["/r/pyproject.toml", '[tool."py\\u0074est".ini_options]\naddopts = "-n 3"\n'],
+    ["/r/pytest.toml", '[pytest]\n"add\\u006fpts" = ["-n", "3"]\n'],
+    ["/r/pyproject.toml", '[tool.pytest.ini_options]\n"addopts" = "-n 3"\n'],
+    ["/r/pyproject.toml", "[tool.pytest.ini_options]\n'addopts' = '-n 3'\n"],
+    ["/r/pyproject.toml", '[ tool . "pytest" . ini_options ]\naddopts = "-n 3"\n'],
+  ])("%s %j: the cap lands", async (f, text) => {
+    expect(await detect("pytest", pyRepo({ [f]: text }))).toMatchObject({ xdist: true, userWorkers: { count: 3 } });
+    expect(xdistArgs(spec(await planPy({ [f]: text })))).toEqual(["-n", "2"]);
+  });
+
+  it.each([
+    ['[tool.pytest.ini_options]\n"add\\qopts" = "-n 3"\n', 'unsupported pytest argument ""add\\qopts"" in /r/pyproject.toml'],
+    ['[tool."py\\qtest".ini_options]\naddopts = "-n 3"\n', 'unsupported pytest argument "tool."py\\qtest".ini_options" in /r/pyproject.toml'],
+    ['tool.pytest.ini_options."add\\u006fpts" = "-n 3"\n', 'unsupported pytest argument "addopts" in /r/pyproject.toml'],
+    ['[tool.pytest.ini_options]\naddopts = "-n 1"\naddopts = "-n 3"\n', 'unsupported pytest argument "addopts" in /r/pyproject.toml'],
+    ['[tool.pytest.ini_options]\naddopts = "-n 1"\n[tool.pytest]\naddopts = ["-n", "3"]\n', 'unsupported pytest argument "addopts" in /r/pyproject.toml'],
+  ])("undecodable, dotted or repeated: %j -> S6", async (text, reason) => {
+    expectS6(await detectRunner("pytest", "/r", memFs(pyRepo({ "/r/pyproject.toml": text })), POSIX_HOST), "unsupported-argument", reason);
+  });
+
+  it("values are skipped whole: a header or key inside a string, array or inline table is not one", async () => {
+    const text = [
+      "[tool.pytest.ini_options]",
+      'description = """',
+      '[[ -n "$X" ]]',
+      "[tool.other]",
+      'addopts = "-n 9"',
+      '"""',
+      "markers = [",
+      '  "a: [x] # not a comment",',
+      "  # ] a comment",
+      '  ["nested"],',
+      "]",
+      'x = { a = "}", b = [1, 2] }',
+      "y = '''",
+      "addopts = 'lit'",
+      "'''",
+      'z = """q""""',
+      'w = "a\\"b"',
+      'addopts = "-n 3"',
+    ].join("\n");
+    expect(await detect("pytest", pyRepo({ "/r/pyproject.toml": text }))).toMatchObject({ xdist: true, userWorkers: { count: 3 } });
+  });
+
+  it("broken values and headers: the rest of the line or file is skipped, never read as pytest's", async () => {
+    // A header that is not a key path belongs to no table: its keys are ignored.
+    const odd = '[x y]\naddopts = "-n 9"\n[tool.pytest.ini_options]\naddopts = "-n 3"\n';
+    expect(await detect("pytest", pyRepo({ "/r/pyproject.toml": odd }))).toMatchObject({ userWorkers: { count: 3 } });
+    const unterminated = '[tool.pytest.ini_options]\nx = "abc\naddopts = "-n 3"\ny = """never\n';
+    expect(await detect("pytest", pyRepo({ "/r/pyproject.toml": unterminated }))).toMatchObject({ userWorkers: { count: 3 } });
+    const openArray = '[tool.pytest.ini_options]\naddopts = "-n 3"\nx = [ "a", { b = \'c\' }\n[tool.pytest.ini_options.more]\n';
+    expect(await detect("pytest", pyRepo({ "/r/pyproject.toml": openArray }))).toMatchObject({ userWorkers: { count: 3 } });
+    const openInArray = '[tool.pytest.ini_options]\nx = [ "a\naddopts = "-n 3"\n';
+    expect(await detect("pytest", pyRepo({ "/r/pyproject.toml": openInArray }))).toMatchObject({ userWorkers: { count: 3 } });
+  });
+
+  it("a dotted key defines the pytest table, so the file stops the search; an array table does not", async () => {
+    const files = { "/r/sub/pyproject.toml": "tool.pytest.ini_options.markers = []\n", "/r/pytest.ini": "[pytest]\naddopts = -n 3\n" };
+    const d = await detect("pytest", pyRepo(files), POSIX_HOST, "/r/sub");
+    expect(d.xdist).toBe(false);
+    const arr = { "/r/sub/pyproject.toml": "[[tool.pytest.ini_options]]\nmarkers = []\n", "/r/pytest.ini": "[pytest]\naddopts = -n 3\n" };
+    expect(await detect("pytest", pyRepo(arr), POSIX_HOST, "/r/sub")).toMatchObject({ xdist: true });
+  });
+});
+
+describe("QA-1.3-33: pytest's python_files decides which changed files are tests", () => {
+  const DJANGO = "[pytest]\npython_files = tests.py test_*.py *_tests.py\n";
+  const planPy = (files: Record<string, string>, paths: string[], over: Partial<PlanScopedRunInput> = {}) =>
+    planScopedRun(input({ command: "pytest", files: pyRepo(files), changedFiles: changed(...paths), ...over }));
+
+  it("pytest-django: tests.py and *_tests.py are test files, not modules", async () => {
+    const files = { "/r/pytest.ini": DJANGO, "/r/pkg/tests.py": "", "/r/pkg/str_tests.py": "" };
+    const s = spec(await planPy(files, ["pkg/tests.py", "pkg/str_tests.py"]));
+    expect(s.inputs).toEqual(["/r/pkg/str_tests.py", "/r/pkg/tests.py"]);
+    // Without the setting they are modules, and no test is named after them.
+    const plain = await planPy({ "/r/pkg/tests.py": "" }, ["pkg/tests.py"]);
+    expect(plain).toEqual({ noAffected: true, note: "no affected tests: no test files map to the changed modules" });
+  });
+
+  it("modules are looked up by the names python_files gives them; a literal name gives none", async () => {
+    const search = stubSearch({}, { "test_models.py": ["/r/pkg/test_models.py"] });
+    const files = { "/r/pytest.ini": DJANGO, "/r/pkg/models.py": "", "/r/pkg/test_models.py": "" };
+    expect(spec(await planPy(files, ["pkg/models.py"], { search })).inputs).toEqual(["/r/pkg/test_models.py"]);
+    expect(search.findByName).toHaveBeenCalledWith("/r", ["test_models.py", "models_tests.py"]);
+    const only = { "/r/pytest.ini": "[pytest]\npython_files = tests.py\n", "/r/pkg/models.py": "" };
+    const none = stubSearch();
+    expect(isNoAffected(await planPy(only, ["pkg/models.py"], { search: none }))).toBe(true);
+    expect(none.findByName).not.toHaveBeenCalled();
+  });
+
+  it("TOML arrays and strings, the -o override on the command line, in addopts and in PYTEST_ADDOPTS", async () => {
+    const cases: [Record<string, string>, string, Partial<PlanScopedRunInput>][] = [
+      [{ "/r/pyproject.toml": '[tool.pytest.ini_options]\npython_files = ["check_*.py"]\n' }, "pytest", {}],
+      [{ "/r/pyproject.toml": '[tool.pytest.ini_options]\npython_files = "check_*.py other.py"\n' }, "pytest", {}],
+      [{ "/r/pytest.toml": '[pytest]\npython_files = ["check_*.py"]\n' }, "pytest", {}],
+      [{}, "pytest -o python_files=check_*.py", {}],
+      [{}, 'pytest -o "python_files=a.py check_*.py"', {}],
+      [{ "/r/pytest.ini": "[pytest]\naddopts = -o python_files=check_*.py\n" }, "pytest", {}],
+      [{}, "pytest", { host: { ...POSIX_HOST, pathEnv: "/usr/bin", pytestAddopts: "--override-ini=python_files=check_*.py" } }],
+    ];
+    for (const [files, command, over] of cases) {
+      const s = spec(await planPy({ ...files, "/r/src/check_x.py": "" }, ["src/check_x.py"], { command, ...over }));
+      expect(s.inputs, command).toEqual(["/r/src/check_x.py"]);
+    }
+  });
+
+  it("an unreadable python_files is S6 unless the command line overrides it", async () => {
+    const bad: [string, string][] = [
+      ["/r/pyproject.toml", "[tool.pytest.ini_options]\npython_files = 3\n"],
+      ["/r/pytest.ini", "[pytest]\npython_files = 'open\n"],
+      ["/r/pyproject.toml", 'tool.pytest.ini_options.python_files = ["x.py"]\n'],
+    ];
+    for (const [f, text] of bad) {
+      expectS6(await detectRunner("pytest", "/r", memFs(pyRepo({ [f]: text })), POSIX_HOST), "unsupported-argument", `unsupported pytest argument "python_files" in ${f}`);
+      expect(await detect("pytest -o python_files=t.py", pyRepo({ [f]: text }))).toMatchObject({ pythonFiles: expect.arrayContaining(["t.py"]) });
+    }
+    expectS6(await detectRunner("pytest -o \"python_files='x\"", "/r", memFs(pyRepo()), POSIX_HOST), "unsupported-argument", 'unsupported pytest argument "python_files" in command');
+    const inAddopts = pyRepo({ "/r/pytest.ini": "[pytest]\naddopts = -o \"python_files='x\"\n" });
+    expectS6(await detectRunner("pytest", "/r", memFs(inAddopts), POSIX_HOST), "unsupported-argument", 'unsupported pytest argument "python_files" in addopts of /r/pytest.ini');
+  });
+
+  it("a -o addopts override still reads python_files from the config, and ignores its odd addopts", async () => {
+    const text = '[tool.pytest.ini_options]\npython_files = ["check_*.py"]\n"addopts" = 3\n';
+    const d = await detect('pytest -o "addopts=-q"', pyRepo({ "/r/pyproject.toml": text }));
+    expect(d.pythonFiles).toEqual(["check_*.py"]);
+  });
+
+  it("the union: a release line without a config, or a config without the key, keeps the defaults", async () => {
+    expect((await detect("pytest", pyRepo())).pythonFiles).toEqual([...DEFAULT_PYTHON_FILES]);
+    const toml = await detect("pytest", pyRepo({ "/r/pytest.toml": '[pytest]\npython_files = ["tests.py"]\n' }));
+    expect(toml.pythonFiles).toEqual([...DEFAULT_PYTHON_FILES, "tests.py"]);
+    const both = await detect("pytest", pyRepo({ "/r/pytest.toml": '[pytest]\npython_files = ["tests.py"]\n', "/r/pytest.ini": "[pytest]\npython_files = tests.py\n" }));
+    expect(both.pythonFiles).toEqual(["tests.py"]);
+  });
+
+  it("with a path argument the config above it counts as well", async () => {
+    const files = { "/r/tests/pytest.ini": "[pytest]\npython_files = check_*.py\n", "/r/tests/check_a.py": "" };
+    expect(spec(await planPy(files, ["tests/check_a.py"], { command: "pytest tests" })).inputs).toEqual(["/r/tests/check_a.py"]);
+    expect(isNoAffected(await planPy(files, ["tests/check_a.py"]))).toBe(true);
+  });
+
+  it("path patterns match the whole path; content hits are re-checked; globs follow the patterns", async () => {
+    const files = { "/r/pytest.ini": "[pytest]\npython_files = tests/*.py check_*.py\n", "/r/tests/sub/helper.py": "", "/r/lib/gone_dep.py": "" };
+    expect(spec(await planPy(files, ["tests/sub/helper.py"])).inputs).toEqual(["/r/tests/sub/helper.py"]);
+    const search = stubSearch({ gone: ["/r/tests/sub/helper.py", "/r/lib/gone_dep.py"] });
+    const s = spec(await planPy(files, ["src/gone.py"], { search }));
+    expect(s.inputs).toEqual(["/r/tests/sub/helper.py"]);
+    expect(search.findByContent).toHaveBeenCalledWith("/r", "gone", [":(glob)**/*.py", ":(glob)**/check_*.py"]);
+    expect(search.findByName).toHaveBeenCalledWith("/r", ["check_gone.py"]);
+  });
+
+  it("fnmatch: ?, sets, negated sets, ranges, unclosed brackets and repeated stars", async () => {
+    const patterns = "t?st_[a-c]*.py [!x]x_*.py foo[.py **_spec.py []a]*.py r[a-].py";
+    const files: Record<string, string> = { "/r/pytest.ini": `[pytest]\npython_files = ${patterns}\n` };
+    const tests = ["tast_b1.py", "yx_1.py", "foo[.py", "a_b_spec.py", "]z.py", "r-.py"];
+    const modules = ["tast_d1.py", "xx_1.py", "foo.py", "spec.py", "bz.py", "rb.py"];
+    for (const f of [...tests, ...modules]) files[`/r/p/${f}`] = "";
+    const s = spec(await planPy(files, [...tests, ...modules].map((f) => `p/${f}`)));
+    expect(s.inputs.map((p) => path.posix.basename(p)).sort()).toEqual([...tests].sort());
+  });
+
+  it("win32 matches python_files case-insensitively, with either separator", async () => {
+    const W = { "C:\\repo\\.git": "", "C:\\py\\pytest.exe": "", "C:\\repo\\pytest.ini": "[pytest]\npython_files = TESTS.py Unit/*.py\n", "C:\\repo\\pkg\\tests.py": "", "C:\\repo\\unit\\a.py": "" };
+    const r = spec(await planScopedRun(input({ win: true, command: "pytest", files: W, cwd: "C:\\repo", host: { ...WIN_HOST, pathEnv: "C:\\py" }, changedFiles: changed("pkg\\tests.py", "unit\\a.py") })));
+    expect(r.inputs).toEqual(["C:\\repo\\pkg\\tests.py", "C:\\repo\\unit\\a.py"]);
+  });
+});
+
+describe("QA-1.3-34: config files are size-capped and read once per plan", () => {
+  const big = "#".repeat(CONFIG_SIZE_LIMIT + 1);
+
+  it("a pytest config over the limit is S6 config-too-large, even one pytest would skip", async () => {
+    for (const f of ["/r/pyproject.toml", "/pyproject.toml", "/r/tox.ini"]) {
+      expectS6(await detectRunner("pytest", "/r", memFs(pyRepo({ [f]: big })), POSIX_HOST), "config-too-large", `config file too large to read: ${f} (limit ${CONFIG_SIZE_LIMIT} bytes)`);
+    }
+    expectS6(await detectRunner("pytest -c cfg/x.ini", "/r", memFs(pyRepo({ "/r/cfg/x.ini": big })), POSIX_HOST), "config-too-large");
+  });
+
+  it("with fs.stat the size is checked before the read, and a directory is unreadable", async () => {
+    const base = memFs(pyRepo({ "/r/pyproject.toml": "small", "/r/tox.ini": "[pytest]\n" }));
+    const reads: string[] = [];
+    const fs: PlannerFs = {
+      ...base,
+      readFile: async (p) => {
+        reads.push(p);
+        return base.readFile(p);
+      },
+      stat: async (p) => ({ isFile: !p.endsWith("tox.ini"), size: p.endsWith(".toml") ? BigInt(CONFIG_SIZE_LIMIT + 1) : 10, dev: 1, ino: 1 }),
+    };
+    expectS6(await detectRunner("pytest", "/r", fs, POSIX_HOST), "config-too-large");
+    expect(reads).not.toContain("/r/pyproject.toml");
+    const dirFs: PlannerFs = { ...fs, stat: async (p) => ({ isFile: !p.endsWith("tox.ini"), size: 10, dev: 1, ino: 1 }) };
+    const d = await detectRunner("pytest", "/r", { ...dirFs, fileExists: async (p) => p !== "/r/pyproject.toml" && (await base.fileExists(p)) }, POSIX_HOST);
+    expect((d as DetectedRunner).notes).toContain("unreadable pytest config ignored: /r/tox.ini");
+  });
+
+  it("each config file is read once per plan, across detection, the spec-time lookup and the release lines", async () => {
+    const files = pyRepo({ "/r/pyproject.toml": '[tool.pytest.ini_options]\naddopts = "-n 3"\n', "/r/tests/test_a.py": "" });
+    const base = memFs(files);
+    const reads: string[] = [];
+    const fs: FsSeam = { ...base, readFile: async (p) => (reads.push(p), base.readFile(p)) };
+    spec(await planScopedRun(input({ command: "pytest tests", fs, changedFiles: changed("tests/test_a.py") })));
+    expect(reads.filter((p) => p === "/r/pyproject.toml")).toHaveLength(1);
+  });
+
+  it("a config just under the limit, in the worst line shape, parses quickly", async () => {
+    const text = `[tool.pytest.ini_options]\n${"a=1\n".repeat(Math.floor((CONFIG_SIZE_LIMIT - 40) / 4))}`;
+    const t0 = performance.now();
+    expect(await detect("pytest", pyRepo({ "/r/pyproject.toml": text }))).toMatchObject({ xdist: false });
+    expect(performance.now() - t0).toBeLessThan(3000);
   });
 });

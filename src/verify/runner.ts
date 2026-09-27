@@ -245,17 +245,29 @@
 //         (xdist and cov from any file, the LOWEST cap among the files, "-p no:xdist" only when
 //         every line's file says so). A false xdist hit only costs exit 4 (unverifiable).
 //         `-o addopts=<v>` / `--override-ini addopts=<v>` replaces the file's addopts.
-//         ini files follow iniconfig (column-0 [section], "key = v" or "key: v", indented
-//         continuation lines, # and ; comment lines). TOML addopts is a basic, literal or
-//         multi-line string, or an array of strings, under a bare `addopts` key directly below
-//         the [table] header. A string is split with C.1. Anything else (a bare value, a bad
-//         escape, an unterminated quote) -> S6 unsupported-argument `unsupported pytest argument
-//         "addopts" in <file>`. So is any other TOML spelling that reaches the same key
-//         (QA-1.3-20: a dotted key at the root or under [tool], a quoted "addopts", an inline
-//         table such as `ini_options = { addopts = ... }`), which pytest 9.1.1 honours: the
+//         The keys read are addopts and python_files (G.8, QA-1.3-33).
+//         ini files follow iniconfig (column-0 [section], indented continuation lines, # and ;
+//         comment lines). A key line splits on its first "=" unless the name before it contains
+//         ":", otherwise on its first ":"; whitespace is optional (QA-1.3-31: "addopts:-n 3").
+//         TOML is scanned line by line with every value skipped whole (strings, multi-line
+//         strings, nested arrays and inline tables), so a header inside a string is not one.
+//         Header and key parts are compared DECODED (QA-1.3-31: `"add\u006fpts"`,
+//         `[tool."py\u0074est".ini_options]` are the plain names); a quoted part whose escapes
+//         do not decode -> S6 `unsupported pytest argument "<raw key>" in <file>`. A key is read
+//         only as a single key directly below a [table] header from the line's tables, as a
+//         basic, literal or multi-line string, or an array of strings; a string is split with
+//         C.1. Anything else (a bare value, a bad escape, an unterminated quote, a second
+//         occurrence in any pytest table) -> S6 unsupported-argument `unsupported pytest
+//         argument "<key>" in <file>`. So is any other TOML spelling that reaches the same key
+//         (QA-1.3-20: a dotted key at the root or under [tool], an inline table such as
+//         `ini_options = { addopts = ... }`, an array table), which pytest 9.1.1 honours: the
 //         adapter would append no -n. (An appended "-n N" does win over each of those shapes,
 //         verified with xdist 3.8.0, but it can only be appended when xdist is known to be
-//         present; otherwise pytest exits 4.) An unreadable file is noted and skipped.
+//         present; otherwise pytest exits 4.) A key the command line overrides with -o is not
+//         S6 for its spelling in the file. An unreadable file is noted and skipped. A file over
+//         CONFIG_SIZE_LIMIT (1 MiB) -> S6 config-too-large, even one pytest would skip after
+//         reading it (QA-1.3-34). Each file is read once per planner call and parsed once per
+//         reading (ctx.cache); with PlannerFs.stat the size is checked before the read.
 //       - PYTEST_ADDOPTS: host.pytestAddopts and the cross-env value (C.3). Both are scanned for
 //         evidence; the cap comes from the value the spawn will see (cross-env wins).
 //       - The command (D.1).
@@ -429,7 +441,18 @@
 //        eslint  (K)
 //   8. Classification:
 //        test file (JS): /\.(test|spec)\.[cm]?[jt]sx?$/ or a "__tests__" segment.
-//        test file (py): basename /^test_.*\.py$/ or /_test\.py$/.
+//        test file (py): a .py file matching pytest's python_files (QA-1.3-33; plan amendment to
+//                section 1.5-3, which names only test_<stem>.py/<stem>_test.py). The patterns
+//                are DetectedRunner.pythonFiles: the union over the configs each pytest release
+//                line picks from runnerCwd, and, with path arguments, from their common ancestor
+//                (a line whose config sets none, or that finds no config, adds the default
+//                "test_*.py *_test.py"), plus every `-o python_files=` in the command, addopts or
+//                PYTEST_ADDOPTS. Matching follows pytest's fnmatch_ex: a pattern without a
+//                separator matches the basename, one with a separator the whole path (relative
+//                patterns get "*" plus a separator in front); win32 folds case. pytest-django's
+//                `python_files = tests.py test_*.py *_tests.py` makes pkg/tests.py a test file.
+//                A union only ever classifies more files as tests, and an explicit test file is
+//                always collected by pytest.
 //        non-input (skipped, counted in a note):
 //          - extensions .md .mdx .markdown .rst .adoc .txt;
 //          - any path with a ".github" segment;
@@ -443,16 +466,20 @@
 //        pytest: only .py files count; others are skipped.
 //          - an existing test file becomes an input, if it lies under runnerCwd and under a path
 //            scope (when path scopes exist).
-//          - an existing module is looked up with
-//            search.findByName(gitRoot, ["test_<stem>.py", "<stem>_test.py"]). Hits are filtered
-//            the same way. No hits -> note `no tests named for <rel>`. undefined -> S6
-//            search-failed.
+//          - an existing module is looked up with search.findByName(gitRoot, names), where each
+//            basename pattern with exactly one "*" and no other wildcard gives a name
+//            ("test_*.py" -> test_<stem>.py; by default ["test_<stem>.py", "<stem>_test.py"]).
+//            A literal pattern (tests.py) or a path pattern gives none; with no names at all
+//            there is no search. Hits are filtered the same way. No hits -> note `no tests named
+//            for <rel>`. undefined -> S6 search-failed.
 //          - a gone test file adds a note. A gone module uses the stem search plus findByName,
 //            and gets S6 when both find nothing.
 //        stem = the basename without its last extension. "index" and "__init__" use the parent
 //        directory name instead.
 //   9. Stem search (section 1.5-5): search.findByContent(gitRoot, stem, globs), with JS_TEST_GLOBS
-//      or PY_TEST_GLOBS.
+//      or the pytest globs: ":(glob)**/<pattern>" per python_files basename pattern
+//      (PY_TEST_GLOBS for the default), ":(glob)**/*.py" for a path pattern. pytest hits are
+//      re-checked against python_files before they are counted.
 //        undefined               -> S6 search-failed.
 //        []                      -> S6 deleted-no-tests.
 //        more than STEM_MATCH_LIMIT files -> S6 stem-too-common.
@@ -696,6 +723,8 @@
 //                              node on PATH is not an executable file: <f>   (F.1)
 //     too-many-searches        too many changed modules to map: <n> test searches (limit 50)
 //                              (G.9a)
+//     config-too-large         config file too large to read: <path> (limit 1048576 bytes)
+//                              (QA-1.3-34)
 //   M.2 NoAffected notes:
 //     "no changed files, no affected tests"                          (section 1.5-6, exactly)
 //     "no affected tests: no changed file is a test input"           (docs only, dropped paths,
@@ -805,7 +834,8 @@
 //   1.6 risk.ts takes `ScopingPlan | StaticScoping`. "Scoping impossible" holds when
 //       isUnverifiable(plan). Show plan.reason and branch on plan.code. Callers obtain the plan
 //       from planStaticScoping, which starts no process. S6Code only grows (round 2 added
-//       node-not-found and too-many-searches), so a switch over it needs a default branch.
+//       node-not-found and too-many-searches, round 3 config-too-large), so a switch over it
+//       needs a default branch.
 //   2.1 testsPass: plan = planScopedRun(...).
 //       - NoAffected -> pass, with the note.
 //       - Unverifiable -> S6.
@@ -862,8 +892,12 @@ import type { ExecResult, FsSeam } from "./types";
 
 /** git pathspecs for the section 1.5-5 stem search over JS/TS test files. */
 export const JS_TEST_GLOBS: readonly string[] = [":(glob)**/*.test.*", ":(glob)**/*.spec.*", ":(glob)**/__tests__/**"];
-/** git pathspecs for the section 1.5-5 stem search over pytest test files. */
+/** git pathspecs for the section 1.5-5 stem search over pytest test files (the default python_files; G.8). */
 export const PY_TEST_GLOBS: readonly string[] = [":(glob)**/test_*.py", ":(glob)**/*_test.py"];
+/** pytest's default python_files (G.8, QA-1.3-33). */
+export const DEFAULT_PYTHON_FILES: readonly string[] = ["test_*.py", "*_test.py"];
+/** Config files above this many bytes are not parsed: S6 config-too-large (QA-1.3-34). */
+export const CONFIG_SIZE_LIMIT = 1024 * 1024;
 /** A deleted source whose stem appears in more test files than this is S6 stem-too-common. */
 export const STEM_MATCH_LIMIT = 20;
 /** More changed files needing a process-backed test search than this is S6 too-many-searches (G.9a). */
@@ -910,7 +944,8 @@ export type S6Code =
   | "tmpdir-in-repo"
   | "argv-too-long"
   | "node-not-found"
-  | "too-many-searches";
+  | "too-many-searches"
+  | "config-too-large";
 
 /** S6: scoping is impossible. The reason names the construct (section M.1) and never triggers a full suite. */
 export interface Unverifiable {
@@ -988,9 +1023,22 @@ export interface RunnerHost {
  * Without `realpath`, paths stay lexical, every spec carries `lexicalPaths: true`, and readResult
  * never trusts a run that reports 0 tests (I step 2a, any runner: QA-1.3-19). It stays optional so
  * a plain FsSeam still type-checks; 2.1 must pass the native realpath.
+ * `stat` (optional, round 3) is fs.promises.stat(path, { bigint: true }) mapped to FileStat. With it,
+ * config files are size-checked before they are read (QA-1.3-34), a directory named node(.exe) is
+ * not a node (QA-1.3-36), and a PATH node that is the same file as a non-node runtime (Bun's
+ * temporary hard link, QA-1.3-30) is skipped. 2.1 should pass it.
  */
 export interface PlannerFs extends FsSeam {
   realpath?(path: string): Promise<string>;
+  stat?(path: string): Promise<FileStat>;
+}
+
+/** What PlannerFs.stat reports. bigint dev/ino keep win32 file ids exact. */
+export interface FileStat {
+  readonly isFile: boolean;
+  readonly size: number | bigint;
+  readonly dev: number | bigint;
+  readonly ino: number | bigint;
 }
 
 /** Filesystem seam extended with the one mutation readResult needs. */
@@ -1047,6 +1095,12 @@ export interface DetectedRunner {
   readonly pytestFacts?: PytestFacts;
   /** Absolute canonical paths of the --config/-c (pytest: -c/--config-file) values. Config triggers (G.7, QA-1.3-5). */
   readonly configFiles?: readonly string[];
+  /**
+   * pytest: the python_files patterns the user's run can use (G.8, QA-1.3-33): the union over the
+   * configs every pytest release line picks (defaults where a line's config sets none) and every
+   * `-o python_files=` override. Undefined means DEFAULT_PYTHON_FILES.
+   */
+  readonly pythonFiles?: readonly string[];
 }
 
 /** The pytest command's own worker, xdist and config facts (D.4, QA-1.3-3). */
@@ -1061,6 +1115,8 @@ export interface PytestFacts {
   readonly configFile?: string;
   /** The value of `-o addopts=<v>` / `--override-ini addopts=<v>`: it replaces the config's addopts. */
   readonly overrideAddopts?: string;
+  /** The patterns of every `-o python_files=<v>` on the command line (QA-1.3-33): they replace the config's. */
+  readonly pythonFiles?: readonly string[];
 }
 
 /** What resolveEntry needs. DetectedRunner satisfies it. */
@@ -1221,6 +1277,12 @@ interface Ctx {
   key(p: string): string;
   /** host.execPath is a node executable JS tools can run under (F.1, QA-1.3-18). */
   readonly execIsNode: boolean;
+  /** Per-call caches (QA-1.3-34): a config file is read, and parsed per reading, once per plan. */
+  readonly cache: {
+    readonly texts: Map<string, Promise<TextRead>>;
+    readonly parsed: Map<string, ConfigParse>;
+    readonly exists: Map<string, Promise<boolean>>;
+  };
 }
 
 function resolveHost(h: Partial<RunnerHost> | undefined): RunnerHost {
@@ -1245,7 +1307,51 @@ function makeCtx(h: Partial<RunnerHost> | undefined): Ctx {
   const named = /^node(?:\.exe)?$/.test(win ? P.basename(host.execPath).toLowerCase() : P.basename(host.execPath));
   // F.1: an explicit execPath is trusted by name; the default also needs a runtime that is not Bun.
   const execIsNode = named && (h?.execPath !== undefined || process.versions.bun === undefined);
-  return { host, P, win, key: (p: string) => (win ? p.toLowerCase() : p), execIsNode };
+  const cache = { texts: new Map(), parsed: new Map(), exists: new Map() };
+  return { host, P, win, key: (p: string) => (win ? p.toLowerCase() : p), execIsNode, cache };
+}
+
+/** A config file's text (BOM removed), or why it could not be used (QA-1.3-34). */
+type TextRead = { readonly text: string } | "unreadable" | "too-large";
+
+/**
+ * QA-1.3-34: every config file the planners parse (pytest configs, .npmrc, the JS runner configs)
+ * is read at most once per call, through this cache, and never parsed above CONFIG_SIZE_LIMIT: a
+ * 100 MB pytest config cost up to 86 s and 9 GB. With fs.stat the size is checked before the
+ * read; without it, after. A leading UTF-8 BOM is dropped (npm's ini parser trims it, QA-1.3-32).
+ */
+async function readConfigText(ctx: Ctx, fs: PlannerFs, p: string): Promise<TextRead> {
+  const k = ctx.key(p);
+  const hit = ctx.cache.texts.get(k);
+  if (hit) return hit;
+  const read = (async (): Promise<TextRead> => {
+    try {
+      const st = fs.stat ? await fs.stat(p) : undefined;
+      if (st && !st.isFile) return "unreadable";
+      if (st && Number(st.size) > CONFIG_SIZE_LIMIT) return "too-large";
+      const text = await fs.readFile(p);
+      return text.length > CONFIG_SIZE_LIMIT ? "too-large" : { text: text.replace(/^\uFEFF/, "") };
+    } catch {
+      return "unreadable";
+    }
+  })();
+  ctx.cache.texts.set(k, read);
+  return read;
+}
+
+function tooLarge(p: string): Unverifiable {
+  return s6("config-too-large", `config file too large to read: ${p} (limit ${CONFIG_SIZE_LIMIT} bytes)`);
+}
+
+/** fileExists, cached per call (the pytest config walk probes the same names from several starts). */
+function existsCached(ctx: Ctx, fs: FsSeam, p: string): Promise<boolean> {
+  const k = ctx.key(p);
+  let r = ctx.cache.exists.get(k);
+  if (!r) {
+    r = fs.fileExists(p);
+    ctx.cache.exists.set(k, r);
+  }
+  return r;
 }
 
 function s6(code: S6Code, reason: string): Unverifiable {
@@ -1742,6 +1848,8 @@ interface ArgResult {
   readonly configs: string[];
   /** pytest: the value of `-o addopts=<v>`. */
   readonly overrideAddopts: string | undefined;
+  /** pytest: the values of every `-o python_files=<v>` (QA-1.3-33). */
+  readonly overridePythonFiles: string[];
   readonly notes: string[];
 }
 
@@ -1784,6 +1892,7 @@ async function processArgs(
   let xdistArg = false;
   let cov = false;
   let overrideAddopts: string | undefined;
+  const overridePythonFiles: string[] = [];
   let firstPositional = true;
   const badArg = (t: string) => s6("unsupported-argument", `unsupported ${kind} argument "${t}" in ${where}`);
 
@@ -1830,8 +1939,9 @@ async function processArgs(
       if (m.name === "--cov") cov = true;
       const value = m.inline ? m.value : values[0];
       if (value !== undefined && CONFIG_OPTIONS[kind].includes(m.name)) configs.push(value);
-      if (kind === "pytest" && (m.name === "-o" || m.name === "--override-ini") && value?.startsWith("addopts=")) {
-        overrideAddopts = value.slice("addopts=".length);
+      if (kind === "pytest" && (m.name === "-o" || m.name === "--override-ini") && value !== undefined) {
+        if (value.startsWith("addopts=")) overrideAddopts = value.slice("addopts=".length);
+        if (value.startsWith("python_files=")) overridePythonFiles.push(value.slice("python_files=".length));
       }
       switch (m.entry.action) {
         case "drop":
@@ -1903,7 +2013,7 @@ async function processArgs(
     userWorkers = parseCap(kind, capRaw);
     if (!userWorkers) notes.add(`invalid worker cap "${capRaw}" ignored`);
   }
-  return { kept, capRaw, userWorkers, pathScopes, noXdist, xdistArg, cov, configs, overrideAddopts, notes: [...notes] };
+  return { kept, capRaw, userWorkers, pathScopes, noXdist, xdistArg, cov, configs, overrideAddopts, overridePythonFiles, notes: [...notes] };
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1923,8 +2033,21 @@ const PYTEST_CONFIG_LINES: readonly { readonly names: readonly string[]; readonl
   { names: ["pytest.ini", "pyproject.toml", "tox.ini", "setup.cfg"], legacy: true },
 ];
 
-/** undefined: not a pytest config (pytest skips it). "bad": addopts present but not understood. */
-type ConfigParse = { readonly addopts?: readonly string[] } | "bad" | undefined;
+/** The pytest ini keys the adapter reads (D.4): addopts (QA-1.3-3) and python_files (QA-1.3-33). */
+const PY_KEYS = ["addopts", "python_files"] as const;
+type PyKey = (typeof PY_KEYS)[number];
+
+interface ConfigValues {
+  readonly addopts?: readonly string[];
+  readonly pythonFiles?: readonly string[];
+}
+
+/**
+ * undefined: not a pytest config (pytest skips it). `bad` names what is present but not understood:
+ * "addopts" or "python_files" (an unreadable value, or a TOML spelling other than the bare key
+ * under its table), or a raw TOML key or header whose escapes do not decode.
+ */
+type ConfigParse = { readonly values: ConfigValues; readonly bad: readonly string[] } | undefined;
 
 /**
  * One config file by pytest's per-format rules. `explicit` (-c) files always count. `legacy`
@@ -1933,26 +2056,43 @@ type ConfigParse = { readonly addopts?: readonly string[] } | "bad" | undefined;
  */
 function parsePytestConfig(ctx: Ctx, file: string, text: string, explicit: boolean, legacy: boolean): ConfigParse {
   const base = ctx.P.basename(file);
+  let raw: Partial<Record<PyKey, string | readonly string[]>>;
+  const bad: string[] = [];
   if (ctx.P.extname(base) === ".toml") {
     const own = !legacy && (base === "pytest.toml" || base === ".pytest.toml");
-    const r = tomlAddopts(text, own ? ["pytest"] : legacy ? ["tool.pytest.ini_options"] : ["tool.pytest.ini_options", "tool.pytest"]);
-    if (r === "bad") return "bad";
-    if (!r.found && !own && !explicit) return undefined;
-    return r.addopts === undefined ? {} : { addopts: r.addopts };
+    const r = tomlPytest(text, own ? ["pytest"] : legacy ? ["tool.pytest.ini_options"] : ["tool.pytest.ini_options", "tool.pytest"]);
+    if (r.bad.length === 0 && !r.found && !own && !explicit) return undefined;
+    raw = r.values;
+    bad.push(...r.bad);
+  } else {
+    const r = iniPytest(text, ctx.P.extname(base) === ".cfg" ? "tool:pytest" : "pytest");
+    if (!r.found && base !== "pytest.ini" && base !== ".pytest.ini" && !explicit) return undefined;
+    raw = r.values;
   }
-  const r = iniAddopts(text, ctx.P.extname(base) === ".cfg" ? "tool:pytest" : "pytest");
-  if (!r.found && base !== "pytest.ini" && base !== ".pytest.ini" && !explicit) return undefined;
-  if (r.addopts === undefined) return {};
-  const tokens = tokenize(r.addopts.replace(/\r?\n/g, " "));
-  return tokens ? { addopts: tokens } : "bad";
+  const values: { addopts?: readonly string[]; pythonFiles?: readonly string[] } = {};
+  for (const k of PY_KEYS) {
+    const v = raw[k];
+    if (v === undefined || bad.includes(k)) continue;
+    // A string is split like pytest's shlex (ini values, TOML strings); a TOML array is taken as is.
+    const tokens = typeof v === "string" ? tokenize(v.replace(/\r?\n/g, " ")) : v;
+    if (tokens === undefined) bad.push(k);
+    else if (k === "addopts") values.addopts = tokens;
+    else values.pythonFiles = tokens;
+  }
+  return { values, bad };
 }
 
-/** iniconfig rules: `[section]` at column 0, `key = value` or `key: value`, indented continuation lines, # and ; comment lines. */
-function iniAddopts(text: string, section: string): { found: boolean; addopts?: string } {
+/**
+ * iniconfig rules: `[section]` at column 0, indented continuation lines, # and ; comment lines, and
+ * `key = value` or `key: value` with optional whitespace (QA-1.3-31: `addopts:-n 3` is read). A
+ * line splits on its first "=" unless the name before it contains ":", otherwise on its first ":".
+ */
+function iniPytest(text: string, section: string): { found: boolean; values: Partial<Record<PyKey, string>> } {
   let current: string | undefined;
   let found = false;
   let key: string | undefined;
-  let value: string | undefined;
+  const values: Partial<Record<PyKey, string>> = {};
+  const pyKey = (k: string | undefined): PyKey | undefined => PY_KEYS.find((x) => x === k);
   for (const line of text.split(/\r\n|\r|\n/)) {
     if (/^\s*[#;]/.test(line) || line.trim() === "") continue;
     if (line.startsWith("[")) {
@@ -1961,91 +2101,198 @@ function iniAddopts(text: string, section: string): { found: boolean; addopts?: 
       if (current === section) found = true;
       key = undefined;
     } else if (/^\s/.test(line)) {
-      if (current === section && key === "addopts") value = `${value ?? ""}\n${line.trim()}`;
+      const k = pyKey(key);
+      if (current === section && k) values[k] = `${values[k] ?? ""}\n${line.trim()}`;
     } else {
-      const kv = /^([^=:]+?)\s*(?:=|:\s)\s*(.*)$/.exec(line);
-      key = kv?.[1].trim();
-      if (kv && current === section && key === "addopts") value = kv[2].trim();
+      const kv = iniSplit(line);
+      key = kv?.[0];
+      const k = pyKey(key);
+      if (kv && current === section && k) values[k] = kv[1];
     }
   }
-  return value === undefined ? { found } : { found, addopts: value };
+  return { found, values };
 }
 
-const TOML_HEADER_RE = /^[ \t]*(\[\[?)([^\]\n]*)\]\]?[ \t]*(?:#[^\n]*)?\r?$/;
-const TOML_KEY_PART = String.raw`(?:[A-Za-z0-9_-]+|"(?:[^"\\\n]|\\.)*"|'[^'\n]*')`;
-const TOML_KEY_RE = new RegExp(String.raw`^[ \t]*(${TOML_KEY_PART}(?:[ \t]*\.[ \t]*${TOML_KEY_PART})*)[ \t]*=[ \t]*(\S?)`);
+/** iniconfig's name/value split (QA-1.3-31). undefined: neither "=" nor ":" (iniconfig rejects the line). */
+function iniSplit(line: string): [string, string] | undefined {
+  const eq = line.indexOf("=");
+  if (eq >= 0 && !line.slice(0, eq).includes(":")) return [line.slice(0, eq).trim(), line.slice(eq + 1).trim()];
+  const colon = line.indexOf(":");
+  return colon < 0 ? undefined : [line.slice(0, colon).trim(), line.slice(colon + 1).trim()];
+}
+
+const TOML_HEADER_RE = /^[ \t]*(\[\[?)([^\]\r\n]*)\]\]?[ \t]*(?:#.*)?\r?$/;
+const TOML_KEY_PART = String.raw`(?:[A-Za-z0-9_-]+|"(?:[^"\\\r\n]|\\.)*"|'[^'\r\n]*')`;
+const TOML_KEY_RE = new RegExp(String.raw`^[ \t]*(${TOML_KEY_PART}(?:[ \t]*\.[ \t]*${TOML_KEY_PART})*)[ \t]*=[ \t]*`);
+const TOML_PART_RE = new RegExp(String.raw`[ \t]*(${TOML_KEY_PART})[ \t]*(?:\.|$)`, "y");
+const TOML_ARRAY_GAP_RE = /(?:[\s,]|#[^\n]*)*/y;
 
 /**
- * D.4 (QA-1.3-20): a key that reaches a pytest addopts in a spelling tomlAddopts does not read.
- * pytest 9.1.1 honoured each of these, and the adapter then appended no -n: a dotted key at the
- * root (`tool.pytest.ini_options.addopts = ...`) or under [tool], a quoted `"addopts"`, and an
- * inline table (`ini_options = { addopts = ... }`). The only form read is a bare `addopts` key
- * directly under a [table] header from `tables`; any other key whose path is `<table>.addopts`,
- * or an inline table on the way to one, fails closed. Linear, one pass over the lines.
+ * QA-1.3-31: a dotted TOML key or header, split into DECODED parts, so `"add\u006fpts"` and
+ * `tool."py\u0074est"` compare equal to what pytest's TOML parser reads. []: not a key path (a
+ * shell test such as `[[ -n "$X" ]]` inside a string, say); "bad": a quoted part whose escapes do
+ * not decode.
  */
-function tomlHiddenAddopts(text: string, tables: readonly string[]): boolean {
-  const targets = tables.map((t) => `${t}.addopts`);
-  let header = "";
-  let array = false;
-  for (const line of text.split(/\r\n|\r|\n/)) {
-    const h = TOML_HEADER_RE.exec(line);
-    if (h) {
-      header = h[2].replace(/[\s"']/g, "");
-      array = h[1] === "[[";
-      continue;
+function tomlKeyParts(s: string): string[] | "bad" {
+  const out: string[] = [];
+  for (let i = 0; i < s.length; ) {
+    TOML_PART_RE.lastIndex = i;
+    const m = TOML_PART_RE.exec(s);
+    if (!m || m[0] === "") return [];
+    const raw = m[1];
+    if (raw.startsWith('"')) {
+      const d = tomlString(raw, 0);
+      if (!d) return "bad";
+      out.push(d.value);
+    } else {
+      out.push(raw.startsWith("'") ? raw.slice(1, -1) : raw);
     }
-    const k = TOML_KEY_RE.exec(line);
-    if (!k || (k[1] === "addopts" && !array && tables.includes(header))) continue;
-    const full = (header === "" ? "" : `${header}.`) + k[1].replace(/[\s"']/g, "");
-    if (targets.some((t) => t === full || (k[2] === "{" && t.startsWith(`${full}.`)))) return true;
+    i = TOML_PART_RE.lastIndex;
   }
-  return false;
+  return out;
 }
 
-/** The addopts of the first matching TOML table: a string (tokenized like pytest's shlex) or an array. */
-function tomlAddopts(text: string, tables: readonly string[]): { found: boolean; addopts?: readonly string[] } | "bad" {
-  if (tomlHiddenAddopts(text, tables)) return "bad";
-  const headers = [...text.matchAll(new RegExp(TOML_HEADER_RE.source, "gm"))];
+const startsWithPath = (path: readonly string[], prefix: readonly string[]) => prefix.length <= path.length && prefix.every((p, i) => path[i] === p);
+const samePath = (a: readonly string[], b: readonly string[]) => a.length === b.length && startsWithPath(a, b);
+
+/**
+ * D.4 (QA-1.3-20, QA-1.3-31): the pytest keys (PY_KEYS) of the first matching TOML table, in one
+ * pass over the lines. Headers and keys are compared by their decoded parts. Only a bare key
+ * directly below a [table] header from `tables` is read, as a string or an array of strings; the
+ * same key reached any other way (a dotted key, a quoted key, an inline table on the way, an array
+ * table, a second occurrence) is `bad`, and so is an undecodable quoted part anywhere. Each value is
+ * skipped as a whole, so a header inside a multi-line string is not a header. `found`: some header
+ * or key path outside an array table lies in a table from `tables` (pytest then accepts the file
+ * as its config); a dotted key such as `tool.pytest.ini_options.markers` defines the table too.
+ */
+function tomlPytest(text: string, tables: readonly string[]): { found: boolean; values: Partial<Record<PyKey, string | readonly string[]>>; bad: string[] } {
+  const tabs = tables.map((t) => t.split("."));
+  const targets = PY_KEYS.flatMap((key) => tabs.map((t) => ({ key, table: t, path: [...t, key] })));
+  const values: Partial<Record<PyKey, string | readonly string[]>> = {};
+  const bad = new Set<string>();
   let found = false;
-  for (let h = 0; h < headers.length; h++) {
-    const m = headers[h];
-    if (m[1] === "[[" || !tables.includes(m[2].replace(/[\s"']/g, ""))) continue;
-    found = true;
-    const from = (m.index ?? 0) + m[0].length;
-    const body = text.slice(from, h + 1 < headers.length ? headers[h + 1].index : text.length);
-    const key = /^[ \t]*addopts[ \t]*=[ \t]*/m.exec(body);
-    if (!key) continue;
-    const v = tomlValue(body.slice(key.index + key[0].length));
-    if (v === undefined) return "bad";
-    if (typeof v !== "string") return { found, addopts: v };
-    const tokens = tokenize(v.replace(/\r?\n/g, " "));
-    return tokens ? { found, addopts: tokens } : "bad";
+  let table: readonly string[] | undefined = [];
+  let array = false;
+  for (let pos = 0; pos < text.length; ) {
+    let eol = text.indexOf("\n", pos);
+    if (eol < 0) eol = text.length;
+    const line = text.slice(pos, eol);
+    const h = TOML_HEADER_RE.exec(line);
+    const m = h ?? TOML_KEY_RE.exec(line);
+    let next = eol + 1;
+    if (m) {
+      const raw = m[h ? 2 : 1];
+      const parts = tomlKeyParts(raw);
+      if (parts === "bad") {
+        bad.add(raw.trim());
+      } else if (h) {
+        // A header that is not a key path (text inside a string) belongs to no table.
+        table = parts.length > 0 ? parts : undefined;
+        array = h[1] === "[[";
+        if (!array && tabs.some((t) => startsWithPath(parts, t))) found = true;
+      } else {
+        const vStart = pos + m[0].length;
+        let end = tomlSkipValue(text, vStart);
+        if (table) {
+          const full = [...table, ...parts];
+          if (!array && tabs.some((t) => startsWithPath(full, t))) found = true;
+          for (const t of targets) {
+            if (!array && parts.length === 1 && parts[0] === t.key && samePath(table, t.table)) {
+              // A second occurrence (the same key in two pytest tables) is a TOML or pytest error.
+              const v = values[t.key] === undefined ? tomlValue(text, vStart) : undefined;
+              if (v) {
+                values[t.key] = v.value;
+                end = v.end;
+              } else bad.add(t.key);
+            } else if (samePath(full, t.path) || (text[vStart] === "{" && t.path.length > full.length && startsWithPath(t.path, full))) {
+              bad.add(t.key);
+            }
+          }
+        }
+        if (end > eol) next = end;
+      }
+    }
+    pos = next;
   }
-  return { found };
+  return { found, values, bad: [...bad] };
+}
+
+/** The end of the TOML value starting at s[i] (a string, an array or inline table with nesting, or the rest of the line). */
+function tomlSkipValue(s: string, i: number): number {
+  const lineEnd = (j: number) => {
+    const n = s.indexOf("\n", j);
+    return n < 0 ? s.length : n;
+  };
+  if (s[i] === '"' || s[i] === "'") return tomlStringEnd(s, i) ?? lineEnd(i);
+  if (s[i] !== "[" && s[i] !== "{") return lineEnd(i);
+  let depth = 0;
+  for (let j = i; j < s.length; ) {
+    const c = s[j];
+    if (c === '"' || c === "'") {
+      const end = tomlStringEnd(s, j);
+      if (end === undefined) return lineEnd(j);
+      j = end;
+      continue;
+    }
+    if (c === "#") {
+      j = lineEnd(j);
+      continue;
+    }
+    if (c === "[" || c === "{") depth++;
+    else if (c === "]" || c === "}") {
+      depth--;
+      if (depth === 0) return j + 1;
+    }
+    j++;
+  }
+  return s.length;
+}
+
+/** The end of any TOML string (basic, literal, or their multi-line forms) starting at s[i]; undefined when unterminated. */
+function tomlStringEnd(s: string, i: number): number | undefined {
+  const q = s[i];
+  const q3 = q.repeat(3);
+  const multi = s.startsWith(q3, i);
+  for (let j = i + (multi ? 3 : 1); j < s.length; j++) {
+    const c = s[j];
+    if (q === '"' && c === "\\") {
+      j++;
+      continue;
+    }
+    if (!multi && (c === "\n" || c === "\r")) return undefined;
+    if (!multi && c === q) return j + 1;
+    if (multi && s.startsWith(q3, j)) {
+      // Up to two more quotes belong to the content ("""a"""" is `a"`).
+      let k = j + 3;
+      while (k < j + 5 && s[k] === q) k++;
+      return k;
+    }
+  }
+  return undefined;
 }
 
 const TOML_ESCAPES: Readonly<Record<string, string>> = { '"': '"', "\\": "\\", n: "\n", t: "\t", r: "\r", b: "\b", f: "\f" };
 
-/** A TOML string or array of strings at the start of `s`; undefined for anything else. */
-function tomlValue(s: string): string | string[] | undefined {
-  if (s.startsWith('"""') || s.startsWith("'''")) {
-    const q = s.slice(0, 3);
-    const end = s.indexOf(q, 3);
+/** A TOML string or array of strings at s[i], with the index after it; undefined for anything else. */
+function tomlValue(s: string, i: number): { value: string | string[]; end: number } | undefined {
+  if (s.startsWith('"""', i) || s.startsWith("'''", i)) {
+    const q = s.slice(i, i + 3);
+    const end = s.indexOf(q, i + 3);
     if (end < 0) return undefined;
-    const raw = s.slice(3, end).replace(/^\r?\n/, "");
-    return q === '"""' && raw.includes("\\") ? undefined : raw;
+    const raw = s.slice(i + 3, end).replace(/^\r?\n/, "");
+    return q === '"""' && raw.includes("\\") ? undefined : { value: raw, end: end + 3 };
   }
-  if (s.startsWith('"') || s.startsWith("'")) return tomlString(s, 0)?.value;
-  if (!s.startsWith("[")) return undefined;
+  if (s[i] === '"' || s[i] === "'") return tomlString(s, i);
+  if (s[i] !== "[") return undefined;
   const out: string[] = [];
-  let i = 1;
-  for (;;) {
-    i += /^(?:[\s,]|#[^\n]*)*/.exec(s.slice(i))?.[0].length ?? 0;
-    if (s[i] === "]") return out;
-    const str = tomlString(s, i);
+  for (let j = i + 1; ; ) {
+    TOML_ARRAY_GAP_RE.lastIndex = j;
+    j += TOML_ARRAY_GAP_RE.exec(s)?.[0].length ?? 0;
+    if (s[j] === "]") return { value: out, end: j + 1 };
+    const str = tomlString(s, j);
     if (!str) return undefined;
     out.push(str.value);
-    i = str.end;
+    j = str.end;
   }
 }
 
@@ -2083,52 +2330,55 @@ function tomlString(s: string, i: number): { value: string; end: number } | unde
   return undefined;
 }
 
-interface PytestConfig {
+interface PytestConfig extends ConfigValues {
   readonly path: string;
-  readonly addopts?: readonly string[];
 }
 
 /**
  * pytest's inifile selection for every release line (QA-1.3-21): the -c file alone (read both
  * ways), or, per line, the first accepted file walking from `start` up to the filesystem root
  * (above gitRoot too, as pytest does). Returns the distinct configs found, pytest 9's first. An
- * unreadable file is noted once and skipped. Any "bad" file is S6: some pytest reads it.
+ * unreadable file is noted and skipped; a file over CONFIG_SIZE_LIMIT is S6 config-too-large
+ * (QA-1.3-34). A `bad` key is S6 (some pytest reads it) unless it is in `ignore` (overridden with
+ * -o on the command line). Files are read and parsed once per call (ctx.cache).
  * `everyLine` is false when some release line found no config at all.
  */
 async function findPytestConfigs(
   ctx: Ctx,
-  fs: FsSeam,
+  fs: PlannerFs,
   explicit: string | undefined,
   start: string,
   notes: string[],
+  ignore: ReadonlySet<string>,
 ): Promise<{ configs: PytestConfig[]; everyLine: boolean } | Unverifiable> {
-  const texts = new Map<string, string | undefined>();
-  const load = async (p: string, isExplicit: boolean, legacy: boolean): Promise<ConfigParse | "unreadable"> => {
-    if (!texts.has(p)) {
-      try {
-        texts.set(p, await fs.readFile(p));
-      } catch {
-        notes.push(`unreadable pytest config ignored: ${p}`);
-        texts.set(p, undefined);
-      }
+  const load = async (p: string, isExplicit: boolean, legacy: boolean): Promise<ConfigParse | "unreadable" | Unverifiable> => {
+    const t = await readConfigText(ctx, fs, p);
+    if (t === "too-large") return tooLarge(p);
+    if (t === "unreadable") {
+      const n = `unreadable pytest config ignored: ${p}`;
+      if (!notes.includes(n)) notes.push(n);
+      return "unreadable";
     }
-    const text = texts.get(p);
-    return text === undefined ? "unreadable" : parsePytestConfig(ctx, p, text, isExplicit, legacy);
+    const pk = `${ctx.key(p)}\0${isExplicit}\0${legacy}`;
+    if (!ctx.cache.parsed.has(pk)) ctx.cache.parsed.set(pk, parsePytestConfig(ctx, p, t.text, isExplicit, legacy));
+    const r = ctx.cache.parsed.get(pk);
+    const bad = r?.bad.find((b) => !ignore.has(b));
+    return bad === undefined ? r : s6("unsupported-argument", `unsupported pytest argument "${bad}" in ${p}`);
   };
-  const bad = (p: string) => s6("unsupported-argument", `unsupported pytest argument "addopts" in ${p}`);
   const out: PytestConfig[] = [];
-  const add = (c: PytestConfig) => {
-    if (!out.some((o) => o.path === c.path && JSON.stringify(o.addopts) === JSON.stringify(c.addopts))) out.push(c);
+  const add = (p: string, r: NonNullable<ConfigParse>) => {
+    const c = { path: p, ...r.values };
+    if (!out.some((o) => o.path === c.path && JSON.stringify(o) === JSON.stringify(c))) out.push(c);
   };
   if (explicit !== undefined) {
     for (const legacy of [false, true]) {
       const r = await load(explicit, true, legacy);
-      if (r === "bad") return bad(explicit);
-      if (r !== "unreadable") add({ path: explicit, ...r });
+      if (r === undefined || r === "unreadable") continue;
+      if (isS6(r)) return r;
+      add(explicit, r);
     }
     return { configs: out, everyLine: out.length > 0 };
   }
-  const exists = new Map<string, boolean>();
   const done = PYTEST_CONFIG_LINES.map(() => false);
   let d = start;
   for (;;) {
@@ -2136,12 +2386,11 @@ async function findPytestConfigs(
       if (done[l]) continue;
       for (const name of PYTEST_CONFIG_LINES[l].names) {
         const p = ctx.P.join(d, name);
-        if (!exists.has(p)) exists.set(p, await fs.fileExists(p));
-        if (!exists.get(p)) continue;
+        if (!(await existsCached(ctx, fs, p))) continue;
         const r = await load(p, false, PYTEST_CONFIG_LINES[l].legacy);
-        if (r === "bad") return bad(p);
         if (r === undefined || r === "unreadable") continue;
-        add({ path: p, ...r });
+        if (isS6(r)) return r;
+        add(p, r);
         done[l] = true;
         break;
       }
@@ -2166,6 +2415,8 @@ interface PytestEvidence {
   readonly xdist: boolean;
   readonly covInConfig: boolean;
   readonly userWorkers?: UserWorkerCap;
+  /** The union of the python_files patterns every source can apply (QA-1.3-33). */
+  readonly pythonFiles: readonly string[];
 }
 
 /**
@@ -2175,7 +2426,7 @@ interface PytestEvidence {
  */
 async function pytestEvidence(
   ctx: Ctx,
-  fs: FsSeam,
+  fs: PlannerFs,
   facts: PytestFacts,
   env: Readonly<Record<string, string>>,
   start: string,
@@ -2186,6 +2437,18 @@ async function pytestEvidence(
   // cap: "config" sources are alternatives (one per pytest line, QA-1.3-21): the lowest cap wins.
   // Later sources override in pytest's order: "wins" always, "if-last" unless cross-env follows.
   const sources: { where: string; text?: string; tokens?: readonly string[]; cap: "config" | "wins" | "none" }[] = [];
+  // The config is always looked up: python_files comes from it even when -o addopts replaces its
+  // addopts. A key the command line overrides with -o is not S6 when the file spells it oddly.
+  const ignore = new Set<string>();
+  if (facts.overrideAddopts !== undefined) ignore.add("addopts");
+  if (facts.pythonFiles !== undefined) ignore.add("python_files");
+  const found = await findPytestConfigs(ctx, fs, facts.configFile, start, notes, ignore);
+  if (isS6(found)) return found;
+  // QA-1.3-33: every line's config applies its python_files, or pytest's default when it sets none
+  // or the line found no config. The union only ever classifies more files as tests.
+  const pythonFiles = new Set<string>(found.everyLine ? [] : DEFAULT_PYTHON_FILES);
+  for (const cfg of found.configs) for (const p of cfg.pythonFiles ?? DEFAULT_PYTHON_FILES) pythonFiles.add(p);
+  for (const p of facts.pythonFiles ?? []) pythonFiles.add(p);
   // "-p no:xdist" in a config disables xdist only when every pytest line reads a config that says
   // so: a line whose config does not block xdist would still honour an -n (QA-1.3-21).
   let configsBlock: boolean;
@@ -2193,8 +2456,6 @@ async function pytestEvidence(
     sources.push({ where: "-o addopts", text: facts.overrideAddopts, cap: "config" });
     configsBlock = true;
   } else {
-    const found = await findPytestConfigs(ctx, fs, facts.configFile, start, notes);
-    if (isS6(found)) return found;
     configsBlock = found.everyLine && found.configs.every((c) => c.addopts !== undefined);
     for (const cfg of found.configs) if (cfg.addopts) sources.push({ where: `addopts of ${cfg.path}`, tokens: cfg.addopts, cap: "config" });
   }
@@ -2218,10 +2479,24 @@ async function pytestEvidence(
     cov ||= r.cov;
     if (r.capRaw !== undefined && (src.cap === "wins" || (src.cap === "config" && lowerCap(r.capRaw, capRaw)))) capRaw = r.capRaw;
     for (const n of r.notes) if (n.startsWith("invalid worker cap") && !notes.includes(n)) notes.push(n);
+    const pf = pythonFilesOverride(r.overridePythonFiles, src.where);
+    if (isS6(pf)) return pf;
+    for (const p of pf) pythonFiles.add(p);
   }
   if (facts.cap !== undefined) capRaw = facts.cap;
   const userWorkers = capRaw === undefined ? undefined : parseCap("pytest", capRaw);
-  return { xdist: xdist && !noXdist && !configsBlock, covInConfig: cov, ...(userWorkers ? { userWorkers } : {}) };
+  return { xdist: xdist && !noXdist && !configsBlock, covInConfig: cov, ...(userWorkers ? { userWorkers } : {}), pythonFiles: [...pythonFiles] };
+}
+
+/** The patterns of `-o python_files=<v>` values, split like pytest's shlex (QA-1.3-33). */
+function pythonFilesOverride(values: readonly string[], where: string): string[] | Unverifiable {
+  const out: string[] = [];
+  for (const v of values) {
+    const tokens = tokenize(v);
+    if (!tokens) return s6("unsupported-argument", `unsupported pytest argument "python_files" in ${where}`);
+    out.push(...tokens);
+  }
+  return out;
 }
 
 /** The directory pytest starts its inifile search from: the common ancestor of the file arguments. */
@@ -2240,7 +2515,7 @@ function commonDir(ctx: Ctx, files: readonly string[]): string {
 /** D.4 at spec time (QA-1.3-3c): pytest picks its config from the inputs, so redo the lookup there. */
 async function pytestAtInputs(
   ctx: Ctx,
-  fs: FsSeam,
+  fs: PlannerFs,
   det: DetectedRunner,
   F: readonly string[],
   runnerCwd: string,
@@ -2255,7 +2530,7 @@ async function pytestAtInputs(
   if (det.pytestFacts) return ev;
   // A DetectedRunner built elsewhere: never lose what it already knew.
   const userWorkers = ev.userWorkers ?? det.userWorkers;
-  return { xdist: ev.xdist || det.xdist, covInConfig: ev.covInConfig || det.covInConfig, ...(userWorkers ? { userWorkers } : {}) };
+  return { xdist: ev.xdist || det.xdist, covInConfig: ev.covInConfig || det.covInConfig, ...(userWorkers ? { userWorkers } : {}), pythonFiles: ev.pythonFiles };
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -2350,7 +2625,7 @@ const NPM_WORKSPACE_ENV_RE = /^npm_config_workspaces?$/i;
  */
 async function npmWorkspaceConfig(
   ctx: Ctx,
-  fs: FsSeam,
+  fs: PlannerFs,
   cwd: string,
   gitRoot: string,
   crossEnv: Readonly<Record<string, string>>,
@@ -2396,19 +2671,32 @@ async function finishDetection<K extends ToolKind>(
   let xdist = false;
   let covInConfig = false;
   let pytestFacts: PytestFacts | undefined;
+  let pythonFiles: readonly string[] | undefined;
   if (kind === "pytest") {
     const configFile = configFiles.at(-1);
+    const pf = pythonFilesOverride(a.overridePythonFiles, where);
+    if (isS6(pf)) return pf;
     pytestFacts = {
       xdist: a.xdistArg,
       noXdist: a.noXdist,
       ...(a.capRaw !== undefined ? { cap: a.capRaw } : {}),
       ...(configFile !== undefined ? { configFile } : {}),
       ...(a.overrideAddopts !== undefined ? { overrideAddopts: a.overrideAddopts } : {}),
+      ...(a.overridePythonFiles.length > 0 ? { pythonFiles: pf } : {}),
     };
     // Detection has no inputs yet: start where pytest would with no file arguments.
     const ev = await pytestEvidence(ctx, fs, pytestFacts, env, runnerCwd, runnerCwd, gitRoot, allNotes);
     if (isS6(ev)) return ev;
     ({ xdist, covInConfig, userWorkers } = ev);
+    // QA-1.3-33: with path arguments the user's pytest reads the config above their common
+    // ancestor (a directory argument is its own start), so its python_files count as well.
+    const patterns = new Set(ev.pythonFiles);
+    if (pathScopes.length > 0) {
+      const scoped = await pytestEvidence(ctx, fs, pytestFacts, env, commonDir(ctx, pathScopes.map((s) => ctx.P.join(s, "_"))), runnerCwd, gitRoot, allNotes);
+      if (isS6(scoped)) return scoped;
+      for (const p of scoped.pythonFiles) patterns.add(p);
+    }
+    pythonFiles = [...patterns];
   }
   return {
     kind,
@@ -2425,6 +2713,7 @@ async function finishDetection<K extends ToolKind>(
     notes: allNotes,
     configFiles,
     ...(pytestFacts ? { pytestFacts } : {}),
+    ...(pythonFiles ? { pythonFiles } : {}),
   };
 }
 
@@ -2541,7 +2830,115 @@ async function isBunLink(ctx: Ctx, fs: PlannerFs, f: string): Promise<boolean> {
 // ---------------------------------------------------------------------------------------------
 
 const JS_TEST_RE = /\.(test|spec)\.[cm]?[jt]sx?$/;
-const PY_TEST_RE = /^test_.*\.py$|_test\.py$/;
+
+/**
+ * Python's fnmatch.fnmatch (the matcher behind pytest's python_files), in linear-time form: `*`
+ * matches any run of characters (separators included), `?` one character, `[...]` / `[!...]` a set
+ * with ranges, and an unclosed `[` is literal. `fold` compares case-insensitively (win32 normcase).
+ * A greedy two-pointer match, so a hostile pattern cannot backtrack exponentially.
+ */
+function fnmatch(pattern: string, name: string, fold: boolean): boolean {
+  const pat = fold ? pattern.toLowerCase() : pattern;
+  const s = fold ? name.toLowerCase() : name;
+  type Tok = { readonly star: true } | { readonly star: false; readonly test: (c: string) => boolean };
+  const toks: Tok[] = [];
+  for (let i = 0; i < pat.length; i++) {
+    const c = pat[i];
+    if (c === "*") {
+      if (!toks.at(-1)?.star) toks.push({ star: true });
+      continue;
+    }
+    if (c === "?") {
+      toks.push({ star: false, test: () => true });
+      continue;
+    }
+    let close = -1;
+    if (c === "[") {
+      let j = i + 1;
+      if (pat[j] === "!") j++;
+      if (pat[j] === "]") j++;
+      close = pat.indexOf("]", j);
+    }
+    if (close < 0) {
+      toks.push({ star: false, test: (x) => x === c });
+      continue;
+    }
+    const neg = pat[i + 1] === "!";
+    const body = pat.slice(i + (neg ? 2 : 1), close);
+    toks.push({ star: false, test: (x) => fnmatchSet(body, x) !== neg });
+    i = close;
+  }
+  let p = 0;
+  let k = 0;
+  let starP = -1;
+  let starK = 0;
+  while (k < s.length) {
+    const t = toks[p];
+    if (t && t.star) {
+      starP = p++;
+      starK = k;
+    } else if (t && t.test(s[k])) {
+      p++;
+      k++;
+    } else if (starP >= 0) {
+      p = starP + 1;
+      k = ++starK;
+    } else {
+      return false;
+    }
+  }
+  while (toks[p]?.star) p++;
+  return p === toks.length;
+}
+
+/** One fnmatch set body: single characters and a-z ranges. */
+function fnmatchSet(body: string, c: string): boolean {
+  for (let i = 0; i < body.length; i++) {
+    if (body[i + 1] === "-" && i + 2 < body.length) {
+      if (c >= body[i] && c <= body[i + 2]) return true;
+      i += 2;
+    } else if (body[i] === c) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * G.8 (QA-1.3-33): pytest's python_files rule (_pytest/pathlib.py fnmatch_ex). A pattern without a
+ * separator matches the basename; one with a separator matches the whole path, with "*" and a
+ * separator put in front of a relative pattern. win32 compares case-insensitively with either
+ * separator.
+ */
+function isPyTestFile(ctx: Ctx, patterns: readonly string[], abs: string): boolean {
+  const norm = (s: string) => (ctx.win ? s.replace(/\\/g, "/") : s);
+  const base = ctx.P.basename(abs);
+  return patterns.some((raw) => {
+    const pat = norm(raw);
+    if (!pat.includes("/")) return fnmatch(pat, base, ctx.win);
+    return fnmatch(ctx.P.isAbsolute(raw) ? pat : `*/${pat}`, norm(abs), ctx.win);
+  });
+}
+
+/**
+ * G.8: the test basenames for a module stem, from each basename pattern with exactly one `*` and no
+ * other wildcard ("test_*.py" -> "test_<stem>.py"). A literal name (pytest-django's "tests.py")
+ * or a path pattern names no file for a stem.
+ */
+function pyTestNames(patterns: readonly string[], stem: string): string[] {
+  const out = new Set<string>();
+  for (const p of patterns) {
+    const i = p.indexOf("*");
+    if (i < 0 || p.indexOf("*", i + 1) >= 0 || /[\\/?[]/.test(p)) continue;
+    out.add(p.slice(0, i) + stem + p.slice(i + 1));
+  }
+  return [...out];
+}
+
+/** G.9: git pathspecs covering the test files of `patterns`; a path pattern widens to every .py file (hits are re-checked). */
+function pyTestGlobs(patterns: readonly string[]): string[] {
+  return [...new Set(patterns.map((p) => (/[\\/]/.test(p) ? ":(glob)**/*.py" : `:(glob)**/${p}`)))];
+}
 const NON_INPUT_EXT_RE = /\.(md|mdx|markdown|rst|adoc|txt)$/i;
 const NON_INPUT_NAMES = new Set(["LICENSE", "LICENCE", ".gitignore", ".gitattributes", ".editorconfig", ".npmignore", ".prettierignore"]);
 /** JS dependency and workspace files (G.7, QA-1.3-8): a lockfile-only change can upgrade a dependency. */
@@ -2690,6 +3087,7 @@ async function classify(
   let skipped = 0;
   const inScope = (abs: string) =>
     isInside(ctx, det.runnerCwd, abs) && (det.pathScopes.length === 0 || det.pathScopes.some((s) => isInside(ctx, s, abs)));
+  const pyFiles = det.pythonFiles ?? DEFAULT_PYTHON_FILES;
 
   for (const f of sorted) {
     const base = P.basename(f.abs);
@@ -2700,7 +3098,7 @@ async function classify(
     }
     const exists = await fs.fileExists(f.abs);
     if (det.kind === "pytest") {
-      const isTest = PY_TEST_RE.test(base);
+      const isTest = isPyTestFile(ctx, pyFiles, f.abs);
       if (exists && isTest) {
         if (inScope(f.abs)) addInput(f.abs);
       } else if (exists) modules.push(f);
@@ -2748,7 +3146,13 @@ async function classify(
       }),
     ).then((xs) => xs.filter((x): x is string => x !== undefined));
   const searchFailed = (f: FileRef) => s6("search-failed", `test search failed for ${f.rel}`);
-  const pyNames = (stem: string) => [`test_${stem}.py`, `${stem}_test.py`];
+  // G.8/G.9 (QA-1.3-33): names and globs follow python_files; content hits are re-checked with it.
+  const pyNames = (stem: string) => pyTestNames(pyFiles, stem);
+  const pyGlobs = pyTestGlobs(pyFiles);
+  const byName = async (stem: string): Promise<readonly string[] | undefined> => {
+    const names = pyNames(stem);
+    return names.length === 0 ? [] : search.findByName(gitRoot, names);
+  };
 
   for (const f of goneSources) {
     const stem = stemOf(ctx, f.abs);
@@ -2761,7 +3165,7 @@ async function classify(
     for (const h of await accept(hits, false)) addInput(h);
   }
   for (const f of modules) {
-    const hits = await search.findByName(gitRoot, pyNames(stemOf(ctx, f.abs)));
+    const hits = await byName(stemOf(ctx, f.abs));
     if (hits === undefined) return searchFailed(f);
     const ok = await accept(hits, true);
     if (ok.length === 0) notes.push(`no tests named for ${f.rel}`);
@@ -2769,13 +3173,14 @@ async function classify(
   }
   for (const f of goneModules) {
     const stem = stemOf(ctx, f.abs);
-    const byContent = await search.findByContent(gitRoot, stem, PY_TEST_GLOBS);
-    const byName = await search.findByName(gitRoot, pyNames(stem));
-    if (byContent === undefined || byName === undefined) return searchFailed(f);
-    if (byContent.length > STEM_MATCH_LIMIT) {
-      return s6("stem-too-common", `deleted source ${f.rel}: "${stem}" appears in ${byContent.length} test files (limit ${STEM_MATCH_LIMIT})`);
+    const content = await search.findByContent(gitRoot, stem, pyGlobs);
+    const named = await byName(stem);
+    if (content === undefined || named === undefined) return searchFailed(f);
+    const tests = content.filter((h) => isPyTestFile(ctx, pyFiles, h));
+    if (tests.length > STEM_MATCH_LIMIT) {
+      return s6("stem-too-common", `deleted source ${f.rel}: "${stem}" appears in ${tests.length} test files (limit ${STEM_MATCH_LIMIT})`);
     }
-    const ok = await accept([...byContent, ...byName], true);
+    const ok = await accept([...tests, ...named], true);
     if (ok.length === 0) return s6("deleted-no-tests", `deleted source ${f.rel}: no test file references "${stem}"`);
     for (const h of ok) addInput(h);
   }
