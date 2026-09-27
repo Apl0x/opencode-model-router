@@ -609,12 +609,10 @@
 //      MAX_UNTRACKED_BYTES, and GC also removes this repository's stale
 //      orphan omr-ref dirs. Both address temp-dir exhaustion; the plan does
 //      not specify either.
-//   D8 The ExecOptions/ArgvSeam seam types are declared locally and not
-//      exported, because vrb/p12's types.ts is not on this branch. After the
-//      merge, 2.x replaces the two local declarations with `import type {
-//      ExecOptions, ArgvSeam } from "./types"`. The names and structure are
-//      identical, so no call site changes. They are not exported, to avoid a
-//      second exported ArgvSeam; tests can type the seam as CaptureDeps["argv"].
+//   D8 The ExecOptions/ArgvSeam seam types now come from ./types (imported
+//      once vrb/p12 merged; the former local copies had the identical
+//      shape). This module does not re-export them; tests can type the seam
+//      as CaptureDeps["argv"].
 //      Truncation contract (QA-1.5-21): p12's runArgv caps each stream at its
 //      maxBuffer, keeps the child's exit code and appends the note line
 //      `[stdout truncated at <n> chars]` after git's stderr. runGit honours
@@ -696,25 +694,11 @@ import * as fsp from "node:fs/promises";
 import { createHash, randomBytes } from "node:crypto";
 import { tmpdir as osTmpdir } from "node:os";
 import { posix as pathPosix, win32 as pathWin32 } from "node:path";
-import type { ExecResult } from "./types";
+import type { ArgvSeam, ExecOptions, ExecResult } from "./types";
 import type { TreeSnapshot } from "./dispatch";
 import type { PluginLogger } from "../router/logger";
 
 // --- Seams --------------------------------------------------------------------
-
-/** Local mirror of vrb/p12 types.ts ExecOptions (D8). Replace with the import after merge. */
-interface ExecOptions {
-  cwd?: string;
-  timeoutMs?: number;
-  signal?: AbortSignal;
-  lowPriority?: boolean;
-  env?: Record<string, string>;
-}
-
-/** Local mirror of vrb/p12 types.ts ArgvSeam (D8). Replace with the import after merge. */
-interface ArgvSeam {
-  (file: string, args: readonly string[], opts?: ExecOptions): Promise<ExecResult>;
-}
 
 /** The subset of fs.Stats this module reads. */
 export interface ReferenceStats {
