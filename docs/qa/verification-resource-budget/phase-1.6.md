@@ -24,8 +24,13 @@
 - Tests: `npx vitest run --maxWorkers=2 test/unit/directives.test.ts` → 13 passed; `npm run typecheck` clean.
 - Deviation: signature adds an optional third `log` parameter (the injected logger seam);
   `defaults` carries `defaultVerify`, `captureWaitMs`, `baselineTimeoutMs`.
-- Unknown `VERIFY:` value: the first occurrence decides; an unknown value falls back to the default
-  (with a log line) rather than searching for a later valid value.
+- Unknown `VERIFY:` value: superseded by QA-1.6-2 — the first VALID occurrence wins; unknown values
+  are logged once per key only when no valid occurrence exists.
+- Deviation (QA-1.6-6): the result carries `modeSource` and `waitSource` instead of the plan's single `source`.
+- Extension of §1.5-17 config list (QA-1.6-11): `vite.config.*`, `vitest.workspace.*`, `*setup*.{js,ts}`,
+  `pytest.ini`, `tox.ini`, `setup.cfg`, `setup.py`, `.gitlab-ci.yml`, `Makefile`, `CMakeLists.txt`,
+  `requirements*.txt`/`constraints*.txt`; snapshots (`__snapshots__/**`, `*.snap`) count as test files.
+- `assessRisk` takes an optional `root` (git root); absolute paths are made repo-relative before classification.
 
 ## Risk implementation notes
 
@@ -87,6 +92,7 @@ narrow edge; Info = no change required.
   `\bVERIFY_WAIT\s*:\s*(\d+)(ms|s)\b` (flag `i`), so `required**`, `` required` `` and `required.`
   resolve. Add tests for bold, backtick, trailing period and quotes, asserting parity with
   `parseCapDirective` on `**CAP:3**` / `` `CAP:3` ``.
+- Resolution: 35669c0 — value grammar `([a-z]+)\b` / `(\d+)(ms|s)\b`, one leading quote/markdown mark accepted (`VERIFY:"required"` → required); bold/backtick/period/quote tests and CAP parity tests.
 
 **QA-1.6-2 — Medium — the first occurrence decides even when it is not a directive, which diverges from `CAP:`**
 - Where: directives.ts:58-65 (`firstRealValue` returns the first non-placeholder match, whatever
@@ -104,6 +110,7 @@ narrow edge; Info = no change required.
 - Fix: the first **valid** occurrence wins (skip values outside `required|deferred`, as `CAP:`
   skips non-grammar values). Log an unknown value only when no valid occurrence exists, at most one
   line per key per parse. Remove the "first occurrence decides" deviation note.
+- Resolution: 35669c0 — first VALID occurrence wins; unknown logged once per key only when no valid one exists.
 
 **QA-1.6-3 — Low — the whitespace after the colon spans newlines, so prose turns into a directive**
 - Where: directives.ts:50-51 (`\s*` plus the `i` flag).
@@ -119,6 +126,7 @@ narrow edge; Info = no change required.
 - Fix: use `[ \t]*` instead of `\s*` on both sides of the colon, so a directive cannot straddle a
   line break. Optionally require the value to be followed by whitespace, punctuation or the end of
   the text (as in QA-1.6-1).
+- Resolution: 35669c0 — `[ \t]*` around the colon; line-break tests.
 
 **QA-1.6-4 — Low — the placeholder-skip rule depends on how future router text is worded; that contract is only implied**
 - Where:
@@ -137,6 +145,7 @@ narrow edge; Info = no change required.
   or be preceded by a pinned resolved `VERIFY:<mode>` / `VERIFY_WAIT:<n>ms`.
   The golden check that `parseVerifyDirectives` returns defaults over the final header/protocol text
   is deferred by plan (2.3 protocol text / 2.4 wiring).
+- Resolution: 35669c0 — router-example contract documented in the directives.ts header (2.3/2.4 must follow it).
 
 **QA-1.6-5 — Low — subagent self-selection can only be enforced by the caller; the "security" test proves nothing**
 - Where: directives.ts:20-23 (the contract comment) and directives.test.ts:93-98.
@@ -153,6 +162,7 @@ narrow edge; Info = no change required.
 - Fix: rename the test to "is deterministic" (or delete it), and add the two points above to the
   directives.ts header. The enforcement test ("Subagent cannot self-select", plan 2.4 new tests) is
   deferred by plan (2.4).
+- Resolution: 35669c0 — test renamed "is deterministic and stateless"; header documents prompt-only parsing and the quoting risk. Enforcement test stays deferred (2.4).
 
 **QA-1.6-6 — Low — `source` mixes up where the mode and the wait came from**
 - Where: directives.ts:74, :81, :94, :100.
@@ -163,6 +173,7 @@ narrow edge; Info = no change required.
 - Fix: document `source` as "any directive applied". Better: return `modeSource` and
   `waitSource`. The plan signature has a single `source`, so if it is split, record that as a
   deviation.
+- Resolution: 35669c0 — split into `modeSource`/`waitSource` (deviation recorded under Result).
 
 **QA-1.6-7 — Low — unknown values are logged verbatim: unbounded length and raw control characters**
 - Where: directives.ts:83, :96.
@@ -173,6 +184,7 @@ narrow edge; Info = no change required.
   The value comes from dispatch text and is excluded only from whitespace and `,;)]}`.
 - Fix: truncate to about 32 characters and escape control characters (e.g. `JSON.stringify(v.slice(0, 32))`).
   Together with QA-1.6-2, this limits logging to one bounded line per key per dispatch.
+- Resolution: 35669c0 — logged values truncated to 32 chars via JSON.stringify, C1/DEL escaped; test.
 
 **QA-1.6-8 — Info — the default wait is not capped at `baselineTimeoutMs`**
 - Where: directives.ts:73.
@@ -202,6 +214,7 @@ narrow edge; Info = no change required.
 - Fix: classify on repo-relative paths. Either add `root` to `RiskInput` and strip it (after `\`
   → `/` normalisation, case-insensitively on win32), or require the caller to pass relative paths
   and assert that none is absolute. Add tests with absolute paths under `docs`/`test` ancestors.
+- Resolution: 3ddd994 — `RiskInput.root` added; paths made repo-relative (case-folded for drive-letter roots); unresolvable absolute paths never count as docs; POSIX/Windows tests with `docs`/`test` ancestors.
 
 **QA-1.6-10 — Medium — the "docs" definition is too broad, and the docs-only row wins over the config row**
 - Where: risk.ts:77-80 and :127-129.
@@ -218,6 +231,7 @@ narrow edge; Info = no change required.
   - Restrict `docs/**` to documentation/asset extensions (`md`, `mdx`, `rst`, `txt`, images).
   - Drop bare `*.txt`, or allowlist names such as `LICENSE.txt`/`CHANGELOG.txt`.
   - Classify `requirements*.txt`/`constraints*.txt` as lock/config.
+- Resolution: 3ddd994 — docs exclude test/config paths; `.md/.mdx/.rst/.adoc` anywhere, `LICENSE.txt`/`CHANGELOG.txt`, doc/image types only under `docs/`; bare `*.txt` dropped.
 
 **QA-1.6-11 — Medium — changes to test expectations and test configuration are rated low**
 - Where: risk.ts:82-91 (no snapshot patterns) and :93-113.
@@ -235,6 +249,7 @@ narrow edge; Info = no change required.
   - `isConfigPath`: add `vite.config.*`, `vitest.workspace.*`, `(vitest|jest).setup.*`,
     `setupTests.*`, `pytest.ini`, `tox.ini`, `setup.cfg` and `.gitlab-ci.yml`. Record it as an
     extension of the §1.5-17 list.
+- Resolution: 3ddd994 — snapshots → test (medium); config list extended (recorded under Result as §1.5-17 extension).
 
 **QA-1.6-12 — Medium — a deletion in the porcelain Y (worktree) column is missed**
 - Where: risk.ts:115-117 (`/^d/i` on the trimmed status) and :119-121 (`/^r/i`).
@@ -246,6 +261,7 @@ narrow edge; Info = no change required.
   ` D` and `D ` work.
 - Fix: for a two-character code, D (or R) in either column counts as deleted (or renamed).
   Keep the word forms (`deleted`) and name-status forms (`R100`). Add `MD`/`AD` cases.
+- Resolution: 3ddd994 — two-char porcelain: D/R in either column counts; `MD`/`AD`/`RM` tests.
 
 **QA-1.6-13 — Low — moving a test file out of test collection counts as a modification, not a deletion**
 - Where: risk.ts:143-147.
@@ -255,6 +271,7 @@ narrow edge; Info = no change required.
   runner.ts:302 already says "2.1 should pass previousPath".
 - Fix: when `previousPath` is a test path and `path` is not, add `testDeleted` (high), with a test.
   Filling `previousPath` is deferred by plan (2.1).
+- Resolution: 3ddd994 — test `previousPath` renamed to non-test path → `testDeleted` (high). Filling `previousPath` stays deferred (2.1).
 
 **QA-1.6-14 — Low — an empty change set is rated low, which also hides a failed attribution**
 - Where: risk.ts:126.
@@ -271,6 +288,7 @@ narrow edge; Info = no change required.
 - Evidence (probe): six records for the same `src/a.ts` → medium, "6-15 files changed". This errs
   on the safe side, but it is noise.
 - Fix: deduplicate by normalised path (case-folded on win32) before counting.
+- Resolution: 3ddd994 — count deduplicated by normalised path (case-folded for drive-letter paths).
 
 **QA-1.6-16 — Low — gaps in the test guards**
 - Where: risk.test.ts:119-123 and directives.test.ts (whole file).
@@ -283,6 +301,7 @@ narrow edge; Info = no change required.
     carry no markdown formatting, so it could not catch QA-1.6-1.
 - Fix: add the same import-list assertion for directives.ts, and reject `require(`/`import(`.
   Extend the parity inputs with bold, backticks and trailing punctuation.
+- Resolution: 35669c0, 3ddd994 — directives.ts purity test; `require(`/`import(`/`process.` guards in both; formatted parity inputs.
 
 **QA-1.6-17 — Info — the implementer's additions and thresholds are consistent with §1.5-17 (no change)**
 - Fast tier → medium: the producer tier is a listed input, and §1.5-17 leaves the roll-up to "a
