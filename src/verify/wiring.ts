@@ -109,6 +109,17 @@ export const GRADE_SNAPSHOT_TIMEOUT_MS = 10_000;
 export const TEST_SEARCH_TIMEOUT_MS = 10_000;
 /** QA-2.1-12: the `git diff <dispatch head> HEAD` of a gate whose HEAD moved, bounded further by a gate deadline. */
 export const COMMIT_DIFF_TIMEOUT_MS = 10_000;
+/**
+ * QA-2.2-21: the effective batch window is at most gateBudgetMs / this. config.ts accepts any
+ * batchWindowMs up to the timer limit, and a window close to the gate budget would spend most of
+ * it waiting (batch.ts W3 still keeps each member's recheck reserve).
+ */
+export const BATCH_WINDOW_BUDGET_DIVISOR = 10;
+
+/** QA-2.2-21: batchWindowMs, capped at a tenth of the gate budget; <= 0 disables batching. */
+export function effectiveBatchWindowMs(budget: Pick<VerifyBudget, "batchWindowMs" | "gateBudgetMs">): number {
+  return Math.min(budget.batchWindowMs, Math.floor(budget.gateBudgetMs / BATCH_WINDOW_BUDGET_DIVISOR));
+}
 /** A full object name (SHA-1 or SHA-256); anything else (e.g. an unborn HEAD) is an unknown head. */
 const OBJECT_NAME = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i;
 
@@ -514,7 +525,8 @@ export function createVerificationWiring(deps: {
     // The planner is the direct hook's (planScopedRun over the same PlannerFs and budget), with
     // its git searches bound to whichever deadline the coordinator plans under (B6).
     let testsPass: TestsPassHook = direct;
-    if (budget.batchWindowMs > 0) {
+    const batchWindowMs = effectiveBatchWindowMs(budget);
+    if (batchWindowMs > 0) {
       const plan: BatchPlanner = (input, planDeadline) => planScopedRun({
         command: input.command,
         cwd: input.cwd,
@@ -527,7 +539,7 @@ export function createVerificationWiring(deps: {
         direct,
         plan,
         openScope,
-        batchWindowMs: budget.batchWindowMs,
+        batchWindowMs,
         recheckMinRemainingMs: RECHECK_MIN_REMAINING_MS,
         failureRecheck: budget.failureRecheck,
         ...currentTree,

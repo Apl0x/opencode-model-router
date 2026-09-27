@@ -439,6 +439,39 @@ describe("batch coordinator behind the verification wiring (2.2.3)", () => {
     await expect(wiring.disposeVerification()).resolves.toBeUndefined();
   });
 
+  it("QA-2.2-21: the effective window is at most a tenth of the gate budget", async () => {
+    const armed: number[] = [];
+    const cfg = config({ batchWindowMs: 60_000, gateBudgetMs: 20_000 });
+    const wiring = createVerificationWiring({
+      client: {},
+      directory: state.root,
+      getConfig: () => cfg,
+      logger: { warn: () => {} },
+      batch: {
+        maxBatchSize: 5,
+        timers: {
+          setTimeout: (callback: () => void, ms: number) => {
+            armed.push(ms);
+            return setTimeout(callback, ms);
+          },
+          clearTimeout: (handle: unknown) => clearTimeout(handle as ReturnType<typeof setTimeout>),
+        },
+      },
+    });
+    // W7: b stays in planning, so a's window runs its timer.
+    const releaseB = holdPlanning("b");
+    const held = gate(wiring, "b");
+    const started = Date.now();
+    const a = gate(wiring, "a");
+    await vi.waitFor(() => expect(armed).toHaveLength(1));
+    expect(armed[0]).toBe(2_000);
+    expect((await a).verdict.outcome).toBe("pass");
+    expect(Date.now() - started).toBeLessThan(10_000);
+    releaseB();
+    expect((await held).verdict.outcome).toBe("pass");
+    await wiring.disposeVerification();
+  });
+
   it("QA-2.2-19 (R3, R4): a seam that ignores its abort keeps its slot until it exits; sweep evicts it and dispose returns after the grace", async () => {
     let exit: () => void = () => {};
     state.hang = new Promise<void>(resolve => {
