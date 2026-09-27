@@ -331,6 +331,31 @@ describe("createScopeOpener", () => {
     expect(s.argv).not.toHaveBeenCalled();
   });
 
+  it("hold() takes the scope's one hold without spawning; the next execute reuses it, and a failed hold answers it (QA-2.2-25)", async () => {
+    const held = setup();
+    const d = fakeDeadline(100_000);
+    const hold = held.scope.hold;
+    if (hold === undefined) throw new Error("createScopeOpener's scope has hold()");
+    expect(await hold(fakeDeadline(4_000))).toBe(true);
+    expect(held.acquire.mock.calls[0]?.[0]).toMatchObject({ waitMs: 4_000 });
+    expect(held.argv).not.toHaveBeenCalled();
+    expect(await held.scope.execute(SPEC, d)).toMatchObject({ kind: "ran" });
+    expect(await hold(d)).toBe(true);
+    expect(held.acquire).toHaveBeenCalledTimes(1);
+    await held.scope.close();
+    expect(held.release).toHaveBeenCalledTimes(1);
+    expect(await hold(d)).toBe(false);
+    expect(held.acquire).toHaveBeenCalledTimes(1);
+
+    const busy = setup({ acquire: async () => ({ busy: true }) });
+    const busyHold = busy.scope.hold;
+    if (busyHold === undefined) throw new Error("createScopeOpener's scope has hold()");
+    expect(await busyHold(d)).toBe(false);
+    expect(await busy.scope.execute(SPEC, d)).toMatchObject({ kind: "slot-busy", deadlineCut: false });
+    expect(busy.acquire).toHaveBeenCalledTimes(1);
+    expect(busy.argv).not.toHaveBeenCalled();
+  });
+
   it("never acquires or spawns once the deadline has aborted", async () => {
     const s = setup();
     const d = fakeDeadline(100_000);

@@ -170,7 +170,8 @@ describe("shell edits to files already dirty at dispatch, against a real git rep
   const wiringAt = async (repo: string) => {
     const { snapshotTree } = await real();
     state.snapshotImpl = snapshotTree;
-    const cfg: RouterConfig = { ...harness().cfg, enforcement: { verify: { baselineTimeoutMs: 30_000 } } };
+    // The direct testsPass path (2.2.3 batches only with a window; this file tests attribution).
+    const cfg: RouterConfig = { ...harness().cfg, enforcement: { verify: { baselineTimeoutMs: 30_000, batchWindowMs: 0 } } };
     return { wiring: createVerificationWiring({ client: {}, directory: repo, getConfig: () => cfg, logger: { warn: () => {} } }), store: createChangedFileStore() };
   };
   const paths = (files: readonly { path: string }[]) => files.map(f => key(f.path)).sort();

@@ -831,6 +831,14 @@ export interface CheckScope extends VerificationScope {
    * detect drift since the snapshot (T4.d). Omitted -> materialize gets undefined.
    */
   rechecker(command: string, cwd: string, currentTree?: TreeSnapshot): Rechecker;
+  /**
+   * P4's hold, taken without running anything: the scope's one hold attempt, waiting at most
+   * deadline.bound(slotWaitMs). true when the scope holds the slot. It is the same memoized
+   * attempt as the first execute's, so a later execute reuses the hold (or its failure) and never
+   * takes a second one. For 2.2's batch coordinator (QA-2.2-25), which decides what to run only
+   * once it holds the slot. Never rejects. Optional: createScopeOpener's scopes have it.
+   */
+  hold?(deadline: Deadline): Promise<boolean>;
 }
 
 export type OpenCheckScope = (meta: Parameters<OpenVerificationScope>[0]) => CheckScope;
@@ -1186,8 +1194,18 @@ export function createScopeOpener(deps: ScopeOpenerDeps): OpenCheckScope {
       return closing;
     };
 
+    const hold = (deadline: Deadline): Promise<boolean> =>
+      track(
+        (async (): Promise<boolean> => {
+          if (closed) return false;
+          holdP ??= acquireHold(deadline);
+          return (await holdP).ok;
+        })(),
+      );
+
     return {
       execute: (spec, deadline) => track(runSpec(spec, deadline)),
+      hold,
       rechecker,
       runShell: (command, cwd, deadline) => track(runCommand(deadline, opts => exec(command, { ...opts, cwd }))),
       runLint: (spec, deadline) =>
