@@ -490,20 +490,16 @@
 //            .prettierignore. (Lockfiles are triggers now, 7.)
 //        vitest/jest:
 //          - an existing file becomes an input. A changed test file runs itself (evidence R).
-//          - 8a (QA-1.3-37) except an existing test file that the runner's own config statically
-//            excludes AND that lies in a Playwright testDir: note `playwright test file excluded
-//            by the <runner> config, not run: <rel>`. The exclusion comes from the one config
-//            the runner loads (the last --config file, else runnerCwd's single vitest.config.*,
-//            else vite.config.*; jest.config.*, else package.json) and only when no projects or
-//            workspace key, vitest.workspace/projects file, vitest --root/--dir, or jest
-//            --rootDir/--testPathIgnorePatterns can change it. vitest: an `exclude` literal (or
-//            --exclude) of the form X/**, X/**/*, or either after **/, X a plain path relative
-//            to runnerCwd. jest: a testPathIgnorePatterns literal made only of word characters
-//            and . / : - that is a substring of the path (a literal match implies jest's regex
-//            match), after <rootDir>. Playwright: playwright.config.* from runnerCwd up to
-//            gitRoot; testDir is its literal, the config's directory when absent, or <dir>/e2e
-//            when not a literal. Otherwise the file stays an input, and the I 2a guard keeps a
-//            0-test run unverifiable (fail-closed).
+//          - 8a (QA-1.3-37, QA-1.3-38) a test file the runner's own config excludes (a Playwright
+//            spec under vitest's `test.exclude` or jest's testPathIgnorePatterns, say) is still
+//            an input. The planner does not model runner exclusions: round 3's static reading
+//            (an `exclude` literal plus a Playwright testDir) dropped real vitest tests through
+//            coverage.exclude and typecheck.exclude, and a sound model needs vitest's
+//            test.exclude/root/dir/mergeConfig and Playwright's projects/testMatch/testIgnore.
+//            An e2e-only change therefore runs 0 tests, and the I 2a guard makes that run
+//            unverifiable (fail-closed; see P and Q 2.1). With a source file in the same change
+//            the source's related tests run, and the excluded spec adds nothing, as in the
+//            user's own run.
 //          - a gone test file adds the note `deleted test file not run: <rel>`; the risk signal
 //            covers it.
 //          - any other gone file goes to the stem search (9).
@@ -863,9 +859,11 @@
 //     remains is a setup file under an unconventional name that a config names only through a
 //     non-literal expression (a variable, a computed path). Under vitest that change reruns
 //     every test file (correct, at full cost); under jest the related graph does not see it.
-//   - G.8a (QA-1.3-37) reads `exclude` literals anywhere in the vitest config, so an
-//     `X/**` literal under coverage.exclude also counts. It is only used for a file inside a
-//     Playwright testDir, which Playwright itself runs as its own test.
+//   - A change made only to test files the vitest/jest config excludes (Playwright specs in the
+//     create-vue and Vite layouts) is unverifiable, not a pass: the specs stay inputs (G.8a,
+//     QA-1.3-38) and the run reports 0 tests (I 2a). This is the pre-round-3 behaviour, restored
+//     after round 3's static exclusion dropped real vitest tests. An exact answer needs the
+//     runner itself (Q 2.1).
 //   - A conftest.py or plugin hook (pytest_load_initial_conftests, pytest_cmdline_main) that
 //     adds -n cannot be seen statically; the appended "-n N" only lands when D.4 found xdist.
 //   - Tokenizing: npm on Windows (cmd.exe) does not treat '...' as quotes, while C.1 applies
@@ -901,6 +899,11 @@
 //       S2: map failingFiles into the reference worktree (gitRoot-relative), call
 //       planRerun(runner, mapped, refRunnerCwd, budget, {fs, entry}), and compare failingIds.
 //       testScope "full" is outside this module, except that its recheck uses planRerun.
+//       Known source of unverifiable results (G.8a, QA-1.3-38): a change made only to test files
+//       the runner's config excludes (Playwright specs). If 2.1 wants those to pass, it must ask
+//       the runner, not a static reading: `vitest list --filesOnly --json <file>` (Spike C: no
+//       test module is imported) or `jest --listTests --findRelatedTests <file>` listing nothing
+//       for every such input would justify NoAffected.
 //   2.2 batch: the key is (spec.gitRoot, spec.runner, spec.entry, key-sorted JSON of spec.env).
 //       The union run is planScopedRun over the union of the requests' changed files, with the
 //       same command and cwd. Attribution follows J.
@@ -3119,11 +3122,9 @@ const JS_CONFIG_NAMES: Readonly<Record<"vitest" | "jest", readonly string[]>> = 
   vitest: ["vitest.config", "vite.config"].flatMap((b) => JS_CONFIG_EXTS.map((x) => `${b}.${x}`)),
   jest: [...JS_CONFIG_EXTS.map((x) => `jest.config.${x}`), "jest.config.json", "package.json"],
 };
-const PLAYWRIGHT_CONFIG_NAMES = JS_CONFIG_EXTS.map((x) => `playwright.config.${x}`);
 /** Config keys whose values name setup files (vitest and jest share them). */
 const SETUP_KEYS = ["setupFiles", "setupFilesAfterEnv", "globalSetup", "globalTeardown"] as const;
-const CONFIG_KEY_RE =
-  /(?<![\w$])["']?(setupFiles|setupFilesAfterEnv|globalSetup|globalTeardown|rootDir|exclude|testPathIgnorePatterns|testDir|projects|workspace)["']?[ \t]*:[ \t\r\n]*/g;
+const CONFIG_KEY_RE = /(?<![\w$])["']?(setupFiles|setupFilesAfterEnv|globalSetup|globalTeardown|rootDir)["']?[ \t]*:[ \t\r\n]*/g;
 
 /**
  * G.7a: the string literals a JS/TS/JSON config assigns to CONFIG_KEY_RE's keys, statically: the
@@ -3170,26 +3171,19 @@ function configLiterals(text: string): Map<string, string[]> {
   return out;
 }
 
-/** What the vitest/jest configs say statically (G.7a, QA-1.3-29, QA-1.3-37). */
+/** What the vitest/jest configs say statically (G.7a, QA-1.3-29). */
 interface JsConfigFacts {
   /** Keys of the files named as setupFiles/setupFilesAfterEnv/globalSetup/globalTeardown. */
   readonly setupKeys: ReadonlySet<string>;
   /** The same for references without an extension, which jest resolves (compared without the extension, or as a directory index). */
   readonly setupStems: ReadonlySet<string>;
-  /** vitest `exclude` globs (and --exclude) or jest testPathIgnorePatterns, from the config the runner itself loads. */
-  readonly excludes: readonly { readonly base: string; readonly value: string }[];
 }
 
 /**
  * G.7a: read the vitest or jest config files (every directory from runnerCwd up to gitRoot, and the
  * --config file) once. setup references from any of them are triggers: a superset only adds S6.
- * Exclusions (G.8a) can only remove inputs, so they come from the one file the runner loads and
- * only when nothing else can change what applies: the last --config file, else runnerCwd's own
- * config when exactly one candidate of the first kind present exists (vitest.config.* before
- * vite.config.*; jest.config.* before package.json). No exclusions with a `projects`/`workspace`
- * key, a vitest.workspace/projects file, vitest --root/--dir, or jest --rootDir or
- * --testPathIgnorePatterns on the command line. jest `<rootDir>` resolves only when rootDir is
- * absent (the config's directory) or one literal.
+ * jest `<rootDir>` resolves only when rootDir is absent (the config's directory) or one literal.
+ * Exclusions are not read (G.8a, QA-1.3-38).
  */
 async function jsConfigFacts(ctx: Ctx, fs: PlannerFs, det: DetectedRunner): Promise<JsConfigFacts | Unverifiable> {
   const P = ctx.P;
@@ -3201,27 +3195,8 @@ async function jsConfigFacts(ctx: Ctx, fs: PlannerFs, det: DetectedRunner): Prom
       if (await existsCached(ctx, fs, p)) files.add(p);
     }
   }
-  const kept = det.keptArgs.map(camelOption);
-  const optionSet = (names: readonly string[]) => kept.some((t) => names.some((n) => t === n || t.startsWith(`${n}=`)));
-  let loaded: string | undefined;
-  if (det.configFiles !== undefined && det.configFiles.length > 0) {
-    loaded = det.configFiles.at(-1);
-  } else {
-    const groups = kind === "vitest" ? [JS_CONFIG_NAMES.vitest.slice(0, 6), JS_CONFIG_NAMES.vitest.slice(6)] : [JS_CONFIG_NAMES.jest.slice(0, -1), ["package.json"]];
-    for (const g of groups) {
-      const own = g.map((n) => P.join(det.runnerCwd, n)).filter((p) => files.has(p));
-      if (own.length === 0) continue;
-      loaded = own.length === 1 ? own[0] : undefined;
-      break;
-    }
-  }
-  const workspaceFile =
-    kind === "vitest" &&
-    (await Promise.all(["vitest.workspace", "vitest.projects"].flatMap((b) => [...JS_CONFIG_EXTS, "json"].map((x) => existsCached(ctx, fs, P.join(det.runnerCwd, `${b}.${x}`)))))).some(Boolean);
-  const cliBlocks = kind === "vitest" ? optionSet(["--root", "-r", "--dir"]) : optionSet(["--rootDir", "--testPathIgnorePatterns"]);
   const setupKeys = new Set<string>();
   const setupStems = new Set<string>();
-  const excludes: { base: string; value: string }[] = [];
   for (const file of files) {
     const t = await readConfigText(ctx, fs, file);
     if (t === "too-large") return tooLarge(file);
@@ -3240,23 +3215,8 @@ async function jsConfigFacts(ctx: Ctx, fs: PlannerFs, det: DetectedRunner): Prom
         }
       }
     }
-    if (file !== loaded || workspaceFile || cliBlocks || lits.has("projects") || lits.has("workspace")) continue;
-    if (kind === "vitest") {
-      for (const v of lits.get("exclude") ?? []) excludes.push({ base: det.runnerCwd, value: v });
-    } else {
-      for (const v of lits.get("testPathIgnorePatterns") ?? []) {
-        if (v.includes("<rootDir>") && rootDir === undefined) continue;
-        excludes.push({ base: dir, value: v.replace(/<rootDir>/g, rootDir ?? dir) });
-      }
-    }
   }
-  if (kind === "vitest" && !cliBlocks) {
-    for (let i = 0; i < kept.length; i++) {
-      if (kept[i] === "--exclude" && i + 1 < kept.length) excludes.push({ base: det.runnerCwd, value: det.keptArgs[++i] });
-      else if (kept[i].startsWith("--exclude=")) excludes.push({ base: det.runnerCwd, value: kept[i].slice("--exclude=".length) });
-    }
-  }
-  return { setupKeys, setupStems, excludes };
+  return { setupKeys, setupStems };
 }
 
 /** G.7a: `abs` is a setup file a config names (with its extension, or without it / as a directory index). */
@@ -3267,48 +3227,7 @@ function isReferencedSetup(ctx: Ctx, facts: JsConfigFacts, abs: string): boolean
   return facts.setupStems.has(ctx.key(stem)) || (ctx.P.basename(stem) === "index" && facts.setupStems.has(ctx.key(ctx.P.dirname(abs))));
 }
 
-/**
- * G.8a (QA-1.3-37): the runner's own static exclusion covers `abs`. vitest: an exclude glob of the
- * form `X/**`, `X/**` + `/*`, or the same after `**` + `/`, with X a plain path (relative to runnerCwd).
- * jest: a testPathIgnorePatterns entry made only of word characters, ".", "/", ":" and "-" that is
- * a substring of the path: jest matches it as a regex, and a literal match implies a regex match.
- * Anything else is not understood and excludes nothing (the file stays an input: fail-closed).
- */
-function excludedByRunner(ctx: Ctx, facts: JsConfigFacts, kind: RunnerKind, abs: string): boolean {
-  const slash = (s: string) => s.replace(/\\/g, "/");
-  return facts.excludes.some((ex) => {
-    if (kind === "jest") {
-      const v = slash(ex.value);
-      return /^[\w./:-]+$/.test(v) && slash(abs).includes(v);
-    }
-    const m = /^(?:\.\/)?(\*\*\/)?([\w.-]+(?:\/[\w.-]+)*)\/\*\*(?:\/\*)?$/.exec(ex.value);
-    if (!m) return false;
-    const rel = slash(ctx.P.relative(ex.base, abs));
-    return m[1] ? `/${rel}`.includes(`/${m[2]}/`) : rel.startsWith(`${m[2]}/`);
-  });
-}
 
-/**
- * G.8a (QA-1.3-37): Playwright test directories: each playwright.config.* from runnerCwd up to
- * gitRoot gives its literal testDir (resolved against the config's directory), the config's
- * directory when testDir is absent (Playwright's default), or `<dir>/e2e` when testDir is not a
- * literal.
- */
-async function playwrightDirs(ctx: Ctx, fs: PlannerFs, det: DetectedRunner): Promise<string[] | Unverifiable> {
-  const out: string[] = [];
-  for (const d of ancestors(ctx, det.runnerCwd, det.gitRoot)) {
-    for (const n of PLAYWRIGHT_CONFIG_NAMES) {
-      const p = ctx.P.join(d, n);
-      if (!(await existsCached(ctx, fs, p))) continue;
-      const t = await readConfigText(ctx, fs, p);
-      if (t === "too-large") return tooLarge(p);
-      if (t === "unreadable") continue;
-      const dirs = configLiterals(t.text).get("testDir");
-      out.push(dirs === undefined ? d : dirs.length > 0 ? ctx.P.resolve(d, dirs[0]) : ctx.P.join(d, "e2e"));
-    }
-  }
-  return out;
-}
 const NOTE_NO_CHANGES = "no changed files, no affected tests";
 const NOTE_NO_INPUT = "no affected tests: no changed file is a test input";
 const NOTE_NO_PY_MAP = "no affected tests: no test files map to the changed modules";
@@ -3374,7 +3293,7 @@ async function plan(input: StaticScopingInput, search: TestSearchSeam | undefine
       return s6("config-changed", `config file changed: ${f.rel}`);
     }
   }
-  return classify(ctx, input, det, sorted, notes, search, facts);
+  return classify(ctx, input, det, sorted, notes, search);
 }
 
 /** Change attribution that names only paths the planner cannot use (G.4a). */
@@ -3432,24 +3351,11 @@ async function classify(
   sorted: readonly FileRef[],
   notes: string[],
   search: TestSearchSeam | undefined,
-  facts: JsConfigFacts | undefined,
 ): Promise<ScopingPlan | StaticScoping> {
   const P = ctx.P;
   const fs = input.fs;
   const gitRoot = det.gitRoot;
-  // G.8a (QA-1.3-37): a changed test file in a Playwright testDir that the runner's own config
-  // statically excludes is not an input: the runner would never run it.
-  let pw: string[] | undefined;
-  const playwrightOnly = async (abs: string): Promise<boolean | Unverifiable> => {
-    if (!facts || facts.excludes.length === 0 || !excludedByRunner(ctx, facts, det.kind, abs)) return false;
-    if (pw === undefined) {
-      const dirs = await playwrightDirs(ctx, fs, det);
-      if (isS6(dirs)) return dirs;
-      pw = dirs;
-    }
-    return pw.some((d) => isInside(ctx, d, abs));
-  };
-  // G.8: classification.
+  // G.8: classification. A test file the runner's config excludes stays an input (G.8a, QA-1.3-38).
   const inputs = new Map<string, string>();
   const addInput = (abs: string) => inputs.set(ctx.key(abs), abs);
   const goneSources: FileRef[] = [];
@@ -3477,10 +3383,7 @@ async function classify(
       else goneModules.push(f);
     } else {
       const isTest = JS_TEST_RE.test(base) || f.rel.split("/").includes("__tests__");
-      const e2e = exists && isTest ? await playwrightOnly(f.abs) : false;
-      if (typeof e2e === "object") return e2e;
-      if (e2e) notes.push(`playwright test file excluded by the ${det.kind} config, not run: ${f.rel}`);
-      else if (exists) addInput(f.abs);
+      if (exists) addInput(f.abs);
       else if (isTest) notes.push(`deleted test file not run: ${f.rel}`);
       else goneSources.push(f);
     }

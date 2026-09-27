@@ -2821,77 +2821,54 @@ describe("QA-1.3-29: setup files are triggers under a superset of 1.6's rule", (
   });
 });
 
-describe("QA-1.3-37: a Playwright spec the runner's config excludes is not an input", () => {
+describe("QA-1.3-38: a test file the runner's config excludes stays an input (G.8a)", () => {
   const PW = { "/r/playwright.config.ts": "export default defineConfig({ testDir: './e2e' })" };
   const VCFG = "export default mergeConfig(viteConfig, defineConfig({ test: { environment: 'jsdom', exclude: [...configDefaults.exclude, 'e2e/**'] } }))";
   const plan = (command: string, extra: Record<string, string>, paths: string[]) =>
     planScopedRun(input({ command, files: jsRepo({}, { "/r/e2e/login.spec.ts": "", "/r/src/a.ts": "", ...extra }), changedFiles: changed(...paths) }));
-  const NOTE = (kind: string) => `playwright test file excluded by the ${kind} config, not run: e2e/login.spec.ts`;
 
-  it("create-vue shape: an e2e-only change is NoAffected with a note; with a source it runs the source only", async () => {
+  it("create-vue shape: the e2e spec is an input, and a run of it that reports 0 tests is unverifiable", async () => {
     const extra = { ...PW, "/r/vitest.config.ts": VCFG };
-    expect(await plan("vitest", extra, ["e2e/login.spec.ts"])).toEqual({ noAffected: true, note: "no affected tests: no changed file is a test input" });
-    const s = spec(await plan("vitest", extra, ["e2e/login.spec.ts", "src/a.ts"]));
-    expect(s.inputs).toEqual(["/r/src/a.ts"]);
-    expect(s.notes).toContain(NOTE("vitest"));
+    const s = spec(await plan("vitest", extra, ["e2e/login.spec.ts"]));
+    expect(s.inputs).toEqual(["/r/e2e/login.spec.ts"]);
+    expect(s.notes.filter((n) => n.includes("playwright"))).toEqual([]);
+    expect(spec(await plan("vitest", extra, ["e2e/login.spec.ts", "src/a.ts"])).inputs).toEqual(["/r/e2e/login.spec.ts", "/r/src/a.ts"]);
+    const r = await read(s, { [RPT_JSON]: jsonReport(0) }, 0);
+    expect(r).toMatchObject({ total: 0, complete: false, note: "vitest ran no tests although a test file was passed" });
   });
 
-  it.each([
-    ["**/e2e/**", "vitest"],
-    ["./e2e/**/*", "vitest"],
-    ["e2e/**", "vitest run --exclude e2e/**"],
-    ["e2e/**", "vitest run --exclude=**/e2e/**"],
-  ])("vitest exclude %s (%s)", async (glob, command) => {
-    const cfg: Record<string, string> = command === "vitest" ? { "/r/vitest.config.ts": `export default { test: { exclude: ['${glob}'] } }` } : {};
-    expect(isNoAffected(await plan(command, { ...PW, ...cfg }, ["e2e/login.spec.ts"]))).toBe(true);
+  it.each<[string, string, Record<string, string>, string]>([
+    [
+      "(a) coverage.exclude, Playwright testMatch",
+      "vitest",
+      {
+        "/r/vitest.config.js": "export default { test: { include: ['tests/unit/**/*.test.js'], coverage: { exclude: ['tests/**'] } } }",
+        "/r/playwright.config.js": "module.exports = { testDir: './tests', testMatch: '**/*.e2e.js' }",
+      },
+      "tests/unit/math.test.js",
+    ],
+    [
+      "(b) coverage.exclude, no Playwright testDir",
+      "vitest",
+      { "/r/vitest.config.js": "export default { test: { coverage: { exclude: ['test/**', 'e2e/**'] } } }", "/r/playwright.config.js": "module.exports = { testMatch: 'e2e/**/*.pw.js' }" },
+      "test/math.test.js",
+    ],
+    [
+      "(c) typecheck.exclude, Playwright testIgnore",
+      "vitest",
+      { "/r/vitest.config.js": "export default { test: { typecheck: { exclude: ['tests/**'] } } }", "/r/playwright.config.js": "module.exports = { testDir: './tests', testIgnore: '**/unit/**' }" },
+      "tests/unit/math.test.js",
+    ],
+    ["test.exclude", "vitest", { ...PW, "/r/vitest.config.ts": "export default { test: { exclude: ['**/e2e/**'] } }" }, "e2e/login.spec.ts"],
+    ["--exclude", "vitest run --exclude e2e/**", PW, "e2e/login.spec.ts"],
+    ["jest testPathIgnorePatterns", "jest", { ...PW, "/r/jest.config.js": "module.exports = { testPathIgnorePatterns: ['/node_modules/', '<rootDir>/e2e/'] }" }, "e2e/login.spec.ts"],
+  ])("%s: the changed test file is an input", async (_n, command, extra, f) => {
+    expect(spec(await plan(command, { ...extra, [`/r/${f}`]: "" }, [f])).inputs).toEqual([`/r/${f}`]);
   });
 
-  it("jest: a plain testPathIgnorePatterns entry, with or without <rootDir>", async () => {
-    for (const pat of ["/e2e/", "<rootDir>/e2e/"]) {
-      const cfg = { "/r/jest.config.js": `module.exports = { testPathIgnorePatterns: ['/node_modules/', '${pat}'] }` };
-      const s = spec(await plan("jest", { ...PW, ...cfg }, ["e2e/login.spec.ts", "src/a.ts"]));
-      expect(s.inputs).toEqual(["/r/src/a.ts"]);
-      expect(s.notes).toContain(NOTE("jest"));
-    }
-  });
-
-  it("Playwright's own testDir rules: absent means the config's directory, a non-literal means e2e", async () => {
-    const extra = { "/r/vitest.config.ts": VCFG };
-    expect(isNoAffected(await plan("vitest", { ...extra, "/r/playwright.config.js": "module.exports = { use: {} }" }, ["e2e/login.spec.ts"]))).toBe(true);
-    expect(isNoAffected(await plan("vitest", { ...extra, "/r/playwright.config.js": "module.exports = { testDir: path.join(__dirname, x) }" }, ["e2e/login.spec.ts"]))).toBe(true);
-    const other = { ...extra, "/r/playwright.config.js": "module.exports = { testDir: './tests-e2e' }" };
-    expect(spec(await plan("vitest", other, ["e2e/login.spec.ts"])).inputs).toEqual(["/r/e2e/login.spec.ts"]);
-  });
-
-  it.each<[string, string, Record<string, string>]>([
-    ["no Playwright config", "vitest", { "/r/vitest.config.ts": VCFG }],
-    ["no exclusion", "vitest", { ...PW, "/r/vitest.config.ts": "export default {}" }],
-    ["a glob it does not model", "vitest", { ...PW, "/r/vitest.config.ts": "export default { test: { exclude: ['e2e/*.spec.ts'] } }" }],
-    ["two vitest configs", "vitest", { ...PW, "/r/vitest.config.ts": VCFG, "/r/vitest.config.mjs": VCFG }],
-    ["vite.config when vitest.config exists", "vitest", { ...PW, "/r/vitest.config.ts": "export default {}", "/r/vite.config.ts": VCFG }],
-    ["a projects key", "vitest", { ...PW, "/r/vitest.config.ts": VCFG.replace("environment", "projects: [a], environment") }],
-    ["a workspace file", "vitest", { ...PW, "/r/vitest.config.ts": VCFG, "/r/vitest.workspace.ts": "" }],
-    ["--root on the command line", "vitest --root .", { ...PW, "/r/vitest.config.ts": VCFG }],
-    ["a parent config", "npm test", { ...PW, "/r/vitest.config.ts": VCFG }],
-    ["jest regex pattern", "jest", { ...PW, "/r/jest.config.js": "module.exports = { testPathIgnorePatterns: ['e2e/.*\\\\.spec'] }" }],
-    ["jest <rootDir> with a non-literal rootDir", "jest", { ...PW, "/r/jest.config.js": "module.exports = { rootDir: base, testPathIgnorePatterns: ['<rootDir>/e2e/'] }" }],
-    ["jest --rootDir", "jest --rootDir .", { ...PW, "/r/jest.config.js": "module.exports = { testPathIgnorePatterns: ['/e2e/'] }" }],
-  ])("stays an input (fail-closed): %s", async (_n, command, extra) => {
-    const files = { ...extra, "/r/sub/package.json": JSON.stringify({ name: "s", scripts: { test: "vitest" } }), "/r/sub/e2e/login.spec.ts": "" };
-    const sub = command === "npm test";
-    const r = sub
-      ? await planScopedRun(input({ command, cwd: "/r/sub", files: jsRepo({}, files), changedFiles: changed("/r/sub/e2e/login.spec.ts") }))
-      : await plan(command, extra, ["e2e/login.spec.ts"]);
-    expect(isScopedSpec(r), JSON.stringify(r)).toBe(true);
-  });
-
-  it("the --config file is the one loaded; an oversized Playwright config is S6, an unreadable one is skipped", async () => {
-    const cfg = { "/r/cfg/unit.mts": "export default { test: { exclude: ['e2e/**'] } }" };
-    expect(isNoAffected(await plan("vitest run --config cfg/unit.mts", { ...PW, ...cfg }, ["e2e/login.spec.ts"]))).toBe(true);
+  it("Playwright configs are not read: an oversized one changes nothing", async () => {
     const big = { "/r/vitest.config.ts": VCFG, "/r/playwright.config.ts": "x".repeat(CONFIG_SIZE_LIMIT + 1) };
-    expectS6(await plan("vitest", big, ["e2e/login.spec.ts"]), "config-too-large");
-    const fs = memFs(jsRepo({}, { ...PW, "/r/vitest.config.ts": VCFG, "/r/e2e/login.spec.ts": "" }), false, {}, ["/r/playwright.config.ts"]);
-    expect(spec(await planScopedRun(input({ fs, changedFiles: changed("e2e/login.spec.ts") }))).inputs).toEqual(["/r/e2e/login.spec.ts"]);
+    expect(spec(await plan("vitest", big, ["e2e/login.spec.ts"])).inputs).toEqual(["/r/e2e/login.spec.ts"]);
   });
 });
 describe("QA-1.3-32: .npmrc keys as npm's ini parser reads them, and npx", () => {
