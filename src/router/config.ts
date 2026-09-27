@@ -153,7 +153,13 @@ export interface EnforcementConfig {
     background?: boolean;
     /** How long an unverified delegation stays verifiable, in ms (integer >= 1). Default 3600000. */
     pendingTtlMs?: number;
-    /** Maximum wait for a verification slot, in ms (0 = no wait). Default 60000. */
+    /**
+     * Maximum wait for a verification slot, in ms (0 = no wait). Default 60000.
+     *
+     * Residual (QA-1.4-21): a lock whose owner is not provably dead is reclaimed
+     * only by a caller that waits or stays alive through ~8 s of observation, so
+     * a very short wait may give up on a slot that a longer one would reclaim.
+     */
     slotWaitMs?: number;
     /** Coalescing window, in ms (0 = no batching). Default 2000. */
     batchWindowMs?: number;
@@ -1339,6 +1345,11 @@ export function resolveVerifyBudget(
   const cores = opts.cores ?? availableParallelism();
   const coreCount = Number.isFinite(cores) && cores >= 1 ? Math.floor(cores) : 1;
 
+  // QA-1.6-8: waiting for the reference capture longer than the capture itself
+  // may take is pointless, so the wait never exceeds baselineTimeoutMs.
+  const baselineTimeoutMs = own<number>("baselineTimeoutMs") ?? 15_000;
+  const captureWaitMs = Math.min(own<number>("captureWaitMs") ?? 5000, baselineTimeoutMs);
+
   return {
     testScope: own<"affected" | "full">("testScope") ?? "affected",
     maxWorkers: own<number>("maxWorkers") ?? 2,
@@ -1346,14 +1357,14 @@ export function resolveVerifyBudget(
     maxConcurrentVerifications:
       own<number>("maxConcurrentVerifications") ?? Math.max(1, Math.floor(coreCount / 8)),
     defaultVerify: own<"deferred" | "required">("defaultVerify") ?? "deferred",
-    captureWaitMs: own<number>("captureWaitMs") ?? 5000,
+    captureWaitMs,
     background: own<boolean>("background") ?? false,
     pendingTtlMs: own<number>("pendingTtlMs") ?? 3_600_000,
     slotWaitMs: own<number>("slotWaitMs") ?? 60_000,
     batchWindowMs: own<number>("batchWindowMs") ?? 2000,
     failureRecheck,
     recheckTimeoutMs: own<number>("recheckTimeoutMs") ?? 60_000,
-    baselineTimeoutMs: own<number>("baselineTimeoutMs") ?? 15_000,
+    baselineTimeoutMs,
     gateBudgetMs: own<number>("gateBudgetMs") ?? 90_000,
   };
 }
