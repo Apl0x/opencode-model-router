@@ -612,3 +612,15 @@ with every root spelling and with no root.
 Outcome: every resolved finding except QA-1.6-3 is verified. QA-1.6-3's mandatory part is
 verified, and its residual is QA-1.6-18. Six new Low and three Info findings are open. No High or
 Medium finding is open.
+
+### Round-2 resolutions
+
+- QA-1.6-18 — Resolution: fixed in dcbd023. Non-upper-case keys (`verify:`, `Verify_Wait:`) count only when the value ends the line (optionally followed by closing quotes, `*`, `_`, `)`/`]` or punctuation); otherwise the text is prose and skipped silently. Decision: `verify: required` alone on a line → required. Upper-case `VERIFY`/`VERIFY_WAIT` behave as before. Tests cover 3b, 3c, q1–q4.
+- QA-1.6-19 — Resolution: fixed in dcbd023. The key regexes match key + colon only, and the value is read with a sticky `/\S*/y`: `VERIFY:maybe,VERIFY:required` → required, `VERIFY_WAIT:soon,VERIFY_WAIT:2s` → 2000 (parity with `CAP:abc,CAP:3` → 3).
+- QA-1.6-20 — Resolution: fixed in dcbd023. `[^\S\r\n\u2028\u2029]*` on both sides of the colon; NBSP/U+3000 parse, while newline/U+2028 still do not.
+- QA-1.6-21 — Resolution: fixed in 8ce93d5 (an adjustment to the §1.5-17 extension). The setup rule is now `\.setup\.[cm]?[jt]sx?$` plus the basenames setupTests, setup-tests, test-setup, global-setup, globalSetup, vitest.setup and jest.setup (any js/ts extension). `src/setup.ts`, `SetupWizard.tsx` and similar names are no longer config. A timing test checks that a 100k-character path takes < 50 ms.
+- QA-1.6-22 — Resolution: documented in 8ce93d5. The risk.ts header states that `root` must be the git top-level (real path, `rev-parse --show-toplevel`), never the delegation cwd. Exposing the top-level on `TreeSnapshot` and wiring it through stays deferred (2.1/2.4).
+- QA-1.6-23 — Resolution: fixed in 8ce93d5. `(^|/)requirements/[^/]*\.txt$` counts as a dependency config.
+- QA-1.6-24 — Resolution: fixed in dcbd023. Logged values escape C1/DEL, soft hyphen, U+061C, U+180E, U+200B–200F, U+2028–202E, U+2060–206F, U+FEFF and U+FFF9–FFFB.
+- QA-1.6-25 — Resolution: fixed in dcbd023 and 8ce93d5. Both purity guards also reject `fetch(`, `WebSocket`, `XMLHttpRequest` and `export … from`; both reject any `from "node:…"`.
+- QA-1.6-26 — Resolution: accepted, no change (Info). Word statuses will be mapped explicitly if 2.x introduces them.
