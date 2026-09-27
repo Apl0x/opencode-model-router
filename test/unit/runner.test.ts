@@ -3081,8 +3081,32 @@ describe("QA-1.3-41: jest's inline JSON --config is the config itself", () => {
     const escaped = '{"setup\\u0046iles":["./src/te\\u0073ting/bootstrap.js"]}';
     expectS6(await planJest("jest", { "/r/jest.config.json": escaped }), "config-changed");
     expectS6(await planJest("jest", { "/r/package.json": `{"name":"app","jest":${escaped}}` }), "config-changed");
-    // Unparseable JSON keeps the literal scan.
-    expectS6(await planJest("jest", { "/r/jest.config.json": '{"setupFiles":["./src/testing/bootstrap.js"],}' }), "config-changed");
+    // QA-1.3-46: a JSON config jest cannot parse fails the user's run: S6, whatever changed.
+    const why = "unsupported jest config: /r/jest.config.json does not parse as JSON";
+    expectS6(await planJest("jest", { "/r/jest.config.json": '{"setupFiles":["./src/testing/bootstrap.js"],}' }), "unsupported-argument", why);
+    expectS6(await planJest("jest", { "/r/jest.config.json": "{" }, ["src/a.js"]), "unsupported-argument", why);
+  });
+});
+
+describe("QA-1.3-46: JSON configs are read with comments stripped, as jest-config does", () => {
+  const BOOT = "src/testing/bootstrap.js";
+  const planJest = (extra: Record<string, string>, paths = [BOOT]) =>
+    planScopedRun(input({ command: "jest", files: jsRepo({}, { [`/r/${BOOT}`]: "", "/r/src/a.js": "", ...extra }), changedFiles: changed(...paths) }));
+
+  it.each([
+    '{ // local setup\n  "setup\\u0046ilesAfterEnv": ["./src/te\\u0073ting/bootstrap.js"]\n}\n',
+    '{ /* a\n block */ "setup\\u0046iles": [ "./src/te\\u0073ting/bootstrap.js" /* trailing */ ] }',
+    '{ "x": "a \\" // not a comment", "setup\\u0046iles": ["./src/te\\u0073ting/bootstrap.js"] }\r\n// last line',
+    '{ "x": "\\\\", "setup\\u0046iles": ["./src/te\\u0073ting/bootstrap.js"] } /* unterminated',
+  ])("%j names the file", async (cfg) => {
+    expectS6(await planJest({ "/r/jest.config.json": cfg }), "config-changed", `config file changed: ${BOOT}`);
+  });
+
+  it("a comment marker inside a string is kept; an unparseable package.json is skipped like jest skips it", async () => {
+    expect(spec(await planJest({ "/r/jest.config.json": '{ "testEnvironment": "node // x /* y" }' }, ["src/a.js"])).inputs).toEqual(["/r/src/a.js"]);
+    const pkg = '{ "name": "app", // not JSON\n "jest": { "setup\\u0046iles": ["./src/te\\u0073ting/bootstrap.js"] } }';
+    expectS6(await planJest({ "/r/package.json": pkg }), "config-changed");
+    expect(spec(await planJest({ "/r/sub/package.json": "{ nope", "/r/sub/b.js": "" }, ["sub/b.js"])).inputs).toEqual(["/r/sub/b.js"]);
   });
 });
 

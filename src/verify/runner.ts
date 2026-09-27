@@ -504,7 +504,11 @@
 //      value that starts with "{" and ends with "}", jest's own test) is the config itself: it
 //      is parsed with JSON.parse (S6 unsupported-argument when it does not parse), rooted at
 //      runnerCwd, and is not a config file path. JSON configs (jest.config.json, package.json)
-//      are also read with JSON.parse, so escaped keys and paths count. QA-1.3-42: a reference is
+//      are also read with JSON.parse, so escaped keys and paths count; QA-1.3-46: after
+//      strip-json-comments' rules, as jest-config reads them (`//` and `/* */` outside strings
+//      become whitespace). A .json config that still does not parse fails the user's run -> S6
+//      unsupported-argument; an unparseable package.json is skipped, as jest's lookup skips it
+//      (its text scan still counts). QA-1.3-42: a reference is
 //      resolved only when its last segment names a changed file (basename, stem, or the
 //      directory of an index file), each distinct one once, and at most SETUP_REF_LIMIT (1000)
 //      resolutions (references times bases, plus rootDir literals) per plan; beyond that, S6
@@ -810,6 +814,8 @@
 //                              instead of <file|none>   (D.4 pinning, QA-1.3-43)
 //                              unsupported pytest rootdir: the pytest releases pick <a> or <b>
 //                              unsupported pytest rootdir: pytest expands variables in <dir>
+//                              unsupported <vitest|jest> config: <path> does not parse as JSON
+//                              (G.7a, QA-1.3-46)
 //     ambiguous-option         ambiguous <runner> option "<opt>" in <where>: cannot tell whether
 //                              "<next>" is its value
 //     runner-not-installed     runner not installed: <vitest|jest|pytest|uv>
@@ -1596,6 +1602,34 @@ function parseJson(text: string): unknown {
   } catch {
     return undefined;
   }
+}
+
+/**
+ * QA-1.3-46: strip-json-comments 3, which jest-config runs before parsing a JSON config file: `//`
+ * and `/* *\/` comments outside strings become whitespace, and an unterminated comment runs to the
+ * end. A quote preceded by an odd number of backslashes does not end a string.
+ */
+function stripJsonComments(text: string): string {
+  let out = "";
+  let from = 0;
+  let inString = false;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (c === '"') {
+      let k = i - 1;
+      while (text[k] === "\\") k--;
+      if ((i - 1 - k) % 2 === 0) inString = !inString;
+      continue;
+    }
+    const n = text[i + 1];
+    if (inString || c !== "/" || (n !== "/" && n !== "*")) continue;
+    const close = text.indexOf(n === "/" ? "\n" : "*/", i + 2);
+    const end = close < 0 ? text.length : n === "/" ? close : close + 2;
+    out += text.slice(from, i) + text.slice(i, end).replace(/\S/g, " ");
+    from = end;
+    i = end - 1;
+  }
+  return out + text.slice(from);
 }
 
 /** jest-config's isJSONString: a `--config` value it parses as the config itself (QA-1.3-41). */
@@ -3611,7 +3645,14 @@ async function jsConfigFacts(
     if (t === "unreadable") continue;
     const lits = configLiterals(t.text);
     if (P.extname(file) === ".json") {
-      for (const [k, vs] of jsonLiterals(parseJson(t.text))) lits.set(k, [...(lits.get(k) ?? []), ...vs]);
+      // QA-1.3-46: jest-config reads a JSON config as parseJson(stripJsonComments(text)). One that
+      // still does not parse fails the user's run; package.json is the exception, because jest's
+      // lookup skips a package.json that JSON.parse rejects.
+      const parsed = parseJson(stripJsonComments(t.text));
+      if (parsed === undefined && P.basename(file) !== "package.json") {
+        return s6("unsupported-argument", `unsupported ${det.kind} config: ${file} does not parse as JSON`);
+      }
+      for (const [k, vs] of jsonLiterals(parsed)) lits.set(k, [...(lits.get(k) ?? []), ...vs]);
     }
     const bad = addRefs(lits, P.dirname(file), file);
     if (bad) return bad;
