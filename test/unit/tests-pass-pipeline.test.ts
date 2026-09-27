@@ -168,6 +168,10 @@ describe("recheck helpers", () => {
     ["src/b.test.ts", "src/b.test.ts"],
     ["src\\c.test.ts > x", "src/c.test.ts"],
     ["pkg/a.test.ts > has :: in name", "pkg/a.test.ts"],
+    ["a.test.ts > suite > t", "a.test.ts"],
+    ["tests/test_x.py::test_cmp[1 > 0]", "tests/test_x.py"],
+    ["tests\\test_x.py::TestA::test_cmp[a > b > c]", "tests/test_x.py"],
+    ["tests/test_x.py::test_cmp[1 > 0 :: x]", "tests/test_x.py"],
   ])("fileKeyOfId(%j) = %j", (id, key) => {
     expect(fileKeyOfId(id)).toBe(key);
   });

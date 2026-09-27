@@ -420,7 +420,7 @@ export function resolveRepoCommand(
 // -----------------------------------------------------------------------------------------------
 // T5. VERDICT ALGEBRA: judgeScoped(scoped, recheck) (baseline.ts, 2.1.4). Pure and total.
 //
-//   fileKeyOfId(id) = the part before the first " > ", else before the first "::", else id.
+//   fileKeyOfId(id) = the part before the earliest " > " or "::", else id.
 //   C = scoped.result (kind "ran").
 //   1. Planning, slot, timeout, abort and error kinds -> their row (T6); the recheck is ignored.
 //   2. C.complete && !C.collectionError && C.failingIds empty -> pass (row R1).

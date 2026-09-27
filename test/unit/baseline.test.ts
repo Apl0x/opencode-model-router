@@ -386,6 +386,13 @@ describe("judgeScoped verdict algebra (deterministic.ts T5-T7)", () => {
       expect(j).toMatchObject({ ok: true, failures: { preexisting: [id] } });
     });
 
+    it("a pytest id containing \" > \" keys at the earliest separator, so failing at both sides is pre-existing", () => {
+      const id = "tests/test_x.py::test_cmp[1 > 0]";
+      const j = judgeScoped(ran(rr([id], { source: "report" })), exact([id], { ranFiles: ["tests/test_x.py"] }));
+      expect(j).toMatchObject({ ok: true, unverifiable: false, failures: { introduced: [], preexisting: [id], unknown: [] } });
+      expect(j.note).toContain("no worse than before");
+    });
+
     it("a bare-file id is never pre-existing: introduced when its file ran or is absent", () => {
       const bare = "a.test.ts";
       const scoped = ran(rr([bare], { collectionError: true, complete: false }));

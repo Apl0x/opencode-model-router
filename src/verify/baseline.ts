@@ -67,13 +67,14 @@ export function observeTests(result: ExecResult): TestObservation {
 }
 
 /**
- * The id-space file key of a RunResult id (deterministic.ts header, T5): the part before the first
- * " > ", else before the first "::", else the whole (bare-file) id; "/" separators.
+ * The id-space file key of a RunResult id (deterministic.ts header, T5): the part before the
+ * earliest " > " or "::" separator, else the whole (bare-file) id; "/" separators. The earliest
+ * wins so a pytest parametrisation such as `t.py::test[1 > 0]` keys to `t.py`, and a vitest name
+ * containing "::" keys to its file.
  */
 export function fileKeyOfId(id: string): string {
-  const vitest = id.indexOf(" > ");
-  const pytest = id.indexOf("::");
-  const file = vitest >= 0 ? id.slice(0, vitest) : pytest >= 0 ? id.slice(0, pytest) : id;
+  const cuts = [id.indexOf(" > "), id.indexOf("::")].filter(i => i >= 0);
+  const file = cuts.length > 0 ? id.slice(0, Math.min(...cuts)) : id;
   return file.replace(/\\/g, "/");
 }
 
