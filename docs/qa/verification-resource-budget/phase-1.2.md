@@ -59,3 +59,31 @@ query itself.
 Handled by a separate agent. Implementation prepends `nice -n 10` to argv (`runArgv`) and runs
 `nice -n 10 /bin/sh -c <command>` for `runShell` — the same `/bin/sh -c` that `shell: true`
 spawns, so shell semantics are unchanged and the command is never re-quoted.
+
+## Pre-flight / Spike B (POSIX)
+
+Run on GitHub Actions, ubuntu-24.04, Node v24.21.0 — run id 36282266100 (throwaway branch
+`vrb/p12-spikeb`, since deleted). Parent shell nice = 0.
+
+**nice inheritance** (`ps -o pid,ppid,ni,comm`):
+
+| Form | child `sh` NI | grandchild `sleep` NI |
+|---|---|---|
+| `nice -n 10 sh -c 'sleep 30 & sleep 30 & …; exit 0'` | 10 | 10, 10 |
+| same, `exit 3` | 10 | 10, 10 |
+| `nice -n 10 /bin/sh -c '…; exit 7'` (runShell form) | 10 | 10 |
+| node `spawn("nice",["-n","10","sh","-c",…],{detached:true})` | 10 (PGID = own pid) | 10 ×3, same PGID |
+
+**Exit codes preserved:** shell forms returned 0, 3, 7; node `spawn` reported `code=0` and
+`code=3` (signal null) as expected. `nice` execs into its target, so no wrapper exit code is involved.
+
+**Tree kill:** `process.kill(-pid, "SIGKILL")` on the detached `nice … sh -c 'sleep 60 & sleep 60'`
+tree → child `sig=SIGKILL`; `ps -g <pgid>` afterwards found no processes (exit 1). The runner's
+"orphan process" cleanup listed only `sleep`s from the spike's own non-detached shell probes;
+these came from the spike script's cleanup, not from exec.ts.
+
+**`test/unit/exec.test.ts` on Linux** (`npx vitest run --maxWorkers=2`): **1 file passed —
+17 passed, 2 skipped (19)**, 6.80s. The 2 skipped tests are the `it.runIf(isWin)` `.cmd` cases.
+The POSIX tree-kill tests passed: "kills the whole process tree on timeout, not just the shell",
+"kills the whole process tree on abort" (×2), and "kills the whole process tree on timeout".
+No failures.
