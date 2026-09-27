@@ -15,6 +15,12 @@
 //       executable, `spawn` is wrapped (node only) to start a node stand-in that
 //       ignores its arguments and stdin and lives 60 s in place of PowerShell.
 //
+//   node|bun host.mjs late-sweeper <dir>
+//       The same run and abort as hung-sweeper (node only), with a stand-in
+//       that pins "1 tree", kills the holder at once and reports only after
+//       the kill grace, so the grace settles the run with the pipes closed
+//       and the sweep still reporting (QA-1.2-24).
+//
 // Node targets run on $OMR_NODE when set, else process.execPath (under bun
 // that is bun.exe, not node).
 import childProcess from "node:child_process";
@@ -26,13 +32,34 @@ import { fileURLToPath } from "node:url";
 const [mode, ...rest] = process.argv.slice(2);
 const node = process.env.OMR_NODE || process.execPath;
 const HUNG = "omr-hung-sweeper";
-/** hung-sweeper: the stand-in started in place of PowerShell. */
+const LATE = "omr-late-sweeper";
+/**
+ * late-sweeper's stand-in: pins "1 tree", kills the holder as soon as it
+ * reads `kill`, and reports the kill only after LATE_REPORT_MS.
+ */
+const LATE_REPORT_MS = 2500;
+const LATE_SCRIPT = [
+  "const fs = require('node:fs');",
+  "const holderFile = require('node:path').join(process.argv[1], 'holder.pid');",
+  "process.stdout.write('pinned 1\\n');",
+  "let input = '';",
+  "process.stdin.setEncoding('utf8');",
+  "process.stdin.on('data', (s) => {",
+  "  input += s;",
+  "  if (!input.includes('kill')) return;",
+  "  const holder = Number(fs.readFileSync(holderFile, 'utf8'));",
+  "  process.kill(holder);",
+  `  setTimeout(() => { process.stdout.write(holder + '\\n'); process.exit(0); }, ${LATE_REPORT_MS});`,
+  "});",
+].join("\n");
+/** hung-sweeper / late-sweeper: the stand-in started in place of PowerShell. */
 let standIn;
-if (mode === "hung-sweeper" && !rest[1]) {
+if ((mode === "hung-sweeper" && !rest[1]) || mode === "late-sweeper") {
   const realSpawn = childProcess.spawn;
   childProcess.spawn = (file, args, options) => {
-    if (file !== HUNG) return realSpawn(file, args, options);
-    standIn = realSpawn(node, ["-e", "setTimeout(() => {}, 60000)"], options);
+    if (file === HUNG) standIn = realSpawn(node, ["-e", "setTimeout(() => {}, 60000)"], options);
+    else if (file === LATE) standIn = realSpawn(node, ["-e", LATE_SCRIPT, rest[0]], options);
+    else return realSpawn(file, args, options);
     return standIn;
   };
   // Before exec.ts is imported, so its `spawn` binding is the wrapper.
@@ -66,9 +93,9 @@ if (mode === "exit-mid-run") {
   await waitFor(() => hasContent(pidFile), pidFile);
   process.stdout.write("ready\n");
   process.exit(0);
-} else if (mode === "hung-sweeper") {
+} else if (mode === "hung-sweeper" || mode === "late-sweeper") {
   const [dir, sweeper] = rest;
-  exec.setSweeperExecutableForTests(sweeper || HUNG);
+  exec.setSweeperExecutableForTests(mode === "late-sweeper" ? LATE : sweeper || HUNG);
   const controller = new AbortController();
   const tree = fileURLToPath(new URL("./tree.cjs", import.meta.url));
   const pending = exec.runArgv(node, [tree, "early-exit", dir], { cwd: dir, timeoutMs: 60000, signal: controller.signal });

@@ -277,6 +277,13 @@ function run(file: string, args: string[], shell: boolean, opts: RunOptions, nic
         killed = true;
         const holder = exited ? "a descendant still held them" : "the process did not exit";
         notes.push(`[output streams force-closed ${KILL_GRACE_MS} ms after the kill: ${holder}]`);
+      } else if (sweepPending && sweeper && sweeper.pinnedCount() > 0) {
+        // The pipes closed while the sweep had not reported yet (QA-1.2-24):
+        // with trees pinned, its kill may be what closed them, so the result
+        // must not read as a natural exit. A sweep that has pinned nothing
+        // cannot have killed anything, and the natural result stands (QA-1.2-10).
+        killed = true;
+        notes.push("[orphan sweep still reporting at settle: it may have ended what held the pipes]");
       }
       finish(closed ? closeCode : exitCode);
     };
@@ -494,6 +501,8 @@ interface Sweeper {
    * when the sweep could not run, why. Never throws.
    */
   kill(done: (pids: number[], unavailable?: string) => void): void;
+  /** How many trees the sweeper reported pinned; 0 until its marker arrives. */
+  pinnedCount(): number;
   /** Release the pins without killing anything. */
   dispose(): void;
   /**
@@ -578,6 +587,11 @@ function armSweeper(pid: number, spawnedAt: number, exitedAt: number): Sweeper {
   const lines = () => output.split(/\r?\n/);
   const killedPids = () => lines().filter((l) => /^\d+$/.test(l)).map(Number);
   const pinned = () => lines().some((l) => l.startsWith(`${SWEEP_MARKER} `));
+  const pinnedCount = () => {
+    const marker = lines().find((l) => l.startsWith(`${SWEEP_MARKER} `));
+    const n = marker === undefined ? 0 : Number(marker.slice(SWEEP_MARKER.length + 1));
+    return Number.isInteger(n) && n > 0 ? n : 0;
+  };
   /** Undefined when the sweep ran; otherwise the reason it did not. */
   const unavailable = () => failure ?? (pinned() ? undefined : "no marker");
   let ps: ChildProcess | undefined;
@@ -634,6 +648,7 @@ function armSweeper(pid: number, spawnedAt: number, exitedAt: number): Sweeper {
       // (QA-1.2-19). The sweeper's exit closes the pipe.
       sweeperProcess.stdin?.write("kill\n");
     },
+    pinnedCount,
     dispose() {
       if (ended || !ps) return;
       ps.stdin?.end();

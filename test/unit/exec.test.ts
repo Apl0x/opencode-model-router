@@ -582,6 +582,30 @@ describe("process lifecycle around the direct child's exit", () => {
       await t.release();
     }
   }, 60000);
+
+  it.runIf(isWin && typeStripping)("counts a sweep that pinned trees and reports after the grace as a kill (QA-1.2-24, Windows-only: the sweeper; needs Node type stripping)", async () => {
+    const t = tree("early-exit");
+    const h = startHost(["late-sweeper", t.dir]);
+    let standIn = 0;
+    try {
+      const first = await h.firstLine;
+      expect(first.line, h.stderr()).not.toBe("");
+      const out = JSON.parse(first.line) as { result: { code: number; timedOut: boolean; stderr: string }; sweeper: number | null };
+      standIn = out.sweeper ?? 0;
+      expect(standIn).toBeGreaterThan(0);
+      // The stand-in's kill closed the pipes, so nothing was force-closed; its
+      // report came after the grace settled the run.
+      expect(out.result).toMatchObject({ code: 1, timedOut: true });
+      expect(out.result.stderr).toMatch(/\[orphan sweep still reporting at settle: it may have ended what held the pipes\]/);
+      expect(out.result.stderr).not.toMatch(/output streams force-closed/);
+      expect(alive(t.pid("holder"))).toBe(false);
+      expect((await h.exited).code).toBe(0);
+    } finally {
+      h.kill();
+      killIfAlive(standIn);
+      await t.release();
+    }
+  }, 60000);
 });
 
 describe("tracked-process bookkeeping (QA-1.2-23)", () => {
