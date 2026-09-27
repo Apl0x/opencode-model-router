@@ -915,8 +915,8 @@ describe("background mode (2.4.5)", () => {
     const finish = await wiring.finishDeferred(store, {
       dispatchID: "task:orch:1", orchestratorSessionID: "orch", producerSessionID: "child-1", producerTier: "fast", description: "the work", cwd: state.root, dod: DOD, dispatchedAt: 0,
     });
+    if (!finish.deferred) throw new Error(finish.detail);
     const h = finish.handle;
-    if (h === undefined) throw new Error(finish.footer);
     const queue = queueOf(wiring);
     expect(queue.stats().queued).toBe(1);
     // The deferred result did not wait for the run: nothing has run yet.
@@ -1065,7 +1065,7 @@ describe("background mode (2.4.5)", () => {
     await wiring.startDispatch(store, "task:orch:u", state.root, DOD, "", false);
     const unattributed = await finish(store, "task:orch:u", "child-u");
     state.snapshotThrows = false;
-    expect(unattributed.handle).toBeDefined();
+    expect(unattributed).toMatchObject({ deferred: true });
     expect(wiring.pending.listUnverified("orch")[0]?.changedFiles).toBe("unavailable");
     expect(queue.stats().queued).toBe(0);
 
@@ -1075,7 +1075,7 @@ describe("background mode (2.4.5)", () => {
     await wiring.startDispatch(store, "task:orch:v", state.root, DOD, "", false);
     state.treeFiles = [{ path: src("a"), status: " M" }];
     const kept = await finish(store, "task:orch:v", "child-v");
-    expect(kept.handle).toBeDefined();
+    if (!kept.deferred) throw new Error(kept.detail);
     expect(kept.footer).toContain(`[router] unverified \u00b7 ${kept.handle} \u00b7`);
     expect(wiring.sweepVerification()).toBe(0);
   });

@@ -32,6 +32,7 @@ import {
   MAX_LEDGER_PER_SESSION,
   MAX_STORED_CHANGED_FILES,
   REFERENCE_FAILED_REASON,
+  REFERENCE_SHED_REASON,
   RELEASED_REASON,
   TOMBSTONE_MAX,
   UNATTRIBUTED_RISK_REASON,
@@ -216,7 +217,8 @@ describe("handles (R2)", () => {
       return new Uint8Array(bytes);
     };
     const { registry, add, evictions } = setup({ random, maxPerSession: 1 });
-    add();
+    // Verified, so the cap plans its eviction; the collision then evicts nothing.
+    claimed(registry.markVerifying("orch", add())).settle(PASS);
     calls = 0;
     const r = registry.register(reg());
     expect(r).toMatchObject({ ok: false, code: "handle-collision" });
@@ -389,8 +391,13 @@ describe("scoping (R6)", () => {
 
   it("bounds tombstones FIFO at TOMBSTONE_MAX", () => {
     const { registry, add } = setup({ onEvict: undefined });
+    // Verified entries, so the global cap may evict them (QA-2.4-4: never an unverified one).
     const first = add();
-    for (let i = 0; i < TOMBSTONE_MAX; i += 1) add({ orchestratorSessionID: `s${i}` });
+    claimed(registry.markVerifying("orch", first)).settle(PASS);
+    for (let i = 0; i < TOMBSTONE_MAX; i += 1) {
+      const sid = `s${i}`;
+      claimed(registry.markVerifying(sid, add({ orchestratorSessionID: sid }))).settle(PASS);
+    }
     registry.sweep(Number.MAX_SAFE_INTEGER);
     expect(registry.stats().tombstones).toBe(TOMBSTONE_MAX);
     expect(registry.get("orch", first).kind).toBe("unknown");
@@ -562,27 +569,31 @@ describe("TTL and eviction (R7)", () => {
     expect(registry.get("orch", handle).kind).toBe("expired");
   });
 
-  it("session cap evicts TTL-expired, then verified oldest, then unverified oldest; never verifying", () => {
+  it("QA-2.4-4: the session cap evicts verified entries oldest first, never an unverified or verifying one", () => {
     const { registry, add, c, evictions } = setup({ maxPerSession: 3 });
     const u1 = add();
     c.advance(1);
-    const u2 = add();
+    const v1 = add();
+    claimed(registry.markVerifying("orch", v1)).settle(PASS);
     c.advance(1);
-    const v = add();
-    claimed(registry.markVerifying("orch", v)).settle(PASS);
+    const v2 = add();
+    claimed(registry.markVerifying("orch", v2)).settle(PASS);
     c.advance(1);
     const r1 = registry.register(reg());
-    expect(r1).toMatchObject({ ok: true, evicted: [v] });
-    expect(evictions).toEqual([{ handle: v, cause: "session-cap" }]);
+    expect(r1).toMatchObject({ ok: true, evicted: [v1] });
+    expect(evictions).toEqual([{ handle: v1, cause: "session-cap" }]);
     const r2 = registry.register(reg());
-    expect(r2).toMatchObject({ ok: true, evicted: [u1] });
-    claimed(registry.markVerifying("orch", u2));
-    if (!r1.ok || !r2.ok) return;
-    claimed(registry.markVerifying("orch", r1.handle));
-    claimed(registry.markVerifying("orch", r2.handle));
+    expect(r2).toMatchObject({ ok: true, evicted: [v2] });
+    // Only unverified entries are left: the cap refuses, and nothing is dropped silently.
     const full = registry.register(reg());
     expect(full).toMatchObject({ ok: false, code: "registry-full" });
-    expect(registry.stats()).toMatchObject({ entries: 3, verifying: 3 });
+    expect(evictions).toHaveLength(2);
+    expect(registry.listUnverified("orch").map((e) => e.handle)).toContain(u1);
+    expect(registry.get("orch", u1).kind).toBe("found");
+    if (!r1.ok) return;
+    claimed(registry.markVerifying("orch", r1.handle));
+    expect(registry.register(reg())).toMatchObject({ ok: false, code: "registry-full" });
+    expect(registry.stats()).toMatchObject({ entries: 3, verifying: 1 });
     // Other sessions are unaffected by the session cap.
     expect(registry.register(reg({ orchestratorSessionID: "other" })).ok).toBe(true);
   });
@@ -595,19 +606,25 @@ describe("TTL and eviction (R7)", () => {
     expect(evictions).toEqual([{ handle: old, cause: "ttl" }]);
   });
 
-  it("global cap evicts across sessions in order; registry-full when everything is verifying", () => {
+  it("QA-2.4-4: the global cap evicts another session's verified entry, never its unverified one", () => {
     const { registry, add, c, evictions } = setup({ maxGlobal: 2 });
     const a = add({ orchestratorSessionID: "s1" });
     c.advance(1);
     const b = add({ orchestratorSessionID: "s2" });
     c.advance(1);
+    // Both unverified: a registration in another session is refused, and nothing is evicted.
+    expect(registry.register(reg({ orchestratorSessionID: "s3" }))).toMatchObject({ ok: false, code: "registry-full" });
+    expect(evictions).toEqual([]);
+    expect(registry.listUnverified("s1").map((e) => e.handle)).toEqual([a]);
+    // A verified entry may go, whichever session holds it.
+    claimed(registry.markVerifying("s1", a)).settle(PASS);
     const r = registry.register(reg({ orchestratorSessionID: "s3" }));
     expect(r).toMatchObject({ ok: true, evicted: [a] });
     expect(evictions).toEqual([{ handle: a, cause: "global-cap" }]);
     expect(registry.stats().sessions).toBe(2);
     claimed(registry.markVerifying("s2", b));
-    if (r.ok) claimed(registry.markVerifying("s3", r.handle));
     expect(registry.register(reg({ orchestratorSessionID: "s4" }))).toMatchObject({ ok: false, code: "registry-full" });
+    expect(registry.get("s2", b).kind).toBe("found");
   });
 
   it("a zero per-session cap refuses every registration", () => {
@@ -615,21 +632,25 @@ describe("TTL and eviction (R7)", () => {
     expect(registry.register(reg())).toMatchObject({ ok: false, code: "registry-full" });
   });
 
-  it("weight cap evicts by changed-path weight and refuses an entry that can never fit", () => {
+  it("QA-2.4-4: the weight cap refuses a registration rather than evict an unverified entry", () => {
     const { registry, add, c, evictions } = setup({ maxWeight: 10 });
     const a = add({ changedFiles: paths(4) });
     c.advance(1);
     add({ changedFiles: paths(4) });
     c.advance(1);
-    expect(registry.register(reg({ changedFiles: paths(4) }))).toMatchObject({ ok: true, evicted: [a] });
-    expect(evictions).toEqual([{ handle: a, cause: "weight-cap" }]);
+    expect(registry.register(reg({ changedFiles: paths(4) }))).toMatchObject({ ok: false, code: "registry-full" });
+    expect(evictions).toEqual([]);
     expect(registry.stats().weight).toBe(8);
+    // A verified entry is released (weight 0) and may be evicted; the new entry then fits.
+    claimed(registry.markVerifying("orch", a)).settle(PASS);
+    expect(registry.stats().weight).toBe(4);
+    expect(registry.register(reg({ changedFiles: paths(4) }))).toMatchObject({ ok: true, evicted: [] });
     expect(registry.register(reg({ changedFiles: paths(11) }))).toMatchObject({ ok: false, code: "registry-full" });
-    expect(registry.stats().entries).toBe(2);
+    expect(registry.stats().entries).toBe(3);
   });
 
-  it("adds the captured reference's weight when it resolves and evicts over the weight cap", async () => {
-    const { registry, add, c, evictions } = setup({ maxWeight: 20 });
+  it("QA-2.4-4: a captured reference over the weight cap is shed; its entry stays unverified and listed", async () => {
+    const { registry, add, c, evictions } = setup({ maxWeight: 21 });
     const a = add({ changedFiles: paths(2) });
     c.advance(1);
     let resolveRef: (s: ReferenceState) => void = () => undefined;
@@ -642,12 +663,18 @@ describe("TTL and eviction (R7)", () => {
     resolveRef(captured(10, 5));
     await flush();
     expect(registry.stats().weight).toBe(20);
-    expect(evictions).toEqual([]);
     const c2 = add({ changedFiles: paths(1), reference: Promise.resolve(captured(1, 0)) });
     await flush();
-    expect(evictions).toEqual([{ handle: a, cause: "weight-cap" }]);
-    expect(registry.stats().weight).toBe(20);
-    expect(registry.listUnverified("orch").map((e) => e.handle)).toEqual([c2, b]);
+    expect(evictions).toEqual([]);
+    // c2's own path fits (21); its reference (+1) would not, so it is shed.
+    expect(registry.stats().weight).toBe(21);
+    expect(registry.listUnverified("orch").map((e) => e.handle)).toEqual([c2, b, a]);
+    const shed = registry.get("orch", c2);
+    if (shed.kind !== "found") throw new Error(shed.kind);
+    expect(await shed.entry.reference).toEqual({ kind: "none", reason: REFERENCE_SHED_REASON });
+    const kept = registry.get("orch", b);
+    if (kept.kind !== "found") throw new Error(kept.kind);
+    expect((await kept.entry.reference).kind).toBe("captured");
   });
 
   it("does not add reference weight after the entry is gone or released", async () => {
@@ -845,21 +872,6 @@ describe("text (R9)", () => {
     expect(footer.split("\n")[0].slice("[router] ".length).split(" ")[0]).toBe("unverified");
   });
 
-  it("builds the no-handle footer for every failure code", () => {
-    const tail =
-      "\n[router] This delegation cannot be verified later; re-dispatch it with required verification if the risk matters.";
-    const risk: RiskAssessment = { level: "low", reasons: [] };
-    expect(buildDeferredFooter({ handle: undefined, risk, unregistered: "registry-full" })).toBe(
-      `[router] unverified \u00b7 no handle (pending registry full) \u00b7 risk low${tail}`,
-    );
-    expect(buildDeferredFooter({ handle: undefined, risk, unregistered: "handle-collision" })).toBe(
-      `[router] unverified \u00b7 no handle (handle allocation failed) \u00b7 risk low${tail}`,
-    );
-    expect(buildDeferredFooter({ handle: undefined, risk, unregistered: "invalid-input" })).toBe(
-      `[router] unverified \u00b7 no handle (not registered) \u00b7 risk low${tail}`,
-    );
-    expect(buildDeferredFooter({ handle: undefined, risk })).toContain("no handle (not registered)");
-  });
 
   it("keeps the label rule even when a reason mentions verified", () => {
     const footer = buildDeferredFooter({ handle: h, risk: { level: "high", reasons: ["cannot be verified"] } });
@@ -971,7 +983,6 @@ describe("text (R9)", () => {
       sanitizeDescription(hostile),
       formatRisk("high", [hostile], 3),
       buildDeferredFooter({ handle: h, risk }),
-      buildDeferredFooter({ handle: undefined, risk, unregistered: "registry-full" }),
       buildPendingListBlock([entry(h, hostile, risk)]) ?? "",
       buildLateNoticeBlock([{ handle: h, description: hostile, introduced: [hostile] }]) ?? "",
       buildLineageCaveat({ label: hostile, ids: [hostile] }),

@@ -24,10 +24,11 @@ import {
   DEFERRED_FINISH_MS,
   dispatchDirectiveText,
   hasTestsPass,
+  type DeferredFinish,
 } from "../../src/verify/wiring";
 import { createChangedFileStore, type TreeSnapshot } from "../../src/verify/dispatch";
 import { gateResult } from "../../src/verify/gate";
-import { HANDLE_PATTERN, UNATTRIBUTED_RISK_REASON } from "../../src/verify/pending";
+import { HANDLE_PATTERN, MAX_ENTRIES_PER_SESSION, UNATTRIBUTED_RISK_REASON } from "../../src/verify/pending";
 import { REASONS } from "../../src/verify/risk";
 import type { RouterConfig } from "../../src/router/config";
 import type { DoD } from "../../src/verify/dod";
@@ -147,6 +148,12 @@ const FILE_DOD: DoD = { kind: "deterministic", source: "explicit", criteria: [],
 
 function snap(files: TreeSnapshot["files"], fingerprint: string): TreeSnapshot {
   return { cwd: root, root, head: "HEAD", fingerprint, dirty: files.length > 0, files, digests: new Map() };
+}
+
+/** A finish that deferred (the footer and handle), or the test fails with why it did not. */
+function deferredOf(finish: DeferredFinish): Extract<DeferredFinish, { deferred: true }> {
+  if (!finish.deferred) throw new Error(`not deferred: ${finish.reason} (${finish.detail})`);
+  return finish;
 }
 
 function makeWiring(verify: NonNullable<NonNullable<RouterConfig["enforcement"]>["verify"]> = {}) {
@@ -298,7 +305,7 @@ describe("wiring (2.4.2a)", () => {
       const { wiring, store } = makeWiring();
       await wiring.startDispatch(store, "task:orch:1", root, TESTS_DOD, "", false);
       state.snapshot = snap([{ path: resolve(root, "src", "a.ts"), status: "??" }], "after");
-      const finish = await wiring.finishDeferred(store, input());
+      const finish = deferredOf(await wiring.finishDeferred(store, input()));
       expect(finish.handle).toMatch(HANDLE_PATTERN);
       const first = finish.footer.split("\n")[0];
       expect(first.startsWith(`[router] unverified \u00b7 ${finish.handle} \u00b7 risk `)).toBe(true);
@@ -329,7 +336,7 @@ describe("wiring (2.4.2a)", () => {
       state.snapshot = snap([{ path: resolve(root, "src", "a.ts"), status: " M" }], "after");
       const finishing = wiring.finishDeferred(store, input({ producerTier: "medium" }));
       await vi.advanceTimersByTimeAsync(0);
-      const finish = await finishing;
+      const finish = deferredOf(await finishing);
       expect(finish.risk.reasons).toContain(REASONS.noReference);
       // Not cleared yet: clearing would abort the capture (dispatch.ts evict).
       expect(store.reference("task:orch:1")).toBe(reference);
@@ -344,7 +351,7 @@ describe("wiring (2.4.2a)", () => {
       const { wiring, store } = makeWiring();
       state.snapshot = undefined;
       await wiring.startDispatch(store, "task:orch:1", root, TESTS_DOD, "", false);
-      const finish = await wiring.finishDeferred(store, input());
+      const finish = deferredOf(await wiring.finishDeferred(store, input()));
       expect(finish.risk).toEqual({ level: "high", reasons: [UNATTRIBUTED_RISK_REASON] });
       expect(wiring.pending.listUnverified("orch")[0].changedFiles).toBe("unavailable");
     });
@@ -362,17 +369,35 @@ describe("wiring (2.4.2a)", () => {
       await vi.advanceTimersByTimeAsync(DEFERRED_FINISH_MS - 1);
       expect(done).toBe(false);
       await vi.advanceTimersByTimeAsync(1);
-      const finish = await finishing;
+      const finish = deferredOf(await finishing);
       expect(finish.risk.reasons).toEqual([UNATTRIBUTED_RISK_REASON]);
       expect(finish.handle).toMatch(HANDLE_PATTERN);
     });
 
-    it("a registration the registry refuses still yields an unverified footer without a handle", async () => {
+    it("QA-2.4-4: a registration the registry refuses is not deferred; the dispatch record stays for the required gate", async () => {
       const { wiring, store } = makeWiring();
       await wiring.startDispatch(store, "task:orch:1", root, TESTS_DOD, "", false);
+      state.snapshot = snap([{ path: resolve(root, "src", "a.ts"), status: " M" }], "after");
+      const reference = store.reference("task:orch:1");
       const finish = await wiring.finishDeferred(store, input({ producerSessionID: "" }));
-      expect(finish.handle).toBeUndefined();
-      expect(finish.footer.startsWith("[router] unverified \u00b7 no handle (not registered)")).toBe(true);
+      expect(finish).toMatchObject({ deferred: false, reason: "unregistered" });
+      expect(wiring.pending.listUnverified("orch")).toEqual([]);
+      // Not cleared once its reference settles: the required gate reads the same record.
+      await reference;
+      await new Promise(resolveTick => setTimeout(resolveTick, 0));
+      expect(store.reference("task:orch:1")).toBe(reference);
+      expect(store.baselineSnapshot("task:orch:1")).toBeDefined();
+    });
+
+    it("QA-2.4-4: a finish that throws is not deferred either", async () => {
+      const { wiring, store } = makeWiring();
+      await wiring.startDispatch(store, "task:orch:1", root, TESTS_DOD, "", false);
+      state.snapshot = snap([{ path: resolve(root, "src", "a.ts"), status: " M" }], "after");
+      vi.spyOn(wiring.pending, "register").mockImplementation(() => {
+        throw new Error("registry exploded");
+      });
+      expect(await wiring.finishDeferred(store, input())).toMatchObject({ deferred: false, reason: "error", detail: "registry exploded" });
+      expect(store.baselineSnapshot("task:orch:1")).toBeDefined();
     });
 
     it("canonicalTier lowercases and trims", () => {
@@ -451,7 +476,8 @@ interface PluginHarness {
   startedAt: number | undefined;
   /** The delegate producer's reply (default "DONE: implemented. VERIFY:required"). */
   delegateReply: string | undefined;
-  run(path: DispatchPath, prompt: string, reply?: string, tier?: string): Promise<string>;
+  /** `sessionID`: the dispatching (orchestrator) session; default "orch". */
+  run(path: DispatchPath, prompt: string, reply?: string, tier?: string, sessionID?: string): Promise<string>;
 }
 
 async function makePlugin(home: string): Promise<PluginHarness> {
@@ -462,10 +488,10 @@ async function makePlugin(home: string): Promise<PluginHarness> {
     created: [],
     startedAt: undefined,
     delegateReply: undefined,
-    async run(p, prompt, reply = "DONE: implemented.", tier = "fast") {
+    async run(p, prompt, reply = "DONE: implemented.", tier = "fast", sessionID = "orch") {
       counter += 1;
       if (p === "task") {
-        const input = { tool: "task", sessionID: "orch", callID: `call${counter}`, args: { subagent_type: "fast", prompt, description: "the work" } };
+        const input = { tool: "task", sessionID, callID: `call${counter}`, args: { subagent_type: "fast", prompt, description: "the work" } };
         const before = { args: { ...input.args } };
         await h.hooks["tool.execute.before"](input, before);
         h.startedAt = Date.now();
@@ -475,7 +501,7 @@ async function makePlugin(home: string): Promise<PluginHarness> {
         await h.hooks["tool.execute.after"](input, output);
         return output.output;
       }
-      return h.hooks.tool.delegate.execute({ task: prompt, tier }, { sessionID: "orch" });
+      return h.hooks.tool.delegate.execute({ task: prompt, tier }, { sessionID });
     },
   };
   const ctx = {
@@ -638,13 +664,16 @@ describe("the plugin routes by mode on both dispatch paths", () => {
 
     it("acceptance: 50 parallel deferred delegations with background off build no queue, spawn no test process, take no slot, and each carries the footer", async () => {
       const h = await makePlugin(home);
-      const outs = await Promise.all(Array.from({ length: 50 }, () => h.run(p, `Implement it.\n${ACCEPT_TESTS}`)));
+      // Two orchestrator sessions of 25: one session holds at most MAX_ENTRIES_PER_SESSION (32)
+      // unverified delegations (QA-2.4-4; the 33rd is gated, see below).
+      const outs = await Promise.all(Array.from({ length: 50 }, (_, i) => h.run(p, `Implement it.\n${ACCEPT_TESTS}`, undefined, undefined, i % 2 === 0 ? "orch" : "orch2")));
       for (const out of outs) {
         expect(out).toMatch(FOOTER_LINE);
         // Never labelled accepted or verified (the footer's first token is "unverified").
         expect(out).not.toMatch(/NOT ACCEPTED|\[router status: unmet\]|\[router\] (accepted|verified)|\[router \u2713/i);
       }
       expect(new Set(outs.map(o => /vrf_[0-9a-f]{24}/.exec(o)?.[0])).size).toBe(50);
+      expect([pendingOf("orch").length, pendingOf("orch2").length]).toEqual([25, 25]);
       // Git only: the capture and the snapshots are seams here; nothing else ran.
       expect(state.commands.filter(c => !c.startsWith("git "))).toEqual([]);
       expect(state.scopeOpeners).toBe(0);
@@ -653,6 +682,25 @@ describe("the plugin routes by mode on both dispatch paths", () => {
       expect(state.queues).toBe(0);
       expect(captured.wiring?.background).toBeUndefined();
       if (p === "delegate") expect(h.producerPrompts).toBe(50);
+    });
+
+    it("QA-2.4-4: the 33rd unverified delegation of a session is gated, never deferred over an evicted one", async () => {
+      const h = await makePlugin(home);
+      const deferred = await Promise.all(Array.from({ length: MAX_ENTRIES_PER_SESSION }, () => h.run(p, `Implement it.\n${ACCEPT_TESTS}`)));
+      for (const out of deferred) expect(out).toMatch(FOOTER_LINE);
+      const handles = pendingOf("orch").map(e => e.handle);
+      expect(handles).toHaveLength(MAX_ENTRIES_PER_SESSION);
+      // Session cap reached with unverified entries only: registry-full, so the required gate runs
+      // (its failing fileExists check rejects), and no earlier delegation leaves the list.
+      const gated = await h.run(p, `Implement it.\n${ACCEPT_TESTS_AND_MISSING}`);
+      expect(gated).not.toMatch(FOOTER_LINE);
+      expect(gated).not.toContain("no handle");
+      expect(gated).toMatch(p === "task" ? /NOT ACCEPTED/ : /\[router status: unmet\]/);
+      expect(state.scopeOpeners).toBeGreaterThan(0);
+      expect(pendingOf("orch").map(e => e.handle).sort()).toEqual([...handles].sort());
+      // Another session still defers (its own cap), and never evicts the first session's entries.
+      expect(await h.run(p, `Implement it.\n${ACCEPT_TESTS}`, undefined, undefined, "orch2")).toMatch(FOOTER_LINE);
+      expect(pendingOf("orch")).toHaveLength(MAX_ENTRIES_PER_SESSION);
     });
 
     it("result latency: a deferred return waits for nothing but the git-only snapshot, cut at DEFERRED_FINISH_MS", async () => {

@@ -31,7 +31,8 @@
 //     short while making a collision or a guess irrelevant in practice.
 //   - Collision: a candidate equal to a live handle or a tombstone is redrawn, at most
 //     HANDLE_MAX_DRAWS times; then `register` returns { ok: false, code: "handle-collision" }
-//     (never throws: a registration failure must never fail the delegation, R9 footer variant).
+//     (never throws: a registration failure must never fail the delegation; the dispatch runs the
+//     required gate instead, QA-2.4-4).
 //   - Input normalization (`normalizeHandle`, for router_verify arguments): trim, strip ONE pair of
 //     surrounding backticks or quotes, lowercase, then HANDLE_PATTERN. Anything else is undefined
 //     and reported as UNKNOWN_HANDLE_TEXT. router_verify dedupes normalized handles and accepts at
@@ -91,8 +92,9 @@
 //                 <= now (lazy, R7)                                        ABANDONED result
 //   verified      markVerifying                              verified      "settled": cached result,
 //                                                                          no new run (no CPU)
-//   any but       TTL (now - createdAt >= ttlMs), cap,       (tombstone)   onEvict(entry, cause)
-//   verifying     forgetSession, dispose
+//   any but       TTL (now - createdAt >= ttlMs),            (tombstone)   onEvict(entry, cause)
+//   verifying     forgetSession, dispose; a cap evicts
+//                 verified entries only (R7, QA-2.4-4)
 //
 //   - `retryable` is decided by the caller (2.4.3): true for results that say nothing about the
 //     producer's work — slot busy, deadline/abort, timed out, executor error, a joiner cut by its
@@ -156,12 +158,17 @@
 //   - Caps: MAX_ENTRIES_PER_SESSION = 32, MAX_ENTRIES_GLOBAL = 128, and a global weight
 //     MAX_GLOBAL_WEIGHT = 100000, weight = stored changed paths + (once the reference resolves
 //     "captured") reference.untracked.size + reference.tracked.size. The weight of a reference is
-//     added in its settle callback, which may evict (a promise callback, not a timer).
+//     added in its settle callback (a promise callback, not a timer). A reference that would exceed
+//     the weight cap is shed instead: the entry keeps its place and its reference becomes
+//     { kind: "none", reason: REFERENCE_SHED_REASON } (QA-2.4-4; stricter later, never a false pass).
 //   - Eviction order when a cap would be exceeded (session cap: within the session; global caps:
-//     across sessions): (1) every TTL-expired entry, (2) verified entries, oldest first, (3)
-//     unverified entries, oldest first. Verifying entries are never evicted. If the new entry still
-//     does not fit, register returns { ok: false, code: "registry-full" } and the footer says the
-//     delegation has no handle (R9); the delegation itself is never blocked.
+//     across sessions): (1) every TTL-expired entry, (2) verified entries, oldest first. Unverified
+//     and verifying entries are NEVER evicted by a cap (QA-2.4-4): an evicted unverified delegation
+//     would leave the pending list silently and read as verified. If the new entry still does not
+//     fit, register returns { ok: false, code: "registry-full" }. Every refusal (registry-full,
+//     handle-collision, invalid-input) makes the dispatch run the required gate instead (2.4.2
+//     finishDeferred): no delegation is ever left without a verdict path, and there is no footer
+//     without a handle.
 //   - Worst case: 128 entries, 100000 path strings of the registry's own weight (about 20 MB at
 //     200 B per path), 512 tombstones, 16 x sessions rejection records of <= 50 ids each.
 //   - Resources: a stored reference is data only (DispatchReference: commit ids and hash maps). The
@@ -192,11 +199,8 @@
 //   buildDeferredFooter({ handle, risk })  (section 1.5-16), handle registered:
 //     [router] unverified · <handle> · risk <level> (<r1>; <r2>; <r3>; +<k> more)
 //     [router] Call `router_verify` with this handle before building on this work if the risk matters.
-//   Without a handle (register returned ok: false):
-//     [router] unverified · no handle (<code phrase>) · risk <level> (<reasons>)
-//     [router] This delegation cannot be verified later; re-dispatch it with required verification if the risk matters.
-//   <code phrase>: "invalid-input" -> "not registered", "registry-full" -> "pending registry
-//   full", "handle-collision" -> "handle allocation failed".
+//   There is no footer without a handle (QA-2.4-4): a registration the registry refuses is not
+//   deferred, and the dispatch runs the required gate.
 //   The risk fragment is formatRisk(level, reasons, FOOTER_MAX_REASONS): `risk <level>`, then
 //   ` (<reasons>)` with at most maxReasons reasons, each through sanitizeDescription's character
 //   rules (no length cut), "; "-joined, `; +<k> more` only when k > 0. The parenthesis is omitted
@@ -412,6 +416,8 @@ export const RELEASED_REASON = "reference released after verification";
 export const ABANDONED_REASON = "verification run abandoned before it settled";
 export const DISPOSED_REASON = "verification registry disposed";
 export const UNATTRIBUTED_RISK_REASON = "changed files could not be attributed";
+/** R7, QA-2.4-4: a captured reference dropped at the weight cap (the entry itself is kept). */
+export const REFERENCE_SHED_REASON = "reference dropped at the pending registry's memory bound";
 /** R14: the late-notice header when a notice is not a plain failure (an unverifiable result). */
 export const LATE_NOTICE_MIXED_HEADER = "[router] Background verification did not pass these delegations:";
 /** R14: a settled handle replays its cached verdict (forcing note, next tier) with no new run. */
@@ -606,11 +612,12 @@ export interface PendingRegistry {
 }
 
 export interface FooterInput {
-  /** undefined when register returned ok: false. */
-  readonly handle: string | undefined;
+  /**
+   * The registered handle. A delegation the registry refuses is not deferred at all (QA-2.4-4: the
+   * required gate runs instead), so there is no footer without a handle.
+   */
+  readonly handle: string;
   readonly risk: RiskAssessment;
-  /** register's failure code, required when handle is undefined. */
-  readonly unregistered?: "invalid-input" | "registry-full" | "handle-collision";
 }
 
 export interface LateNotice {
@@ -661,12 +668,6 @@ function formatIds(ids: readonly string[], max: number): string {
   const rest = ids.length - shown.length;
   return rest > 0 ? `${shown.join(", ")} (+${rest} more)` : shown.join(", ");
 }
-
-const UNREGISTERED_PHRASE: Record<NonNullable<FooterInput["unregistered"]>, string> = {
-  "invalid-input": "not registered",
-  "registry-full": "pending registry full",
-  "handle-collision": "handle allocation failed",
-};
 
 function syntheticVerdict(reason: string): Verdict {
   return { pass: false, outcome: "unverifiable", method: "deterministic", reasons: [reason], caveats: [reason] };
@@ -731,14 +732,15 @@ function isNonEmptyString(value: unknown): value is string {
   return typeof value === "string" && value.length > 0;
 }
 
-/** Eviction order (R7): verified oldest first, then unverified oldest first. Verifying never. */
+/**
+ * Eviction order (R7, QA-2.4-4): verified entries only, oldest first. An unverified or verifying
+ * entry is never evicted by a cap: its delegation would leave the pending list silently and read as
+ * verified. A cap that only such entries fill refuses the new registration ("registry-full"), and
+ * the dispatch then runs the required gate instead.
+ */
 function evictionCandidates(records: Iterable<EntryRecord>): EntryRecord[] {
   const byAge = (a: EntryRecord, b: EntryRecord): number => a.createdAt - b.createdAt || a.seq - b.seq;
-  const all = [...records].filter((r) => r.state !== "verifying");
-  return [
-    ...all.filter((r) => r.state === "verified").sort(byAge),
-    ...all.filter((r) => r.state === "unverified").sort(byAge),
-  ];
+  return [...records].filter((r) => r.state === "verified").sort(byAge);
 }
 
 /** R2-R8, R11. */
@@ -900,13 +902,21 @@ export function createPendingRegistry(options: PendingRegistryOptions): PendingR
     return !("kind" in value);
   }
 
-  function enforceWeight(): void {
-    if (counters.weight <= maxWeight) return;
-    maintain(now());
-    for (const victim of evictionCandidates(byHandle.values())) {
-      if (counters.weight <= maxWeight) break;
-      evict(victim, "weight-cap");
+  /**
+   * R7, QA-2.4-4: a captured reference that would push the weight over the cap is shed, never an
+   * entry: the entry stays unverified and listed, and its reference becomes { kind: "none", reason:
+   * REFERENCE_SHED_REASON }, so a later verification cannot excuse pre-existing failures (stricter,
+   * never a false pass). Expired entries go first (verified entries hold no weight once released).
+   */
+  function admitReferenceWeight(rec: EntryRecord, refWeight: number): void {
+    if (counters.weight + refWeight > maxWeight) maintain(now());
+    if (!rec.live || rec.released) return;
+    if (counters.weight + refWeight <= maxWeight) {
+      rec.refWeight = refWeight;
+      counters.weight += refWeight;
+      return;
     }
+    rec.reference = Promise.resolve<ReferenceState>({ kind: "none", reason: REFERENCE_SHED_REASON });
   }
 
   function drawHandle(): string | undefined {
@@ -956,7 +966,7 @@ export function createPendingRegistry(options: PendingRegistryOptions): PendingR
         count -= 1;
       }
       if (count + 1 > maxPerSession) {
-        return { ok: false, code: "registry-full", detail: `session holds ${count} verifying entries` };
+        return { ok: false, code: "registry-full", detail: `session holds ${count} unverified or verifying entries` };
       }
     } else if (maxPerSession < 1) {
       return { ok: false, code: "registry-full", detail: "per-session cap is 0" };
@@ -1027,9 +1037,7 @@ export function createPendingRegistry(options: PendingRegistryOptions): PendingR
     // R7: the reference's weight is added when it resolves "captured" (a promise callback).
     void reference.then((state) => {
       if (!rec.live || rec.released || state.kind !== "captured") return;
-      rec.refWeight = state.reference.untracked.size + state.reference.tracked.size;
-      counters.weight += rec.refWeight;
-      enforceWeight();
+      admitReferenceWeight(rec, state.reference.untracked.size + state.reference.tracked.size);
     });
 
     return { ok: true, handle, evicted: victims.map((v) => v.rec.handle) };
@@ -1575,16 +1583,9 @@ export function unattributedRisk(): RiskAssessment {
 /** R9, section 1.5-16. */
 export function buildDeferredFooter(input: FooterInput): string {
   const risk = formatRisk(input.risk.level, input.risk.reasons, FOOTER_MAX_REASONS);
-  if (input.handle !== undefined) {
-    return (
-      `[router] unverified \u00b7 ${input.handle} \u00b7 ${risk}\n` +
-      "[router] Call `router_verify` with this handle before building on this work if the risk matters."
-    );
-  }
-  const phrase = UNREGISTERED_PHRASE[input.unregistered ?? "invalid-input"];
   return (
-    `[router] unverified \u00b7 no handle (${phrase}) \u00b7 ${risk}\n` +
-    "[router] This delegation cannot be verified later; re-dispatch it with required verification if the risk matters."
+    `[router] unverified \u00b7 ${input.handle} \u00b7 ${risk}\n` +
+    "[router] Call `router_verify` with this handle before building on this work if the risk matters."
   );
 }
 

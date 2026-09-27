@@ -647,17 +647,21 @@ const ModelRouterPlugin: Plugin = async (ctx: PluginInput) => {
               // 2.4.2c, section 1.5-16: a deferred delegation runs no gate and no ladder. A producer
               // that failed outright produced nothing to verify later; it keeps today's
               // failed-attempt path, which runs no verification process either.
-              if (dispatchStart !== undefined && producerError === null && isDeferred(dod, dispatchStart.directives)) {
-                const finish = await finishDeferred(changedFileStore, {
-                  dispatchID: baselineID,
-                  orchestratorSessionID: toolCtx?.sessionID ?? "",
-                  producerSessionID: producerSid,
-                  producerTier: tier,
-                  description: args.task,
-                  cwd: args.cwd,
-                  dod,
-                  dispatchedAt: dispatchStart.dispatchedAt,
-                });
+              const finish = dispatchStart !== undefined && producerError === null && isDeferred(dod, dispatchStart.directives)
+                ? await finishDeferred(changedFileStore, {
+                    dispatchID: baselineID,
+                    orchestratorSessionID: toolCtx?.sessionID ?? "",
+                    producerSessionID: producerSid,
+                    producerTier: tier,
+                    description: args.task,
+                    cwd: args.cwd,
+                    dod,
+                    dispatchedAt: dispatchStart.dispatchedAt,
+                  })
+                : undefined;
+              // QA-2.4-4 / QA-2.4-10: a finish that did not defer falls through to the required gate
+              // (and its ladder) below, with the dispatch record still in the store.
+              if (finish?.deferred === true) {
                 deferredOwnsBaseline = true;
                 if (producerSid !== baselineID) changedFileStore.clear(producerSid);
                 try {
@@ -673,6 +677,10 @@ const ModelRouterPlugin: Plugin = async (ctx: PluginInput) => {
                 }
                 await disposeChildSession(producerSid);
                 return { sessionID: producerSid, text: producerText, deferredFooter: finish.footer };
+              }
+              // Once a delegation is gated, every later attempt of its ladder is gated too.
+              if (finish !== undefined && dispatchStart !== undefined) {
+                dispatchStart = { ...dispatchStart, directives: { ...dispatchStart.directives, mode: "required" } };
               }
 
               const { gateBudgetMs } = resolveVerifyBudget(activeCfg);
@@ -1265,10 +1273,13 @@ const ModelRouterPlugin: Plugin = async (ctx: PluginInput) => {
                 dod,
                 dispatchedAt: start.dispatchedAt,
               });
-              output.output = appendRouterFooter(typeof output.output === "string" ? output.output : "", finish.footer);
-              // The dispatch record is cleared by finishDeferred once its capture settled.
-              if (childSessionID) changedFileStore.clear(childSessionID);
-              return;
+              if (finish.deferred) {
+                output.output = appendRouterFooter(typeof output.output === "string" ? output.output : "", finish.footer);
+                // The dispatch record is cleared by finishDeferred once its capture settled.
+                if (childSessionID) changedFileStore.clear(childSessionID);
+                return;
+              }
+              // QA-2.4-4 / QA-2.4-10: not deferred after all; today's required gate runs below.
             }
             // Same bound as the delegate gate: one deadline per invocation,
             // a withTimeout ceiling, and abort-on-reject so a hung check or

@@ -200,13 +200,29 @@ export interface DeferredFinishInput {
   readonly dispatchedAt: number;
 }
 
-export interface DeferredFinish {
-  /** The section 1.5-16 footer; always present, also when registration failed. */
-  readonly footer: string;
-  /** undefined when the registry refused the entry (the footer then says "no handle"). */
-  readonly handle: string | undefined;
-  readonly risk: RiskAssessment;
-}
+/**
+ * What finishDeferred decided. `deferred: false` means the delegation is NOT deferred and the
+ * caller runs today's required gate on it (QA-2.4-4, QA-2.4-10): the dispatch record is left in the
+ * store for that gate. Deferred or background verification is never weaker than that gate.
+ */
+export type DeferredFinish =
+  | {
+      readonly deferred: true;
+      /** The section 1.5-16 footer, naming the handle. */
+      readonly footer: string;
+      readonly handle: string;
+      readonly risk: RiskAssessment;
+    }
+  | {
+      readonly deferred: false;
+      /**
+       * "unregistered": the registry refused the entry (registry-full, handle-collision,
+       * invalid-input); "no-change": an attributed empty change set, which the required gate passes
+       * with no process (section 1.5-6); "error": the finish itself failed.
+       */
+      readonly reason: "unregistered" | "no-change" | "error";
+      readonly detail: string;
+    };
 
 /** What R11 lineage needs from a required gate's dispatch. */
 export interface LineageContext {
@@ -590,7 +606,9 @@ export interface VerificationWiring {
    * (runner.ts: no spawn), the risk (pending.ts R10), the drift digests (fs reads, not awaited),
    * `pending.register`, and the section 1.5-16 footer. The dispatch's reference promise is
    * registered un-awaited, and the dispatch record is cleared only after it settles (clearing it
-   * earlier would abort the capture). Never rejects: any failure still yields a footer.
+   * earlier would abort the capture). Never rejects. QA-2.4-4: when the registry refuses the entry
+   * or the finish fails, the result is `deferred: false` and the caller runs the required gate on
+   * the dispatch (whose record is then left in the store); there is no footer without a handle.
    */
   finishDeferred(store: ReturnType<typeof createChangedFileStore>, input: DeferredFinishInput): Promise<DeferredFinish>;
   /**
@@ -1223,6 +1241,7 @@ export function createVerificationWiring(deps: {
     const referenceCaptured = settledReferences.get(reference)?.kind === "captured";
     const deadline = createDeadline(DEFERRED_FINISH_MS);
     let risk: RiskAssessment = unattributedRisk();
+    let deferred = false;
     try {
       const change = await observeChange(store, input.dispatchID, input.producerSessionID, input.cwd, deadline);
       let changedFiles: ChangedPath[] | "unavailable" = "unavailable";
@@ -1255,9 +1274,11 @@ export function createVerificationWiring(deps: {
         ...(digests !== undefined ? { digests } : {}),
       });
       if (!reg.ok) {
-        logger.warn("[verify] deferred delegation not registered", { code: reg.code, detail: reg.detail });
-        return { footer: buildDeferredFooter({ handle: undefined, risk, unregistered: reg.code }), handle: undefined, risk };
+        // QA-2.4-4: never a delegation without a verdict path: the caller runs the required gate.
+        logger.warn("[verify] deferred delegation not registered; verifying synchronously", { code: reg.code, detail: reg.detail });
+        return { deferred: false, reason: "unregistered", detail: `${reg.code}: ${reg.detail}` };
       }
+      deferred = true;
       // 2.4.5 (pending.ts R14): queued, never awaited: the queue's own timer starts the run later.
       // An unattributed change set is not queued (nothing could run; it stays listed instead).
       if (background !== undefined && changedFiles !== "unavailable") {
@@ -1268,16 +1289,18 @@ export function createVerificationWiring(deps: {
           logger.warn("[verify] deferred delegation not queued for background verification", { handle: reg.handle, error: errorText(err) });
         }
       }
-      return { footer: buildDeferredFooter({ handle: reg.handle, risk }), handle: reg.handle, risk };
+      return { deferred: true, footer: buildDeferredFooter({ handle: reg.handle, risk }), handle: reg.handle, risk };
     } catch (err) {
-      logger.warn("[verify] deferred finish failed; the delegation has no handle", { error: errorText(err) });
-      return { footer: buildDeferredFooter({ handle: undefined, risk, unregistered: "invalid-input" }), handle: undefined, risk };
+      // QA-2.4-4: as for a refused registration, the required gate runs instead.
+      logger.warn("[verify] deferred finish failed; verifying synchronously", { error: errorText(err) });
+      return { deferred: false, reason: "error", detail: errorText(err) };
     } finally {
       deadline.dispose();
-      // The dispatch record goes once the finish has read it (delta) AND its reference settled:
-      // clearing it earlier aborts an in-flight capture (dispatch.ts evict) and ends its
-      // contamination tracking (section 1.5-14).
-      void reference.then(() => store.clear(input.dispatchID));
+      // A deferred dispatch's record goes once the finish has read it (delta) AND its reference
+      // settled: clearing it earlier aborts an in-flight capture (dispatch.ts evict) and ends its
+      // contamination tracking (section 1.5-14). A dispatch that is not deferred keeps it for the
+      // required gate, which clears it as before.
+      if (deferred) void reference.then(() => store.clear(input.dispatchID));
     }
   };
 
