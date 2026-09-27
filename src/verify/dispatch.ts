@@ -12,7 +12,7 @@ import { parseDoDFromDispatch, inferDoD } from "./dod";
 import type { DoD, InferHints } from "./dod";
 import { DEFAULT_IDLE_TTL_MS } from "../router/idle-sweep";
 import { basename, dirname, join, resolve } from "node:path";
-import { realpathSync } from "node:fs";
+import { existsSync, realpathSync } from "node:fs";
 import type { ReferenceState } from "./types";
 import type { DispatchReference } from "./reference";
 import { REFERENCE_NONE } from "./baseline";
@@ -326,7 +326,14 @@ export function createChangedFileStore(options: ChangedFileStoreOptions = {}) {
           const was = snapshot.digests;
           const now = current.digests;
           if (was === undefined || was === "unavailable" || now === undefined || now === "unavailable") {
-            available = false; // No per-file proof: the change set cannot be trusted (§1.5-6 S6).
+            // QA-2.1-14: no per-file proof (over the digest bounds). None of the dispatch-listed
+            // paths can be proven unchanged, so each is included (wider scope, fails safe) and the
+            // change set stays available: still listed, with its current status; left the listing
+            // (restored, committed, deleted), as modified or deleted by what is on disk now.
+            for (const file of snapshot.files) {
+              const key = pathKey(file.path);
+              files.set(key, listed.get(key) ?? files.get(key) ?? { path: file.path, status: existsSync(file.path) ? " M" : " D" });
+            }
           } else {
             const nowByKey = new Map([...now].map(([path, digest]) => [pathKey(path), digest] as const));
             for (const [path, digest] of was) {

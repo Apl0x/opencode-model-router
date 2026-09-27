@@ -5,7 +5,11 @@ import { lstat, readFile, readlink, realpath } from "node:fs/promises";
 import { resolve } from "node:path";
 import { ABSENT_DIGEST, FILE_DIGEST_PREFIX, LINK_DIGEST_PREFIX, type TreeSnapshot, type ChangedFile } from "./dispatch";
 
-/** QA-2.1-2: above this many paths to digest, a snapshot's per-file digests are "unavailable". */
+/**
+ * QA-2.1-2: above this many paths to digest, a snapshot's per-file digests are "unavailable".
+ * QA-2.1-14: the change set then widens to every dispatch-listed path (delta), so this bounds the
+ * gate's reads, not attribution.
+ */
 export const MAX_DIGEST_FILES = 500;
 /** QA-2.1-2: above this many bytes of regular files to digest, per-file digests are "unavailable". */
 export const MAX_DIGEST_BYTES = 64 * 1024 * 1024;

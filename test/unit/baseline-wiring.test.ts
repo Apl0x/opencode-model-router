@@ -227,23 +227,36 @@ describe("shell edits to files already dirty at dispatch, against a real git rep
     });
   });
 
-  it("over MAX_DIGEST_FILES dirty paths: an unchanged tree stays available, a changed one makes the result unverifiable", async () => {
-    await withRepo(async repo => {
+  it("over MAX_DIGEST_FILES dirty paths: an unchanged tree stays available, an edit widens to the dispatch paths and runs scoped tests (QA-2.1-14)", async () => {
+    await withRepo(async (repo, git) => {
+      // A vitest project, so the planner can scope a run (the argv seam records it; nothing spawns).
+      writeFileSync(join(repo, ".gitignore"), "node_modules/\n");
+      writeFileSync(join(repo, "package.json"), JSON.stringify({ name: "qa2114", scripts: { test: "vitest run" }, devDependencies: { vitest: "3.0.0" } }));
+      mkdirSync(join(repo, "node_modules", "vitest"), { recursive: true });
+      writeFileSync(join(repo, "node_modules", "vitest", "package.json"), JSON.stringify({ name: "vitest", version: "3.0.0", bin: { vitest: "vitest.mjs" } }));
+      writeFileSync(join(repo, "node_modules", "vitest", "vitest.mjs"), "");
+      git("add", ".gitignore", "package.json"); git("commit", "-q", "-m", "vitest");
       mkdirSync(join(repo, "gen"));
       for (let i = 0; i <= 500; i++) writeFileSync(join(repo, "gen", `f${i}.txt`), `${i}`);
       const { wiring, store } = await wiringAt(repo);
       await wiring.beginVerification(store, "d", undefined, dod);
       expect(store.baselineSnapshot("d")?.digests).toBe("unavailable");
-      expect((await wiring.prepareVerification(store, "d", "d")).changeBaseline).toBe("available");
+      expect(await wiring.prepareVerification(store, "d", "d")).toMatchObject({ changedFiles: [], changeBaseline: "available" });
+      // The producer's edit through the recorded edit tool breaks the already-dirty src/a.js.
       writeFileSync(join(repo, "src", "a.js"), "// WIP\nexport const add = (x, y) => x - y;\n");
+      store.record("d", "edit", { filePath: join(repo, "src", "a.js") });
       const prepared = await wiring.prepareVerification(store, "d", "d");
-      expect(prepared.changeBaseline).toBe("unavailable");
+      expect(prepared.changeBaseline).toBe("available");
+      expect(paths(prepared.changedFiles)).toContain(key(join(repo, "src", "a.js")));
+      expect(prepared.changedFiles).toHaveLength(502); // src/a.js and every gen/f*.txt listed at dispatch.
       const deps = wiring.buildGateDeps(undefined, undefined, prepared);
-      expect(deps.deterministic.changedFiles).toBe("unavailable");
-      const r = await accept({ dod }, { ...prepared, finalReturnText: "done", declaredOutputs: [], producerSessionID: "d", producerTier: "medium" }, deps);
-      expect(r.verdict.outcome).toBe("unverifiable");
-      expect(r.verdict.pass).toBe(false);
-      expect(state.commands).toEqual([]);
+      expect(deps.deterministic.changedFiles).not.toBe("unavailable");
+      state.commands = [];
+      const r = await accept({ dod: { ...dod, checks: [{ kind: "testsPass", command: "npm test" }] } }, { ...prepared, finalReturnText: "done", declaredOutputs: [], producerSessionID: "d", producerTier: "medium" }, deps);
+      expect(r.verdict.reasons.join(" ")).not.toContain("attribution-unavailable");
+      const scoped = state.commands.filter(c => c.includes("related"));
+      expect(scoped).toHaveLength(1);
+      expect(scoped[0]).toContain(join(repo, "src", "a.js"));
     });
   });
 });

@@ -337,16 +337,25 @@ describe("dispatch reference capture in the changed-file store", () => {
       const partial = await gate({ ...current, digests: new Map([[a, "file:a1"], [b, "file:b1"], [c, "file:c1"], [d, "file:d1"]]) });
       expect(partial.changedFiles.map(f => f.path).sort()).toEqual([b, u].sort());
     });
-    it("without per-file digests a changed fingerprint makes the change set unavailable; an unchanged one does not", async () => {
-      const edited = tree({ ...before, fingerprint: "f2" });
+    it("without per-file digests a changed fingerprint widens to every dispatch-listed path, still available (QA-2.1-14)", async () => {
+      const edited = tree({ ...before, fingerprint: "f2", files: [{ path: a, status: " M" }, { path: c, status: "D " }, { path: u, status: "??" }] });
+      const gone = resolve(cwd, "no-such-dir-qa2114", "b.js");
       for (const [dispatch, current] of [
         [{ ...before, digests: "unavailable" as const }, edited],
         [before, { ...edited, digests: "unavailable" as const }],
         [{ ...before, digests: undefined }, edited],
         [before, { ...edited, digests: undefined }],
       ]) {
-        expect((await gate(current, dispatch)).changeBaseline).toBe("unavailable");
+        const delta = await gate(current, dispatch);
+        expect(delta.changeBaseline).toBe("available");
+        // Still listed: the current status. Left the listing: modified if on disk, else deleted.
+        expect(delta.changedFiles).toEqual(expect.arrayContaining([
+          { path: a, status: " M" }, { path: c, status: "D " }, { path: u, status: "??" },
+        ]));
+        expect(delta.changedFiles.map(f => f.path).sort()).toEqual([a, b, c, d, u].sort());
       }
+      const left = tree({ ...before, files: [{ path: gone, status: " M" }], digests: "unavailable" });
+      expect((await gate(tree({ ...left, fingerprint: "f2", files: [] }), left)).changedFiles).toEqual([{ path: gone, status: " D" }]);
       const same = await gate({ ...before, digests: "unavailable" }, { ...before, digests: "unavailable" });
       expect(same).toEqual({ changedFiles: [], changeBaseline: "available" });
     });
