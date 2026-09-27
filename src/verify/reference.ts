@@ -1022,6 +1022,9 @@ function splitZ(stdout: string): string[] {
  * mixed, none, -text, or "" for a missing or non-regular file). Each record is
  * "i/%-5s w/%-5s attr/%-17s\t<path>" (git's ls-files.c); only the path follows the tab.
  */
+/** Pathspecs limiting `ls-files --eol` to paths with a conversion attribute (QA-1.5-17). */
+const EOL_ATTR_PATHSPECS = [":(attr:text)", ":(attr:text=auto)", ":(attr:eol=crlf)", ":(attr:eol=lf)"] as const;
+
 function parseEolList(stdout: string): Map<string, { i: string; w: string }> {
   const result = new Map<string, { i: string; w: string }>();
   for (const record of splitZ(stdout)) {
@@ -1769,7 +1772,13 @@ export async function materialize(
       // The caller's signal, not the budget's: this is the last step, so a spent budget
       // leaves the reference approximate ("" reason) instead of failing it.
       const eolClasses = async (cwd: string) => {
-        const listed = await runGit(deps.argv, ["ls-files", "--eol", "-z"], { cwd, timeoutMs: budget.remaining(), signal });
+        // QA-1.5-17: only paths whose attributes can convert (git >= 2.13 attr magic); without
+        // attributes only core.autocrlf converts, and that already added the "" reason above.
+        const listed = await runGit(deps.argv, ["ls-files", "--eol", "-z", "--", ...EOL_ATTR_PATHSPECS], {
+          cwd,
+          timeoutMs: budget.remaining(),
+          signal,
+        });
         return listed && listed.code === 0 ? parseEolList(listed.stdout) : undefined;
       };
       const liveEol = await eolClasses(root);
