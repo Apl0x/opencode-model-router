@@ -106,7 +106,8 @@ function relativize(p: string, root: string | undefined): string | null {
   const n = norm(p).replace(/^(\.\/)+/, "");
   if (!isAbsolute(n)) return n;
   if (root === undefined) return null;
-  const r = norm(root).replace(/\/+$/, "");
+  let r = norm(root);
+  while (r.endsWith("/")) r = r.slice(0, -1); // linear trim (QA-1.6-32)
   const fold = DRIVE.test(r);
   const nc = fold ? n.toLowerCase() : n;
   const rc = fold ? r.toLowerCase() : r;
@@ -145,7 +146,7 @@ export function isTestPath(p: string): boolean {
  * `*setup*` names (`src/setup.ts`, `SetupWizard.tsx`) are application code, not config.
  */
 const SETUP_FILE =
-  /\.setup\.[cm]?[jt]sx?$|^(setupTests|setup-tests|test-setup|global-setup|globalSetup|vitest\.setup|jest\.setup)\.[cm]?[jt]sx?$/i;
+  /\.setup\.[cm]?[jt]sx?$|^(setupTests|setup-tests|test-setup|global-setup|globalSetup|vitest\.setup|jest\.setup|setup-jest|jest-setup|vitest-setup|global-teardown)\.[cm]?[jt]sx?$/i;
 
 export function isConfigPath(p: string): boolean {
   const n = norm(p);
@@ -162,8 +163,10 @@ export function isConfigPath(p: string): boolean {
     b === "poetry.lock" ||
     b === "uv.lock" ||
     b === "Pipfile.lock" ||
+    b === "Pipfile" ||
     /^tsconfig.*\.json$/.test(b) ||
     /^(vite|vitest|jest)\.config\./.test(b) ||
+    /^playwright\.config\./.test(b) ||
     /^vitest\.workspace\./.test(b) ||
     SETUP_FILE.test(b) ||
     b === "conftest.py" ||
@@ -176,6 +179,7 @@ export function isConfigPath(p: string): boolean {
     b === "Makefile" ||
     b === "CMakeLists.txt" ||
     /^(requirements|constraints).*\.txt$/.test(b) ||
+    /^requirements.*\.in$/.test(b) || // pip-tools sources (QA-1.6-31)
     /(^|\/)requirements\/[^/]*\.txt$/.test(n)
   );
 }

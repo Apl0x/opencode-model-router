@@ -204,8 +204,33 @@ describe("assessRisk", () => {
 
   it("risk.ts imports nothing with side effects", () => {
     const src = readFileSync(new URL("../../src/verify/risk.ts", import.meta.url), "utf8");
-    expect(src).not.toMatch(/child_process|from ["'](node:)?(fs|http|https|net)["']|from ["']node:|\brequire\(|\bimport\(|\bprocess\.|\bfetch\(|\bWebSocket\b|\bXMLHttpRequest\b|^export .* from/m);
     expect(src.match(/^import .*$/gm)).toEqual(['import type { ChangedPath, StaticScoping } from "./runner";']);
+    // QA-1.6-30: comments stripped first; the one allowed type import removed; spaced calls caught.
+    const code = src
+      .replace(/\/\*[\s\S]*?\*\//g, "")
+      .replace(/(^|[^:\\])\/\/.*$/gm, "$1")
+      .replace('import type { ChangedPath, StaticScoping } from "./runner";', "");
+    expect(code).not.toMatch(
+      /child_process|\brequire\s*\(|\bimport\s*\(|\bimport\b|node:|\bprocess\b|\bfetch\b|\bWebSocket\b|\bXMLHttpRequest\b|^\s*export\b.*\bfrom\b|export\s*\*|\bWorker\b|\bEventSource\b|sendBeacon|\bBun\.|\bDeno\./m,
+    );
+  });
+
+  it("QA-1.6-31: more test-setup and dependency conventions are config", () => {
+    for (const p of [
+      "src/setup-jest.ts", "jest-setup.js", "vitest-setup.mts", "global-teardown.ts", "e2e/global-teardown.cjs",
+      "playwright.config.ts", "requirements.in", "requirements-dev.in", "Pipfile",
+    ]) {
+      expect(isConfigPath(p)).toBe(true);
+    }
+    expect(isConfigPath("src/teardown.ts")).toBe(false);
+    expect(isConfigPath("src/Pipfile.md")).toBe(false);
+  });
+
+  it("QA-1.6-32: root trailing-slash trim is linear", () => {
+    const t0 = performance.now();
+    run({ root: `${"/".repeat(1_000_000)}x`, changedFiles: [{ path: "src/a.ts" }] });
+    run({ root: `/repo${"/".repeat(1_000_000)}`, changedFiles: [{ path: "/repo/docs/a.md" }] });
+    expect(performance.now() - t0).toBeLessThan(200);
   });
 });
 
