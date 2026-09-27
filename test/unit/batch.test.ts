@@ -288,6 +288,14 @@ describe("attributeUnion", () => {
       py,
       { kind: "derived", exitCode: 1, result: run({ failingIds: ["tests/test_b.py"], failingFiles: ["/r/py/tests/test_b.py"], total: 3 }) },
     ],
+    [
+      // QA-2.2-11: the file part ends at the earliest separator, here "::", not at the " > " inside the name.
+      "7.3a pytest name containing \" > \" is charged to its file",
+      run({ failingIds: ["tests/test_a.py::test_cmp[1 > 0]", "tests/test_c.py::test_cmp[2 > 1]"], failingFiles: ["/r/py/tests/test_a.py", "/r/py/tests/test_c.py"] }),
+      pyCounts,
+      py,
+      { kind: "derived", exitCode: 1, result: run({ failingIds: ["tests/test_a.py::test_cmp[1 > 0]"], failingFiles: ["/r/py/tests/test_a.py"], total: 3 }) },
+    ],
     ["7.3a pytest failure elsewhere, counted", run({ failingIds: ["tests/test_c.py::t9"], failingFiles: ["/r/py/tests/test_c.py"] }), pyCounts, py, green(3)],
     ["7.3a pytest failure elsewhere, no counts", run({ failingIds: ["tests/test_c.py::t9"] }), undefined, py, { kind: "own-run", cause: "zero-test-ambiguous" }],
     // 7.3b
@@ -1845,6 +1853,24 @@ describe("createBatchCoordinator: attribution and rechecks", () => {
     ]);
   });
 
+  it("QA-2.2-11 (a): a complete pytest union keeps every failing id for the taint, also one that names no input", async () => {
+    const ghost = "tests/test_z.py::t_ghost";
+    const { calls, runtime } = harness(MODEL, {
+      execute: (spec, _d, n) => {
+        const out = ranModel(MODEL, spec);
+        if (n !== 0 || out.kind !== "ran") return out;
+        return { ...out, exitCode: 1, result: { ...out.result, failingIds: [ghost], failingFiles: [at("tests/test_z.py")] } };
+      },
+    });
+    const { runs, stats } = await batch(runtime, ["a", "b"].map((x) => req([`tests/test_${x}.py`], { command: "pytest" })));
+    expect(calls.executes).toHaveLength(1);
+    for (const run of runs) {
+      expect(run.recheck).toBeUndefined();
+      expect(ran(run).result).toMatchObject({ failingIds: [], complete: false, note: `batched run failure not reproduced by any request's own run: ${ghost}` });
+    }
+    expect(stats).toMatchObject({ unionRuns: 1, ownRuns: 0, taints: 1 });
+  });
+
   it("a guard-sensitive member of a green union: derived from per-file counts, else a confirmation run", async () => {
     const withCounts = harness();
     const one = await batch(withCounts.runtime, [req(["test/a.test.ts"]), req(["src/b.ts"])]);
@@ -2271,12 +2297,12 @@ interface Verdict {
   readonly unknown: readonly string[];
 }
 
-/** 2.1-T5's fileKeyOfId: the part before the first " > ", else before the first "::", else the id. */
+/** 2.1-T5's fileKeyOfId: the part before the earliest " > " or "::", else the id (QA-2.2-11). */
 function fileKeyOfId(id: string): string {
   const gt = id.indexOf(" > ");
-  if (gt >= 0) return id.slice(0, gt);
   const cc = id.indexOf("::");
-  return cc >= 0 ? id.slice(0, cc) : id;
+  const cut = gt < 0 ? cc : cc < 0 ? gt : Math.min(gt, cc);
+  return cut >= 0 ? id.slice(0, cut) : id;
 }
 
 /**
@@ -2355,8 +2381,11 @@ const VS = [..."abcdef"].map((x) => `src/${x}.ts`);
 /** pytest test files: three share the dotted suffix "test_x", and tests/test_x.py sits next to the package tests/test_x/. */
 const PT = ["tests/test_a.py", "tests/test_b.py", "tests/test_x.py", "sub/tests/test_x.py", "app/tests/test_x.py", "tests/test_x/test_y.py"];
 const V_NAMES = ["t1", "t2", "smoke1"];
-/** "TestK::t2" is a test method of class TestK: junit classname "<module>.TestK", name "t2". */
-const P_NAMES = ["t1", "TestK::t2", "smoke1"];
+/**
+ * "TestK::t2" is a test method of class TestK: junit classname "<module>.TestK", name "t2".
+ * QA-2.2-11: parametrized names may contain " > " (pytest writes it as "&gt;" in the report).
+ */
+const P_NAMES = ["t1", "TestK::t2", "smoke1", "test_cmp[1 > 0]", "TestK::test_gt[a > b]"];
 
 interface TestFile {
   readonly names: readonly string[];
@@ -2543,9 +2572,10 @@ function vitestReport(w: World, model: PropertyModel, spec: ScopedSpec, flaky: b
 function pytestReport(w: World, model: PropertyModel, spec: ScopedSpec, flaky: boolean): { text: string; code: number } {
   const cases: string[] = [];
   let failed = false;
+  const esc = (s: string) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
   const testcase = (classname: string, name: string, fails: boolean) => {
     failed ||= fails;
-    cases.push(`<testcase classname="${classname}" name="${name}" time="0.01">${fails ? '<failure message="assert">boom</failure>' : ""}</testcase>`);
+    cases.push(`<testcase classname="${esc(classname)}" name="${esc(name)}" time="0.01">${fails ? '<failure message="assert">boom</failure>' : ""}</testcase>`);
   };
   for (const abs of spec.inputs) {
     const k = slashKey(w, w.py, abs);
@@ -2660,6 +2690,8 @@ const propertyTally = {
   unpinnedSuffixUnions: 0,
   filteredBatches: 0,
   reusedRechecks: 0,
+  /** QA-2.2-11: pytest unions of several members with a failing name that contains " > ". */
+  gtNameUnions: 0,
 };
 
 describe("createBatchCoordinator: B12 batched verdicts equal solo verdicts", () => {
@@ -2744,6 +2776,7 @@ describe("createBatchCoordinator: B12 batched verdicts equal solo verdicts", () 
         if (union?.spec.args.includes("-c") === true) propertyTally.unpinnedSuffixUnions++;
       }
       const u = union?.out;
+      if (pytest && u?.kind === "ran" && u.result.failingIds.some((id) => id.includes(" > "))) propertyTally.gtNameUnions++;
       const comparable = u?.kind === "ran" && u.result.complete && !u.result.collectionError && u.result.source === "report";
       if (!comparable) expect(executes.length, `${at}: not comparable -> 1 + n`).toBe(1 + n);
       else if (pytest) expect(executes.length, `${at}: pytest attributes statically`).toBe(1);
@@ -2815,7 +2848,53 @@ describe("createBatchCoordinator: B12 batched verdicts equal solo verdicts", () 
     await c.dispose();
   });
 
-  it("the property cases reached every verdict, shared runs, flaky members, win32, several cwds, colliding pytest paths, -t and reuse", () => {
+  it("QA-2.2-11: a pytest failure whose name contains \" > \" is charged to its file through the real readResult; batched is never a pass where solo is unverifiable", async () => {
+    const pc: PropertyCase = {
+      world: LINUX,
+      model: {
+        related: {},
+        // parametrize('expr', ['1 > 0']): pytest 9.0.2 writes classname="tests.test_x" name="test_cmp[1 &gt; 0]".
+        now: { "tests/test_x.py": { names: ["test_cmp[1 > 0]", "t1"], failing: ["test_cmp[1 > 0]"] }, "tests/test_a.py": { names: ["t1"], failing: [] } },
+        refs: {},
+      },
+      requests: ["tests/test_x.py", "tests/test_a.py"].map((f) => ({
+        command: "pytest",
+        cwd: LINUX.py,
+        files: [f],
+        reference: { kind: "captured", reference: REF },
+        failureRecheck: true,
+      })),
+      flaky: false,
+    };
+    const id = "tests/test_x.py::test_cmp[1 > 0]";
+    const unionSpec = specOf(planCase(LINUX, { command: "pytest", cwd: LINUX.py, changedFiles: pc.requests.flatMap((r) => (r.files === "unavailable" ? [] : r.files.map((path) => ({ path, status: "M" as const })))) }, 0));
+    expect(pytestReport(LINUX, pc.model, unionSpec, false).text).toContain('<testcase classname="tests.test_x" name="test_cmp[1 &gt; 0]" time="0.01"><failure');
+
+    // Alone: the failure is A's, and pytest's recheck is runner-unsupported, so A is unverifiable (2.1 decision 5).
+    const solo = propertySeams(pc, false);
+    const soloRuns: TestsPassRun[] = [];
+    for (const cr of pc.requests) soloRuns.push(await directOver(solo.runtime, toRequest(cr)));
+    expect(ran(soloRuns[0] ?? aborted(""))).toMatchObject({ result: { failingIds: [id], complete: true } });
+    expect(soloRuns[0]?.recheck).toMatchObject({ kind: "unusable", cause: "runner-unsupported" });
+    expect(soloRuns.map((r) => judgeStandIn(r).verdict)).toEqual(["unverifiable", "pass"]);
+
+    // Batched: one union run through the real readResult; its " > " id is derived for A, as alone.
+    const { calls, runtime } = propertySeams(pc, false);
+    const c = createBatchCoordinator({ platform: "linux" });
+    const outs = pc.requests.map((cr) => c.hook(runtime)(toRequest(cr)));
+    await vi.advanceTimersByTimeAsync(WINDOW);
+    const runs = await Promise.all(outs);
+    expect(calls.executes).toHaveLength(1);
+    expect(calls.executes[0]?.out).toMatchObject({ result: { failingIds: [id], complete: true } });
+    expect(ran(runs[0] ?? aborted(""))).toMatchObject({ result: { failingIds: [id], complete: true } });
+    expect(runs[0]?.recheck).toEqual(soloRuns[0]?.recheck);
+    expect(runs.map((r) => judgeStandIn(r).verdict)).toEqual(["unverifiable", "pass"]);
+    expect(runs.map(judgeStandIn)).toEqual(soloRuns.map(judgeStandIn));
+    expect(c.stats()).toMatchObject({ unionRuns: 1, ownRuns: 0, taints: 0 });
+    await c.dispose();
+  });
+
+  it("the property cases reached every verdict, shared runs, flaky members, win32, several cwds, colliding pytest paths, -t, reuse and \" > \" names", () => {
     for (const [what, n] of Object.entries(propertyTally)) expect(n, what).toBeGreaterThan(10);
   });
 
@@ -2829,6 +2908,7 @@ describe("createBatchCoordinator: B12 batched verdicts equal solo verdicts", () 
     let capturedButOff = 0;
     let fewerAtRef = 0;
     let nested = 0;
+    let gtFailing = 0;
     for (let i = 0; i < PROPERTY_CASES; i++) {
       const pc = genCase(PROPERTY_SEED + i);
       if (pc.flaky) flaky++;
@@ -2841,7 +2921,8 @@ describe("createBatchCoordinator: B12 batched verdicts equal solo verdicts", () 
       if (pc.requests.some((r) => r.reference.kind === "captured" && !r.failureRecheck)) capturedButOff++;
       if (Object.values(pc.model.refs).some((at) => Object.entries(at).some(([k, f]) => f.names.length < (pc.model.now[k]?.names.length ?? 0)))) fewerAtRef++;
       if (Object.values(pc.model.now).some((f) => f.failing.includes("TestK::t2"))) nested++;
+      if (PT.some((k) => pc.model.now[k]?.failing.some((n) => n.includes(" > ")) === true)) gtFailing++;
     }
-    for (const n of [flaky, pytest, multi, distinctRefs, guardSensitive, zeroTest, capturedButOff, fewerAtRef, nested]) expect(n).toBeGreaterThan(10);
+    for (const n of [flaky, pytest, multi, distinctRefs, guardSensitive, zeroTest, capturedButOff, fewerAtRef, nested, gtFailing]) expect(n).toBeGreaterThan(10);
   });
 });

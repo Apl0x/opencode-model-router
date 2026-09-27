@@ -183,9 +183,11 @@
 //   RunResult computed from the union's) and "own-run" (the member's own planScopedRun spec runs,
 //   B5.5).
 //   Keys: fileKeyOf(spec.cwd, abs) is the id-space file key (cwd-relative, "/" separators), the
-//   construction readResult uses. idFileKey(id) is 2.1-T5's fileKeyOfId (the part before " > ",
-//   else before "::", else the whole id). It stays a private copy here until 2.2.3 can import
-//   2.1's.
+//   construction readResult uses. idFileKey(id) is 2.1-T5's fileKeyOfId: the part before the
+//   EARLIEST " > " or "::", else the whole id (QA-2.2-11: a pytest name may contain " > ", as in
+//   tests/test_x.py::test_cmp[1 > 0], and its file is still the part before "::"). It is the only
+//   id-to-file rule in this module (7.3a, 7.5, B8.5), and stays a private copy here until 2.2.3 can
+//   import 2.1's.
 //
 //   7.1 Not comparable: !U.complete, U.collectionError, or U.source !== "report" -> own-run
 //       (cause "not-comparable"). A vitest syntax error in any test file aborts `related` without
@@ -235,10 +237,11 @@
 //       it is decided once it is empty or no own run is left (B5.7). If it is then non-empty,
 //       some union failure was reproduced by no member's own run, and taintUnreproduced makes
 //       EVERY live member's "ran" result complete = false, with the note "batched run failure not
-//       reproduced by any request's own run: <ids>". A pytest union id that names none of the
-//       union's inputs (a classname readResult could not map, runner.ts I step 3) is left out: its
-//       raw form cannot equal any own run's id, and it only occurs in an incomplete union, whose
-//       members all run their own specs verbatim (7.1). Per 2.1-T6, complete = false never passes (R4 u12; R2i u10 or u8), and a
+//   reproduced by any request's own run: <ids>". A complete union keeps every id (QA-2.2-11: an
+//   id no derivation reproduces taints, whatever its key). Only an incomplete pytest union leaves
+//   out an id that names none of its inputs (a classname readResult could not map, runner.ts I
+//   step 3): its raw form cannot equal any own run's id, and every member of an incomplete union
+//   runs its own spec verbatim (7.1). Per 2.1-T6, complete = false never passes (R4 u12; R2i u10 or u8), and a
 //       proven introduced id still rejects (R2i x X- = F r1). The unreproduced id could belong to
 //       any member's related set, and for vitest/jest a green own run cannot rule that out.
 //
@@ -1118,14 +1121,16 @@ export function createBatchCoordinator(options: BatchCoordinatorOptions = {}): B
   }
 
   /**
-   * B7.5: the union failing ids the taint compares with the members' outcomes. For pytest an id
-   * that names none of the union's inputs is a classname readResult could not map (runner.ts I
-   * step 3: unmapped or ambiguous), whose raw form no own run can reproduce. It only occurs in an
-   * incomplete union, where every member runs its own spec verbatim anyway, so it is left out.
+   * B7.5: the union failing ids the taint compares with the members' outcomes. A complete union
+   * keeps every id (QA-2.2-11): an id no member's derivation reproduces must taint, whatever its
+   * key. Only an INCOMPLETE pytest union leaves out an id that names none of its inputs: that is a
+   * classname readResult could not map (runner.ts I step 3: unmapped or ambiguous), whose raw form
+   * no own run can reproduce, and every member of an incomplete union runs its own spec verbatim
+   * (7.1), so none of them is judged on the union's result.
    */
   function taintable(union: RanOutcome): readonly string[] {
     const spec = union.spec;
-    if (spec === undefined || !spec.inputsAreTests) return union.result.failingIds;
+    if (union.result.complete || spec === undefined || !spec.inputsAreTests) return union.result.failingIds;
     const keys = new Set(spec.inputs.map((f) => fold(fileKeyOf(spec.cwd, f, platform), platform)));
     return union.result.failingIds.filter((id) => keys.has(fold(idFileKey(id), platform)));
   }
@@ -1605,14 +1610,16 @@ export function fileKeyOf(cwd: string, absolutePath: string, platform: NodeJS.Pl
 }
 
 /**
- * 2.1-T5's fileKeyOfId, private until 2.2.3 can import it: the part of an id before " > ", else
- * before "::", else the whole id.
+ * 2.1-T5's fileKeyOfId, private until 2.2.3 can import it: the part of an id before the EARLIEST
+ * " > " or "::", else the whole id (QA-2.2-11). A vitest/jest id's first separator is " > ", and a
+ * pytest id's is "::", whatever its test name contains: `tests/test_x.py::test_cmp[1 > 0]` is keyed
+ * `tests/test_x.py`, never `tests/test_x.py::test_cmp[1`.
  */
 function idFileKey(id: string): string {
   const gt = id.indexOf(" > ");
-  if (gt >= 0) return id.slice(0, gt);
   const cc = id.indexOf("::");
-  return cc >= 0 ? id.slice(0, cc) : id;
+  const cut = gt < 0 ? cc : cc < 0 ? gt : Math.min(gt, cc);
+  return cut >= 0 ? id.slice(0, cut) : id;
 }
 
 /** The sum of `counts` over `keys`, matched with the platform's folding. */
