@@ -539,3 +539,119 @@ row, and 4 of 6 B12 chunks, each with "false pass" (e.g. seed 11158, `pytest -q`
 
 **QA-2.2-12, QA-2.2-13, QA-2.2-14, QA-2.2-15, QA-2.2-16**: accepted per owner rule (post-round-2:
 only major/critical are fixed). QA-2.2-15 (2) is covered anyway by the `" > "` names above.
+
+## Task 2.2.3 record (wiring)
+
+- **Merge:** `7b62cae` merges `origin/vrb/wave-2` (`fbcf456`, Phase 2.1) into `vrb/p22`. It had no
+  conflicts. `src/verify/types.ts` auto-merged: the 2.1.1 contract block is the same on both sides,
+  and wave-2 adds only 2.1's later fields (`Verdict.failures`, the `DeterministicDeps` testsPass
+  seams). Phase 2.1 did not touch `runner.ts`, so p22's `testsByFile` and the pytest rootdir
+  mapping carried over unchanged. After the merge, `npm run typecheck` was clean, and `batch.test.ts`
+  + `runner.test.ts` + `tests-pass-pipeline.test.ts` passed 984/984.
+- **Commits:** `ae92325` (a, wiring), `83dedaf` (b, tests).
+
+### 2.2.3a: wiring (`src/verify/wiring.ts`, `src/verify/batch.ts`, `src/index.ts`)
+
+- **One coordinator per plugin instance:** `createVerificationWiring` creates it once, with the
+  wiring's logger. A `batch` option passes the test seams (clock, timers, platform, maximum
+  window size); the logger is always the wiring's.
+- **Per gate (`buildGateDeps`, deviation D6):**
+  - 2.1's direct hook is built as before and becomes `runtime.direct`.
+  - With `budget.batchWindowMs > 0`, `testsPass` is `coordinator.hook(runtime)`. The runtime
+    shares the direct hook's scope opener, PlannerFs and budget:
+    - `plan` is `planScopedRun` with the same inputs as the direct hook, and with its git
+      searches bound to the deadline it is given (the member's deadline, or the batch deadline D
+      for the union, B6);
+    - `failureRecheck` is the gate-time `budget.failureRecheck` (QA-2.2-2);
+    - `recheckMinRemainingMs` is 2.1's `RECHECK_MIN_REMAINING_MS`.
+  - With `batchWindowMs <= 0`, the direct hook is used as is: no coordinator is involved.
+- **QA-2.2-8 (resolved):** `BatchRuntime.currentTree` is new, and additive. Each member keeps
+  its own gate's snapshot, and `recheck` forwards it: `scope.rechecker(command, cwd, tree)`.
+  `BatchRuntime.openScope` is now `OpenBatchScope`, whose scope's rechecker takes the optional
+  tree, as 2.1's `CheckScope` does. Any `OpenVerificationScope` still fits, because a
+  two-argument rechecker is assignable to it; `batch.test.ts` compiles unchanged.
+  - A single-member recheck gets that member's tree, exactly as alone.
+  - A shared recheck gets its first member's tree, with that member's command and cwd. Every
+    member of a group shares the reference and therefore its root (B8.2). The tree only feeds
+    materialize's same-repository guard (reference.ts section 4 step 0), so no verdict depends on
+    which member's tree is used.
+  - The frozen types block is untouched.
+- **`fileKeyOfId`:** batch.ts imports 2.1's exported `fileKeyOfId` from `baseline.ts`, and the
+  private `idFileKey` is gone.
+  - The separator rule is the same: the earliest `" > "` or `"::"`.
+  - 2.1's function also turns `\` into `/`. Both sides of every comparison are then
+    `/`-separated, because `fileKeyOf` already does that on the file side. readResult's ids are
+    `/`-separated anyway.
+  - `baseline.ts`'s only runtime import is `../guard/scrub`, so the new import creates no cycle.
+- **Sweep and dispose (`index.ts`, minimal):**
+  - `VerificationWiring` gains `sweepVerification()` (the coordinator's `sweep`) and
+    `disposeVerification()` (its `dispose`).
+  - The existing idle-TTL sweeper list gains `() => { sweepVerification(); }`. It is throttled
+    to once every 5 minutes, and each sweeper runs inside its own try/catch.
+  - Plugin `dispose` awaits `disposeVerification()` after `stopReferenceGc()` and before
+    `logger.flush()`. The coordinator's dispose never rejects. It waits at most
+    `BATCH_STALE_GRACE_MS` for a seam that ignores its abort signal, and nothing else is ever
+    that slow.
+- **Default behaviour change:** `batchWindowMs` defaults to 2000 (config.ts). A testsPass gate
+  with a spec now waits up to 2 s in a window before its run, unless the window fills up (8
+  requests) or the W3 rule closes it earlier.
+  - `baseline-wiring.test.ts`'s QA-2.1-14 case tests attribution through the direct path and ran
+    near its 5 s timeout. Its `wiringAt` config now sets `batchWindowMs: 0`. No assertion changed.
+
+### 2.2.3b: tests
+
+- **`test/integration/batch-wiring.test.ts` (new, 7 tests):**
+  - Setup: 5 concurrent gates through `createVerificationWiring` → `buildGateDeps` → `accept`,
+    over a real vitest-shaped project in a temp dir. The planner, scope opener, `readResult` and
+    judge are real. The fake seams are:
+    - `runArgv`: writes the JSON report the spec names;
+    - `runShell`;
+    - `acquireSlot`: counts holds and their nesting;
+    - `materialize` and `gcStaleReferences`: materialize records the tree it receives, then fails.
+  - Each scenario runs batched (window 60 s, closed by a size cap of 5) and with
+    `batchWindowMs: 0`. The acceptance, outcome, failure classification and reasons must be
+    equal.
+  - Assertions:
+    - Green path: 1 scoped run over the 5 sources, 1 acquire, 1 release, never 2 holds at
+      once. Alone: 5 runs and 5 acquires.
+    - Failing vitest path (mode B, D2): 1 + 5 runs, all under the one hold. Only the producer of
+      the failing test is unverifiable (its reference is none), as alone.
+    - QA-2.2-5 (B10): a gate settles while its batch still holds the slot; the hold is released
+      once, at the end.
+    - QA-2.2-8: with two distinct references, each batched recheck's materialize receives its
+      own gate's tree.
+    - Shared reference: exactly one recheck, with the tree of one of the failing members; alone,
+      there are two.
+    - `testScope: "full"` bypasses the window: the direct hook runs, with one shell run and one
+      hold per gate.
+    - Dispose: a gate that waits in its window, and a later gate, both get `BATCH_REASONS.disposed`
+      (unverifiable). Nothing spawns or acquires, `sweepVerification()` evicts nothing live, and a
+      second dispose resolves.
+  - Mutants: "the wiring never batches" fails 6 of 7 tests. "batch.ts drops the tree" fails the
+    2 tree tests.
+- **B12 with 2.1's real `judgeScoped` (`test/unit/batch.test.ts`):**
+  - `runCase` takes the judge as a parameter, and 6 more chunks run the same 300 seeds under
+    `judgeReal`, which maps `judgeScoped`'s ok/unverifiable/failures to the stand-in's shape.
+  - With the real judge, every solo and batched run is also judged by the stand-in, and both
+    judges must agree (B12: "both must agree"). They agree on all 300 cases.
+  - Mutant "judgeReal never says fail" fails all 6 chunks.
+  - Placement: the plan puts this variant under 2.2.3b, but it lives in `batch.test.ts`, next to
+    the harness it reuses (`genCase`, `propertySeams`, `directOver`). Moving the harness into a
+    shared module would rewrite 400 lines of a QA-reviewed test for no gain in what is checked.
+- **Test runs:**
+  - `npx vitest run --maxWorkers=2 test/unit/batch.test.ts test/integration/batch-wiring.test.ts
+    test/unit/baseline-wiring.test.ts test/unit/tests-pass-pipeline.test.ts
+    test/integration/layer2-wiring.test.ts test/integration/delegate-timeout.test.ts
+    test/integration/session-lifecycle.test.ts` → Test Files 7 passed (7), Tests 409 passed (409).
+    `batch.test.ts` has 158 tests, and `batch-wiring.test.ts` has 7.
+  - `npm run typecheck` is clean.
+  - The other wiring consumers that mention testsPass also pass, 224/224: `annotate-plan`,
+    `deterministic`, `dod`, `wiring`, `enforcement-defaults`, `modeA-e2e`, `modeB-e2e` and
+    `reference-gc-start`.
+  - The full suite was not run (§0.6.7).
+- **Coverage** (v8, the 7-file run with `--coverage.include` of both files):
+  - `batch.ts`: lines 98.55%, branches 93.09%. Uncovered: L1237-1238 (the defensive
+    `settleLate` branch) and L1478-1482 (sweep's eviction of an empty window), as in the 2.2.2
+    record.
+  - `wiring.ts`: lines 100%, branches 91.89%. No uncovered branch lies in the changed region
+    (L262, L504-545, L658-659); the uncovered arms are all in 2.1 code.
