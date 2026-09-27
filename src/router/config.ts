@@ -725,11 +725,12 @@ function validateEnforcement(obj: Record<string, unknown>): void {
         );
       }
     }
-    if (
-      enforcement.verify !== undefined &&
-      typeof enforcement.verify === "object" &&
-      enforcement.verify !== null
-    ) {
+    if (enforcement.verify !== undefined) {
+      // A non-object (including `null`) would skip every check below, and an
+      // override `verify: null` would erase the whole bundled block on merge.
+      if (!isPlainObject(enforcement.verify)) {
+        throw new Error("tiers.json: enforcement.verify must be an object");
+      }
       const verify = enforcement.verify as Record<string, unknown>;
       // An own `__proto__`/`constructor`/`prototype` key is never read, but a
       // later `Object.assign` copy would reparent through it; reject it here.

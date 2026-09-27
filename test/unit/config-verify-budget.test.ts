@@ -223,8 +223,16 @@ describe("validateConfig — enforcement.verify budget keys", () => {
     const good = Object.create({ maxWorkers: 9 });
     expect(resolveVerifyBudget(cfgWith(good), { cores: 16 }).maxWorkers).toBe(2);
   });
-  it("a null verify block resolves to defaults", () => {
-    expect(resolveVerifyBudget(cfgWith(null), { cores: 16 })).toEqual(DEFAULTS);
+  it("a non-object verify block is rejected", () => {
+    for (const bad of [null, "x", 5, []]) {
+      expect(() => cfgWith(bad)).toThrow("tiers.json: enforcement.verify must be an object");
+    }
+  });
+  it("an override verify:null cannot erase the base block through deepMerge", () => {
+    const merged = deepMerge(validRaw({ maxWorkers: 4 }), { enforcement: { verify: null } });
+    expect(() => validateConfig(merged)).toThrow(
+      "tiers.json: enforcement.verify must be an object",
+    );
   });
 });
 
