@@ -91,6 +91,45 @@ async function waitFor(predicate: () => Promise<boolean>, timeoutMs: number): Pr
   return predicate();
 }
 
+interface CwdHolder {
+  release(): Promise<void>;
+}
+
+/**
+ * A process whose cwd is `cwd`: on win32 a cwd handle blocks deleting that directory
+ * (a Node file handle does not). Resolves only once the child has printed READY, i.e.
+ * it runs with that cwd; the `spawn` event fires before the child has opened its cwd,
+ * and a holder gated on it lost that race (QA-1.5-14).
+ */
+async function holdCwd(cwd: string): Promise<CwdHolder> {
+  const holder = spawn(process.execPath, ["-e", "process.stdout.write('READY\\n'); setTimeout(() => {}, 120000)"], {
+    cwd, stdio: ["ignore", "pipe", "ignore"], windowsHide: true,
+  });
+  const closed = new Promise<void>((resolve) => {
+    holder.once("close", () => resolve());
+    holder.once("error", () => resolve());
+  });
+  const release = async () => {
+    holder.kill();
+    await closed;
+  };
+  try {
+    await new Promise<void>((resolve, reject) => {
+      let out = "";
+      holder.stdout.setEncoding("utf8").on("data", (chunk: string) => {
+        out += chunk;
+        if (out.includes("READY")) resolve();
+      });
+      holder.once("error", reject);
+      holder.once("exit", (code) => reject(new Error(`cwd holder exited before READY (code ${code})`)));
+    });
+  } catch (error) {
+    await release();
+    throw error;
+  }
+  return { release };
+}
+
 let base: string;
 let repo: string;
 let tmp: string;
@@ -498,13 +537,9 @@ describe("materialize / dispose", { timeout: 60_000 }, () => {
 
   it.runIf(isWin)("QA-1.5-9a: a process whose cwd is inside the reference -> dispose resolves bounded and warns; GC removes it later", async () => {
     const handle = await mat(await capture());
-    // A cwd handle blocks deleting that directory on win32 (a Node file handle does not).
-    const holder = spawn(process.execPath, ["-e", "setTimeout(() => {}, 120000)"], {
-      cwd: join(handle.dir, "packages"), stdio: "ignore", windowsHide: true,
-    });
-    const exited = new Promise((resolve) => holder.once("exit", resolve));
+    let holder: CwdHolder | undefined;
     try {
-      await new Promise((resolve, reject) => holder.once("spawn", resolve).once("error", reject));
+      holder = await holdCwd(join(handle.dir, "packages")); // READY-gated (QA-1.5-14)
       const started = Date.now();
       await expect(handle.dispose()).resolves.toBeUndefined();
       expect(Date.now() - started).toBeLessThan(20_000);
@@ -513,8 +548,7 @@ describe("materialize / dispose", { timeout: 60_000 }, () => {
       expect(await worktreeCount(repo)).toBe(2); // git never ran on the existing dir
       for (const link of handle.links) expect(await exists(link)).toBe(false); // links went first
     } finally {
-      holder.kill();
-      await exited;
+      await holder?.release();
     }
     // The released dir is ours and stale at once, although this process is alive and it is fresh.
     const report = await gcStaleReferences(repo, deps());
