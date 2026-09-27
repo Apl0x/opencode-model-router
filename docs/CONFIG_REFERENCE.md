@@ -190,10 +190,22 @@ may contain instruction text or paths.
 | `minGraderTier` | `string \| null` | `null` | Optional floor for the grader tier, independent of producer. `null` means no floor and is identical to omitting the key. |
 | `delegateTimeoutMs` | `integer ≥ 1` | `600000` (10 min) | Ceiling for **one** producer `session.prompt` turn in the `delegate` tool. Each ladder attempt gets its own budget. On expiry the child session is aborted and deleted, the attempt is recorded as failed with `producer failed: …`, and the ladder advances — the delegation never fabricates a pass. |
 | `graderTimeoutMs` | `integer ≥ 1` | tier-dependent | Explicit override wins over grader-tier defaults: fast `60000`, medium `180000`, heavy/custom `600000` ms, defined in `GRADER_TIMEOUT_MS_BY_TIER` in `src/verify/timeout.ts`. Timeout produces `unverifiable`; the grader is aborted and deleted. |
-| `gateBudgetMs` | `integer ≥ 1` | `90000` (90 s) | Separate whole-gate ceiling for one delegate attempt. Expiry aborts that invocation's graders and produces `unverifiable`, not producer failure. Raise this too if a medium/heavy grader should use its full tier timeout. |
+| `gateBudgetMs` | `integer ≥ 1` | `90000` (90 s) | Deadline for every synchronous verification: one delegate attempt's gate, one required `task` gate, one `router_verify` call. Expiry aborts that invocation's graders and test runs and produces `unverifiable`, not producer failure. Raise this too if a medium/heavy grader should use its full tier timeout. **No longer shipped in the bundled `tiers.json`** (removed; the in-code default applies — set it in an overrides file to change it). |
 | `strictUnverifiable` | `boolean` | `false` | Restores the former fail-closed rejection for unavailable verification. It does not buy producer retries or tier escalations. |
-| `testBaseline` | `boolean` | `true` | Capture conservative test baselines in the live working directory at dispatch, asynchronously. Set `false` to disable capture **and consumption**; `testsPass` then reports `unverifiable`, not a producer failure. Does not disable changed-file snapshots for grading. |
-| `baselineTimeoutMs` | `integer ≥ 1` | `60000` (60 s) | Independent ceiling for each dispatch fingerprint and baseline capture (test run plus closing fingerprint). Expiry discards the baseline and kills its whole process tree (`taskkill /T` on Windows, the process group on POSIX), so a timed-out suite cannot keep running as orphaned workers. Neither is awaited before producer dispatch. |
+| `testScope` | `"affected" \| "full"` | `"affected"` | Which tests a verification runs. `"affected"` runs only the tests related to the producer's changed files (see [Affected-test verification](#affected-test-verification)). `"full"` runs the configured `testsPass` command once, unscoped. |
+| `maxWorkers` | `integer ≥ 1` | `2` | Worker cap passed to runners that support one (vitest/jest). |
+| `lowPriority` | `boolean` | `true` | Run verification commands at below-normal OS priority. |
+| `maxConcurrentVerifications` | `integer ≥ 1` | `max(1, floor(cores / 8))` | Machine-wide verification slots, shared by every opencode process on the machine. `cores` is `os.availableParallelism()`. |
+| `slotWaitMs` | `integer ≥ 0` | `60000` (60 s) | Maximum wait for a verification slot (`0` = no wait); a verification that gets no slot in time is `unverifiable`. **Residual (QA-1.4-21):** a lock whose owner is not provably dead is reclaimed only by a caller that waits or stays alive through ~8 s of observation, so a very short wait may give up on a slot that a longer one would reclaim. |
+| `baselineTimeoutMs` | `integer ≥ 1` | `15000` (15 s) | Bounds the whole git-only reference capture taken at dispatch. It runs no tests. |
+| `captureWaitMs` | `integer ≥ 0` | `5000` (5 s) | Longest wait for the reference capture before the producer starts (`0` = never wait). **Clamped to `baselineTimeoutMs`.** A `VERIFY_WAIT:` directive overrides it per dispatch. |
+| `failureRecheck` | `boolean` | `true` | Capture a dispatch-time reference and recheck scoped failures against it. `false` = no reference; a failing scoped run then counts as a failure without a recheck. |
+| `recheckTimeoutMs` | `integer ≥ 1` | `60000` (60 s) | Budget for the reference rerun (the recheck). |
+| `batchWindowMs` | `integer ≥ 0` | `2000` (2 s) | Coalescing window for concurrent gates (`0` = no batching). The effective window is `min(batchWindowMs, gateBudgetMs / 10)`. |
+| `defaultVerify` | `"deferred" \| "required"` | `"deferred"` | Mode for dispatches without a `VERIFY:` directive. See [Deferred verification](#deferred-verification). |
+| `background` | `boolean` | `false` | Also run deferred verifications in the background. Opt-in. **Read at plugin start: changing it needs a restart.** |
+| `pendingTtlMs` | `integer ≥ 1` | `3600000` (1 h) | How long an unverified delegation stays verifiable. **Read at plugin start: changing it needs a restart.** |
+| `testBaseline` | `boolean` | _(none)_ | **Deprecated** (logs a one-time warning whenever the key is present, whatever its value). `false` maps to `failureRecheck: false`; `true` changes nothing; an explicit `failureRecheck` wins. Use `failureRecheck`. |
 
 Verification has three outcomes: `pass` means checks ran successfully, `fail` means
 the work did not satisfy a performed check, and `unverifiable` carries the reason
@@ -202,49 +214,62 @@ appending a **Verification caveats — NOT verified** list for every unavailable
 acceptance does not turn those checks into passes. Mixed failure/unavailable results
 still reject and may escalate. Strict mode rejects unavailable-only results without
 escalation. `run`, build and lint exit failures remain genuine failures. `testsPass`
-compares against a measured dispatch-time baseline instead of blaming the producer
-for every non-zero exit.
+runs only the affected tests and rechecks their failures against a dispatch-time
+reference instead of blaming the producer for every non-zero exit.
 
-### Test and changed-file baselines
+### Affected-test verification
 
-Both native `task` and plugin `delegate` start capture before producer execution,
-but only when the dispatch's DoD carries a `testsPass` check; read-only and other
-dispatches run no tests. `testsPass` commands use their own cache entries and the
-same command allowlist as verification. At most one capture runs per working
-directory and command: while one is in flight, a dispatch with a different tree
-fingerprint gets no baseline (`unverifiable`) instead of starting a second suite.
-No repository is copied and tests run only in the live directory; suites can still
-have external side effects (ports, databases, services). Disable `testBaseline` for
-projects where background execution is inappropriate.
+A `testsPass` check does **not** run the whole suite, and nothing runs tests at
+dispatch. What happens instead:
 
-The existing changed-file store owns a **per-plugin-instance, in-memory** cache,
-evicted by the same idle-TTL sweep as session state. Its key is canonical working
-directory, Git HEAD, SHA-256 of porcelain status plus binary working/index diffs
-and untracked file contents, and the exact test command. Dirty starting trees are
-allowed, explicitly recorded and compared only to the same fingerprint. A changed
-HEAD or uncommitted diff cannot reuse that entry. Delegate retries retain the
-original dispatch reference, so a failed attempt cannot become its own baseline.
+1. **Scoped run (after the producer returns).** With `testScope: "affected"` (the
+   default) the gate runs only the tests related to the producer's changed files:
+   `vitest related <files>` / `jest --findRelatedTests <files>`-style related runs
+   for JS runners, and the affected test files for pytest. `maxWorkers` caps the
+   runner's workers where the runner supports it. With `testScope: "full"` the
+   configured `testsPass` command runs **once**, unscoped. Changed files that cannot
+   be scoped make the check `unverifiable`, never a silent full run.
+2. **Dispatch-time reference (git only).** At dispatch the router records the tree
+   with `git stash create` (a commit object holding tracked changes, without
+   touching your working tree or stash list) plus copies of untracked files. This
+   capture runs no tests and is bounded by `baselineTimeoutMs`; the producer waits
+   for it at most `captureWaitMs`. Only when a scoped run **fails** and needs a
+   recheck is the reference materialized, as a detached `git worktree` whose
+   `node_modules` are linked to the live ones (directory junctions on Windows).
+3. **Recheck.** The failing tests are rerun in the reference (bounded by
+   `recheckTimeoutMs`). A failure that also fails at an **exact** reference is
+   pre-existing and does not count against the producer: the accepted result means
+   **"no worse than before," not "the suite is green,"** and says so. An
+   approximate or unusable reference (the capture was incomplete, timed out, or the
+   rerun could not be planned) makes the check `unverifiable`, not a pass.
+   `failureRecheck: false` skips the reference and the recheck.
+4. **Machine-wide slot.** Every verification run takes one of
+   `maxConcurrentVerifications` slots shared by all opencode processes on the
+   machine, runs at below-normal priority when `lowPriority` is `true`, and waits
+   at most `slotWaitMs` for a slot (see the QA-1.4-21 residual in the table above).
+5. **Batching.** Concurrent gates with the same runner and options that arrive
+   within the effective window `min(batchWindowMs, gateBudgetMs / 10)` share one
+   run. Each gate still gets the verdict it would have got alone.
 
-Capture is discarded if its closing fingerprint differs, an editing tool is
-observed for that directory during capture, execution times out, or fingerprinting
-is unavailable. An edit with unknown directory conservatively invalidates all
-in-flight captures. Edits are observed before and after tools, including patches.
-Shell/exec tools conservatively count as possible edits during capture, even when
-their command ultimately only reads; they are not added to the child's edit log.
-Submodule repositories are conservatively unavailable; ignored files and external
-environment changes are not fingerprinted. External edit-and-revert cycles between
-fingerprints are not observable unless editing-tool hooks report them.
+Outcomes: a scoped failure that is not pre-existing rejects and can escalate. An
+`unverifiable` result is **accepted with a caveat** unless `strictUnverifiable` is
+`true`; it is never reported as a pass.
 
-`testsPass` records exit code, opportunistic failing identities and test counts.
-Complete identity sets are compared by difference; only newly failing identities
-are named in a rejection. A formerly green suite becoming non-zero, or an increased
-failure count, rejects and can escalate. Equal non-zero exits or counts without
-complete identities cannot prove that failures are unchanged: they produce
-`unverifiable`, with the observed identities/count/exit for human judgment. Unknown
-runner output never throws. Missing, disabled, timed-out or contaminated baselines
-likewise produce `unverifiable` (accepted with a caveat unless strict mode is enabled).
-An accepted comparison against a pre-broken baseline means **“no worse than before,”
-not “the suite is green”**; the returned result includes that explicit verification note.
+**pytest.** A green pytest run passes. A failing pytest run is always
+`unverifiable`: the reference rerun is not supported for pytest, because an
+editable install imports the live tree rather than the reference worktree, so the
+rerun could not prove anything.
+
+**Windows.** The reference worktree links `node_modules` with directory junctions,
+which need no elevation. When the plugin directory is reached through an 8.3 short
+path (for example `C:\Users\ABCDEF~1\…`), a rerun can be unplannable, which makes
+the check `unverifiable` (QA-2.4-23).
+
+**Deprecations.** `testBaseline` is deprecated (`false` maps to
+`failureRecheck: false`; a one-time warning is logged). `gateBudgetMs` is no
+longer shipped in the bundled `tiers.json`; its in-code default applies.
+
+### Grader changed-file set
 
 For the LLM grader, the dispatch snapshot is a changed-path set. Grader input is
 the child's editing-tool paths union paths newly present in the current changed
@@ -274,6 +299,117 @@ unavailable. No arbitrary `npm run build` is attempted when neither exists.
 > negative values are **rejected at load** precisely so that "no timeout" cannot be
 > requested by accident. `gateBudgetMs` bounds verification, not production, and
 > should stay well under `delegateTimeoutMs`.
+
+---
+
+## Deferred verification
+
+**By default an unverified delegation is not checked unless the orchestrator asks
+(`router_verify` / `VERIFY:required`) or `background` is enabled.**
+
+With `defaultVerify: "deferred"` (the default), a qualifying delegation returns at
+once, marked unverified, with a handle the orchestrator can verify later.
+
+### Which delegations defer
+
+All of these must hold. Everything else runs the required (synchronous) gate:
+
+- the caller is a proven root orchestrator (a subagent cannot defer its own work);
+- the DoD carries a `testsPass` check;
+- the producer changed files.
+
+When registration fails (for example a handle collision), the delegation falls
+back to the required gate. It is never marked accepted or verified by that failure.
+The deferred return adds up to 2 s (typically ~0.4–0.5 s) for a git-only snapshot
+of the producer's changes.
+
+### Directives
+
+| Directive | Effect |
+|---|---|
+| `VERIFY:required` | Gate this dispatch synchronously, whatever `defaultVerify` says. |
+| `VERIFY:deferred` | Defer this dispatch (if it qualifies, see above). |
+| `VERIFY_WAIT:<n>s` | Wait at most `<n>` seconds for the reference capture before the producer starts (`<n>ms` also accepted). `0` is allowed; the value is capped at `baselineTimeoutMs`. |
+
+Write the keys in upper case. Lower-case keys go through a prose guard and are
+often ignored. Directives are parsed **only from the orchestrator's own dispatch
+prompt** (the `task`/`delegate` prompt argument), never from tool results or a
+subagent's text. Because the **first valid occurrence wins**, put the directives
+before any quoted text: a quoted `VERIFY:deferred` that appears earlier would win.
+
+### The footer
+
+A deferred result ends with this footer (from `buildDeferredFooter` in
+`src/verify/pending.ts`):
+
+```text
+[router] unverified · vrf_<24 hex> · risk …
+[router] Call `router_verify` with this handle before building on this work if the risk matters.
+```
+
+The risk part is the level and up to a few reasons. The router always appends its
+footer last, so **only the last `[router]` footer counts**. A producer can print a
+fake footer earlier in its text.
+
+### Risk levels
+
+From `src/verify/risk.ts`. The level is the maximum of every matching row, then
+row 12 applies once. Rows 1–2 stop evaluation.
+
+| #  | Condition | Level / effect |
+|----|---|---|
+| 1  | no changed files | low, stop |
+| 2  | every changed file is documentation | low, stop |
+| 3  | 1–5 changed files | low |
+| 4  | 6–15 changed files | medium |
+| 5  | 16 or more changed files | high |
+| 6  | a test file was deleted, or renamed to a non-test path | high |
+| 7  | a test file (incl. snapshots) was modified (added, changed, renamed) | medium |
+| 8  | a non-test file was deleted or any file was renamed | medium |
+| 9  | config / lock / CI / test-setup file changed | medium |
+| 10 | scoping impossible (unverifiable) | medium |
+| 11 | producer tier `fast` | medium |
+| 12 | no reference captured | +1 step (max high) |
+
+### `router_verify`
+
+Pass **exactly one** of `handles` (the `vrf_` handles from the footers) or
+`pending: true` (every still-unverified delegation of the calling session). The
+tool runs the same checks as a required verification (affected tests, batched,
+under the verification slot) with **one `gateBudgetMs` deadline per call**, and
+returns one verdict per handle: pass, fail (with the introduced failures and a
+suggested next tier) or unverifiable. Nothing is retried or escalated for you.
+
+Verification runs on the **current** tree, not a copy of the tree as the producer
+left it. Drift is checked only on the producer's own files: if any of them changed
+since the producer returned, a pass becomes `unverifiable`. Changes to other files
+are not detected. Handles live in memory: after an opencode restart they are
+unknown. An entry expires after `pendingTtlMs`.
+
+### Pending list
+
+While a session has unverified delegations, the router injects a list into the
+orchestrator's system prompt: **at most 5, newest first** (then `... and N more`),
+ending with a reminder to call `router_verify` before the final answer.
+
+### `background`
+
+Off by default, opt-in. When `true`, deferred delegations are also verified in the
+background at low priority, and foreground test runs preempt them. A background
+result that does not pass is shown **once** as a late notice in the orchestrator's
+next system prompt (`buildLateNoticeBlock`):
+
+```text
+[router] Background verification found introduced failures:
+- vrf_… · <description> · failing: <test ids>
+[router] Nothing was retried; decide whether to re-dispatch.
+[router] Call `router_verify` with a handle for its full verdict; nothing is run again.
+```
+
+When some notices are unverifiable rather than failures, the header reads
+`[router] Background verification did not pass these delegations:`. A pass
+produces no notice. `background` and `pendingTtlMs` are read at plugin start, so
+**changing either needs a restart**.
 
 ---
 
@@ -382,8 +518,11 @@ Evaluated by `resolveEnforcementMode` on every dispatch.
 | `verify.minGraderTier` must be a string or `null`. |
 | `verify.graderTemperature` must be a number ≥ 0. |
 | `verify.requireExplicitDoD` must be a boolean. |
-| `verify.delegateTimeoutMs`, `verify.graderTimeoutMs`, `verify.gateBudgetMs` and `verify.baselineTimeoutMs` must each be an integer ≥ 1 (milliseconds). `0` and negatives are rejected, not read as "no timeout". |
-| `verify.testBaseline` must be a boolean. |
+| `verify.delegateTimeoutMs`, `verify.graderTimeoutMs`, `verify.gateBudgetMs`, `verify.baselineTimeoutMs`, `verify.recheckTimeoutMs` and `verify.pendingTtlMs` must each be an integer ≥ 1 (milliseconds). `0` and negatives are rejected, not read as "no timeout". |
+| `verify.maxWorkers` and `verify.maxConcurrentVerifications` must each be an integer ≥ 1. |
+| `verify.captureWaitMs`, `verify.slotWaitMs` and `verify.batchWindowMs` must each be an integer ≥ 0 and ≤ 2147483647 (milliseconds). |
+| `verify.lowPriority`, `verify.background`, `verify.failureRecheck` and the deprecated `verify.testBaseline` must each be a boolean. |
+| `verify.testScope` must be `"affected"` or `"full"`; `verify.defaultVerify` must be `"deferred"` or `"required"`. |
 | `proportional.trivialBypass` must be a boolean. |
 | A tier's `effort` (when present) must be one of `low \| medium \| high \| xhigh \| max`. Error: `tiers.json: preset '<preset>' tier '<tier>': effort must be one of low, medium, high, xhigh, max`. |
 
@@ -745,7 +884,6 @@ pins this: it resolves the real policies from the shipped file and from the same
 | `verify.delegateTimeoutMs` | `600000` | `src/index.ts` (`delegate` producer prompt) |
 | `verify.graderTimeoutMs` | fast `60000` / medium `180000` / heavy/custom `600000` | `src/verify/timeout.ts` (`graderTimeoutMs`), consumed by `dispatchGrader` |
 | `verify.strictUnverifiable` | `false` | `src/verify/gate.ts` |
-| `verify.gateBudgetMs` | `90000` | `src/index.ts` (`accept()` call in `delegate`) |
 | `escalate.ladder` | `["fast","medium","heavy"]` | `src/escalate/ladder.ts` |
 | `escalate.floorTier` | `null` | `src/escalate/ladder.ts` |
 | `escalate.maxAttemptsPerTier` | `1` | `src/escalate/ladder.ts` |
@@ -757,6 +895,8 @@ Fields deliberately **not** shipped, because no code reads them and a written-do
 would document a fiction: `verify.require` (no default — see above), `verify.graderPolicy`,
 `verify.preferDeterministic`, `proportional.trivialClassifier`, and
 `escalate.costCeiling.base`. These are validated when present but never consumed.
+`verify.gateBudgetMs` was removed from the bundled file; its in-code default (`90000`)
+still applies, as do the defaults of the other §1.4 `verify` keys (see the `verify` table).
 
 ### `mode` defaults to `advisory`, and what `enforced` would change
 
