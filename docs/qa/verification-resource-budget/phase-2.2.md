@@ -145,6 +145,7 @@ export interface BatchRuntime {
   readonly openScope: OpenVerificationScope;
   readonly batchWindowMs: number;
   readonly recheckMinRemainingMs: number;
+  readonly failureRecheck: boolean; // QA-2.2-2: the gate-time setting, read per request
 }
 export interface BatchTimers {
   setTimeout(callback: () => void, ms: number): unknown;
@@ -221,9 +222,46 @@ The full breakdown is in `batch.ts` B16. In brief:
 1. Approve P1 (runner.ts `RunResult.testsByFile` + `test/unit/runner.test.ts` cases) as a 2.2
    write-set addition? Without it 2.2.2 skips task a, and green batches with test-file changes pay
    confirmation runs.
+   **Decided: approved** by the orchestrator. P1 landed as `e4ab59b`. The QA-2.2-1 root fix in
+   runner.ts (`3fd26e4`) was approved under the same write-set addition.
 2. Is the acceptance reading in note 5 accepted? The criterion "≤ 1 scoped run + ≤ 1 recheck per
    window" would hold on the green path, on the pytest path and with a shared reference. On the
    vitest/jest failing path, 1 + n runs are expected under mode B.
+   **Decided: accepted** by the orchestrator (deviation D2). QA round 1 treats it as an approved
+   deviation.
+
+## Task 2.2.2 record (QA-2.2-7)
+
+- **Commits (2.2.2):** `e4ab59b` (a, runner.ts P1 `testsByFile`), `3745902` (b, pure helpers),
+  `19058fa` (c, coordinator core), `95fc4f4` (d, attribution and shared recheck), `0791c91` (e,
+  the B12 property). **Round-1 fixes:** `3fd26e4`, `5827256`, `94dec74`, `00129c3`, `ae69340`,
+  `c041ad6` and `7f3d0a8` (see Resolutions below).
+- **Tests:** `npx vitest run --maxWorkers=2 --coverage --coverage.include=src/verify/batch.ts
+  test/unit/batch.test.ts test/unit/runner.test.ts` → Test Files 2 passed (2), Tests 866 passed
+  (866): `batch.test.ts` 149, `runner.test.ts` 717. The B12 property runs 300 seeded cases (6
+  chunks of 50). `npm run typecheck` is clean. The full suite was not run (§0.6.7).
+- **Coverage of `src/verify/batch.ts`** (v8, same run): statements 96.93%, **branches 92.85%**,
+  functions 99.2%, **lines 98.35%**. That meets the ≥ 90% lines and branches of B16 2.2.2.e and the
+  plan's DoD. Uncovered: L1199-1200 (a defensive `settleLate` branch for a member with no outcome,
+  unreachable because held and ready members always have one) and L1439-1444 (sweep's eviction of
+  a window with no live member, which `leaveWindow` already deletes).
+- **Mutation check, re-run on the final state** (in-place mutants of `batch.ts` and `runner.ts`,
+  each restored from a copy afterwards; "B12" = `batch.test.ts -t B12`, "file" = all of
+  `batch.test.ts`):
+
+  | mutant | result |
+  | --- | --- |
+  | M7 `deriveSharedRecheck` ignores `total === 0` | killed by B12, 1 chunk (survived in round 1) |
+  | M9 `batchKey` without `argvTemplate` | killed by B12, 1 chunk (survived in round 1) |
+  | runner.ts: a key shared by two inputs goes to the first input (the QA-2.2-1 bug) | killed by B12, 2 |
+  | runner.ts: the classname walk stops at the first hit | killed by B12, 3 |
+  | runner.ts: the pinned rootdir is ignored (suffix map only) | survives B12: it only makes more unions ambiguous, hence incomplete and run per member, which costs runs, not verdicts; killed by 6 unit tests (`runner.test.ts` and the `batch.test.ts` QA-2.2-1 cases) |
+  | `referenceDecision` ignores `failureRecheck` (QA-2.2-2) | killed by B12, 6 |
+  | `attributeUnion` always derived for vitest/jest (M1) | killed by B12, 8 |
+  | flaky taint disabled | killed by B12, 6 |
+  | the taint counts unmapped pytest ids (see QA-2.2-6 below) | killed by file, 1 |
+  | derived ids of settled pytest members not counted (QA-2.2-3 c) | killed by file, 1 (a unit test: B12 has no deadline expiry, by design) |
+  | held members wait for every own run (the round-1 schedule) | killed by file, 13 |
 
 ## QA findings (round 1)
 
@@ -271,6 +309,121 @@ spots are listed in QA-2.2-6.
 | QA-2.2-8 | info | **Contract drift for 2.2.3.** 2.1's `CheckScope.rechecker(command, cwd, currentTree?)` (p21 deterministic.ts L782, direct hook L1223) forwards the gate's tree to `materialize`. batch.ts calls the frozen two-argument `VerificationScope.rechecker`, and `TestsPassRequest` carries no tree, so batched rechecks skip `materialize`'s same-repository guard. That guard is "never used to decide exactness" (reference.ts section 4 step 0), and `referenceKey` includes `root`, so no verdict changes. | Deferred by plan (2.2.3): either bind the opener's tree in the runtime's `openScope`, or accept the gap in B15. |
 | QA-2.2-9 | nit | **Abort wording differs from the direct path.** A member aborted while the union waits for the slot gets `BATCH_REASONS.run` "gate budget exhausted during the scoped run" (L776-777), where alone it would get slot-busy with `deadlineCut` (u14 "…waiting for the verification slot"). B2.4 (L1209) answers `aborted` before planning, where 2.1's direct hook plans first (a NoAffected or S6 plan gives P n0 / V u15). Both differences are V, or more cautious than alone. | Document both in B9, or record the member's phase as `slot` until the first execute returns. |
 | QA-2.2-10 | nit | **`void runBatch(b)` (L870) and the `void p.then(...)` in `closeScope` (L1199) have no rejection handler.** If the injected `logger.warn` throws inside `runBatch`'s `catch` or in `closeScope`'s `.catch`, the rejection is unhandled, and `dispose()`'s `Promise.all([...closing])` can reject, contrary to "never rejects". Unverified whether `PluginLogger.warn` can throw. | Wrap `warn` in try/catch, and end `runBatch`/`closeScope` chains with a terminal `.catch(() => {})`. |
+
+### Resolutions (round 1)
+
+**QA-2.2-1** (critical)
+Resolution: `3fd26e4` — root fix in runner.ts I step 3, as approved. `parseJunit` maps a
+classname by the exact rootdir-relative path. The rootdir is the last `--rootdir` of the spec's
+argv (D.4's pin or the user's kept value, resolved against `spec.cwd`; a value pytest would expand
+is not trusted). Every dot prefix of the classname is walked, so classes nested in the module stay
+in the id. Without a trusted rootdir (an explicit `-c`, a `--rootdir` in `PYTEST_ADDOPTS`, the
+unpinned QA-1.3-49 spawn), the gitRoot-relative suffixes are kept as candidates. In both modes, a
+classname that more than one input answers is ambiguous: it is charged to no file, it is left out
+of `testsByFile`, and the result is `complete: false` with the note `pytest classname maps to more
+than one test file: <classname>`. This holds for failing and passing cases alike, so a batch with
+such a union runs every member's own spec (7.1). "First input wins" is gone. The runner test that
+pinned it now asserts the ambiguity. Regression through the real `readResult` + `attributeUnion`
+(QA's scenario, `batch.test.ts` "QA-2.2-1"): with the pin, the owner of `tests/test_x.py` is
+charged its failure, exactly as alone, and `sub/tests/test_x.py`'s owner derives green with its
+own count. Without the pin, the union is not comparable. Both tests fail on the old runner.ts. B7.3a
+records the dependency.
+
+**QA-2.2-2** (major)
+Resolution: `5827256` — `BatchRuntime.failureRecheck` carries the gate-time setting. Each member
+keeps the value of the hook that submitted it, never the window opener's. `referenceDecision`
+applies 2.1's rule first: `!failureRecheck` gives `disabled` for any reference. The property
+oracle `directOver` now applies the direct hook's rule, not the batch's own, and draws the setting
+per request. Unit test: a captured reference with the setting off gives `disabled`, per request,
+whichever gate opened the window. The unit test and the property fail on the old batch.ts.
+
+**QA-2.2-3** (major)
+Resolution: `94dec74` (with `7f3d0a8`) — B5 steps 5-8 are one queue under the single hold,
+earliest deadline first across own runs and rechecks. Scopes are never nested.
+- A member's outcome is final once every union failing id is reproduced, or once no own run is
+  left, in which case the taint is applied once.
+- A final member settles at once, or rechecks at its turn. A later member at the same reference
+  reuses a recorded recheck that covers its files (B8.6). Only outcomes that hold for any member
+  are reused: exact, approximate, and unusable `reference-vanished`, `unreproduced-inputs` or
+  `runner-unsupported`. Never a deadline-bound one, nor `materialize-failed` or `error`.
+- A member that aborts after its outcome is known settles with that outcome, not a bare abort.
+  While a union failure is unexplained the outcome is made incomplete with those ids (never a
+  pass), and its recheck becomes its reference decision, else `skipped-deadline` (B9 table).
+- QA's (c): pytest derivations of members that left during the union still count as reproduced.
+- The recheck threshold is unchanged: a member below `recheckMinRemainingMs` gets
+  `skipped-deadline`.
+- Plan-case test (5 requests with a shared pre-existing failure, 90 s budgets, a 10 s threshold,
+  15 s per run): the first three members pass with the note (pre-existing at the exact reference)
+  at 45.1 s, 60.1 s and 75.1 s, with one recheck. The other two cannot fit their own runs in 90 s
+  and are unverifiable, never a false pass. A request alone passes. On the old schedule every
+  member held its outcome until all 1 + 5 runs had ended (90.1 s), so each was aborted at its
+  90 s deadline.
+- More tests cover the EDF interleaving, an abort while held, an abort while waiting for a recheck
+  turn, a pytest member leaving mid-union, and reuse hits and misses.
+
+**QA-2.2-4** (minor)
+Resolution: `00129c3` — `dispose()` no longer closes a scope right after aborting D. It awaits
+each running batch's promise, and `runBatch`'s `finally` closes the scope only after the in-flight
+seam has returned, that is once the killed tree has exited. The wait is bounded by
+`BATCH_STALE_GRACE_MS`, with one injected timer that is cleared afterwards. A batch still running
+after that goes through the same `evict` path as `sweep()`, which logs that its slot is released
+before the seam exits. Tests: the slot is released only after the tree exits; a hung seam is
+evicted after the grace, with no timer left; a seam that returns after eviction does not close the
+scope a second time (`7f3d0a8`).
+
+**QA-2.2-5** (minor)
+Resolution: `00129c3` — documented in B10 as an accepted cost, the minimal fix. An early-settled
+member's next S3 check may wait for its own batch's hold, and can end slot-busy (u14). It cannot
+deadlock: the batch never waits on a gate or another scope, a settled member is released from D,
+and every batch step is bounded by a remaining member's deadline. The wiring assertion is deferred
+by plan (2.2.3).
+
+**QA-2.2-6** (minor)
+Resolution: `c041ad6` (with `5827256`) — B12 was rebuilt.
+- The fake executor writes real vitest JSON and pytest junit reports and parses them with the real
+  `readResult`. The pytest reports use a pinned `--rootdir` or an explicit `-c`, suffix-colliding
+  paths (`tests/test_x.py`, `sub/tests/test_x.py`, `app/tests/test_x.py`), a module next to a
+  package of the same name, and nested classes.
+- Requests come from several cwds. About a third of the cases use win32 paths, some spelled in
+  another case. `-t smoke` filters the tests now and at the reference. Test counts differ per
+  reference, including zero.
+- Each case asserts one scope per batch and the B13 spawn bounds: a batch of one is the direct
+  path; a not comparable union or mode B runs 1 + n; pytest runs 1; a green union runs
+  1 + ambiguous members, with no recheck; rechecks ≤ n + distinct references.
+- `judgeStandIn` ports 2.1's `judgeScoped` rules (T5/T6), so R2i/R3 × X- is a rejection.
+- Tallies require more than 10 hits each for win32 batches, multi-cwd batches, suffix-colliding
+  unions (pinned and unpinned), `-t` batches, recheck reuse and flaky members.
+- M7 and M9 are now killed, and so is a revert of the QA-2.2-1 mapping (see the 2.2.2 record).
+- The stronger property found one more divergence, toward caution. An unpinned pytest union whose
+  classname is ambiguous keeps a raw id (`tests.test_x::t1`) that no own run can reproduce, so the
+  flaky taint made every member unverifiable. Such ids name no input and only occur in an
+  incomplete union, whose members all run their own specs, so the taint now leaves them out (B7.5).
+  There is a deterministic test for it.
+- The real `judgeScoped` oracle stays deferred by plan (2.2.3).
+
+**QA-2.2-7** (minor)
+Resolution: this commit — see "Task 2.2.2 record" above: commits, test counts, `batch.ts`
+coverage (lines 98.35%, branches 92.85%), and the mutation re-run. Both open questions are marked
+as decided, with the approval.
+
+**QA-2.2-8** (info)
+Resolution: deferred by plan (2.2.3); unchanged in this round.
+
+**QA-2.2-9** (nit)
+Resolution: `ae69340` — a request whose deadline is already aborted is planned first, as in 2.1's
+direct hook. A NoAffected or S6 plan therefore gives the same outcome as alone, and only a spec
+gets `ABORTED_BEFORE_RUN` (B2.4-5). `BATCH_REASONS.beforeRun` and `.run` are asserted to equal
+2.1's `ABORTED_BEFORE_RUN` and `ABORTED_DURING_RUN` verbatim. B9 records why a member cut while
+the union waits for the slot reports `ABORTED_DURING_RUN` rather than slot-busy
+(`SLOT_DEADLINE_REASON`): the scope does not expose when its first execute took the hold. Both
+are unverifiable.
+
+**QA-2.2-10** (nit)
+Resolution: `ae69340` — the coordinator's `warn` wraps the logger. A logger whose `warn` throws
+is dropped for the coordinator's life, so neither `runBatch`, a scope close nor `dispose()` can
+reject. Test: a throwing logger during an internal failure, a split and a failing close gives no
+unhandled rejection, and `dispose()` resolves. On the old batch.ts, vitest reports an unhandled
+rejection.
 
 ### Verified without a finding
 
