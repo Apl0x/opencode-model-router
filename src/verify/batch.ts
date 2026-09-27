@@ -38,6 +38,13 @@
 //   B-G5 The hook never rejects (TestsPassHook contract). Any internal failure becomes a
 //        ScopedOutcome "error" for the requests it affects (fail-closed, 2.1-T6 R8).
 //   B-G6 State is bounded. No timer outlives its window, and nothing outlives dispose().
+//   B-G7 Deadline pressure (QA-2.2-17). A batched request does not end weaker than it would with
+//        batchWindowMs: 0 under the same budget, as far as a cheap estimate can ensure. By default
+//        an unverifiable verdict is accepted with a caveat (strictUnverifiable off), so a batch
+//        that turned a rejection into a deadline-induced unverifiable would weaken the gate. A
+//        lone request never waits (W7). The window never eats into a member's reserve (W3). A
+//        member whose budget cannot cover the batched schedule runs alone, first (B5.2a).
+//        Residuals: B15.
 //
 // -----------------------------------------------------------------------------------------------
 // B2. BYPASSES (no window, no union), checked in this order on arrival
@@ -82,16 +89,25 @@
 // B4. WINDOWS
 //
 //   W1 A window opens when the first request for a key finishes planning with a ScopedSpec. Its
-//      close time is fixed at that moment: openedAt + batchWindowMs, using the opener's runtime
+//      close time is set at that moment: openedAt + batchWindowMs, using the opener's runtime
 //      value. A config reload does not stretch a window that is already open. Each window has
-//      exactly one timer.
+//      exactly one timer. The wiring caps batchWindowMs at gateBudgetMs / 10 (QA-2.2-21), so the
+//      window itself is never most of a gate's budget.
 //   W2 The window closes at that time, or at once when it holds maxBatchSize requests
-//      (BATCH_MAX_REQUESTS = 8 by default), whichever comes first. The close time never moves:
-//      arrivals do not push it back (no debounce). So a steady stream cannot keep a window open,
-//      and no request waits in a window for longer than batchWindowMs (2.1-T3's bound for the
-//      batch wait). This is the starvation bound.
-//   W3 A joining request whose deadline.remaining() does not exceed the time left until the
-//      close closes the window at once. Waiting would only turn it into an abort.
+//      (BATCH_MAX_REQUESTS = 8 by default), whichever comes first. The close time never moves
+//      later: arrivals do not push it back (no debounce). So a steady stream cannot keep a window
+//      open, and no request waits in a window for longer than batchWindowMs (2.1-T3's bound for
+//      the batch wait). This is the starvation bound. W3 and W7 only close it earlier.
+//   W3 The reserve (QA-2.2-17 b). A member's floor is its runtime.recheckMinRemainingMs when it
+//      can recheck at all (failureRecheck on and a captured reference), else 0, plus
+//      BATCH_RESERVE_MARGIN_MS (1 s: union planning and scheduling). With e = the key's last
+//      measured run duration (0 before the first run of the key), the window closes no later than
+//      the moment any member would be left with less than floor + e: what the direct path needs
+//      for its run and its recheck. When a member joins, and when a run of the key is measured,
+//      the close time moves earlier if needed (the timer is re-armed, still one per window), or
+//      the window closes at once when that moment has passed. A joiner whose remaining() is
+//      within its floor therefore closes the window at once, as the former W3 did for a joiner
+//      that could not outlive the wait.
 //   W4 At close, the window is removed from the key map before anything asynchronous happens. A
 //      request for the same key that finishes planning later opens the NEXT window. "Later"
 //      covers the whole life of the batch: planning its union, waiting for the slot, running,
@@ -104,14 +120,43 @@
 //      in parallel only as far as maxConcurrentVerifications allows. Two batches for the SAME
 //      key (window N running, window N+1 closed) are just as independent, and serialize on the
 //      slot when there is only one.
+//   W7 Idle close (QA-2.2-17 a, QA-2.2-18). When no request is planning (between its arrival and
+//      its window or planning outcome) and no batch is running, nothing can join an open window
+//      and the slot is free, so every open window closes at once. It is checked when a request
+//      joins, when a planning ends without a spec, and when a batch ends or is evicted. A lone
+//      request therefore pays no window latency: its window closes as it joins, and it runs as
+//      the direct path (B5.1). Requests that arrive while a batch runs gather in the next window,
+//      which closes when that batch ends, at its timer, or by W2/W3 (group commit: under one slot
+//      they would have waited for it anyway). The signal is the coordinator's own. The wiring
+//      cannot see a gate that has not reached testsPass yet without index.ts and 2.4 bracketing
+//      every gate, so concurrent gates batch when they reach testsPass together or while another
+//      batch runs. BatchCoordinatorOptions.idleClose: false keeps only the timed close, for the
+//      tests of W1-W6.
 //
 // -----------------------------------------------------------------------------------------------
 // B5. BATCH RUN SEQUENCE
 //
 //   At close, with members M (in arrival order) and the batch deadline D (B9):
-//   1. |M| = 1: skip step 2. Step 4 runs the member's own spec with the member's own deadline.
-//      Steps 5 and 7 have nothing to do, and step 8 is a single-member recheck. This is exactly
-//      the direct path.
+//   1. |M| = 1: skip steps 2a and 2. Step 4 runs the member's own spec with the member's own
+//      deadline. Steps 5 and 7 have nothing to do, and step 8 is a single-member recheck. This is
+//      exactly the direct path.
+//   2a. Deadline check (QA-2.2-17 c), before union planning. Take the members in deadline order,
+//      and e and each member's floor as in W3. A member is "solo" when its remaining() is below
+//        floor + 2e x (number of solo members) + e x (1 + p + i),
+//      where p is the number of pooled (not solo) members and i its index among them. That sum is
+//      the worst case of the batched schedule ahead of its recheck: the union, every pooled
+//      member's own run (mode B; a member can be held until the last of them, B5.7), one recheck
+//      for each pooled member ahead of it, and the own run and recheck of each solo member, which
+//      come first. The check repeats until no member moves (at most once per member).
+//        - Fewer than two pooled members: split (step 6). Every member runs its own spec in
+//          deadline order, which is the alone cost and order.
+//        - Otherwise, after step 3, the solo members' own runs and rechecks run first, in deadline
+//          order, outside the union. Each is its own run's outcome, verbatim, and final at once:
+//          no union failure can taint it. A solo run never counts as reproducing a union failure
+//          (7.5), because it cannot tell which pooled member the failure belongs to. Steps 2, 4
+//          and 7 then cover the pooled members only.
+//      Before the first measured run of a key, e is 0 and only the floor counts (a residual,
+//      B15).
 //   2. Union planning (B6), bounded by D: runtime.plan({ command and cwd of the first member,
 //      changedFiles: unionChangedFiles(M) }, D). The batch splits (step 6) in three cases: the
 //      result is not a ScopedSpec; batchKey(unionSpec) differs from the batch key; or its inputs
@@ -136,7 +181,8 @@
 //      the meantime (an abort) is skipped, and nothing is spawned for it.
 //   6. Split: every member is "own-run" (step 5), and there is no union run. The cost is the
 //      same as without batching, and the verdicts are the same by construction. The split is
-//      logged once per batch.
+//      logged once per batch. Causes: an inconsistent union plan (step 2), or step 2a's
+//      deadline check.
 //   7. Finality and the flaky taint (B7.5). A member's outcome is known after step 4 (derived) or
 //      after its own run. It is FINAL once no taint can change it: the union was green or did not
 //      run, or every union failing id is reproduced (by a finished own run or a static
@@ -233,7 +279,8 @@
 //   7.5 Flaky taint (B-G2). When U had failing ids, unreproduced = U.failingIds minus the ids of
 //       every finished own run and every static derivation (7.3a). A derivation counts even for
 //       a member that left during the union run, because pytest attribution is exact (QA-2.2-3);
-//       an own run counts even when its member left before it returned. The set only shrinks, so
+//       an own run counts even when its member left before it returned. A solo member's run
+//       (B5.2a) does not count: it ran outside the union. The set only shrinks, so
 //       it is decided once it is empty or no own run is left (B5.7). If it is then non-empty,
 //       some union failure was reproduced by no member's own run, and taintUnreproduced makes
 //       EVERY live member's "ran" result complete = false, with the note "batched run failure not
@@ -369,9 +416,14 @@
 //   - When all members have aborted, D aborts. The running execute or rechecker kills its tree
 //     (exec.ts), and nothing more is spawned: an aborted signal never spawns. The batch then
 //     finishes and closes its scope.
-//   - A batch that runs longer than one requester's budget therefore costs that requester an
-//     unverifiable verdict at its deadline (2.1-T6 R5 u13, or u6 during the recheck). It never
-//     makes the requester wait past its deadline.
+//   - A batch that runs longer than one requester's budget costs that requester an unverifiable
+//     verdict at its deadline (2.1-T6 R5 u13, or u6 during the recheck). It never makes the
+//     requester wait past its deadline.
+//   - QA-2.2-17: under the default policy (strictUnverifiable off) such a verdict is accepted, so
+//     the batch must not be what runs a member out of budget. W3 keeps each member's floor plus
+//     one run out of the window wait. B5.2a keeps a member out of the union unless its budget
+//     covers the worst-case batched schedule ahead of its recheck. W7 removes the window from a
+//     lone request altogether. What remains is an estimate's error (B15).
 //
 // -----------------------------------------------------------------------------------------------
 // B10. SLOT DISCIPLINE (S3, QA-1.4-18)
@@ -393,7 +445,11 @@
 //   and never extends it, and every step of the batch is bounded by a remaining member's
 //   deadline. Holding the member until the hold ends would spend the same wait inside testsPass
 //   instead, and would give back QA-2.2-3's early settlement. 2.2.3's wiring test asserts the
-//   behaviour (deferred by plan).
+//   behaviour (deferred by plan), with the order forced (QA-2.2-22). QA-2.2-17 revisits the
+//   premise: that next check may end slot-busy behind its own batch where alone it could have run
+//   and failed. That stays an accepted residual (B15). The wait is bounded by the batch's
+//   remaining steps, which B5.2a and W3 already keep within the members' budgets, and a
+//   slot-busy check is unverifiable, never a pass.
 //
 // -----------------------------------------------------------------------------------------------
 // B11. MEMORY AND DISPOSAL
@@ -401,29 +457,37 @@
 //   State:
 //     - windows: a Map from key to window, each with <= maxBatchSize members and one timer;
 //     - running batches: a Set;
-//     - per member: the request, its plan and its resolver.
-//   Everything is dropped when the member settles or the batch ends. Memory is O(live requests),
-//   and no window outlives its timer.
+//     - per member: the request, its plan and its resolver;
+//     - the last measured run duration per batch key (W3, B5.2a), at most 64 keys (the oldest
+//       is dropped), and the number of requests in planning (W7).
+//   Everything else is dropped when the member settles or the batch ends. Memory is O(live
+//   requests) plus that bounded map, and no window outlives its timer.
 //   sweep() is called by the wiring's TTL sweep (2.2.3). It evicts defensively:
 //     - windows with no live member;
 //     - batches whose members are all settled but whose seam never returned (a hung executor
 //       that ignored its signal) for longer than BATCH_STALE_GRACE_MS. D aborted when the last
-//       member settled, so the tree was killed that long ago: the batch's scope is closed and
-//       its slot released while the hung seam may still be exiting, and that is logged.
+//       member settled, so the tree was killed that long ago. The coordinator stops tracking the
+//       batch and asks its scope to close, which is logged. QA-2.2-19: 2.1's scope closes only
+//       once its in-flight seams have returned (deterministic.ts close()), so the slot stays
+//       held until the hung seam exits. Nothing else runs beside a tree that may still be alive,
+//       which is the safer behaviour, and it is kept.
 //   It logs each eviction and returns the number of evictions.
-//   The slot is otherwise never released before the running tree has exited (QA-2.2-4): the
-//   scope is closed only by runBatch's finally, after its last seam returned.
+//   The slot is never released before the running tree has exited (QA-2.2-4): runBatch's
+//   finally closes the scope after its last seam returned, and an eviction's close waits for
+//   the seam too.
 //   dispose():
 //     1. marks the coordinator disposed (later requests get B2.1);
 //     2. clears every window timer;
 //     3. settles every pending member with aborted BATCH_REASONS.disposed;
 //     4. aborts every batch deadline, which kills the running trees;
 //     5. awaits every running batch, that is its in-flight seam (the killed tree's exit) and
-//        then its scope close, for at most BATCH_STALE_GRACE_MS (one timer, cleared after);
-//        a batch still running after that is evicted as by sweep();
-//     6. awaits the scope closes.
-//   It is idempotent and never rejects. The default timers are unref'd, so an open window never
-//   keeps the process alive.
+//        then its scope close, within one grace of BATCH_STALE_GRACE_MS (one timer, cleared
+//        after); a batch still running after that is evicted as by sweep();
+//     6. awaits the scope closes within the rest of the same grace (QA-2.2-19). A close still
+//        pending after it waits for a hung seam: dispose stops waiting and logs it, and that
+//        slot is released when the seam exits.
+//   It is idempotent, never rejects, and returns within one grace. The default timers are
+//   unref'd, so an open window never keeps the process alive.
 //
 // -----------------------------------------------------------------------------------------------
 // B12. THE EQUIVALENCE PROPERTY AND ITS TEST
@@ -463,8 +527,10 @@
 //   vitest/jest, failing              1 + n scoped runs (mode B), + 1 recheck per distinct
 //                                     reference among the failing members when later members'
 //                                     files are covered (B8.6), else up to 1 per member
-//   split (union inconsistent)        n scoped runs, as without batching
-//   n = 1                             exactly the direct path
+//   split (union inconsistent, or     n scoped runs, as without batching
+//     the B5.2a deadline check)
+//   s solo members (B5.2a)            s own runs, then the pooled cost above for n - s members
+//   n = 1                             exactly the direct path (W7: no window wait when alone)
 //   The plan's acceptance criterion, "<= 1 scoped run + <= 1 recheck per window", is asserted on
 //   the green and pytest paths and with a shared reference. On the vitest/jest failing path the
 //   test asserts 1 + n runs and one recheck per distinct reference (deviation D2).
@@ -501,6 +567,24 @@
 //     tree-hash key would need git at capture time, which is out of scope.
 //   - A config reload in the middle of a window keeps the opener's window length and scope
 //     options.
+//   - Deadline estimates (QA-2.2-17, B-G7). W3 and B5.2a rely on the key's last measured run
+//     duration, with a recheck estimated as one more run.
+//       - Before the first measured run of a key in a plugin instance, e is 0: the first
+//         concurrent window of a key pools any member that has its floor, and a failing
+//         vitest/jest union can still cost a tight member its recheck there (the QA's R5 with
+//         every gate in one window). A lone gate (W7), or any earlier batch of the key, measures
+//         e. The first window of a key was not made to split by default: that would give up the
+//         saving of every first fan-out.
+//       - A run slower than the last one, or a recheck slower than a run (materialize), can
+//         exceed the estimate by more than BATCH_RESERVE_MARGIN_MS.
+//       - The first run of a scope includes its slot wait. That only overstates e, and costs
+//         batching, not verdicts, until the next measurement.
+//   - Serial runs under one hold. With maxConcurrentVerifications > 1, the direct path could run
+//     members in parallel where a batch runs their own runs and rechecks one at a time. B5.2a
+//     sizes each pooled member's worst case against its own budget, whatever the slot count,
+//     but the solo members still run one after another.
+//   - QA-2.2-5 (B10): an early-settled member's next S3 check may end slot-busy behind its own
+//     batch where alone it could have run.
 //
 // -----------------------------------------------------------------------------------------------
 // B16. IMPLEMENTATION TASKS (each <= ~20 tool calls; commit and push each one green)
@@ -568,6 +652,8 @@
 //           the gate-time failureRecheck and the gate's tree (QA-2.2-8: BatchRuntime.currentTree,
 //           OpenBatchScope). index.ts's idle-TTL sweeper calls sweepVerification() (the
 //           coordinator's sweep), and plugin dispose awaits disposeVerification().
+//           QA-2.2-21: the runtime's batchWindowMs is effectiveBatchWindowMs(budget), that is
+//           min(batchWindowMs, gateBudgetMs / 10): 2000 ms at the defaults.
 //   2.2.3.b test/unit/batch-wiring.test.ts, with 5 concurrent testsPass gates through
 //           buildGateDeps:
 //             - the argv seam sees 1 scoped run per window (+ <= 1 recheck with a shared

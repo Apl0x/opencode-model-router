@@ -785,3 +785,130 @@ with a single gate (R6). There are three minor findings (QA-2.2-18, QA-2.2-19, Q
 nits (QA-2.2-21, QA-2.2-22). No false pass was found in the tree, `failureRecheck`, `fileKeyOfId`,
 reference, retry or full-scope routing. This is the first wiring round: all of these may be fixed,
 and one more round follows.
+
+### Resolutions (2.2.3 wiring, round 1)
+
+Owner decision for QA-2.2-17: a batched gate must never end weaker than the same gate would with
+`batchWindowMs: 0` under the same budget, as far as can be ensured cheaply. The decision set three
+parts: (a) early close, (b) the recheck reserve, and (c) the mode-B union under deadline pressure.
+All three are implemented; nothing was deferred to a residual except the estimate's own limits
+(below). The B-sections of `batch.ts` changed: B-G7 (new), B4 W1-W3 and W7 (new), B5 steps 1, 2a
+(new) and 6, B7.5, B9, B10, B11, B13, B15 and B16.
+
+- **QA-2.2-17 (major).** Resolution: fixed in `9ed2abb`.
+  - (a) **W7, idle close.** A window closes at once when no request is planning and no batch is
+    running. At that point nothing can join it, and the slot is free.
+    - The signal is the coordinator's own: requests between arrival and their window, plus the
+      running set. A gate-level count would need index.ts and 2.4 to bracket every gate, and this
+      signal needs neither.
+    - A lone gate's window closes as it joins, so it runs as the direct path (B5.1) with no window
+      latency: R6's batched gate now ends well inside the 2 s window (the test bounds it at 1.5 s).
+    - Requests that arrive while a batch runs gather in the next window (group commit). That
+      window closes when the batch ends, at its timer, or by W2/W3.
+  - (b) **W3, the reserve.** A member's floor is its recheck threshold (only when it can recheck:
+    `failureRecheck` on and a captured reference) plus `BATCH_RESERVE_MARGIN_MS` (1 s).
+    - The window closes no later than the moment any member would be left with less than floor +
+      e, where e is the key's last measured run duration.
+    - The close time moves earlier (the timer is re-armed) when a member joins and when a run of
+      the key is measured. It never moves later, so W2's starvation bound stands.
+  - (c) **B5.2a, the deadline check before a union.** A member is solo when its remaining time is
+    below floor + 2e × (solo members) + e × (1 + p + i). That sum is the union, every pooled own run
+    (a member can be held until the last, B5.7), the pooled rechecks ahead of it, and the solo
+    members' runs and rechecks.
+    - Solo members run their own spec and recheck first, in deadline order, under the batch's one
+      hold, outside the union.
+    - Fewer than two pooled members splits the batch.
+    - A solo run never counts as reproducing a union failure, so B-G2 stands.
+    - Two alternatives were rejected:
+      - Serving a solo member through `runtime.direct`: its own scope would race the batch for the
+        slot, and could wait behind the whole batch.
+      - Splitting the first window of every key: that gives up the saving of every first fan-out.
+  - **Residuals** (B15):
+    - Before the first measured run of a key in a plugin instance, e is 0, so a first concurrent
+      window pools any member that has its floor. A lone gate, or any earlier batch of the key,
+      measures e first.
+    - A run or recheck slower than the last measured run by more than the margin.
+    - Serial own runs under one hold when `maxConcurrentVerifications` > 1.
+    - QA-2.2-5's early-settled member's next check.
+  - **Tests.**
+    - Unit (`batch.test.ts`, +5):
+      - W3 moves the close time earlier and keeps one timer;
+      - W7 for a lone request and for arrivals during a running batch;
+      - W7 with a request still planning;
+      - B5.2a with a measured estimate, and with a cold one;
+      - B5.2a/B-G2: a solo run does not explain a union failure.
+    - Changed unit tests:
+      - The W3 case now expects the 60 ms joiner to split and run first.
+      - Two B9/B8.3 cases give the short member enough budget for its floor. Their assertions on
+        the phase labels and on skipped-deadline are unchanged.
+      - The pre-existing tests of the W1-W6 mechanics and the B12 property use
+        `idleClose: false` through a local `createBatchCoordinator`.
+    - Wiring (`batch-wiring.test.ts`, +4):
+      - R6 (one gate, 11 s);
+      - W3 with another gate in flight (11.5 s);
+      - R5 as reported (c arrives 30 ms late behind a running batch);
+      - R5 in one window after a measured run. The members split, and c rechecks and is rejected,
+        as alone.
+      - Each compares with `batchWindowMs: 0`, and all four fail on `798735f`.
+      - A mutant that keeps every member pooled (no B5.2a) fails the one-window R5 and three unit
+        tests (the W2/W3 case, B5.2a and B-G2).
+      - A mutant that counts solo runs as reproducing fails the B-G2 unit test.
+    - The concurrent wiring tests hold every gate's `planScopedRun` at a barrier until all are
+      planning, so W7 cannot split them by timing.
+- **QA-2.2-18 (minor).** Resolution: fixed by QA-2.2-17 (a) in `9ed2abb`. The R6 wiring test
+  asserts a lone batched gate spends under 1.5 s, with 2 runs (the scoped run and the reference
+  run).
+- **QA-2.2-19 (minor).** Resolution: fixed in `8f0f936`.
+  - `dispose()` bounds both waits, for the in-flight seams and then for the scope closes, by one
+    `BATCH_STALE_GRACE_MS`. It logs a close still pending after the grace.
+  - The eviction warning and B11 now say what happens. The scope closes, and releases the slot, once
+    the seam exits. That is kept, as the safer behaviour.
+  - Tests:
+    - a unit case whose close waits for its hung execute, as 2.1's does: dispose returns after one
+      grace, and the slot is released only when the seam returns;
+    - the R3/R4 wiring case: the union seam ignores its abort, sweep evicts it after the clock
+      moves 61 s, and dispose returns after a 20 ms grace. It asserts 1 acquire and 0 releases
+      until the seam exits, then 1 release.
+- **QA-2.2-20 (minor).** Resolution: fixed in `36b471f`. The R5/R6 deadline cases landed in
+  `9ed2abb`, and the R3/R4 sweep case in `8f0f936`.
+  - New wiring cases:
+    - an exact reference compared batched against alone: c's introduced failure is rejected, d's
+      pre-existing one passes, and there is one shared recheck;
+    - R2: `failureRecheck: false` at the gate with a captured, exact reference;
+    - a config flip between two gates of one window.
+  - `test/integration/batch-plugin-hookup.test.ts` (new) checks that the idle sweeper calls
+    `sweepVerification`, and that plugin dispose awaits `disposeVerification`.
+  - Mutation check on the final state (in-place, each restored after its run):
+
+    | mutant | result |
+    | --- | --- |
+    | MW3 runtime `failureRecheck: true` | killed: R2 and the config flip |
+    | MB3 `referenceDecision` reads the window opener's `failureRecheck` | killed: the config flip |
+    | MW6 `sweepVerification: () => 0` | killed: the R3/R4 case |
+    | MW7 `disposeVerification: async () => {}` | killed: the dispose case and the R3/R4 case |
+    | MW8 index.ts dispose does not await `disposeVerification()` | killed: the plugin hookup test |
+    | MW9 index.ts idle sweeper list without the coordinator entry | killed: the plugin hookup test |
+
+- **QA-2.2-21 (nit).** Resolution: fixed in `0b6e61e`. The wiring hands the coordinator
+  `effectiveBatchWindowMs(budget)`, which is min(`batchWindowMs`, ⌊`gateBudgetMs` / 10⌋). That is
+  2000 ms at the defaults, unchanged. W3 still keeps each member's reserve inside it. Test: with
+  `batchWindowMs` 60000 and `gateBudgetMs` 20000, the window timer is armed for 2000 ms.
+- **QA-2.2-22 (nit).** Resolution: fixed in `2cb8bd5`.
+  - The failing producer (a) has the least time left, so its own run comes first after the union
+    and makes it final.
+  - Every later run waits on a promise that the first settled gate resolves.
+  - The test asserts that the first verdict is a's, with one hold live, and that the hold is
+    released once.
+
+**Test runs (final state).**
+
+- `npx vitest run --maxWorkers=2 test/unit/batch.test.ts test/integration/batch-wiring.test.ts
+  test/unit/baseline-wiring.test.ts test/unit/tests-pass-pipeline.test.ts
+  test/integration/layer2-wiring.test.ts test/integration/delegate-timeout.test.ts
+  test/integration/session-lifecycle.test.ts` → Test Files 7 passed (7), Tests 424 passed (424).
+  `batch.test.ts` has 164 tests and `batch-wiring.test.ts` has 16.
+- `batch-wiring.test.ts` alone, 3 runs: 16/16 each time, about 29 s each.
+- `batch-plugin-hookup.test.ts`: 1/1.
+- The other wiring consumers pass 224/224: `annotate-plan`, `deterministic`, `dod`, `wiring`,
+  `enforcement-defaults`, `modeA-e2e`, `modeB-e2e` and `reference-gc-start`.
+- `npm run typecheck` is clean. The full suite was not run (§0.6.7).
