@@ -809,6 +809,11 @@ const flush = () => vi.advanceTimersByTimeAsync(0);
 const at = (k: string, cwd = ROOT) => posix.join(cwd, k);
 const aborted = (reason: string): TestsPassRun => ({ scoped: { kind: "aborted", reason }, recheck: undefined });
 
+function specOf(plan: ScopingPlan): ScopedSpec {
+  if ("noAffected" in plan || "unverifiable" in plan) throw new Error(`expected a ScopedSpec, got ${JSON.stringify(plan)}`);
+  return plan;
+}
+
 function ran(run: TestsPassRun): Extract<ScopedOutcome, { kind: "ran" }> {
   if (run.scoped.kind !== "ran") throw new Error(`expected a ran outcome, got ${JSON.stringify(run.scoped)}`);
   return run.scoped;
@@ -1342,5 +1347,363 @@ describe("createBatchCoordinator: windows and the union run", () => {
     expect(timers.clearTimeout).toHaveBeenCalledWith(1);
     expect(calls.executes).toHaveLength(1);
     await c.dispose();
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// createBatchCoordinator: B7 attribution, B7.5 taint, B8 shared recheck
+// ---------------------------------------------------------------------------------------------
+
+describe("createBatchCoordinator: attribution and rechecks", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  /** Submits one request per change set in one window and returns the settled runs. */
+  async function batch(runtime: BatchRuntime, requests: readonly TestRequest[], options: Parameters<typeof createBatchCoordinator>[0] = {}) {
+    const c = createBatchCoordinator({ platform: "linux", ...options });
+    const hook = c.hook(runtime);
+    const outs = requests.map((r) => hook(r));
+    await vi.advanceTimersByTimeAsync(WINDOW);
+    const runs = await Promise.all(outs);
+    await c.dispose();
+    return { runs, stats: c.stats() };
+  }
+
+  const sharedFile = (file: string): Model => ({
+    related: Object.fromEntries([..."abcd"].map((x) => [`src/${x}.ts`, [`test/${x}.test.ts`, file]])),
+  });
+
+  it("a union failure in one member's file fails only that member: 1 + n runs (mode B), outcomes as direct", async () => {
+    const model: Model = { ...MODEL, failing: { "test/b.test.ts": ["breaks"] }, atRef: { "test/b.test.ts": [] } };
+    const { calls, runtime } = harness(model);
+    const { runs, stats } = await batch(runtime, [req(["src/a.ts"]), req(["src/b.ts"]), req(["src/c.ts"])]);
+    expect(calls.executes).toHaveLength(4);
+    expect(calls.executes.slice(1).map((e) => e.spec)).toEqual(calls.planned.slice(0, 3));
+    const own = calls.planned.slice(0, 3).map(specOf);
+    expect(runs).toEqual([
+      { scoped: ranModel(model, own[0] ?? spec()), recheck: undefined },
+      { scoped: ranModel(model, own[1] ?? spec()), recheck: recheckModel(model, "npx vitest run", ROOT, [at("test/b.test.ts")]) },
+      { scoped: ranModel(model, own[2] ?? spec()), recheck: undefined },
+    ]);
+    expect(ran(runs[1] ?? aborted("")).result.failingIds).toEqual(["test/b.test.ts > breaks"]);
+    expect(calls.rechecks.map((r) => r.files)).toEqual([[at("test/b.test.ts")]]);
+    expect(stats).toMatchObject({ unionRuns: 1, ownRuns: 3, rechecks: 1, taints: 0, splits: 0 });
+  });
+
+  it("a failing file related to two members: both are rechecked, through one shared recheck", async () => {
+    const model: Model = { ...sharedFile("test/shared.test.ts"), failing: { "test/shared.test.ts": ["new"] }, atRef: { "test/shared.test.ts": [] } };
+    const { calls, runtime } = harness({
+      ...model,
+      related: { ...model.related, "src/c.ts": ["test/c.test.ts"] },
+    });
+    const { runs, stats } = await batch(runtime, [req(["src/a.ts"]), req(["src/b.ts"]), req(["src/c.ts"])]);
+    expect(calls.rechecks.map((r) => r.files)).toEqual([[at("test/shared.test.ts")]]);
+    const exact = {
+      kind: "exact",
+      result: { failingIds: [], failingFiles: [], collectionError: false, total: 2, complete: true, source: "report" },
+      ranFiles: ["test/shared.test.ts"],
+      absentFiles: [],
+      notes: ["rechecked at the reference"],
+    };
+    expect(runs.map((r) => r.recheck)).toEqual([exact, exact, undefined]);
+    expect(runs.map((r) => ran(r).result.failingIds)).toEqual([["test/shared.test.ts > new"], ["test/shared.test.ts > new"], []]);
+    expect(stats).toMatchObject({ unionRuns: 1, ownRuns: 3, rechecks: 1 });
+  });
+
+  it("a pre-existing failure shared by every member at one reference: a single recheck, all derive exact, one scope", async () => {
+    const model: Model = { ...sharedFile("test/common.test.ts"), failing: { "test/common.test.ts": ["old"] }, atRef: { "test/common.test.ts": ["old"] } };
+    const { calls, runtime } = harness(model);
+    const { runs, stats } = await batch(runtime, [..."abcd"].map((x) => req([`src/${x}.ts`])));
+    expect(calls.rechecks).toHaveLength(1);
+    for (const run of runs) {
+      expect(run.recheck).toEqual({
+        kind: "exact",
+        result: {
+          failingIds: ["test/common.test.ts > old"],
+          failingFiles: ["/tmp/omr-ref/test/common.test.ts"],
+          collectionError: false,
+          total: 2,
+          complete: true,
+          source: "report",
+        },
+        ranFiles: ["test/common.test.ts"],
+        absentFiles: [],
+        notes: ["rechecked at the reference"],
+      });
+    }
+    expect(stats).toMatchObject({ unionRuns: 1, ownRuns: 4, rechecks: 1 });
+    expect(calls.events).toEqual(["open 0", ...Array.from({ length: 5 }, () => "execute 0"), "recheck 0", "close 0"]);
+  });
+
+  it("distinct references get one recheck each", async () => {
+    const model: Model = { ...sharedFile("test/common.test.ts"), failing: { "test/common.test.ts": ["old"] }, atRef: { "test/common.test.ts": ["old"] } };
+    const { calls, runtime } = harness(model);
+    const other: DispatchReference = { ...REF, commit: "c2" };
+    const { runs, stats } = await batch(runtime, [
+      req(["src/a.ts"]),
+      req(["src/b.ts"], { reference: { kind: "captured", reference: other } }),
+      req(["src/c.ts"]),
+    ]);
+    expect(calls.rechecks.map((r) => r.reference.commit).sort()).toEqual(["c1", "c2"]);
+    expect(runs.map((r) => r.recheck?.kind)).toEqual(["exact", "exact", "exact"]);
+    expect(stats.rechecks).toBe(2);
+  });
+
+  it("a run-level unusable shared recheck splits into own rechecks; a reference-level one is shared", async () => {
+    const model: Model = {
+      ...MODEL,
+      failing: { "test/a.test.ts": ["x"], "test/b.test.ts": ["y"] },
+      atRef: { "test/a.test.ts": [], "test/b.test.ts": ["y"] },
+    };
+    const collection: RecheckOutcome = { kind: "unusable", cause: "collection-error", reason: "setup failed at the reference" };
+    const split = harness(model, {
+      rechecker: (_ref, files, _d, n) => (n === 0 ? collection : recheckModel(model, "npx vitest run", ROOT, files)),
+    });
+    const warn = vi.fn();
+    const one = await batch(split.runtime, [req(["src/a.ts"]), req(["src/b.ts"])], { logger: { warn } });
+    expect(split.calls.rechecks.map((r) => r.files)).toEqual([[at("test/a.test.ts"), at("test/b.test.ts")], [at("test/a.test.ts")], [at("test/b.test.ts")]]);
+    expect(one.runs.map((r) => r.recheck)).toEqual([
+      recheckModel(model, "npx vitest run", ROOT, [at("test/a.test.ts")]),
+      recheckModel(model, "npx vitest run", ROOT, [at("test/b.test.ts")]),
+    ]);
+    expect(one.stats.rechecks).toBe(3);
+    expect(warn).toHaveBeenCalledWith("verify batch: a shared recheck split into own rechecks", { members: 2, shared: "unusable" });
+
+    const vanished: RecheckOutcome = { kind: "unusable", cause: "reference-vanished", reason: "stash commit missing" };
+    const shared = harness(model, { rechecker: () => vanished });
+    const two = await batch(shared.runtime, [req(["src/a.ts"]), req(["src/b.ts"])]);
+    expect(two.runs.map((r) => r.recheck)).toEqual([vanished, vanished]);
+    expect(shared.calls.rechecks).toHaveLength(1);
+  });
+
+  it("a member below the recheck threshold gets skipped-deadline and leaves its group", async () => {
+    const model: Model = { ...sharedFile("test/common.test.ts"), failing: { "test/common.test.ts": ["old"] }, atRef: { "test/common.test.ts": ["old"] } };
+    const { calls, runtime } = harness(model);
+    const { runs } = await batch(runtime, [req(["src/a.ts"], { deadline: liveDeadline(1_050) }), req(["src/b.ts"])]);
+    expect(runs[0]?.recheck).toEqual({ kind: "skipped-deadline", remainingMs: 950 });
+    expect(runs[1]?.recheck?.kind).toBe("exact");
+    expect(calls.rechecks).toHaveLength(1);
+    expect(calls.rechecks[0]?.deadline.remaining()).toBe(59_900);
+  });
+
+  it("reference disabled or none: decided without a recheck", async () => {
+    const model: Model = { ...MODEL, failing: { "test/a.test.ts": ["x"], "test/b.test.ts": ["y"] } };
+    const { calls, runtime } = harness(model);
+    const { runs } = await batch(runtime, [
+      req(["src/a.ts"], { reference: { kind: "disabled" } }),
+      req(["src/b.ts"], { reference: { kind: "none", reason: "dispatch not tracked" } }),
+    ]);
+    expect(runs.map((r) => r.recheck)).toEqual([
+      { kind: "disabled" },
+      { kind: "unusable", cause: "no-reference", reason: "dispatch not tracked" },
+    ]);
+    expect(calls.rechecks).toHaveLength(0);
+  });
+
+  it("the flaky taint: a union failure that no own run reproduces makes every member incomplete", async () => {
+    const flaky: Model = { ...MODEL, failing: { "test/a.test.ts": ["flaky"] } };
+    const warn = vi.fn();
+    const { calls, runtime } = harness(MODEL, { execute: (spec, _d, n) => ranModel(n === 0 ? flaky : MODEL, spec) });
+    const { runs, stats } = await batch(runtime, [req(["src/a.ts"]), req(["src/b.ts"])], { logger: { warn } });
+    expect(calls.executes).toHaveLength(3);
+    for (const run of runs) {
+      expect(run.recheck).toBeUndefined();
+      expect(ran(run).result).toMatchObject({
+        failingIds: [],
+        complete: false,
+        note: "batched run failure not reproduced by any request's own run: test/a.test.ts > flaky",
+      });
+    }
+    expect(stats.taints).toBe(1);
+    expect(warn).toHaveBeenCalledWith("verify batch: a batched run failure was not reproduced by any request's own run", {
+      ids: ["test/a.test.ts > flaky"],
+    });
+  });
+
+  it("pytest: static attribution from the union's report, without a process", async () => {
+    const model: Model = { failing: { "tests/test_b.py": ["test_x"] }, tests: { "tests/test_c.py": 0 } };
+    const { calls, runtime } = harness(model);
+    const requests = ["a", "b", "c"].map((x) => req([`tests/test_${x}.py`], { command: "pytest" }));
+    const { runs, stats } = await batch(runtime, requests);
+    expect(calls.executes).toHaveLength(1);
+    const own = calls.planned.slice(0, 3).map(specOf);
+    runs.forEach((run, i) => {
+      const direct = runModel(model, own[i] ?? spec());
+      const s = ran(run);
+      expect(s.result).toMatchObject({
+        failingIds: direct.failingIds,
+        failingFiles: direct.failingFiles,
+        total: direct.total,
+        complete: direct.complete,
+      });
+      expect(s.result.note).toBe(direct.note);
+      expect(s.notes).toEqual(["planned 1 input(s)", "batched: 1 run for 3 requests"]);
+    });
+    expect(runs.map((r) => ran(r).exitCode)).toEqual([0, 1, 5]);
+    expect(runs.map((r) => r.recheck)).toEqual([undefined, { kind: "unusable", cause: "runner-unsupported", reason: "pytest imports the live tree" }, undefined]);
+    expect(stats).toMatchObject({ unionRuns: 1, ownRuns: 0, rechecks: 1, taints: 0 });
+
+    // Without per-file counts, the members with no failure of their own confirm by running alone.
+    const bare = harness({ ...model, counts: false });
+    const without = await batch(bare.runtime, ["a", "b", "c"].map((x) => req([`tests/test_${x}.py`], { command: "pytest" })));
+    expect(bare.calls.executes.map((e) => e.spec.inputs)).toEqual([
+      [at("tests/test_a.py"), at("tests/test_b.py"), at("tests/test_c.py")],
+      [at("tests/test_a.py")],
+      [at("tests/test_c.py")],
+    ]);
+    expect(without.runs.map((r) => [ran(r).result.failingIds, ran(r).result.complete])).toEqual([
+      [[], true],
+      [["tests/test_b.py::test_x"], true],
+      [[], false],
+    ]);
+  });
+
+  it("a guard-sensitive member of a green union: derived from per-file counts, else a confirmation run", async () => {
+    const withCounts = harness();
+    const one = await batch(withCounts.runtime, [req(["test/a.test.ts"]), req(["src/b.ts"])]);
+    expect(withCounts.calls.executes).toHaveLength(1);
+    expect(ran(one.runs[0] ?? aborted("")).result).toMatchObject({ failingIds: [], complete: true, total: 2 });
+    expect(ran(one.runs[1] ?? aborted("")).result).toMatchObject({ failingIds: [], complete: true, total: 4 });
+
+    const bare = harness({ ...MODEL, counts: false });
+    const two = await batch(bare.runtime, [req(["test/a.test.ts"]), req(["src/b.ts"])]);
+    expect(bare.calls.executes.map((e) => e.spec.inputs)).toEqual([[at("src/b.ts"), at("test/a.test.ts")], [at("test/a.test.ts")]]);
+    expect(two.runs.map((r) => ran(r).exitCode)).toEqual([0, 0]);
+    expect(two.stats).toMatchObject({ unionRuns: 1, ownRuns: 1 });
+  });
+
+  it("an abort while queued for an own run settles with the attribution phase, and that run is never spawned", async () => {
+    const model: Model = { ...MODEL, failing: { "test/a.test.ts": ["x"] }, atRef: { "test/a.test.ts": ["x"] } };
+    const gate = deferred<void>();
+    const { calls, runtime } = harness(model, {
+      execute: async (spec, _d, n) => {
+        if (n === 1) await gate.promise;
+        return ranModel(model, spec);
+      },
+    });
+    const c = createBatchCoordinator({ platform: "linux" });
+    const hook = c.hook(runtime);
+    const a = req(["src/a.ts"]);
+    const b = req(["src/b.ts"]);
+    const outs = [hook(a), hook(b)];
+    await vi.advanceTimersByTimeAsync(WINDOW);
+    expect(calls.executes).toHaveLength(2);
+    b.deadline.abort();
+    expect(await outs[1]).toEqual(aborted(BATCH_REASONS.attribution));
+    gate.resolve();
+    const run = await outs[0];
+    expect(ran(run ?? aborted("")).result.failingIds).toEqual(["test/a.test.ts > x"]);
+    expect(run?.recheck?.kind).toBe("exact");
+    expect(calls.executes).toHaveLength(2);
+    await c.dispose();
+  });
+
+  it("a member whose deadline ends during its own run settles with that run at once, as alone", async () => {
+    const model: Model = { ...MODEL, failing: { "test/a.test.ts": ["x"], "test/b.test.ts": ["y"] }, atRef: { "test/b.test.ts": [] } };
+    const gate = deferred<void>();
+    const { calls, runtime } = harness(model, {
+      execute: async (spec, _d, n) => {
+        if (n === 1) await gate.promise;
+        return ranModel(model, spec);
+      },
+    });
+    const c = createBatchCoordinator({ platform: "linux" });
+    const hook = c.hook(runtime);
+    const a = req(["src/a.ts"]);
+    const d = req(["src/d.ts"], { reference: { kind: "disabled" } });
+    const outs = [hook(a), hook(req(["src/b.ts"])), hook(d)];
+    await vi.advanceTimersByTimeAsync(WINDOW);
+    a.deadline.abort();
+    expect(calls.executes[1]?.deadline.signal.aborted).toBe(true);
+    gate.resolve();
+    const [ra, rb, rd] = await Promise.all(outs);
+    expect(ra?.recheck).toEqual({ kind: "skipped-deadline", remainingMs: 0 });
+    expect(ran(ra ?? aborted("")).result.failingIds).toEqual(["test/a.test.ts > x"]);
+    expect(rb?.recheck?.kind).toBe("exact");
+    expect(rd).toMatchObject({ scoped: { kind: "ran", exitCode: 0 }, recheck: undefined });
+    await c.dispose();
+
+    // The same with a disabled reference reports its reference decision.
+    const gate2 = deferred<void>();
+    const h2 = harness(model, {
+      execute: async (spec, _d, n) => {
+        if (n === 1) await gate2.promise;
+        return ranModel(model, spec);
+      },
+    });
+    const c2 = createBatchCoordinator({ platform: "linux" });
+    const x = req(["src/a.ts"], { reference: { kind: "disabled" } });
+    const outs2 = [c2.hook(h2.runtime)(x), c2.hook(h2.runtime)(req(["src/c.ts"]))];
+    await vi.advanceTimersByTimeAsync(WINDOW);
+    x.deadline.abort();
+    gate2.resolve();
+    expect((await outs2[0])?.recheck).toEqual({ kind: "disabled" });
+    await Promise.all(outs2);
+    await c2.dispose();
+  });
+
+  it("an abort while waiting for a shared recheck gets timed-out; when all abort, the recheck's signal aborts", async () => {
+    const model: Model = { ...sharedFile("test/common.test.ts"), failing: { "test/common.test.ts": ["old"] }, atRef: { "test/common.test.ts": ["old"] } };
+    const gate = deferred<void>();
+    const { calls, runtime } = harness(model, {
+      rechecker: async (_ref, files) => {
+        await gate.promise;
+        return recheckModel(model, "npx vitest run", ROOT, files);
+      },
+    });
+    const c = createBatchCoordinator({ platform: "linux" });
+    const hook = c.hook(runtime);
+    const a = req(["src/a.ts"]);
+    const outs = [hook(a), hook(req(["src/b.ts"]))];
+    await vi.advanceTimersByTimeAsync(WINDOW);
+    expect(calls.rechecks).toHaveLength(1);
+    a.deadline.abort();
+    const ra = await outs[0];
+    expect(ra?.recheck).toEqual({ kind: "timed-out", boundMs: 59_900 });
+    expect(ra?.scoped.kind).toBe("ran");
+    expect(calls.rechecks[0]?.deadline.signal.aborted).toBe(false);
+    gate.resolve();
+    expect((await outs[1])?.recheck?.kind).toBe("exact");
+    await c.dispose();
+
+    const killed = harness(model, {
+      rechecker: (_ref, _files, deadline) =>
+        new Promise<RecheckOutcome>((resolve) => {
+          deadline.signal.addEventListener("abort", () => resolve({ kind: "timed-out", boundMs: 1 }), { once: true });
+        }),
+    });
+    const c2 = createBatchCoordinator({ platform: "linux" });
+    const members = [req(["src/a.ts"]), req(["src/b.ts"])];
+    const outs2 = members.map((m) => c2.hook(killed.runtime)(m));
+    await vi.advanceTimersByTimeAsync(WINDOW);
+    for (const m of members) m.deadline.abort();
+    expect((await Promise.all(outs2)).map((r) => r.recheck)).toEqual([
+      { kind: "timed-out", boundMs: 59_900 },
+      { kind: "timed-out", boundMs: 59_900 },
+    ]);
+    expect(killed.calls.rechecks[0]?.deadline.signal.aborted).toBe(true);
+    await c2.dispose();
+    expect(killed.calls.closes).toEqual([0]);
+  });
+
+  it("dispose during a shared recheck aborts it and settles every member", async () => {
+    const model: Model = { ...sharedFile("test/common.test.ts"), failing: { "test/common.test.ts": ["old"] }, atRef: { "test/common.test.ts": ["old"] } };
+    const { calls, runtime } = harness(model, {
+      rechecker: (_ref, _files, deadline) =>
+        new Promise<RecheckOutcome>((resolve) => {
+          deadline.signal.addEventListener("abort", () => resolve({ kind: "timed-out", boundMs: 1 }), { once: true });
+        }),
+    });
+    const c = createBatchCoordinator({ platform: "linux" });
+    const outs = [c.hook(runtime)(req(["src/a.ts"])), c.hook(runtime)(req(["src/b.ts"]))];
+    await vi.advanceTimersByTimeAsync(WINDOW);
+    await c.dispose();
+    expect(await Promise.all(outs)).toEqual([aborted(BATCH_REASONS.disposed), aborted(BATCH_REASONS.disposed)]);
+    expect(calls.rechecks[0]?.deadline.signal.aborted).toBe(true);
+    expect(calls.closes).toEqual([0]);
   });
 });
