@@ -51,6 +51,12 @@ CI's job. See `docs/adr/0003-affected-test-verification.md`.
 
 ### Changed
 
+- **Gate labels say what was verified.** A result the gate let through without verifying it
+  (unverifiable: gate timeout, slot busy, budget exhausted, no reference; or a pass carrying a
+  caveat) is headed `[router ⚠ UNVERIFIED: <method>]` above its `Verification caveats — NOT
+  verified` list, instead of `[router ✓ accepted: …]` (plan G2, QA-3.1-21). A clean pass,
+  which used to add no text on a native `Task()`, now ends with `[router ✓ verified: <method>]`,
+  and a pass with notes uses the same label (QA-3.1-18). Accept/reject policy is unchanged.
 - **`testsPass` runs only the affected tests.** The runner adapter builds the command
   (`vitest related`, `jest --findRelatedTests`, pytest module mapping) and spawns it
   without a shell. When scoped tests fail, only those test files are rerun in an

@@ -94,7 +94,9 @@ function mentionsAny(args: string, spellings: readonly string[]): boolean {
 }
 
 /** Verdict markers appended by the gate (src/verify/dispatch.ts buildAcceptedSuffix / buildForcingNote). */
-const ACCEPTED_MARK = "[router \u2713 accepted";
+const UNVERIFIED_MARK = "[router \u26a0 UNVERIFIED";
+/** QA-3.1-21 (plan G2): no router label may claim a pass on an unverified delegation. */
+const PASS_CLAIM = /\[router \u2713|\u2713 accepted|verified:/;
 const REJECTED_MARK = "NOT ACCEPTED";
 const CAVEAT_MARK = "Verification caveats \u2014 NOT verified";
 /** A deferred verification footer names a vrf_ handle; VERIFY:required dispatches must not carry one. */
@@ -907,10 +909,11 @@ suite("verify resource budget: machine-wide bound (3.1.2.b-e)", () => {
     expect(late.length).toBeGreaterThanOrEqual(1);
     // Returns on time.
     expect(res.afterMs).toBeLessThanOrEqual(GATE_BUDGET_MS + 3000);
-    // Not a pass: rejected, or accepted only with an unverified caveat naming the timeout.
+    // Not a pass: rejected, or returned UNVERIFIED with a caveat naming the timeout (QA-3.1-21).
     const out = res.output;
-    const notPass = out.includes(REJECTED_MARK) || (out.includes(ACCEPTED_MARK) && out.includes(CAVEAT_MARK));
+    const notPass = out.includes(REJECTED_MARK) || (out.includes(UNVERIFIED_MARK) && out.includes(CAVEAT_MARK));
     expect(notPass, out).toBe(true);
+    expect(PASS_CLAIM.test(out), out).toBe(false);
     expect(/timed out|budget|deadline/i.test(out), out).toBe(true);
     expect(DEFERRED_FOOTER.test(out), out).toBe(false);
     // No orphans 3 s after return.

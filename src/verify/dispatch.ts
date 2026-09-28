@@ -13,7 +13,7 @@ import type { DoD, InferHints } from "./dod";
 import { DEFAULT_IDLE_TTL_MS } from "../router/idle-sweep";
 import { basename, dirname, join, resolve } from "node:path";
 import { existsSync, realpathSync } from "node:fs";
-import type { ReferenceState } from "./types";
+import type { ReferenceState, Verdict } from "./types";
 import type { DispatchReference } from "./reference";
 import { REFERENCE_NONE } from "./baseline";
 import { neutralizeDirectives } from "./pending";
@@ -620,9 +620,20 @@ export function buildForcingNote(
  * Suffix appended to an accepted delegate-tool result. Caveats and notes can name producer test ids
  * ("no worse than before; pre-existing failures: <ids>"), so directive keys lose their colons as in
  * buildForcingNote (QA-2.4-6).
+ *
+ * Plan G2 (QA-3.1-21): only an outcome "pass" with no caveats reads `[router ✓ verified: <method>]`
+ * (QA-3.1-18). Anything else the gate let through (unverifiable, a skipped check, a pass carrying
+ * caveats) reads `[router ⚠ UNVERIFIED: <method>]` and is never labelled accepted or verified.
  */
-export function buildAcceptedSuffix(method: string, caveats: string[] = [], notes: string[] = []): string {
-  return `\n\n[router \u2713 accepted: ${method}]` + (caveats.length
+export function buildAcceptedSuffix(
+  method: string,
+  outcome: Verdict["outcome"],
+  caveats: string[] = [],
+  notes: string[] = [],
+): string {
+  const verified = outcome === "pass" && caveats.length === 0;
+  const label = verified ? `[router \u2713 verified: ${method}]` : `[router \u26a0 UNVERIFIED: ${method}]`;
+  return `\n\n${label}` + (caveats.length
     ? `\nVerification caveats — NOT verified (acceptance is not a passing check):\n${caveats.map(r => `- ${neutralizeDirectives(r)}`).join("\n")}`
     : "") + (notes.length ? `\nVerification notes:\n${notes.map(r => `- ${neutralizeDirectives(r)}`).join("\n")}` : "");
 }

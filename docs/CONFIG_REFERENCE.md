@@ -211,7 +211,9 @@ Verification has three outcomes: `pass` means checks ran successfully, `fail` me
 the work did not satisfy a performed check, and `unverifiable` carries the reason
 a check could not be performed. The gate accepts when there is no genuine failure,
 appending a **Verification caveats — NOT verified** list for every unavailable check;
-acceptance does not turn those checks into passes. Mixed failure/unavailable results
+acceptance does not turn those checks into passes. Such a result is headed
+`[router ⚠ UNVERIFIED: <method>]`, never "accepted" or "verified"; only a clean pass
+reads `[router ✓ verified: <method>]` (`deterministic` or `checker`). Mixed failure/unavailable results
 still reject and may escalate. Strict mode rejects unavailable-only results without
 escalation. `run`, build and lint exit failures remain genuine failures. `testsPass`
 runs only the affected tests and rechecks their failures against a dispatch-time

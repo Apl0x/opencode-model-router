@@ -638,7 +638,7 @@ export function formatVerifyReport(
       lines.push(indent(`[router] ${DRIFT_UNCHECKED_NOTICE}`));
     }
     if (judged.accepted) {
-      lines.push(indent(buildAcceptedSuffix(verdict.method, judged.verdict.caveats, verdict.notes).trim()));
+      lines.push(indent(buildAcceptedSuffix(verdict.method, judged.verdict.outcome, judged.verdict.caveats, verdict.notes).trim()));
     } else {
       lines.push(indent(scrubText(buildForcingNote(verdict.reasons, { producerTier: item.producerTier, nextTier: result.nextTier ?? null }))));
       lines.push(indent(ROUTER_VERIFY_NO_RETRY_TEXT));

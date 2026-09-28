@@ -441,10 +441,11 @@ suite("verify resource budget: deferred (3.1.2.f-h)", () => {
     expect(report).toContain(DRIFT_NOTICE);
     const line = report.split("\n").find(l => l.includes(h as string)) ?? "";
     // Not a pass: drift downgrades the verdict (to unverifiable, or fail if tests broke). Under the
-    // default strictUnverifiable=false an unverifiable verdict still carries the "accepted" suffix
-    // with a NOT-verified caveat (QA-2.2-17), so the outcome word is what is asserted.
+    // default strictUnverifiable=false an unverifiable verdict is still returned with a NOT-verified
+    // caveat (QA-2.2-17), labelled UNVERIFIED and never accepted or verified (QA-3.1-21, plan G2).
     expect(line).not.toMatch(/\u00b7 pass\b/);
     expect(line).toMatch(/\u00b7 (unverifiable|fail)\b/);
+    expect(report).not.toMatch(/\[router \u2713|\u2713 accepted|verified:/);
   }, TEST_TIMEOUT_MS);
 
   it("3.1.2.h: background: true reports an introduced failure once, as a late notice", async () => {

@@ -240,10 +240,33 @@ describe("buildForcingNote", () => {
 });
 
 describe("buildAcceptedSuffix", () => {
-  it("returns the expected suffix string", () => {
-    expect(buildAcceptedSuffix("deterministic")).toBe(
-      "\n\n[router \u2713 accepted: deterministic]",
+  it("QA-3.1-18: labels a clean pass as verified", () => {
+    expect(buildAcceptedSuffix("deterministic", "pass")).toBe(
+      "\n\n[router \u2713 verified: deterministic]",
     );
+  });
+  it("keeps notes on a pass under the verified label", () => {
+    expect(buildAcceptedSuffix("checker", "pass", [], ["no worse than before; pre-existing failures: t1"])).toBe(
+      "\n\n[router \u2713 verified: checker]\nVerification notes:\n- no worse than before; pre-existing failures: t1",
+    );
+  });
+  it("QA-3.1-21 (plan G2): an unverifiable result is never labelled accepted or verified", () => {
+    const out = buildAcceptedSuffix("none", "unverifiable", ["verification gate timed out after 6000ms"]);
+    expect(out).toBe(
+      "\n\n[router \u26a0 UNVERIFIED: none]\n" +
+        "Verification caveats — NOT verified (acceptance is not a passing check):\n" +
+        "- verification gate timed out after 6000ms",
+    );
+    expect(out).not.toMatch(/\u2713|accepted|\bverified:/);
+  });
+  it("labels a pass that carries caveats, and a skipped check, as UNVERIFIED", () => {
+    expect(buildAcceptedSuffix("deterministic", "pass", ["concurrent delegation"])).toMatch(/^\n\n\[router \u26a0 UNVERIFIED: deterministic\]\n/);
+    expect(buildAcceptedSuffix("none", undefined)).toBe("\n\n[router \u26a0 UNVERIFIED: none]");
+  });
+  it("the labels carry no directive token", () => {
+    for (const out of [buildAcceptedSuffix("deterministic", "pass"), buildAcceptedSuffix("none", "unverifiable", ["x"])]) {
+      expect(out).not.toMatch(/VERIFY:|CAP:/);
+    }
   });
 });
 

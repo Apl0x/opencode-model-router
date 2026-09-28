@@ -171,10 +171,10 @@ A `VERIFY:required` delegation, and every `router_verify` or background run, goe
 
 | outcome | when | gate result |
 |---|---|---|
-| **pass** | the scoped run is complete, has no collection error and no failing test; or no test is affected | accepted |
-| **pass — "no worse than before"** | every failing test id also fails at an **exact** reference, and the scoped inventory is complete | accepted, with the note `no worse than before; pre-existing failures: …; suite is NOT green` |
+| **pass** | the scoped run is complete, has no collection error and no failing test; or no test is affected | accepted, labelled `[router ✓ verified: deterministic]` |
+| **pass — "no worse than before"** | every failing test id also fails at an **exact** reference, and the scoped inventory is complete | accepted, labelled `[router ✓ verified: deterministic]` with the note `no worse than before; pre-existing failures: …; suite is NOT green` |
 | **fail** | at least one failing id is **proven** introduced against an exact recheck: it fails now and passed at the reference, or its test file did not exist at dispatch | rejected; only the introduced ids are named |
-| **unverifiable** | anything else (below) | accepted **with a caveat**, or rejected when `strictUnverifiable` is on |
+| **unverifiable** | anything else (below) | returned **with a caveat** under `[router ⚠ UNVERIFIED: <method>]`, or rejected when `strictUnverifiable` is on |
 
 A fail is always backed by a proven id. A result that cannot be decided either way is unverifiable, never fail and never pass.
 
@@ -230,7 +230,15 @@ Unverifiable means the router could not tell whether the change broke tests. It 
 - **scoping is impossible**: changed files are unavailable, or no planner exists for the command (S6);
 - the command is not allowlisted, the check errored, or the lineage caveat applies.
 
-By default an unverifiable result is **accepted with a caveat** that names the reason. Set `verify.strictUnverifiable: true` to reject it instead. Unverifiable never counts as verified. It is not proof that the tests pass.
+By default an unverifiable result is **returned with a caveat** that names the reason. Set `verify.strictUnverifiable: true` to reject it instead. Unverifiable never counts as verified. It is not proof that the tests pass, and it is never labelled accepted or verified (plan G2). A gate that timed out, for example, renders:
+
+```
+[router ⚠ UNVERIFIED: none]
+Verification caveats — NOT verified (acceptance is not a passing check):
+- verification gate timed out after 6000ms
+```
+
+A clean pass renders the single line `[router ✓ verified: <method>]` (`deterministic` or `checker`), on the `delegate` tool and on a native `Task()` alike. A pass that carries a caveat (for example concurrent delegations in the same tree) is labelled `UNVERIFIED` too.
 
 ### pytest module mapping
 
@@ -311,7 +319,7 @@ The plugin-owned `delegate` tool produces via the OpenCode client, runs the gate
 | `graderTimeoutMs` | `60000` (1 min) | one grader `session.prompt` turn |
 | `gateBudgetMs` | `90000` (90 s) | the whole acceptance gate, grader ladder included |
 
-**Fail-closed, in both directions.** A gate that runs out of budget is `unmet` with the reason `verification gate timed out after <n>ms` — never accepted, because the one thing worse than a slow verifier is a fast fabricated pass. And an unusable configured value (zero, negative, non-finite, non-numeric) falls back to the *default* ceiling, never to "no ceiling"; `validateEnforcement` already rejects those in `tiers.json`, so `timeoutMs()` is defence in depth for config that reaches the runtime through an override layer or a hand-built `RouterConfig`.
+**Fail-closed, in both directions.** A gate that runs out of budget never passes: it is `unverifiable` with the reason `verification gate timed out after <n>ms`, rendered `[router ⚠ UNVERIFIED: none]` (returned with that caveat by default, rejected under `strictUnverifiable`), and a failure the gate had already observed before the timeout still rejects it — because the one thing worse than a slow verifier is a fast fabricated pass. And an unusable configured value (zero, negative, non-finite, non-numeric) falls back to the *default* ceiling, never to "no ceiling"; `validateEnforcement` already rejects those in `tiers.json`, so `timeoutMs()` is defence in depth for config that reaches the runtime through an override layer or a hand-built `RouterConfig`.
 
 **A real cancellation, not an abandoned wait.** Every call site pairs the rejection with `session.abort` — directly, or via `disposeChildSession`, which aborts before it deletes. The abort is a genuine server-side call, so the underlying turn actually stops.
 

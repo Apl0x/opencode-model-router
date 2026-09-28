@@ -296,19 +296,22 @@ function assertVerdict(text: string, exp: Expect, r: RunnerSpec, mode: Mode, int
   }
   switch (exp) {
     case "accepted":
-      // A clean required-mode pass appends no router text at all (observed); the deferred
-      // report says "· pass" (checked above).
+      // QA-3.1-18: a clean pass appends exactly the verified label, in both modes (the deferred
+      // report also says "· pass", checked above).
+      expect(t).toMatch(/\[router ✓ verified: (deterministic|checker)\]/);
+      expect(t).not.toContain("UNVERIFIED");
       expect(t).not.toContain("NOT ACCEPTED");
       expect(t).not.toContain(CAVEAT);
       expect(t).not.toContain("introduced failures:");
       break;
     case "rejected":
       if (mode === "required") expect(t).toContain("NOT ACCEPTED");
-      expect(t).not.toContain("[router ✓ accepted");
+      expect(t).not.toContain("[router ✓");
       expect(t).toContain("introduced failures:");
       expect(t).toContain(introducedId);
       break;
     case "accepted-preexisting":
+      expect(t).toContain("[router ✓ verified:");
       expect(t).not.toContain("NOT ACCEPTED");
       expect(t).not.toContain("introduced failures:");
       expect(t).toContain("no worse than before; pre-existing failures:");
@@ -321,7 +324,10 @@ function assertVerdict(text: string, exp: Expect, r: RunnerSpec, mode: Mode, int
       expect(t).toMatch(/no affected tests/);
       break;
     case "unverifiable":
-      // Accepted with a caveat (strictUnverifiable off), never a clean pass nor a rejection.
+      // Returned with a caveat (strictUnverifiable off), never a clean pass nor a rejection, and
+      // never labelled accepted or verified (QA-3.1-21, plan G2).
+      expect(t).toContain("[router ⚠ UNVERIFIED:");
+      expect(t).not.toMatch(/\[router ✓|✓ accepted|verified:/);
       expect(t).toContain(CAVEAT);
       expect(t).not.toContain("NOT ACCEPTED");
       expect(t).not.toContain("introduced failures:");

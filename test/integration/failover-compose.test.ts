@@ -149,7 +149,7 @@ describe("Phase 3.3 — provider-failover / quality-escalation orthogonality", (
     });
 
     // Eventually accepted on attempt 2.
-    expect(result).toContain("[router ✓ accepted:");
+    expect(result).toContain("[router ✓ verified:");
     expect(result).not.toContain("status: unmet");
     // Exactly 2 producer calls: the throwing attempt (counted as one failed ladder
     // attempt) plus one successful attempt. The API error did NOT spawn an extra
@@ -257,7 +257,7 @@ describe("Phase 3.3 — provider-failover / quality-escalation orthogonality", (
     // The result is either accepted (third attempt passed before cost ceiling) or
     // unmet (cost ceiling fired after recording medium cost). Either is valid —
     // what matters is no duplicate producer call was spawned per attempt.
-    const isAccepted = result.includes("[router ✓ accepted:");
+    const isAccepted = result.includes("[router ✓ verified:");
     const isUnmet = result.includes("[router status: unmet]");
     expect(isAccepted || isUnmet).toBe(true);
   });
