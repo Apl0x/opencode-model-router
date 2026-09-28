@@ -263,4 +263,32 @@ describe("parseVerifyDirectives", () => {
     expect(line).toContain("\\u2066");
     expect(line).not.toMatch(/[\u200e\u200f\u202a-\u202e\u2066-\u2069\u200b]/);
   });
+
+  it("a value that is only a leading quote/mark is malformed, not an empty directive", () => {
+    const log = vi.fn();
+    expect(parseVerifyDirectives('VERIFY:" required', D, log)).toEqual(DEFAULT);
+    expect(log).toHaveBeenCalledTimes(1);
+    expect(String(log.mock.calls[0]?.[0])).toContain('"\\""');
+    const log2 = vi.fn();
+    expect(parseVerifyDirectives("VERIFY_WAIT:` 2s", D, log2)).toEqual(DEFAULT);
+    expect(log2).toHaveBeenCalledTimes(1);
+    // A later valid directive still wins.
+    expect(parseVerifyDirectives("VERIFY:* VERIFY:required", D)).toEqual(REQUIRED);
+  });
+
+  it("QA-1.6-34: lower-case keys sharing one token reuse the prose-guard verdict at the token end", () => {
+    // Both values are malformed, so both end at the token end: the second key reuses the first
+    // key's tail result instead of re-testing it.
+    const log = vi.fn();
+    expect(parseVerifyDirectives("verify:?verify:?", D, log)).toEqual(DEFAULT);
+    expect(log).toHaveBeenCalledTimes(1);
+    expect(String(log.mock.calls[0]?.[0])).toContain('"?verify:?"');
+    // Followed by prose: both are prose (cached false verdict), silently ignored.
+    const log2 = vi.fn();
+    expect(parseVerifyDirectives("verify:?verify:? more words\nVERIFY:required", D, log2)).toEqual(REQUIRED);
+    expect(log2).not.toHaveBeenCalled();
+    const log3 = vi.fn();
+    expect(parseVerifyDirectives("verify_wait:?verify_wait:? then prose", D, log3)).toEqual(DEFAULT);
+    expect(log3).not.toHaveBeenCalled();
+  });
 });
