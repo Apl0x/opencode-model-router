@@ -684,9 +684,15 @@
 //     sweep and fs.rm (the QA-1.5-3 window), which only a process running
 //     after the dispose contract was broken can create.
 //   - Bun (owner: 3.1, which adds a Bun smoke). opencode runs the plugin under
-//     Bun 1.3.14, not Node, and every measurement here is Node's. Bun's
-//     fs.promises.rm is native code: whether it follows junctions, and which
-//     code it reports for a held dir (EBUSY, EPERM, ...), are unverified. The
+//     Bun 1.3.14, not Node, and the measurements above are Node's. Verified
+//     on Bun 1.3.14/win32 (global QA, attempt 3, E1/E2; QA-G-8):
+//     lstat(junction).isSymbolicLink() is true (isDirectory() false), a
+//     recursive fs.promises.rm of a dir holding a junction removes the
+//     junction without following it (the target's content survives), and the
+//     dispose path keeps the real node_modules and leaves no omr-ref dir (E2
+//     and the Bun smoke, test/smoke/bun-runtime.smoke.ts). Other Bun versions
+//     are unverified, and so is which code Bun's native rm reports for a held
+//     dir (EBUSY, EPERM, ...). The
 //     flat retry loop no longer relies on the engine honouring maxRetries or
 //     retryDelay (QA-1.5-11), but a code outside TRANSIENT_FS_CODES would end
 //     it at once (the dir is then left for GC). The heartbeat assumes
