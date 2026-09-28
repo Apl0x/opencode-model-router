@@ -556,3 +556,77 @@ three minor findings above. QA-G-15 … QA-G-17 are minor and predate 29ca663. U
 recorded for acceptance.
 
 - QA-G-17 Resolution: 2d8df09 — the deleted-module content search now uses the module's own Python name, as the existing-module search does since 29ca663: a deleted `app/index.py` searches `index` (only `__init__.py` uses the package name); `findByName` keeps the stem (`test_app.py`), and the fail-closed rules are unchanged (no hit → S6 `deleted-no-tests`, more than `STEM_MATCH_LIMIT` → S6 `stem-too-common`). Tests (test/unit/runner.test.ts): deleted `app/index.py` with importers `from app.index import x` and `from .index import x` → exactly those two inputs; deleted `tests/pkg/index.py` → its relative importer; deleted `app/mod02.py` still searches `mod02`, deleted `tests/pkg/__init__.py` still searches `pkg`. On the pre-fix `src` the index case fails (`expected [ '/r/tests/test_i1.py', …(5) ] to deeply equal [ '/r/tests/test_i1.py', …(1) ]`).
+
+---
+
+## Final verification (QA-G-17)
+
+**Scope.** `git diff ffbde73..142885e`: 2d8df09 (a deleted module's content search uses its own Python name),
+plus the test-only 56e989e and 4266263. The goal was a false pass: a deleted or renamed pytest module whose
+importer is not selected while the plan is a spec or NoAffected.
+
+**Verdict: NOT CLEAN.** 2d8df09 resolves QA-G-17. Every direct-importer spelling tried selects its test. The
+attack found four false passes, each confirmed with real pytest:
+
+- QA-G-18 is a regression caused by 2d8df09. It falls inside a documented residual.
+- QA-G-19 … QA-G-21 predate the diff (ffbde73 gives the same plan). They sit in the deleted-file paths next to it.
+
+### Method
+
+- `npx vitest run --maxWorkers=2 test/unit/runner.test.ts` → `Test Files  1 passed (1)` / `Tests  746 passed (746)`.
+- A scratch harness in `%TEMP%` (deleted afterwards) ran the real `planScopedRun` (`uv run pytest`) over real git
+  repositories (Git for Windows 2.51.0):
+  - It used the wiring's exact argv: `grep -l -z -F [-w] --untracked -e <name> -- <globs>` and
+    `ls-files -z --cached --others --exclude-standard`.
+  - The fs seam was the real worktree.
+  - It ran each case on this commit and on `git archive ffbde73 src`.
+  - It checked each attack with `uv run --no-project --with pytest python -m pytest -q`, running both the full
+    suite and the planned inputs.
+  - Base fixture: `testpaths = ["tests"]`, `app/__init__.py`, `app/mod01.py`, and `tests/test_mod01.py`
+    (`from app.mod01 import X`).
+
+**Controls.** Each of these selects its importer at 142885e. The search needle is shown first.
+
+| Case | Result at 142885e |
+|---|---|
+| `import app.index as i` | `index`, selected |
+| QA-G-17 repro (`app/test_in.py`: `from .index import x`) | `index`, `["app/test_in.py"]`. The scoped run fails with `ModuleNotFoundError: No module named 'app.index'`. ffbde73 gave `["tests/test_mod01.py"]`. |
+| CRLF `from app import (mod01,\r\n    index)` | `index`, selected |
+| rename `app/index.py` → `app/main.py` (previousPath), with a stale `from app.index import x` | `main` + `index` → `["tests/test_new.py","tests/test_old.py"]`. The scoped run exits 2. |
+| rename `app/index.py` → `app/index/__init__.py` | selected |
+| `pkg/__init__.py` deleted, test `from pkg import helper` | `pkg`, selected |
+| src layout (`pythonpath = ["src"]`), `src/lib/index.py` or `src/lib/__init__.py` deleted | `index` or `lib`, selected |
+| `app/app.py` and `index/index.py` deleted | selected |
+| `app/app.py` deleted, with 21 `from app.mod01` decoys | `S6 stem-too-common: … "app" appears in 23 test files (limit 20)` |
+| `app/mod+1.py` deleted, test `import_module("app.mod+1")` | selected |
+| `app/[x].py` deleted | `tests/test_[x].py`, found by name |
+| `tests/pkg/index.py` deleted, test `from .index import helper` | selected. ffbde73 gave `S6 deleted-no-tests`. |
+
+Deleting an unreferenced `app/index.py` now gives `S6 deleted-no-tests … "index"`. ffbde73 gave
+`["tests/test_mod01.py"]`. This moves toward fail-closed, so it gets no finding.
+
+**Test-only commits.**
+
+- 56e989e changes only the tree-kill `afterEach` cleanup. The retry delay goes from 50 to 100 ms. After the
+  retries, `EBUSY`, `EPERM` and `ENOTEMPTY` log a warning instead of throwing.
+- 4266263 adds two directives tests and removes nothing.
+
+Neither commit weakens an assertion. The new QA-G-17 runner tests assert the exact inputs and the exact needle.
+
+### Final findings
+
+| ID | Severity | Evidence | Fix |
+|---|---|---|---|
+| QA-G-18 | minor | **Regression inside a documented residual: `app/__init__.py` still imports the deleted `index.py`.**<br>**Setup (X1):** `app/__init__.py` holds `from .index import VERSION`. `tests/test_util.py` holds `assert [1, 2].index(2) == 1`. `app/index.py` is deleted.<br>**At 142885e:** `grep "index"` → `SPEC inputs=["tests/test_util.py"]`. The scoped run gives `exit=0 1 passed`, but the full run gives `exit=2 ModuleNotFoundError: No module named 'app.index' \| ERROR tests/test_mod01.py`.<br>**At ffbde73:** `grep "app"` → `["tests/test_mod01.py"]`, which fails, so the miss is new.<br>**Why minor:** VERIFICATION.md documents package re-exports as a residual. X1b (`app/helpers.py`, same shape) passes at both commits, so the directory-name search covered `index.py` only by accident. | Optional: when a deleted module's sibling `__init__.py` still exists and names it, also search the package name. This covers X1 and X1b. |
+| QA-G-19 | critical | **A deleted module that a nested conftest.py imports is not S6.** The gone-module search omits `CONFTEST_GLOB`. The existing-module path fails closed on a conftest hit.<br>**Setup (X2):** `tests/api/conftest.py` holds `from app.helpers import make`, used by a fixture in `tests/api/test_api.py`. `tests/unit/test_unit.py` holds a comment `# string helpers …`. `app/helpers.py` is deleted.<br>**Result:** `SPEC inputs=["tests/unit/test_unit.py"]`. The scoped run gives `exit=0`, but the full run gives `exit=2 ERROR tests/api - ModuleNotFoundError: No module named 'app.helpers'`.<br>**Variants:** X2b (`index.py` with an `.index(` decoy) behaves the same. The control X2c (the same module modified) → `S6 unmapped-module: changed module app/helpers.py is referenced by tests/api/conftest.py …`.<br>**Scope:** ffbde73 gives the same plan. A root `tests/conftest.py` is caught, since every selected test loads it. | Search `[...pyGlobs, CONFTEST_GLOB]` for a gone module too. Return S6 `unmapped-module` on a conftest hit (unscoped `accept`), as the existing-module loop does. |
+| QA-G-20 | critical | **A deleted or renamed-away test file that other tests import adds only a note.**<br>**Setup (X3):** rename `tests/test_base.py` → `tests/base.py` (previousPath). `tests/test_a.py` is updated to `from base import Base`. `tests/test_b.py` still holds `from test_base import Base`.<br>**Result:** `grep -w "base"` → `SPEC inputs=["tests/test_a.py"]`. The scoped run gives `exit=0`, but the full run gives `exit=2 ModuleNotFoundError: No module named 'test_base' \| ERROR tests/test_b.py`.<br>**Variant:** X3b (`tests/test_base.py` deleted alone) → `noAffected: no affected tests: no changed file is a test input`, labelled ✓ verified (QA-G-14).<br>**Scope:** this predates 2d8df09 (the `deleted test file not run` branch is unchanged). "Nothing to run" (phase-3.1) assumes a test file is a leaf. | For a gone test file, run the gone-module content search on its module name (`test_base`) and add the hits. A conftest hit gives S6. No hit keeps today's note. |
+| QA-G-21 | critical | **A deleted package `__init__.py` misses the in-package tests that import it relatively.** This is the QA-G-17 class, still open for `__init__.py`: `from . import helper` never spells the package name.<br>**Setup (X4):** `tests/pkg/__init__.py` is deleted. `tests/pkg/test_rel.py` holds `from . import helper`. `tests/test_other.py` holds `import pkgutil`.<br>**Result:** `grep "pkg"` → `SPEC inputs=["tests/test_other.py"]`, matched through the substring `pkgutil`. The scoped run gives `exit=0`, but the full run gives `exit=2 ImportError: attempted relative import with no known parent package \| ERROR tests/pkg/test_rel.py`.<br>**Scope:** ffbde73 gives the same plan. Without the decoy, the plan is S6 `deleted-no-tests`. | For a deleted `__init__.py`, also add every in-scope test file under its directory, since those files lose their package. Alternatively, return S6 when any such file exists. |
+
+**Severity rule:** a constructed false pass outside the documented residuals is critical, as this round's
+dispatch specifies. One inside a residual is minor. Round 3 rated the pre-existing QA-G-15 … QA-G-17 minor, and
+QA-G-19 … QA-G-21 also predate 2d8df09.
+
+**Status:** QA-G-17 is **verified resolved**. The final verification is **NOT CLEAN**:
+
+- QA-G-19, QA-G-20 and QA-G-21 are critical and pre-existing. Under the owner rule they need fixes.
+- QA-G-18 is minor and is recorded.
