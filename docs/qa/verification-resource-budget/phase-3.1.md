@@ -807,3 +807,110 @@ passes locally (65/65) and in CI. The main gaps:
 - several assertions that can pass vacuously or are looser than the plan's (QA-3.1-4 to -11).
 
 QA-3.1-19 to -21 are deferred by plan to 3.2. QA-3.1-22 and -23 need no action.
+
+### 3.1.5 evidence
+
+Recorded for QA-3.1-16. Local host: Windows 11, 16 cores, node v24.21.0, bun 1.3.14, at 15e9218.
+
+**Keyless smoke lane** (`npm run smoke:keyless`: registration, subagent-tiers and deferred-catalog),
+exit 1:
+
+```
+ ❯ test/smoke/registration.smoke.test.ts (2 tests | 1 failed) 19066ms
+     × loads the plugin, resolves overrides and registers agents with no API key 12102ms
+ FAIL  test/smoke/registration.smoke.test.ts > keyless registration smoke > loads the plugin, resolves overrides and registers agents with no API key
+AssertionError: expected { providerID: 'anthropic', …(1) } to deeply equal { providerID: 'openai', …(1) }
+-   "modelID": "gpt-5.6-luna-fast",
+-   "providerID": "openai",
++   "modelID": "claude-sonnet-5",
++   "providerID": "anthropic",
+ ❯ test/smoke/registration.smoke.test.ts:161:27
+ Test Files  1 failed | 2 passed (3)
+      Tests  1 failed | 8 passed (9)
+   Duration  80.91s
+```
+
+The one failure is the known local-only one: `expect(agent.model).toEqual(OPENAI_MODEL)` at
+`registration.smoke.test.ts:161`. On this host the agent resolves to the local user's anthropic model
+instead of the test's openai override, so the providerID differs (cause not re-investigated here). It
+does not touch verification. The other 8 tests pass: the second registration test and both the
+subagent-tiers and deferred-catalog files.
+
+**Bun smoke** (`bun test/smoke/bun-runtime.smoke.ts`), exit 0:
+
+```
+bun 1.3.14 on win32-x64, execPath C:\Users\Marquinho\.bun\bin\bun.exe
+PASS exec: runArgv keeps exit codes 0 and 3 (724 ms)
+PASS exec: runArgv passes argv byte for byte (372 ms)
+PASS exec: the deadline kills the whole tree (2333 ms): child and grandchild dead 332 ms after the deadline
+PASS exec: lowPriority lowers the child (1426 ms): base priority 6
+PASS exec: runArgv refuses a .cmd target and it does not run (510 ms)
+PASS runner: resolveEntry picks node, not bun (60 ms): C:\Users\Marquinho\scoop\apps\nodejs-lts\current\node.exe
+PASS runner: planScopedRun's spec runs node, not bun (137 ms): C:\Users\Marquinho\scoop\apps\nodejs-lts\current\node.exe
+PASS slot: max 1 in one Bun process (20 ms)
+PASS slot: the machine clock under Bun reads the OS uptime (65 ms): hrtime 6105 ms, mono 143337111 ms, uptime 143337109 ms
+PASS slot: max 1 across two Bun processes (191 ms)
+PASS reference: dispose keeps the real node_modules and leaves no omr-ref dir (1652 ms): junction links removed, exact=true
+PASS exec: the exit hook kills a runShell tree when a Bun host exits (868 ms): child and grandchild dead 0 ms after the host exited
+OK: 12 passed, 0 failed, 0 skipped
+```
+
+**CI, Test run 36366712022 (head bb3e4bb), conclusion `success`.** All 12 jobs green (`gh run view
+36366712022 --json jobs`): test × 6 (ubuntu/windows × node 20/22/24), e2e × 2 (ubuntu, windows),
+bun smoke × 2, coverage, and the coverage gate. Merged per-file table, reproduced locally from the
+run's `coverage-linux` and `coverage-windows` artifacts with `scripts/coverage-merge.mjs` (4 inputs,
+`coverage gate passed`, exit 0):
+
+| file | lines | branches |
+| --- | --- | --- |
+| src/verify/exec.ts | 96.12 % (248/258) | 96.22 % (204/212) |
+| src/verify/runner.ts | 99.88 % (1778/1780) | 97.94 % (2003/2045) |
+| src/verify/slot.ts | 98.46 % (640/650) | 98.24 % (505/514) |
+| src/verify/reference.ts | 98.11 % (624/636) | 98.8 % (581/588) |
+| src/verify/batch.ts | 98.4 % (557/566) | 92.34 % (362/392) |
+| src/verify/directives.ts | 100 % (59/59) | 91.04 % (61/67) |
+| src/verify/risk.ts | 100 % (75/75) | 98.36 % (120/122) |
+| src/verify/pending.ts | 99.62 % (532/534) | 93.94 % (388/413) |
+
+**Local e2e run** (QA round 1, above): `Test Files  5 passed (5)`, `Tests  65 passed (65)`,
+`Duration  281.21s`, exit 0.
+
+**Keyed 3.1.4 smokes** (`test/smoke/layer2-gate.smoke.test.ts`) are not in `smoke:keyless`. They
+soft-pass when the live model does not follow the dispatch protocol (the early `return`s at
+`:587-595`, `:631-639`, `:680-681`), so a green keyed run alone does not prove the hard path. The one
+live keyed run that reached the hard assertions (as reported by the 3.1.4 implementer; its evidence
+file was not re-run in this round) showed: `router_verify` completed with a pass; on the required
+path, exactly one verifier run, scoped (`related …m01.js`); the deferred dispatch returned the
+`[router] unverified · vrf_… · risk …` footer with 0 verifier runs.
+
+Not recorded here: a full unit-suite run (this dispatch was limited to targeted suites).
+
+### Round-1 resolutions
+
+- **QA-3.1-1** (e116182): `scripts/coverage-merge.mjs` gains `--warn-only <file>` (repeatable; the
+  file must be one of `MERGED_PER_FILE_GATED`, else exit 2). A warn-only file is still measured and
+  printed, and a miss prints `::warning::` instead of failing. `test.yml` passes
+  `--warn-only src/verify/exec.ts` only when `win-unit` is missing; every other gated file always
+  blocks, and exec.ts is gated at 90/90 whenever `win-unit` is present (3 or 4 inputs). Checked
+  locally on run 36366712022's artifacts, with the workflow's own bash step (extracted from the YAML
+  and run with Git bash): Linux-only → exec.ts `WARN (warn-only)` 65.11/57.54, the other 7 `ok`,
+  `coverage gate passed`, exit 0; Linux + win-e2e → exec.ts warn-only (68.21/64.15), exit 0;
+  Linux + win-unit → exec.ts 96.12/96.22 `ok`, blocking, exit 0; all 4 → all gated, exit 0;
+  Linux-only with slot.ts's counters zeroed → slot.ts `0% FAIL`, exec.ts still only a warning,
+  `coverage gate FAILED on the merged report (2 inputs)`, exit 1. Without the flag, Linux-only
+  exits 1 on exec.ts. `npx --yes js-yaml .github/workflows/test.yml` exit 0.
+- **QA-3.1-14** (15e9218): E2E-1 (whole-word content mapping plus name matches, S6
+  `unmapped-module` for no mapped test or a naming `conftest.py`, testpaths-bounded inputs; residual:
+  direct importers only, non-`.py` files alone give "no affected tests") and E2E-3 (only
+  `NON_WRITING_TOOLS` leave an in-flight snapshot or capture alone; any other tool, MCP and custom
+  included, makes that dispatch's change set unavailable and reference none → unverifiable; residual:
+  writes with no tool event, writers under a non-writing name) documented in `docs/VERIFICATION.md`
+  (two new sections, linked from Unverifiable), `docs/CONFIG_REFERENCE.md` (pytest paragraph of
+  Affected-test verification; Deferred verification), ADR 0003 Consequences and CHANGELOG
+  `[Unreleased]` → Fixed. `npx vitest run --maxWorkers=2 test/unit/config-verify-budget.test.ts
+  test/unit/docs-drift.test.ts`: `Tests  71 passed (71)`.
+- **QA-3.1-16**: evidence recorded in "3.1.5 evidence" above (keyless lane 8/9 with the known
+  local-only providerID failure, Bun smoke 12/12, CI run 36366712022 12/12 jobs green with the merged
+  table, local e2e 65/65, the keyed smokes' soft-pass caveat and the one hard-path keyed run). The
+  keyed run's evidence file is cited as reported, not reproduced; no full unit-suite run is recorded.
+
