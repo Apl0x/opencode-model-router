@@ -1479,3 +1479,9 @@ retries this `EPERM`.
 
 **Status: phase 1.2 QA is NOT CLEAN.** QA-1.2-30 (nit, test-only) is open. QA-1.2-28 and
 QA-1.2-29 are verified.
+
+**Closing note (phase 3.2).** QA-1.2-30 was resolved in e59297c (see its Resolution above). The
+items deferred to 3.2 are applied: QA-1.2-12 in 52ecef2 (unused import removed, 1.2 acceptance
+wording amended), and the G4 wording, risk-table row and 3.1.2.d alignment in 5dd1e92.
+
+Status: CLEAN (closed 2026-09-28, phase 3.2).
