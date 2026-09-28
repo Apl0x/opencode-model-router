@@ -57,9 +57,19 @@ let warns: string[] = [];
 
 afterEach(async () => {
   H.fail = undefined;
-  for (const h of handles.splice(0)) await h.release();
-  warns = [];
-  for (const d of dirs.splice(0)) rmSync(d, { recursive: true, force: true });
+  try {
+    for (const h of handles.splice(0)) await h.release();
+  } finally {
+    warns = [];
+    // Retry a busy entry (EBUSY/EPERM on Windows); one stuck directory must not strand the rest.
+    for (const d of dirs.splice(0)) {
+      try {
+        rmSync(d, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+      } catch {
+        // Best effort: left to the OS temp cleanup.
+      }
+    }
+  }
 });
 
 function fresh(): string {
