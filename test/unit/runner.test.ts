@@ -1281,20 +1281,24 @@ describe("E2E-1: pytest maps a changed module to the tests that import it, and f
     );
   });
 
-  it("QA-G-17: a deleted ordinary module and a deleted __init__.py keep their search names", async () => {
+  it("QA-G-17: a deleted ordinary module keeps its search name; a deleted __init__.py is S6 (QA-G-22)", async () => {
     // app/mod02.py deleted: searched as "mod02", finds its importer.
     const files = Object.fromEntries(Object.entries(fixture()).filter(([p]) => p !== "/r/app/mod02.py"));
     const search = treeSearch(files);
     expect(spec(await plan(files, ["app/mod02.py"], { search })).inputs).toEqual(["/r/tests/test_mod02_1.py"]);
     expect(search.findByContent).toHaveBeenCalledWith("/r", "mod02", [...PY_TEST_GLOBS, ":(glob)**/conftest.py"]);
-    // tests/pkg/__init__.py deleted: the package name, "pkg".
+    // tests/pkg/__init__.py deleted: was a spec of the package name's importers ("pkg"), now S6 before any search.
     const init = fixture({ "/r/tests/pkg/test_p.py": "from tests.pkg import helper\n" });
     const initSearch = treeSearch(init);
-    expect(spec(await plan(init, ["tests/pkg/__init__.py"], { search: initSearch })).inputs).toEqual(["/r/tests/pkg/test_p.py"]);
-    expect(initSearch.findByContent).toHaveBeenCalledWith("/r", "pkg", [...PY_TEST_GLOBS, ":(glob)**/conftest.py"]);
+    expectS6(
+      await plan(init, ["tests/pkg/__init__.py"], { search: initSearch }),
+      "unmapped-module",
+      "package structure changed: tests/pkg/__init__.py deleted; pytest import paths may shift",
+    );
+    expect(initSearch.findByContent).not.toHaveBeenCalled();
   });
 
-  describe("QA-G-18..21: a deleted pytest file's conftest, test and package importers run, or the plan is S6", () => {
+  describe("QA-G-18..22: a deleted pytest file's conftest and test importers run, a deleted __init__.py is S6, or the plan is S6", () => {
     const GLOBS = [...PY_TEST_GLOBS, ":(glob)**/conftest.py"];
     const UNMAPPABLE = ": the tests its fixtures reach cannot be mapped";
     /** The fixture tests that import the app package (`from app.modNN import ...`); extra/ is outside testpaths. */
@@ -1384,44 +1388,101 @@ describe("E2E-1: pytest maps a changed module to the tests that import it, and f
       expectS6(await plan(pyRepo(), gone), "too-many-searches", `too many changed modules to map: ${SEARCH_LIMIT + 1} test searches (limit ${SEARCH_LIMIT})`);
     });
 
-    it("QA-G-21: a deleted __init__.py runs every in-scope test under its package (was a spec through a pkgutil decoy)", async () => {
-      const search = treeSearch(X4);
-      expect(spec(await plan(X4, ["tests/pkg/__init__.py"], { search })).inputs).toEqual(["/r/tests/pkg/test_rel.py", "/r/tests/test_other.py"]);
-      expect(search.findByContent).toHaveBeenCalledWith("/r", "pkg", GLOBS);
-      expect(search.listFiles).toHaveBeenCalledWith("/r", "tests/pkg");
-      expect(search.findByName).toHaveBeenCalledWith("/r", ["test_rel.py"]);
-      // Without the decoy (was S6 deleted-no-tests).
-      expect(spec(await plan(without(X4, "/r/tests/test_other.py"), ["tests/pkg/__init__.py"])).inputs).toEqual(["/r/tests/pkg/test_rel.py"]);
-      // Subdirectories lose it too; pytest's prepend import mode now imports tests/pkg/test_mod01_1.py as
-      // `test_mod01_1`, which collides with tests/test_mod01_1.py, so that test runs as well.
-      const deep = fixture({ "/r/tests/pkg/sub/test_deep.py": "", "/r/tests/pkg/test_mod01_1.py": "" });
-      expect(spec(await plan(deep, ["tests/pkg/__init__.py"])).inputs).toEqual(["/r/tests/pkg/sub/test_deep.py", "/r/tests/pkg/test_mod01_1.py", "/r/tests/test_mod01_1.py"]);
-      // Only in-scope tests: app/ lies outside testpaths, so app/test_in.py is never collected; the package-name hits stay.
-      const app = without(fixture({ "/r/app/test_in.py": "from . import mod01\n" }), "/r/app/__init__.py");
-      expect(spec(await plan(app, ["app/__init__.py"])).inputs).toEqual(APP);
-      // A deleted __init__.py at the git root lists ".".
-      const root = stubSearch({}, {}, { ".": ["/r/tests/test_mod01_1.py", "/r/app/mod01.py"] });
-      expect(spec(await plan(fixture(), ["__init__.py"], { search: root })).inputs).toEqual(["/r/tests/test_mod01_1.py"]);
-      expect(root.listFiles).toHaveBeenCalledWith("/r", ".");
-      // python_files that match __init__.py do not make it a leaf test file.
-      const star = pyRepo({ "/r/pytest.ini": "[pytest]\npython_files = *.py\n", "/r/tests/pkg/test_rel.py": "from . import helper\n" });
-      expect(spec(await plan(star, ["tests/pkg/__init__.py"])).inputs).toEqual(["/r/tests/pkg/test_rel.py"]);
+    /** QA-G-22: the S6 every deleted or renamed-away __init__.py gives, before any search. */
+    const pkgChanged = (rel: string) => `package structure changed: ${rel} deleted; pytest import paths may shift`;
+    const noSearch = (search: TestSearchSeam) => {
+      expect(search.findByContent).not.toHaveBeenCalled();
+      expect(search.findByName).not.toHaveBeenCalled();
+    };
+    // QA-G-22 repro: tests/pkg/__init__.py deleted; tests/pkg is now put first on sys.path, and its
+    // utils.py (only g) shadows src/utils.py (f) for tests/test_uses.py, which never names "pkg".
+    const G22 = pyRepo({
+      "/r/tests": "",
+      "/r/pytest.ini": "[pytest]\npythonpath = src\n",
+      "/r/src/utils.py": "def f():\n    return 1\n",
+      "/r/tests/pkg/utils.py": "def g():\n    return 2\n",
+      "/r/tests/pkg/test_p.py": "def test_p():\n    assert True\n",
+      "/r/tests/test_uses.py": "import utils\n\ndef test_u():\n    assert utils.f() == 1\n",
     });
 
-    it("QA-G-21: fails closed on a conftest.py under the package, too many tests, and a failed listing or name search", async () => {
+    it("QA-G-22: a deleted test-package __init__.py whose modules shadow others -> S6 unmapped-module (was a spec of tests/pkg/test_p.py)", async () => {
+      const search = treeSearch(G22);
+      expectS6(await plan(G22, ["tests/pkg/__init__.py"], { search }), "unmapped-module", pkgChanged("tests/pkg/__init__.py"));
+      noSearch(search);
+      // A subpackage shadowing a source package (tests/api/helpers/ over src/helpers/) is the same S6.
+      const sub = pyRepo({
+        "/r/tests": "",
+        "/r/pytest.ini": "[pytest]\npythonpath = src\n",
+        "/r/src/helpers/__init__.py": "def f():\n    return 1\n",
+        "/r/tests/api/helpers/__init__.py": "",
+        "/r/tests/api/test_api.py": "def test_api():\n    pass\n",
+        "/r/tests/test_h.py": "from helpers import f\n",
+      });
+      expectS6(await plan(sub, ["tests/api/__init__.py"]), "unmapped-module", pkgChanged("tests/api/__init__.py"));
+    });
+
+    it("QA-G-21/22: a deleted __init__.py is S6 in every shape 68edf52 mapped (was a spec of the package's tests)", async () => {
+      // X4, the QA-G-21 repro: was ["tests/pkg/test_rel.py", "tests/test_other.py"].
+      const search = treeSearch(X4);
+      expectS6(await plan(X4, ["tests/pkg/__init__.py"], { search }), "unmapped-module", pkgChanged("tests/pkg/__init__.py"));
+      noSearch(search);
+      expect(search.listFiles).not.toHaveBeenCalled();
+      // X4 without the decoy: was ["tests/pkg/test_rel.py"].
+      expectS6(await plan(without(X4, "/r/tests/test_other.py"), ["tests/pkg/__init__.py"]), "unmapped-module", pkgChanged("tests/pkg/__init__.py"));
+      // Subdirectories and a namesake: was ["tests/pkg/sub/test_deep.py", "tests/pkg/test_mod01_1.py", "tests/test_mod01_1.py"].
+      const deep = fixture({ "/r/tests/pkg/sub/test_deep.py": "", "/r/tests/pkg/test_mod01_1.py": "" });
+      expectS6(await plan(deep, ["tests/pkg/__init__.py"]), "unmapped-module", pkgChanged("tests/pkg/__init__.py"));
+      // A deleted source package __init__.py (app/ lies outside testpaths): was the five `from app.modNN` tests.
+      const app = without(fixture({ "/r/app/test_in.py": "from . import mod01\n" }), "/r/app/__init__.py");
+      expectS6(await plan(app, ["app/__init__.py"]), "unmapped-module", pkgChanged("app/__init__.py"));
+      // At the git root: was ["tests/test_mod01_1.py"] through the "." listing.
+      const root = stubSearch({}, {}, { ".": ["/r/tests/test_mod01_1.py", "/r/app/mod01.py"] });
+      expectS6(await plan(fixture(), ["__init__.py"], { search: root }), "unmapped-module", pkgChanged("__init__.py"));
+      noSearch(root);
+      // python_files that match __init__.py do not make it a leaf test file: was ["tests/pkg/test_rel.py"].
+      const star = pyRepo({ "/r/pytest.ini": "[pytest]\npython_files = *.py\n", "/r/tests/pkg/test_rel.py": "from . import helper\n" });
+      expectS6(await plan(star, ["tests/pkg/__init__.py"]), "unmapped-module", pkgChanged("tests/pkg/__init__.py"));
+      // Was S6 unmapped-module "deleted package … conftest.py loses its package", stem-too-common (21 in the
+      // package; 11 plus 11 namesakes) and search-failed (listing, name search): one reason for all now.
       const conf = fixture({ "/r/tests/pkg/conftest.py": "from . import helper\n", "/r/tests/pkg/sub/test_s.py": "" });
-      expectS6(await plan(conf, ["tests/pkg/__init__.py"]), "unmapped-module", `deleted package tests/pkg/__init__.py: tests/pkg/conftest.py loses its package${UNMAPPABLE}`);
-      const tooMany = (n: number) =>
-        `deleted package tests/pkg/__init__.py: ${n} test files lose its package or share a basename with one that does (limit ${STEM_MATCH_LIMIT})`;
+      expectS6(await plan(conf, ["tests/pkg/__init__.py"]), "unmapped-module", pkgChanged("tests/pkg/__init__.py"));
       const crowd = fixture(Object.fromEntries(Array.from({ length: STEM_MATCH_LIMIT + 1 }, (_, i) => [`/r/tests/pkg/test_p${i}.py`, ""])));
-      expectS6(await plan(crowd, ["tests/pkg/__init__.py"]), "stem-too-common", tooMany(STEM_MATCH_LIMIT + 1));
-      // 11 in the package, 11 namesakes elsewhere: 22.
+      expectS6(await plan(crowd, ["tests/pkg/__init__.py"]), "unmapped-module", pkgChanged("tests/pkg/__init__.py"));
       const pairs = fixture(Object.fromEntries(Array.from({ length: 11 }, (_, i) => [`/r/tests/pkg/test_d${i}.py`, `/r/tests/other/test_d${i}.py`]).flat().map((p) => [p, ""])));
-      expectS6(await plan(pairs, ["tests/pkg/__init__.py"]), "stem-too-common", tooMany(22));
-      const failed = "test search failed for tests/pkg/__init__.py";
-      expectS6(await plan(X4, ["tests/pkg/__init__.py"], { search: stubSearch({}, {}, { "tests/pkg": undefined }) }), "search-failed", failed);
-      const names = stubSearch({}, { "test_rel.py": undefined }, { "tests/pkg": ["/r/tests/pkg/test_rel.py"] });
-      expectS6(await plan(X4, ["tests/pkg/__init__.py"], { search: names }), "search-failed", failed);
+      expectS6(await plan(pairs, ["tests/pkg/__init__.py"]), "unmapped-module", pkgChanged("tests/pkg/__init__.py"));
+      const failing = stubSearch({ pkg: undefined }, { "test_rel.py": undefined }, { "tests/pkg": undefined });
+      expectS6(await plan(X4, ["tests/pkg/__init__.py"], { search: failing }), "unmapped-module", pkgChanged("tests/pkg/__init__.py"));
+      noSearch(failing);
+    });
+
+    it("QA-G-22/23: any gone __init__.py in the change set is S6, renamed away, beside mapped files, statically and before SEARCH_LIMIT", async () => {
+      // Renamed away (the rename source is gone): tests/pkg -> tests/pkg2, as git reports the moved __init__.py.
+      const moved = fixture({ "/r/tests/pkg2/__init__.py": "", "/r/tests/pkg2/test_rel.py": "from . import helper\n" });
+      const renamed: ChangedPath[] = [{ path: "tests/pkg2/__init__.py", previousPath: "tests/pkg/__init__.py" }];
+      expectS6(await plan(moved, [], { changedFiles: renamed }), "unmapped-module", pkgChanged("tests/pkg/__init__.py"));
+      // Beside a changed test that maps and a module that maps: the whole change is S6, not a spec of them.
+      expectS6(await plan(G22, ["tests/test_uses.py", "src/utils.py", "tests/pkg/__init__.py"]), "unmapped-module", pkgChanged("tests/pkg/__init__.py"));
+      // QA-G-23 shape: an untracked test beside the deleted __init__.py no longer turns the S6 into a spec of it.
+      const drift = fixture({ "/r/tests/Pkg/helper.py": "", "/r/tests/Pkg/test_rel.py": "from . import helper\n", "/r/tests/Pkg/test_new.py": "def test_new():\n    pass\n" });
+      const driftSearch = treeSearch(drift);
+      expectS6(await plan(drift, ["tests/Pkg/__init__.py", "tests/Pkg/test_new.py"], { search: driftSearch }), "unmapped-module", pkgChanged("tests/Pkg/__init__.py"));
+      noSearch(driftSearch);
+      // Outside testpaths and runnerCwd scopes too: pytest's import of anything under it may shift.
+      expectS6(await plan(fixture({ "/r/extra/pkg/test_x.py": "" }), ["extra/pkg/__init__.py"]), "unmapped-module", pkgChanged("extra/pkg/__init__.py"));
+      // Static scoping decides it without a search (was {scopable: true, pendingSearches: 1}).
+      const { search: _s, ...rest } = input({ command: "uv run pytest", files: G22, changedFiles: changed("tests/pkg/__init__.py") });
+      expectS6(await planStaticScoping(rest), "unmapped-module", pkgChanged("tests/pkg/__init__.py"));
+      // It comes before SEARCH_LIMIT: 51 gone modules plus a gone __init__.py name the package change.
+      const gone = [...Array.from({ length: SEARCH_LIMIT + 1 }, (_, i) => `app/gone${i}.py`), "tests/pkg/__init__.py"];
+      expectS6(await plan(G22, gone), "unmapped-module", pkgChanged("tests/pkg/__init__.py"));
+      // A kept __init__.py is a module as before (G22 control: test_p.py edited maps to itself).
+      expect(spec(await plan({ ...G22, "/r/tests/pkg/__init__.py": "" }, ["tests/pkg/test_p.py"])).inputs).toEqual(["/r/tests/pkg/test_p.py"]);
+    });
+
+    it("QA-G-22: win32 compares the gone __init__.py's name case-insensitively", async () => {
+      const files = { "C:\\repo\\.git": "", "C:\\repo\\tests\\pkg\\test_p.py": "" };
+      const r = await planScopedRun(input({ win: true, command: "pytest", files, cwd: "C:\\repo", changedFiles: changed("tests\\pkg\\__INIT__.py") }));
+      expectS6(r, "unmapped-module", pkgChanged("tests/pkg/__INIT__.py"));
     });
 
     it("QA-G-18: a deleted module its package's __init__.py still imports runs the package's importers (was a spec through an .index( decoy)", async () => {
@@ -1443,7 +1504,7 @@ describe("E2E-1: pytest maps a changed module to the tests that import it, and f
       expectS6(await plan(conf, ["app/index.py"]), "unmapped-module", `deleted source app/index.py: tests/api/conftest.py references "app"${UNMAPPABLE}`);
     });
 
-    it("QA-G-18..21: the same plans through real git (the wiring's argv)", async () => {
+    it("QA-G-18..22: the same plans through real git (the wiring's argv)", async () => {
       await withGitTree(X2, async (search) => {
         expectS6(await plan(X2, ["app/helpers.py"], { search }), "unmapped-module", `deleted source app/helpers.py: tests/api/conftest.py references "helpers"${UNMAPPABLE}`);
       });
@@ -1452,8 +1513,12 @@ describe("E2E-1: pytest maps a changed module to the tests that import it, and f
       });
       const x4 = { ...X4, "/r/tests/pkg/sub/test_deep.py": "", "/r/tests/pkgutil/test_near.py": "" };
       await withGitTree(x4, async (search) => {
-        expect(spec(await plan(x4, ["tests/pkg/__init__.py"], { search })).inputs).toEqual(["/r/tests/pkg/sub/test_deep.py", "/r/tests/pkg/test_rel.py", "/r/tests/test_other.py"]);
-        expect(search.listFiles).toHaveBeenCalledWith("/r", "tests/pkg");
+        // Was ["tests/pkg/sub/test_deep.py", "tests/pkg/test_rel.py", "tests/test_other.py"].
+        expectS6(await plan(x4, ["tests/pkg/__init__.py"], { search }), "unmapped-module", pkgChanged("tests/pkg/__init__.py"));
+        noSearch(search);
+      });
+      await withGitTree(G22, async (search) => {
+        expectS6(await plan(G22, ["tests/pkg/__init__.py"], { search }), "unmapped-module", pkgChanged("tests/pkg/__init__.py"));
       });
       await withGitTree(X1, async (search) => {
         expect(spec(await plan(X1, ["app/index.py"], { search })).inputs).toEqual([...APP, "/r/tests/test_util.py"]);
