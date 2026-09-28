@@ -4,7 +4,7 @@ import { spawnSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { observeTests, REFERENCE_NONE } from "../../src/verify/baseline";
-import { ABSENT_DIGEST, createChangedFileStore, buildAcceptedSuffix, type TreeSnapshot, type DispatchCaptureDeps } from "../../src/verify/dispatch";
+import { ABSENT_DIGEST, contaminatedReferenceReason, createChangedFileStore, buildAcceptedSuffix, type TreeSnapshot, type DispatchCaptureDeps } from "../../src/verify/dispatch";
 import { accept, type Artefact } from "../../src/verify/gate";
 import { buildGradingPrompt } from "../../src/verify/checker";
 import { validateConfig } from "../../src/router/config";
@@ -170,11 +170,13 @@ describe("dispatch reference capture in the changed-file store", () => {
     h.capture.mockImplementationOnce(async (_c, s) => { signal = s; return held.promise; });
     const settled = h.start("child");
     await vi.waitFor(() => expect(signal).toBeDefined());
-    h.store.observeEdit(cause === "patch" ? "apply_patch" : cause, cwd);
+    const tool = cause === "patch" ? "apply_patch" : cause;
+    h.store.observeEdit(tool, cwd);
     expect(signal?.aborted).toBe(true);
     held.resolve(REF);
     await settled;
-    expect(await h.get("child")).toEqual({ kind: "none", reason: REFERENCE_NONE.contaminated });
+    // QA-3.1-3: the reason names the tool whose call discarded the capture.
+    expect(await h.get("child")).toEqual({ kind: "none", reason: `${REFERENCE_NONE.contaminated} (tool "${tool}")` });
     const r = await grade({ scoped: scopedRun(result([id("observed")])), recheck: { kind: "unusable", cause: "no-reference", reason: REFERENCE_NONE.contaminated } });
     expect(r.verdict.outcome).toBe("unverifiable");
     expect(r.accepted).toBe(true);
@@ -185,7 +187,8 @@ describe("dispatch reference capture in the changed-file store", () => {
     const settled = h.start("child"); h.store.observeEdit("edit", cwd); held.resolve(tree());
     await settled;
     expect(h.store.delta("child", "child", tree()).changeBaseline).toBe("unavailable");
-    expect(await h.get("child")).toEqual({ kind: "none", reason: REFERENCE_NONE.contaminated });
+    expect(h.store.snapshotContaminatedBy("child")).toBe("edit");
+    expect(await h.get("child")).toEqual({ kind: "none", reason: contaminatedReferenceReason("edit") });
   });
   // E2E-3: opencode fires tool.execute.before for MCP tools (`<server>_<tool>`) and custom tools
   // too. An edit by one of them that lands while the dispatch snapshot is still in flight
@@ -213,7 +216,9 @@ describe("dispatch reference capture in the changed-file store", () => {
       const delta = h.store.delta("child", "child", edited);
       expect(delta.changeBaseline).toBe("unavailable");
       expect(h.store.baselineSnapshot("child")).toBeUndefined();
-      expect(await h.get("child")).toEqual({ kind: "none", reason: REFERENCE_NONE.contaminated });
+      // QA-3.1-3: both discards name the unknown tool, so the unverifiable verdict can say which.
+      expect(h.store.snapshotContaminatedBy("child")).toBe(tool);
+      expect(await h.get("child")).toEqual({ kind: "none", reason: `${REFERENCE_NONE.contaminated} (tool "${tool}")` });
     },
   );
   it.each(["read", "glob", "grep", "task", "delegate", "router_verify", "todowrite", "webfetch", "read_mcp_resource", "skill"])(

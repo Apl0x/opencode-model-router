@@ -65,6 +65,7 @@ import {
   buildAcceptedSuffix,
   buildForcingNote,
   tierModel,
+  toolLabel,
   type ChangedFile,
   type createChangedFileStore,
   type DispatchCaptureDeps,
@@ -72,7 +73,7 @@ import {
 } from "./dispatch";
 import { runArgv, runShell } from "./exec";
 import { snapshotTree } from "./tree";
-import { captureReference, DEFAULT_CAPTURE_TIMEOUT_MS, gcStaleReferences, nodeReferenceFs } from "./reference";
+import { captureReference, DEFAULT_CAPTURE_TIMEOUT_MS, gcStaleReferences, nodeReferenceFs, type DispatchReference } from "./reference";
 import type { PluginLogger } from "../router/logger";
 import { REFERENCE_NONE } from "./baseline";
 import { scrubText } from "../guard/scrub";
@@ -141,6 +142,8 @@ export interface PreparedVerification {
    * (the change set holds their edits too). Absent or 0: none.
    */
   concurrentDispatches?: number;
+  /** QA-3.1-3: the tool whose call discarded the dispatch snapshot, which left the change set unavailable. */
+  contaminatedBy?: string;
 }
 
 /**
@@ -151,13 +154,22 @@ export function concurrentDispatchesCaveat(count: number): string {
   return `other delegations ran in this working tree concurrently (${count}); introduced failures may come from their edits`;
 }
 
+/** QA-3.1-3: an unverifiable verdict whose change baseline a tool call discarded names that tool. */
+export function contaminatedBaselineCaveat(tool: string): string {
+  return `the dispatch-time change baseline was discarded: tool "${toolLabel(tool)}" ran in an overlapping directory before it resolved`;
+}
+
 /**
- * QA-3.1-2: router caveats from the dispatch's own context, on a gate result. A fail that lists
- * introduced failures gains concurrentDispatchesCaveat when other dispatches overlapped it. The
- * outcome and `accepted` never change. Pure; the text goes through neutralizeDirectives like all
- * router text.
+ * QA-3.1-2 / QA-3.1-3: router caveats from the dispatch's own context, on a gate result. A fail that
+ * lists introduced failures gains concurrentDispatchesCaveat when other dispatches overlapped it; an
+ * unverifiable verdict gains contaminatedBaselineCaveat (reasons and caveats) when a tool call
+ * discarded its change baseline. The outcome and `accepted` never change. Pure; the text goes through
+ * neutralizeDirectives like all router text.
  */
-export function applyDispatchCaveats(res: GateResult, ctx: { readonly concurrentDispatches?: number }): GateResult {
+export function applyDispatchCaveats(
+  res: GateResult,
+  ctx: { readonly concurrentDispatches?: number; readonly contaminatedBy?: string },
+): GateResult {
   const verdict = res.verdict;
   if (verdict.skipped === true) return res;
   const outcome = verdict.outcome ?? (verdict.pass ? "pass" : "fail");
@@ -165,7 +177,112 @@ export function applyDispatchCaveats(res: GateResult, ctx: { readonly concurrent
   if (outcome === "fail" && concurrent > 0 && (verdict.failures?.introduced.length ?? 0) > 0) {
     return { ...res, verdict: { ...verdict, reasons: [...verdict.reasons, neutralizeDirectives(concurrentDispatchesCaveat(concurrent))] } };
   }
+  if (outcome === "unverifiable" && ctx.contaminatedBy !== undefined) {
+    const caveat = neutralizeDirectives(contaminatedBaselineCaveat(ctx.contaminatedBy));
+    return { ...res, verdict: { ...verdict, reasons: [...verdict.reasons, caveat], caveats: [...(verdict.caveats ?? []), caveat] } };
+  }
   return res;
+}
+
+/**
+ * QA-3.1-3: single flight for the dispatch-time snapshot and capture. Each dispatch spawns 7 git
+ * processes for its snapshot and 8 for its capture; 20 parallel dispatches spawned 300, and on
+ * Windows each then took 130-560 ms instead of ~60 ms (p50 2.9 s per dispatch).
+ *
+ * Requests with one key share one run, but a run is only ever shared by requests made BEFORE it
+ * started: a request that arrives while a run is in flight waits for the next run, which starts when
+ * the current one settled and serves every request that arrived meanwhile. A shared result is so
+ * always taken after each sharer's request began, as its own run would have been. A request's signal
+ * ends only its own wait (undefined); a started run is aborted once every sharer has left, and a
+ * queued run nobody waits for any more never starts. The returned function never rejects.
+ */
+export function createSharedFlight<T>(): (
+  key: string,
+  run: (signal: AbortSignal) => Promise<T | undefined>,
+  signal: AbortSignal,
+) => Promise<T | undefined> {
+  interface Flight {
+    readonly controller: AbortController;
+    readonly result: Promise<T | undefined>;
+    readonly start: () => void;
+    sharers: number;
+    started: boolean;
+  }
+  interface Lane {
+    running?: Flight;
+    next?: Flight;
+  }
+  const lanes = new Map<string, Lane>();
+  const makeFlight = (run: (signal: AbortSignal) => Promise<T | undefined>): Flight => {
+    const controller = new AbortController();
+    let settle = (_value: T | undefined): void => undefined;
+    const result = new Promise<T | undefined>(ok => {
+      settle = ok;
+    });
+    const flight: Flight = {
+      controller,
+      result,
+      // Synchronous: the run's own start-up (the first git spawn) happens inside the call that
+      // starts it, so a VERIFY_WAIT counted from the dispatch's start covers it (ab81633).
+      start: () => {
+        flight.started = true;
+        let running: Promise<T | undefined>;
+        try {
+          running = run(controller.signal);
+        } catch {
+          running = Promise.resolve(undefined);
+        }
+        running.then(settle, () => settle(undefined));
+      },
+      sharers: 0,
+      started: false,
+    };
+    return flight;
+  };
+  const launch = (key: string, lane: Lane, flight: Flight): void => {
+    lane.running = flight;
+    flight.start();
+    void flight.result.then(() => {
+      lane.running = undefined;
+      const next = lane.next;
+      lane.next = undefined;
+      if (next !== undefined) launch(key, lane, next);
+      else if (lanes.get(key) === lane) lanes.delete(key);
+    });
+  };
+  return (key, run, signal) => {
+    if (signal.aborted) return Promise.resolve(undefined);
+    let lane = lanes.get(key);
+    if (lane === undefined) {
+      lane = {};
+      lanes.set(key, lane);
+    }
+    let flight: Flight;
+    if (lane.next !== undefined) flight = lane.next;
+    else if (lane.running !== undefined) flight = lane.next = makeFlight(run);
+    else {
+      flight = makeFlight(run);
+      launch(key, lane, flight);
+    }
+    flight.sharers += 1;
+    const owner = lane;
+    return new Promise<T | undefined>(settle => {
+      const onAbort = (): void => {
+        flight.sharers -= 1;
+        if (flight.sharers === 0) {
+          // Nobody waits for it any more: stop a started run; never start a queued one.
+          if (flight.started) flight.controller.abort();
+          else if (owner.next === flight) owner.next = undefined;
+        }
+        settle(undefined);
+      };
+      signal.addEventListener("abort", onAbort, { once: true });
+      void flight.result.then(value => {
+        signal.removeEventListener("abort", onAbort);
+        settle(value);
+      });
+    });
+  };
 }
 
 /**
@@ -855,6 +972,9 @@ export function createVerificationWiring(deps: {
       return true;
     }
   };
+  /** QA-3.1-3: dispatches starting together share their snapshot and capture (createSharedFlight). */
+  const sharedSnapshots = createSharedFlight<TreeSnapshot>();
+  const sharedCaptures = createSharedFlight<DispatchReference>();
 
   const abs = (p: string): string => (isAbsolute(p) ? p : join(directory, p));
 
@@ -1071,9 +1191,13 @@ export function createVerificationWiring(deps: {
     const judgedByTests = cfg.enforcement?.verify?.require !== "never" && dod.checks.some(
       c => c.kind === "testsPass" && isCommandAllowed(resolveRepoCommand(c, "testsPass", undefined), DEFAULT_ALLOWLIST),
     );
+    // QA-3.1-3: one run per key serves every dispatch that asked before it started (same cwd and
+    // the same priority and bound, so the same git processes).
+    const flightKey = (at: string): string => `${budget.lowPriority ? "low" : "normal"}\0${budget.baselineTimeoutMs}\0${at}`;
     const base = {
       // QA-3.1-8: the snapshot's git processes run at the configured priority, as the capture's do.
-      snapshot: (at: string, signal: AbortSignal) => snapshotTree(at, signal, { lowPriority: budget.lowPriority }),
+      snapshot: (at: string, signal: AbortSignal) =>
+        sharedSnapshots(flightKey(at), shared => snapshotTree(at, shared, { lowPriority: budget.lowPriority }), signal),
       timeoutMs: budget.baselineTimeoutMs,
     };
     if (!judgedByTests) return { ...base, uncaptured: { kind: "none", reason: REFERENCE_NONE.notRequested } };
@@ -1082,7 +1206,8 @@ export function createVerificationWiring(deps: {
     const argv: ArgvSeam = (file, args, opts) => argvSeam(file, args, { ...opts, lowPriority: budget.lowPriority });
     return {
       ...base,
-      capture: (at, signal) => captureReference(at, signal, { argv, fs: nodeReferenceFs, timeoutMs: budget.baselineTimeoutMs }),
+      capture: (at, signal) =>
+        sharedCaptures(flightKey(at), shared => captureReference(at, shared, { argv, fs: nodeReferenceFs, timeoutMs: budget.baselineTimeoutMs }), signal),
     };
   };
 
@@ -1236,10 +1361,12 @@ export function createVerificationWiring(deps: {
       controller.abort();
     }
     const committed = await committedSinceDispatch(store.baselineSnapshot(id), snapshot, deadline);
+    const contaminatedBy = store.snapshotContaminatedBy(id);
     return {
       ...store.delta(id, childID, snapshot, base, committed),
       snapshot,
       concurrentDispatches: store.concurrentDispatches(id, snapshot?.root),
+      ...(contaminatedBy !== undefined ? { contaminatedBy } : {}),
     };
   };
 
@@ -1389,9 +1516,10 @@ export function createVerificationWiring(deps: {
         changedFiles,
         risk,
         ...(digests !== undefined ? { digests } : {}),
-        // QA-3.1-2: the window ends here (the change set is fixed now); router_verify adds the
-        // caveat to its verdict.
+        // QA-3.1-2 / QA-3.1-3: the window ends here (the change set is fixed now); router_verify
+        // adds the caveats to its verdict.
         ...(change.concurrentDispatches !== undefined && change.concurrentDispatches > 0 ? { concurrentDispatches: change.concurrentDispatches } : {}),
+        ...(change.contaminatedBy !== undefined ? { contaminatedBy: change.contaminatedBy } : {}),
       });
       if (!reg.ok) {
         // QA-2.4-4: never a delegation without a verdict path: the caller runs the required gate.
@@ -1632,7 +1760,7 @@ export function createVerificationWiring(deps: {
   const judgeVerdict = (entry: PendingEntry, prep: ClaimPreparation, gate: ClaimGate, cfg: RouterConfig): VerificationResult => {
     if (gate.kind === "final") return gate.result;
     const { strict, retryable } = gate;
-    // QA-3.1-2: the dispatch's own context, recorded when the producer returned.
+    // QA-3.1-2 / QA-3.1-3: the dispatch's own context, recorded when the producer returned.
     const res = applyDispatchCaveats(
       lineageDowngrade(gate.res, { orchestratorSessionID: entry.orchestratorSessionID, root: prep.root, dispatchedAt: entry.dispatchedAt, strictUnverifiable: strict }),
       entry,

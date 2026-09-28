@@ -545,7 +545,7 @@ describe("dispatch reference wiring", () => {
     state.finish?.();
     await begun;
     expect((await wiring.prepareVerification(store, "dispatch", "child")).reference)
-      .toEqual({ kind: "none", reason: REFERENCE_NONE.contaminated });
+      .toEqual({ kind: "none", reason: `${REFERENCE_NONE.contaminated} (tool "bash")` });
   });
   it("the capture's argv seam runs at the configured priority", async () => {
     const { cfg, wiring, store } = harness();

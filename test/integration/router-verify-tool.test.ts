@@ -23,6 +23,7 @@ import { parseVerifyDirectives } from "../../src/verify/directives";
 import {
   backgroundOutcomes,
   concurrentDispatchesCaveat,
+  contaminatedBaselineCaveat,
   createVerificationWiring,
   digestFiles,
   DRIFT_NOTICE,
@@ -904,7 +905,7 @@ describe("router_verify edge cases (2.4.6)", () => {
     await wiring.startDispatch(store, "task:orch:bad", state.root, DOD, "VERIFY_WAIT:0s", false);
     store.observeEdit("edit", state.root);
     releaseBad();
-    expect(await store.reference("task:orch:bad")).toEqual({ kind: "none", reason: REFERENCE_NONE.contaminated });
+    expect(await store.reference("task:orch:bad")).toEqual({ kind: "none", reason: `${REFERENCE_NONE.contaminated} (tool "edit")` });
     const bad = await register(wiring.pending, "a", { dispatchID: "task:orch:bad", producerSessionID: "child-bad", reference: store.reference("task:orch:bad") });
 
     const good = verdictOf((await wiring.verifyHandles("orch", { kind: "handles", handles: [ok] })).items[0]);
@@ -958,6 +959,17 @@ describe("router_verify edge cases (2.4.6)", () => {
     const alone = verdictOf((await wiring.verifyHandles("orch", { kind: "handles", handles: [solo] })).items[0]);
     expect(alone.result.verdict.outcome).toBe("fail");
     expect(alone.result.verdict.reasons.join(" ")).not.toContain("concurrently");
+  });
+
+  it("QA-3.1-3: an unattributed change set that a tool call caused names the tool in the unverifiable verdict", async () => {
+    const { wiring } = makeWiring();
+    const h = await register(wiring.pending, "a", { changedFiles: "unavailable", digests: undefined, contaminatedBy: "github_create_file" });
+    const report = await wiring.verifyHandles("orch", { kind: "handles", handles: [h] });
+    const item = verdictOf(report.items[0]);
+    expect(item.result.verdict.outcome).toBe("unverifiable");
+    expect(item.result.verdict.caveats).toContain(contaminatedBaselineCaveat("github_create_file"));
+    expect(report.text).toContain('tool "github_create_file"');
+    expect(state.runs).toEqual([]);
   });
 
   it("QA-3.1-8: router_verify's current-tree snapshot runs its git at the configured priority", async () => {

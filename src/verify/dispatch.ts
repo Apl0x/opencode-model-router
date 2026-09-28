@@ -153,12 +153,30 @@ interface DispatchWindow {
   readonly overlapping: Set<DispatchWindow>;
 }
 
+/**
+ * QA-3.1-3: a tool name as router text names it: at most 64 characters of [A-Za-z0-9_.-], anything
+ * else as "?". Tool names reach the plugin from MCP servers and custom tools.
+ */
+export function toolLabel(tool: string): string {
+  const label = tool.replace(/[^A-Za-z0-9_.-]/g, "?");
+  return label.length > 64 ? `${label.slice(0, 64)}…` : label;
+}
+
+/** QA-3.1-3: REFERENCE_NONE.contaminated, naming the tool whose call discarded the capture. */
+export function contaminatedReferenceReason(tool: string): string {
+  return `${REFERENCE_NONE.contaminated} (tool "${toolLabel(tool)}")`;
+}
+
 /** One tracked dispatch: its change baseline and its reference (T2 P0). */
 interface DispatchRecord {
   cwd: string;
   snapshotPending: boolean;
   /** An overlapping edit was observed while the snapshot was in flight: the snapshot is discarded. */
   snapshotContaminated: boolean;
+  /** QA-3.1-3: the first tool whose call discarded the snapshot. */
+  snapshotContaminatedBy?: string;
+  /** QA-3.1-3: the first tool whose call discarded the capture. */
+  captureContaminatedBy?: string;
   /** QA-3.1-2: this dispatch's lifetime, for concurrentDispatches. */
   window: DispatchWindow;
   snapshot?: TreeSnapshot;
@@ -203,10 +221,14 @@ export function createChangedFileStore(options: ChangedFileStoreOptions = {}) {
       || pathKey(cwd).startsWith(pathKey(other) + "/") || pathKey(other).startsWith(pathKey(cwd) + "/");
     for (const d of dispatches.values()) {
       if (!overlaps(d.cwd)) continue;
-      if (d.snapshotPending) d.snapshotContaminated = true;
+      if (d.snapshotPending) {
+        d.snapshotContaminated = true;
+        d.snapshotContaminatedBy ??= tool;
+      }
       // The capture would describe a tree that already holds the edit: discard it, and stop it.
       if (d.capturePending && !d.captureContaminated) {
         d.captureContaminated = true;
+        d.captureContaminatedBy = tool;
         d.captureController.abort();
       }
     }
@@ -308,7 +330,9 @@ export function createChangedFileStore(options: ChangedFileStoreOptions = {}) {
             d.capturePending = false;
             d.captureController.abort();
           }
-          if (d.captureContaminated) return none(REFERENCE_NONE.contaminated);
+          if (d.captureContaminated) {
+            return none(d.captureContaminatedBy !== undefined ? contaminatedReferenceReason(d.captureContaminatedBy) : REFERENCE_NONE.contaminated);
+          }
           return captured ? { kind: "captured", reference: captured } : none(REFERENCE_NONE.failed);
         })();
       }
@@ -433,6 +457,10 @@ export function createChangedFileStore(options: ChangedFileStoreOptions = {}) {
       let count = 0;
       for (const w of d.window.overlapping) if (onRoot(w, known ?? d.cwd, known !== undefined)) count += 1;
       return count;
+    },
+    /** QA-3.1-3: the tool whose call discarded this dispatch's snapshot (the change baseline), if one did. */
+    snapshotContaminatedBy(id: string): string | undefined {
+      return dispatches.get(id)?.snapshotContaminatedBy;
     },
     record(sessionID: string, tool: string, args: unknown): void {
       touch(sessionID);

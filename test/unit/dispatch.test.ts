@@ -8,8 +8,11 @@ import {
   shouldVerifyTask,
   buildForcingNote,
   buildAcceptedSuffix,
+  contaminatedReferenceReason,
+  toolLabel,
   type TreeSnapshot,
 } from "../../src/verify/dispatch";
+import { REFERENCE_NONE } from "../../src/verify/baseline";
 import { join, resolve } from "node:path";
 import type { RouterConfig } from "../../src/router/config";
 
@@ -288,5 +291,37 @@ describe("QA-3.1-2: concurrentDispatches (dispatch windows in one git tree)", ()
     // A cwd above the dispatch's tree overlaps it too.
     await begin(store, "top", resolve("."), null);
     expect(store.concurrentDispatches("top")).toBe(3);
+  });
+});
+
+describe("QA-3.1-3: the tool that discarded a dispatch's snapshot or capture", () => {
+  it("toolLabel keeps [A-Za-z0-9_.-], turns anything else into ?, and caps at 64 characters", () => {
+    expect(toolLabel("github_create_file")).toBe("github_create_file");
+    expect(toolLabel("Serena.replace-symbol_body")).toBe("Serena.replace-symbol_body");
+    expect(toolLabel("VERIFY:required`x\ny")).toBe("VERIFY?required?x?y");
+    expect(toolLabel("a".repeat(80))).toBe(`${"a".repeat(64)}\u2026`);
+    expect(contaminatedReferenceReason("mcp_write")).toBe(`${REFERENCE_NONE.contaminated} (tool "mcp_write")`);
+  });
+
+  it("snapshotContaminatedBy is the first tool seen while the snapshot was in flight; none after it settled", async () => {
+    const store = createChangedFileStore();
+    let settle: (s: TreeSnapshot) => void = () => undefined;
+    const begun = store.beginDispatch("d", resolve("qa-3-1-3"), {
+      snapshot: () => new Promise<TreeSnapshot>(ok => { settle = ok; }),
+      timeoutMs: 1_000,
+    });
+    store.observeEdit("read");
+    expect(store.snapshotContaminatedBy("d")).toBeUndefined();
+    store.observeEdit("github_create_file");
+    store.observeEdit("bash");
+    expect(store.snapshotContaminatedBy("d")).toBe("github_create_file");
+    settle({ cwd: "x", root: "x", head: "h", fingerprint: "f", dirty: false, files: [] });
+    await begun;
+    expect(store.baselineSnapshot("d")).toBeUndefined();
+    const clean = createChangedFileStore();
+    await clean.beginDispatch("e", resolve("qa-3-1-3"), { snapshot: async () => undefined, timeoutMs: 1_000 });
+    clean.observeEdit("edit");
+    expect(clean.snapshotContaminatedBy("e")).toBeUndefined();
+    expect(clean.snapshotContaminatedBy("untracked")).toBeUndefined();
   });
 });

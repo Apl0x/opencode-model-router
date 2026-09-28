@@ -807,7 +807,7 @@ const ModelRouterPlugin: Plugin = async (ctx: PluginInput) => {
                 returnedAt,
                 strictUnverifiable: activeCfg.enforcement?.verify?.strictUnverifiable,
               });
-              // QA-3.1-2: other delegations live in this working tree during the dispatch.
+              // QA-3.1-2 / QA-3.1-3: concurrent delegations in this tree; a tool that discarded the baseline.
               gateRes = applyDispatchCaveats(gateRes, verification);
 
               // Per-attempt cleanup (drop producer session tracking + state).
@@ -1411,7 +1411,7 @@ const ModelRouterPlugin: Plugin = async (ctx: PluginInput) => {
               returnedAt,
               strictUnverifiable: cfg.enforcement?.verify?.strictUnverifiable,
             });
-            // QA-3.1-2: other delegations live in this working tree during the dispatch.
+            // QA-3.1-2 / QA-3.1-3: concurrent delegations in this tree; a tool that discarded the baseline.
             res = applyDispatchCaveats(res, verification);
             if (!res.accepted && !res.verdict.skipped) {
               const ladder = cfg.enforcement?.escalate?.ladder ?? ["fast", "medium", "heavy"];
