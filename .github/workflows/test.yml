@@ -166,16 +166,19 @@ jobs:
             if [ ! -f "$f" ]; then echo "::error::required Linux coverage input missing: $f"; exit 1; fi
           done
           if [ "${#inputs[@]}" -lt 2 ] || [ "${#inputs[@]}" -gt 4 ]; then echo "::error::expected 2-4 coverage inputs, got ${#inputs[@]}"; exit 1; fi
-          if [ "${#inputs[@]}" -eq 4 ]; then
-            node scripts/coverage-merge.mjs coverage/merged "${inputs[@]}"
-          else
-            # Windows e2e is non-blocking (phase 3.1 follow-ups). Linux-only coverage misses the
-            # win32 branches of src/verify/exec.ts (65% lines / 58% branches on run 36364312868),
-            # so without all 4 inputs the table is still printed but the gate is a warning.
-            echo "::warning::Windows coverage inputs missing; merged gate is Linux-only for this run"
-            rc=0; node scripts/coverage-merge.mjs coverage/merged "${inputs[@]}" || rc=$?
-            if [ "$rc" -eq 1 ]; then echo "::warning::per-file coverage gate failed on the Linux-only merge; not blocking because Windows inputs are missing"; elif [ "$rc" -ne 0 ]; then exit "$rc"; fi
+          # The gate always blocks for the platform-neutral files. Windows e2e is non-blocking
+          # (phase 3.1 follow-ups), so a Windows input may be missing. Linux-only coverage misses
+          # the win32 branches of src/verify/exec.ts (65% lines / 58% branches on run 36364312868),
+          # so only exec.ts turns warn-only, and only when the win-unit input (whose unit tests
+          # cover those branches) is missing.
+          soft=()
+          if [ ! -f coverage-artifacts/coverage-windows/win-unit/coverage-final.json ]; then
+            echo "::warning::Windows unit coverage input missing; src/verify/exec.ts is warn-only for this run, the other gated files still block"
+            soft=(--warn-only src/verify/exec.ts)
+          elif [ "${#inputs[@]}" -lt 4 ]; then
+            echo "::warning::Windows e2e coverage input missing; the gate still blocks for every file"
           fi
+          node scripts/coverage-merge.mjs "${soft[@]}" coverage/merged "${inputs[@]}"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always()
         with:
