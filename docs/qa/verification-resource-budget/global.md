@@ -383,6 +383,7 @@ end under Node and Bun.
 - QA-3.1-18 Resolution: 9d06d3c — a clean pass ends with `[router ✓ verified: <method>]`.
 - QA-3.1-21 Resolution: 9d06d3c — every accepted non-clean result is headed `[router ⚠ UNVERIFIED: <method>]`.
 - QA-3.1-23 Resolution: 7859b65 — G6 amended: no CodeQL workflow; CodeQL default setup left to the owner.
+- QA-G-10 Resolution: 29ca663 — the pytest module content search is again `git grep -F -w` on the module's name (index.py by its own name), so every import layout selects its test. Only a module named like the regular package that holds it (`app/app.py` beside `app/__init__.py`) reads its hits and drops a file whose every whole-word occurrence heads a longer one-line import path (`from app.mod01 import x`); an unreadable, oversized or occurrence-free file is kept. `pyImportPattern` and the seam's `regex` option are removed. Tests: the finding's corpus in LF, CRLF and CR, in memory and through real git (all 13 shapes hit, `mod020` does not); literal `mod+1`, `mod.1` and `a(b)`; C1 still maps `app/app.py` to its importer only; and the e2e repro (`tests/test_combo.py` in the pytest argv, `[router ⚠ UNVERIFIED: deterministic]`, `observed failures: tests/test_combo.py::test_combo02`). On the pre-fix `src`, the same e2e gives `[router ✓ verified: deterministic]` with argv `[… tests\test_mod02_1.py]` only.
 
 ## New findings (round 2)
 
@@ -409,3 +410,8 @@ end under Node and Bun.
 
 Under the owner rule, only QA-G-10 (critical) is for fixing. QA-G-11 … QA-G-14 (minor/nit) are recorded
 for acceptance.
+
+## Round 2 acceptance
+
+- QA-G-10: resolved in 29ca663 (see Resolution lines).
+- QA-G-11, -12, -13, -14 accepted per owner rule (post-round-2: only major/critical are fixed).
