@@ -631,7 +631,9 @@
 //            one. Without this, extra/test_preexisting.py (outside testpaths = ["tests"], never
 //            collected by `uv run pytest`) became an input of every app/mod01.py change.
 //          - a gone test file adds a note. A gone module uses the stem search plus findByName,
-//            and gets S6 when both find nothing.
+//            and gets S6 when both find nothing. QA-G-17: its content search uses the module's
+//            Python name, as for an existing module (a deleted app/index.py searches "index",
+//            not "app"); findByName keeps the stem.
 //        stem = the basename without its last extension. "index" and "__init__" use the parent
 //        directory name instead.
 //   9. Stem search (section 1.5-5): search.findByContent(gitRoot, stem, globs), with JS_TEST_GLOBS
@@ -4527,17 +4529,21 @@ async function classify(
     if (ok.length === 0) return s6("unmapped-module", `no test file maps to the changed module ${f.rel}`);
     for (const h of ok) addInput(h);
   }
+  // QA-G-17: a deleted module is searched by the name its importers spell, as an existing one is:
+  // a deleted app/index.py by "index" (`from app.index import x`, `from .index import x`), not by
+  // its directory's name; only __init__.py uses the package name. The name search keeps the stem.
   for (const f of goneModules) {
     const stem = stemOf(ctx, f.abs);
-    const content = await search.findByContent(gitRoot, stem, pyGlobs);
+    const name = P.basename(f.abs) === "__init__.py" ? stem : P.basename(f.abs, ".py");
+    const content = await search.findByContent(gitRoot, name, pyGlobs);
     const named = await byName(stem);
     if (content === undefined || named === undefined) return searchFailed(f);
     const tests = content.filter((h) => isPyTestFile(ctx, pyFiles, h));
     if (tests.length > STEM_MATCH_LIMIT) {
-      return s6("stem-too-common", `deleted source ${f.rel}: "${stem}" appears in ${tests.length} test files (limit ${STEM_MATCH_LIMIT})`);
+      return s6("stem-too-common", `deleted source ${f.rel}: "${name}" appears in ${tests.length} test files (limit ${STEM_MATCH_LIMIT})`);
     }
     const ok = await accept([...tests, ...named], true);
-    if (ok.length === 0) return s6("deleted-no-tests", `deleted source ${f.rel}: no test file references "${stem}"`);
+    if (ok.length === 0) return s6("deleted-no-tests", `deleted source ${f.rel}: no test file references "${name}"`);
     for (const h of ok) addInput(h);
   }
 

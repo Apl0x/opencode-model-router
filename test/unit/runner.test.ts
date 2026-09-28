@@ -1248,6 +1248,42 @@ describe("E2E-1: pytest maps a changed module to the tests that import it, and f
     expect(search.findByName).toHaveBeenCalledWith("/r", ["test_app.py", "app_test.py"]);
   });
 
+  it("QA-G-17: a deleted index.py is searched by its own name, so its importers run (was a false pass)", async () => {
+    // app/index.py is deleted (not in the tree); two tests still import it and will fail with ImportError.
+    const files = fixture({
+      "/r/tests/test_i1.py": "from app.index import x\n",
+      "/r/tests/test_i2.py": "from .index import x\n",
+    });
+    const search = treeSearch(files);
+    expect(spec(await plan(files, ["app/index.py"], { search })).inputs).toEqual(["/r/tests/test_i1.py", "/r/tests/test_i2.py"]);
+    expect(search.findByContent).toHaveBeenCalledWith("/r", "index", PY_TEST_GLOBS);
+    expect(search.findByName).toHaveBeenCalledWith("/r", ["test_app.py", "app_test.py"]);
+    // Inside a test package: tests/pkg/index.py deleted, its sibling imports it relatively.
+    const pkg = fixture({ "/r/tests/pkg/__init__.py": "", "/r/tests/pkg/test_rel.py": "from .index import helper\n" });
+    expect(spec(await plan(pkg, ["tests/pkg/index.py"])).inputs).toEqual(["/r/tests/pkg/test_rel.py"]);
+    // Fail-closed rules are unchanged: no reference -> S6, more than STEM_MATCH_LIMIT -> S6.
+    expectS6(await plan(fixture(), ["app/index.py"]), "deleted-no-tests", 'deleted source app/index.py: no test file references "index"');
+    const many = Object.fromEntries(Array.from({ length: STEM_MATCH_LIMIT + 1 }, (_, i) => [`/r/tests/test_ix${i}.py`, "from app.index import x\n"]));
+    expectS6(
+      await plan(fixture(many), ["app/index.py"]),
+      "stem-too-common",
+      `deleted source app/index.py: "index" appears in ${STEM_MATCH_LIMIT + 1} test files (limit ${STEM_MATCH_LIMIT})`,
+    );
+  });
+
+  it("QA-G-17: a deleted ordinary module and a deleted __init__.py keep their search names", async () => {
+    // app/mod02.py deleted: searched as "mod02", finds its importer.
+    const files = Object.fromEntries(Object.entries(fixture()).filter(([p]) => p !== "/r/app/mod02.py"));
+    const search = treeSearch(files);
+    expect(spec(await plan(files, ["app/mod02.py"], { search })).inputs).toEqual(["/r/tests/test_mod02_1.py"]);
+    expect(search.findByContent).toHaveBeenCalledWith("/r", "mod02", PY_TEST_GLOBS);
+    // tests/pkg/__init__.py deleted: the package name, "pkg".
+    const init = fixture({ "/r/tests/pkg/test_p.py": "from tests.pkg import helper\n" });
+    const initSearch = treeSearch(init);
+    expect(spec(await plan(init, ["tests/pkg/__init__.py"], { search: initSearch })).inputs).toEqual(["/r/tests/pkg/test_p.py"]);
+    expect(initSearch.findByContent).toHaveBeenCalledWith("/r", "pkg", PY_TEST_GLOBS);
+  });
+
   describe("QA-G-10: app/app.py keeps a hit it cannot prove is not an importer", () => {
     // Dropped when read: its only `app` heads `app.mod01`.
     const X = "/r/tests/test_x.py";
