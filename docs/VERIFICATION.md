@@ -187,7 +187,7 @@ The mode is chosen by directives in the orchestrator's dispatch prompt. A subage
 - `VERIFY:required`, or `VERIFY:deferred` (the default).
 - `VERIFY_WAIT:<n>s` or `VERIFY_WAIT:<n>ms`: `0` is allowed, and the value is capped at `baselineTimeoutMs`. A malformed value falls back to `captureWaitMs` and is logged.
 
-Deferral applies to delegations whose DoD has a `testsPass` check. Such a DoD defers **as a whole**: its build, lint, `run` and criteria checks are deferred too. On the native `task` path, a dispatch made while the enforcement mode is `off` gets no gate at all. The full list of conditions is in `docs/CONFIG_REFERENCE.md` → "Which delegations defer".
+Deferral applies to delegations whose DoD has a `testsPass` check. Such a DoD defers **as a whole**: its build, lint, `run` and criteria checks are deferred too, also when the producer changed nothing (then with risk `low`). The one exception is a `testsPass`-only DoD whose producer provably changed nothing: it takes the required gate, which passes it ("no changed files") without running a process. A DoD **without** `testsPass` (for example `buildPasses` only) is gated synchronously in either mode, and its checks run before return. On the native `task` path, a dispatch made while the enforcement mode is `off` gets no gate at all. The full list of conditions is in `docs/CONFIG_REFERENCE.md` → "Which delegations defer".
 
 1. **Dispatch.** When the DoD has `testsPass` and `failureRecheck` is on, the router starts a **git-only** reference capture of the working tree. It never runs the test command at dispatch time. The dispatch waits for the capture for at most `VERIFY_WAIT` (default `captureWaitMs`), then starts the producer anyway. The capture keeps running for up to `baselineTimeoutMs`. A capture that fails or times out means "no reference". It never blocks or fails the dispatch.
 2. **Producer returns.** The deferred finish takes a git-only tree snapshot, bounded at 2 s (`DEFERRED_FINISH_MS`). From that snapshot it computes:
@@ -259,6 +259,7 @@ Delegations that run at the same time in one working tree share that tree. Their
 
 ### Process limits (all platforms)
 
+- **What a normal exit leaves running** (QA-G-5). When a verification command exits on its own, what it left in the background is ended with it on POSIX: the run's process group is killed when the run settles (`cmd &`, a child that was not waited for). A descendant that left the group (`setsid`, Node's `detached: true`) is not reached. On Windows nothing is swept after a normal exit: the orphan sweep (a PowerShell start, 0.2–6 s of CPU) runs only for a deadline or an abort, so a detached or background descendant of a passing command keeps running outside the verification slot, and repeated verifications can accumulate them.
 - **Unhandled signals.** Runs still in flight when opencode exits are killed from a `process.once("exit")` hook. Death by an unhandled signal (SIGTERM, SIGHUP, Ctrl-C, per the host's policy) skips that hook on every platform, POSIX process groups included, so those runs are not killed by the router.
 
 ### Windows limits

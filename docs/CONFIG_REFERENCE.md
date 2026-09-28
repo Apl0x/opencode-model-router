@@ -337,15 +337,23 @@ All of these must hold:
 - the DoD carries a `testsPass` check, and the dispatch is not a trivial dispatch with
   an inferred DoD;
 - on the `delegate` path, the producer did not error;
-- the producer changed files. Only an attributed, empty change set falls back; a change
-  set that cannot be attributed still defers, with risk `high`.
+- the producer changed files, **or** the DoD has any check besides `testsPass`, or a
+  criterion. Only a `testsPass`-only DoD with an attributed, empty change set falls
+  back: the required gate passes it ("no changed files") without running a process. A
+  change set that cannot be attributed still defers, with risk `high`.
 
 A DoD with a `testsPass` check defers **as a whole**: its build, lint, `run` and
-criteria checks are deferred too, and run only when the handle is verified.
+criteria checks are deferred too, and run only when the handle is verified. This holds
+when the producer changed nothing: the delegation is deferred with risk `low` (no
+changes attributed), and its build, lint, `run` and criteria checks never run before
+the result returns.
 
 Otherwise the dispatch is handled as before deferred verification: the required
 (synchronous) gate, or no gate when `require` is `"never"` or, on the native `task`
-path, when the enforcement mode at dispatch time is `off`.
+path, when the enforcement mode at dispatch time is `off`. In particular, a DoD
+**without** `testsPass` (for example `buildPasses` or `fileExists` only) is gated
+before return in either mode, and its checks run synchronously; `VERIFY:deferred`
+does not change that.
 
 When registration fails (for example a handle collision), the delegation falls
 back to the required gate. It is never marked accepted or verified by that failure.
