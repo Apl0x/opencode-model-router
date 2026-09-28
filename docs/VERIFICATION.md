@@ -180,6 +180,8 @@ A fail is always backed by a proven id. A result that cannot be decided either w
 
 8. **Escalation.** A rejection follows the existing `onFailure` handling and the escalation ladder (`docs/ESCALATION.md`). The `delegate` tool retries up the ladder. The native `task` path appends a forcing note.
 
+Residual limits (JS runners, QA-G-7): `vitest related` and `jest --findRelatedTests` follow **static** imports only. A test that reaches the changed file only through a file read (a fixture, a JSON or data file loaded from disk), a dynamic `import()` or `require()` with a non-literal specifier, or a cross-package effect is not run, and the scope can pass without it, or report "no affected tests". Config and global-setup changes are reported as unverifiable. See ADR 0003, "Consequences".
+
 ### Deferred path (the default)
 
 The mode is chosen by directives in the orchestrator's dispatch prompt. A subagent cannot select its own mode.

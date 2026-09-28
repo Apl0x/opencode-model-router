@@ -588,11 +588,17 @@
 //          - an existing test file becomes an input, if it lies under runnerCwd and under a path
 //            scope (when path scopes exist).
 //          - an existing module (E2E-1) maps to the union of:
-//            (i) its importers: search.findByContent(gitRoot, stem, [...pytest globs (9),
-//                ":(glob)**/conftest.py"], {word: true}), hits re-checked against python_files.
-//                Every import spelling holds the stem as a whole word (`import app.mod02`,
-//                `from app.mod02 import x`, `from app import mod02`, `from .mod02 import x`,
-//                `from . import mod02`); a longer name (mod020) does not match.
+//            (i) its importers: search.findByContent(gitRoot, pyImportPattern(parent dir name,
+//                stem, parent has no __init__.py), [...pytest globs (9), ":(glob)**/conftest.py"],
+//                {regex: true}), hits re-checked against python_files. QA-G-2: the lines must be
+//                import-shaped for the module's dotted path (`import app.mod02`,
+//                `from app.mod02 import x`, `from app import mod02` incl. a parenthesised or
+//                continued name list, `from .mod02 import x`, `from . import mod02`; bare
+//                `import mod02` / `from mod02 import x` only when app/ has no __init__.py); a
+//                longer name (mod020) does not match. The bare stem as a word mapped app/app.py
+//                to every `from app.modNN import` test. A package's __init__.py keeps the
+//                whole-word search for the package name ({word: true}): importing any submodule
+//                runs it. More than STEM_MATCH_LIMIT importing test files -> S6 stem-too-common.
 //            (ii) the tests named after it: search.findByName(gitRoot, names), where each
 //                basename pattern with exactly one "*" and no other wildcard gives a name
 //                ("test_*.py" -> test_<stem>.py; by default ["test_<stem>.py", "<stem>_test.py"]).
@@ -1266,10 +1272,15 @@ export interface TestSearchSeam {
   /**
    * Absolute paths under gitRoot that match a pathspec in `globs` and contain `needle` literally.
    * With `options.word` the needle must stand as a whole word (git grep -w: not preceded or
-   * followed by a letter, digit or "_"), as a Python module name does in every import spelling
-   * (`import a.mod`, `from a.mod import x`, `from a import mod`, `from .mod import x`).
+   * followed by a letter, digit or "_"). With `options.regex` (QA-G-2) the needle is a POSIX
+   * extended regex matched one line at a time (git grep -E instead of -F), as pyImportPattern builds.
    */
-  findByContent(gitRoot: string, needle: string, globs: readonly string[], options?: { readonly word?: boolean }): Promise<readonly string[] | undefined>;
+  findByContent(
+    gitRoot: string,
+    needle: string,
+    globs: readonly string[],
+    options?: { readonly word?: boolean; readonly regex?: boolean },
+  ): Promise<readonly string[] | undefined>;
 }
 
 export type CommandSource =
@@ -4155,6 +4166,40 @@ function stemOf(ctx: Ctx, abs: string): string {
   return stem === "index" || stem === "__init__" ? ctx.P.basename(ctx.P.dirname(abs)) : stem;
 }
 
+/** QA-G-2: escapes the ERE metacharacters (a JS RegExp reads the result alike). */
+const ereEscape = (s: string): string => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+/**
+ * QA-G-2 (G.8): an extended regex (git grep -E) for the lines that import module `stem` of the
+ * package directory `parent`, instead of the bare stem as a word (`app/app.py` named every test
+ * with `from app.modNN import ...`). It uses only constructs git grep -E and a JS RegExp read
+ * alike: literal space/tab classes, no \b, \s or POSIX classes. The alternatives:
+ *   `(^|\W)parent.stem(\W|$)`          import app.mod, from app.mod import x, from .app.mod import x, "app.mod.f"
+ *   `from [prefix.]parent import … stem` from app import x, mod; from .app import mod; from app import(mod)
+ *   `from .+ import … stem`             from . import mod, from .. import x, mod
+ *   `from .+stem import`                from .mod import x
+ *   a line holding only `stem[ as x]` then `,`, `)`, `#`, `\` or its end: one name of a parenthesised
+ *                                       or continued `from app import (` (git grep reads one line at a time).
+ * With `topLevel` (the parent directory has no __init__.py, so the module may be importable by its
+ * bare name): also `import [a, ]stem` and `from stem import`. Over-inclusion only ever adds a test.
+ */
+export function pyImportPattern(parent: string, stem: string, topLevel: boolean): string {
+  const W = "[^A-Za-z0-9_]";
+  const S = "[ \t]";
+  const s = ereEscape(stem);
+  const p = ereEscape(parent);
+  const end = `(${W}|$)`;
+  const alts = [
+    `(^|${W})${p}\\.${s}${end}`,
+    `from${S}+([A-Za-z0-9_.]*\\.)?${p}${S}+import(${W}.*)?${W}${s}${end}`,
+    `from${S}+\\.+${S}*import(${W}.*)?${W}${s}${end}`,
+    `from${S}+\\.+${s}${S}+import`,
+    `^${S}*${s}(${S}+as${S}+[A-Za-z0-9_]+)?${S}*(,|\\)|#|\\\\|$)`,
+  ];
+  if (topLevel) alts.push(`^${S}*import${S}(.*${W})?${s}([^A-Za-z0-9_.]|$)`, `^${S}*from${S}+${s}${S}+import`);
+  return alts.map((a) => `(${a})`).join("|");
+}
+
 /** G.3-G.5 for one path: canonical absolute path inside gitRoot, or undefined. */
 function canonicalize(ctx: Ctx, cwd: string, gitRoot: string, p: string): FileRef | undefined {
   const abs = ctx.P.resolve(cwd, p);
@@ -4404,13 +4449,21 @@ async function classify(
     }
     for (const h of await accept(hits, false)) addInput(h);
   }
-  // G.8 (E2E-1): an existing module maps to every test file that imports it (a whole-word content
-  // search for its stem, which every import spelling contains) plus the test files named after it.
-  // It fails closed: a module no in-scope test maps to, or one a conftest.py references (its
-  // fixtures reach tests that never name the module), is S6 unmapped-module, never NoAffected.
+  // G.8 (E2E-1, QA-G-2): an existing module maps to every test file that imports it (an
+  // import-shaped content search, pyImportPattern; a package's __init__.py, which every import of
+  // the package or of its submodules runs, keeps the whole-word search for the package name) plus
+  // the test files named after it. It fails closed: a module no in-scope test maps to, or one a
+  // conftest.py references (its fixtures reach tests that never name the module), is S6
+  // unmapped-module, and one more than STEM_MATCH_LIMIT test files import is S6 stem-too-common,
+  // never NoAffected.
   for (const f of modules) {
     const stem = stemOf(ctx, f.abs);
-    const content = await search.findByContent(gitRoot, stem, [...pyGlobs, CONFTEST_GLOB], { word: true });
+    const globs = [...pyGlobs, CONFTEST_GLOB];
+    const dir = P.dirname(f.abs);
+    const content =
+      P.basename(f.abs) === "__init__.py"
+        ? await search.findByContent(gitRoot, stem, globs, { word: true })
+        : await search.findByContent(gitRoot, pyImportPattern(P.basename(dir), stem, !(await existsCached(ctx, fs, P.join(dir, "__init__.py")))), globs, { regex: true });
     if (content === undefined) return searchFailed(f);
     // Unscoped: pytest also loads the conftest.py files above the collected tests (up to confcutdir).
     const conftests = await accept(content.filter((h) => P.basename(h) === "conftest.py"), false);
@@ -4418,9 +4471,13 @@ async function classify(
       const rel = toSlash(ctx, P.relative(gitRoot, conftests[0]));
       return s6("unmapped-module", `changed module ${f.rel} is referenced by ${rel}: the tests its fixtures reach cannot be mapped`);
     }
+    const tests = content.filter((h) => isPyTestFile(ctx, pyFiles, h));
+    if (tests.length > STEM_MATCH_LIMIT) {
+      return s6("stem-too-common", `changed module ${f.rel}: ${tests.length} test files import it (limit ${STEM_MATCH_LIMIT})`);
+    }
     const named = await byName(stem);
     if (named === undefined) return searchFailed(f);
-    const ok = await accept([...content.filter((h) => isPyTestFile(ctx, pyFiles, h)), ...named], true);
+    const ok = await accept([...tests, ...named], true);
     if (ok.length === 0) return s6("unmapped-module", `no test file maps to the changed module ${f.rel}`);
     for (const h of ok) addInput(h);
   }

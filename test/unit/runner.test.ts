@@ -1,6 +1,7 @@
 import { afterAll, describe, it, expect, vi } from "vitest";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { realpath as fsRealpath } from "node:fs/promises";
+import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import {
@@ -20,6 +21,7 @@ import {
   STEM_MATCH_LIMIT,
   JS_TEST_GLOBS,
   PY_TEST_GLOBS,
+  pyImportPattern,
   type ChangedPath,
   type DetectedRunner,
   type PlanScopedRunInput,
@@ -906,7 +908,8 @@ describe("planScopedRun: pytest", () => {
     const search = stubSearch();
     const r = await planScopedRun(input({ command: "pytest", files: pyRepo(mods), changedFiles: changed("src/pkg/mod.py", "data.json"), search }));
     expectUnmapped(r, "src/pkg/mod.py");
-    expect(search.findByContent).toHaveBeenCalledWith("/r", "mod", [...PY_TEST_GLOBS, ":(glob)**/conftest.py"], { word: true });
+    // QA-G-2: src/pkg has no __init__.py, so the bare top-level import forms are searched too.
+    expect(search.findByContent).toHaveBeenCalledWith("/r", pyImportPattern("pkg", "mod", true), [...PY_TEST_GLOBS, ":(glob)**/conftest.py"], { regex: true });
     // A data file alone is not a module: nothing to map.
     expect(await planScopedRun(input({ command: "pytest", files: pyRepo(mods), changedFiles: changed("data.json") }))).toEqual({
       noAffected: true,
@@ -917,7 +920,7 @@ describe("planScopedRun: pytest", () => {
   it("name or content search failure -> S6", async () => {
     const search = stubSearch({}, { "test_mod.py": undefined });
     expectS6(await planScopedRun(input({ command: "pytest", files: pyRepo(mods), changedFiles: changed("src/pkg/mod.py"), search })), "search-failed");
-    const content = stubSearch({ mod: undefined }, { "test_mod.py": ["/r/tests/test_mod.py"] });
+    const content = stubSearch({ [pyImportPattern("pkg", "mod", true)]: undefined }, { "test_mod.py": ["/r/tests/test_mod.py"] });
     expectS6(await planScopedRun(input({ command: "pytest", files: pyRepo(mods), changedFiles: changed("src/pkg/mod.py"), search: content })), "search-failed", "test search failed for src/pkg/mod.py");
     expect(content.findByName).not.toHaveBeenCalled();
   });
@@ -962,11 +965,12 @@ function treeSearch(files: Record<string, string>, root = "/r"): TestSearchSeam 
   };
   return {
     findByName: vi.fn(async (_r: string, names: readonly string[]) => under.filter((p) => names.includes(path.posix.basename(p)))),
-    findByContent: vi.fn(async (_r: string, needle: string, globs: readonly string[], options?: { readonly word?: boolean }) => {
-      const esc = needle.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    findByContent: vi.fn(async (_r: string, needle: string, globs: readonly string[], options?: { readonly word?: boolean; readonly regex?: boolean }) => {
+      const esc = options?.regex === true ? needle : needle.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
       const re = options?.word === true ? new RegExp(`(?<![A-Za-z0-9_])${esc}(?![A-Za-z0-9_])`) : new RegExp(esc);
       const match = globs.map(glob);
-      return under.filter((p) => match.some((m) => m(p)) && re.test(files[p]));
+      // git grep matches one line at a time.
+      return under.filter((p) => match.some((m) => m(p)) && files[p].split("\n").some((line) => re.test(line)));
     }),
   };
 }
@@ -1042,6 +1046,94 @@ describe("E2E-1: pytest maps a changed module to the tests that import it, and f
     // One unmapped module in a change makes the whole change S6, even when another one maps.
     expectUnmapped(await plan(fixture({ "/r/app/orphan.py": "" }), ["app/mod02.py", "app/orphan.py"]), "app/orphan.py");
   });
+
+  it("QA-G-2 (C1): app/app.py, named like its package, maps to the one test that imports it, not to every `from app.modNN` test", async () => {
+    const files = fixture({ "/r/app/app.py": "X = 1\n", "/r/tests/test_app_use.py": "from app.app import X\n" });
+    expect(spec(await plan(files, ["app/app.py"])).inputs).toEqual(["/r/tests/test_app_use.py"]);
+    // Imported by no test: S6 unmapped-module (every test still names "app" as a word).
+    expectUnmapped(await plan(fixture({ "/r/app/app.py": "X = 1\n" }), ["app/app.py"]), "app/app.py");
+    // `from app import X` loads app/__init__.py, not app/app.py (app/ is a package).
+    expectUnmapped(await plan(fixture({ "/r/app/app.py": "", "/r/tests/test_pkg.py": "from app import X\nimport app\n" }), ["app/app.py"]), "app/app.py");
+  });
+
+  it("QA-G-2: import spellings of the dotted path, relative and multi-line forms", async () => {
+    const files = fixture({
+      "/r/app/app.py": "",
+      "/r/tests/test_p1.py": "import app.app as m\n",
+      "/r/tests/test_p2.py": "from app import mod01, app\n",
+      "/r/tests/test_p3.py": "from app import (\n    mod01,\n    app as a,\n)\n",
+      "/r/tests/test_p4.py": "from app import mod01, \\\n    app\n",
+      "/r/tests/test_p5.py": "import app\nx = app.app.X\n",
+      "/r/tests/test_no1.py": "from app.app_utils import X\nfrom app.mod01 import app\n",
+      "/r/tests/test_no2.py": "import app\nfrom app import application\n",
+    });
+    expect(spec(await plan(files, ["app/app.py"])).inputs).toEqual(
+      ["/r/tests/test_p1.py", "/r/tests/test_p2.py", "/r/tests/test_p3.py", "/r/tests/test_p4.py", "/r/tests/test_p5.py"],
+    );
+    const rel = fixture({
+      "/r/tests/pkg/__init__.py": "",
+      "/r/tests/pkg/util.py": "",
+      "/r/tests/pkg/test_r1.py": "from .util import X\n",
+      "/r/tests/pkg/test_r2.py": "from .. import pkg\nfrom . import (\n  other,\n)\n",
+      "/r/tests/pkg/test_r3.py": "from .. import util\n",
+      "/r/tests/pkg/test_r4.py": "from .pkg import util\n",
+    });
+    expect(spec(await plan(rel, ["tests/pkg/util.py"])).inputs).toEqual(["/r/tests/pkg/test_r1.py", "/r/tests/pkg/test_r3.py", "/r/tests/pkg/test_r4.py"]);
+  });
+
+  it("QA-G-2: a module outside a package also matches its bare top-level imports", async () => {
+    const files = pyRepo({
+      "/r/tests": "",
+      "/r/lib/helpers.py": "",
+      "/r/tests/test_h1.py": "import os, helpers\n",
+      "/r/tests/test_h2.py": "from helpers import f\n",
+      "/r/tests/test_h3.py": "import helpers_x\nfrom helpersx import f\n",
+    });
+    const s = spec(await planScopedRun(input({ command: "pytest", files, changedFiles: changed("lib/helpers.py"), search: treeSearch(files) })));
+    expect(s.inputs).toEqual(["/r/tests/test_h1.py", "/r/tests/test_h2.py"]);
+    expect(pyImportPattern("lib", "helpers", false)).not.toContain("^[ \t]*from[ \t]+helpers[ \t]+import");
+  });
+
+  it("QA-G-2: more than STEM_MATCH_LIMIT importing test files -> S6 stem-too-common; __init__.py keeps the word search", async () => {
+    const many = Object.fromEntries(Array.from({ length: STEM_MATCH_LIMIT + 1 }, (_, i) => [`/r/tests/test_imp${i}.py`, "from app.mod02 import value02\n"]));
+    const s6 = await plan(fixture(many), ["app/mod02.py"]);
+    expectS6(s6, "stem-too-common", `changed module app/mod02.py: ${STEM_MATCH_LIMIT + 2} test files import it (limit ${STEM_MATCH_LIMIT})`);
+    // Exactly at the limit still maps.
+    const atLimit = Object.fromEntries(Object.entries(many).slice(0, STEM_MATCH_LIMIT - 1));
+    expect(spec(await plan(fixture(atLimit), ["app/mod02.py"])).inputs).toHaveLength(STEM_MATCH_LIMIT);
+    // A package's __init__.py runs on every import of the package: every fixture test names "app".
+    const search = treeSearch(fixture(many));
+    expectS6(await plan(fixture(many), ["app/__init__.py"], { search }), "stem-too-common");
+    expect(search.findByContent).toHaveBeenCalledWith("/r", "app", [...PY_TEST_GLOBS, ":(glob)**/conftest.py"], { word: true });
+  });
+
+  it("QA-G-2: the pattern means the same to real git grep -E as to the in-memory search", () => {
+    const dir = mkdtempSync(path.join(tmpdir(), "omr-qag2-"));
+    try {
+      execFileSync("git", ["init", "-q"], { cwd: dir });
+      const cases: Record<string, string> = {
+        "test_y1.py": "import app.app\n",
+        "test_y2.py": "from app import mod01, app\n",
+        "test_y3.py": "from app import (\n\tmod01,\n    app,\n)\n",
+        "test_y4.py": "from . import app\n",
+        "test_y5.py": "from .app import X\n",
+        "test_y6.py": "from ..app import app\n",
+        "test_n1.py": "from app.mod02 import value02\nfrom app import X\nimport app\n",
+        "test_n2.py": "from app.app_x import X\nclient = make(app)\n",
+      };
+      for (const [n, c] of Object.entries(cases)) writeFileSync(path.join(dir, n), c);
+      const re = pyImportPattern("app", "app", false);
+      const out = execFileSync("git", ["grep", "-l", "-E", "--untracked", "-e", re, "--", "*.py"], { cwd: dir, encoding: "utf8" });
+      const got = out.split("\n").filter(Boolean).sort();
+      expect(got).toEqual(["test_y1.py", "test_y2.py", "test_y3.py", "test_y4.py", "test_y5.py", "test_y6.py"]);
+      const js = new RegExp(re);
+      expect(Object.keys(cases).filter((n) => cases[n].split("\n").some((l) => js.test(l))).sort()).toEqual(got);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+
 });
 
 describe("G.8b: testpaths decide which test inputs the user's run collects", () => {
@@ -2846,7 +2938,7 @@ describe("QA-1.3-26: process-backed searches are bounded", () => {
   it("pytest modules count too; exactly SEARCH_LIMIT still plans", async () => {
     const mods = Array.from({ length: SEARCH_LIMIT + 1 }, (_, i) => `src/m${i}.py`);
     const files = pyRepo({ ...Object.fromEntries(mods.map((m) => [`/r/${m}`, ""])), "/r/tests/test_all.py": "" });
-    const search = stubSearch(Object.fromEntries(mods.map((_, i) => [`m${i}`, ["/r/tests/test_all.py"]])));
+    const search = stubSearch(Object.fromEntries(mods.map((_, i) => [pyImportPattern("src", `m${i}`, true), ["/r/tests/test_all.py"]])));
     expectS6(await planScopedRun(input({ command: "pytest", files, changedFiles: changed(...mods), search })), "too-many-searches", why(SEARCH_LIMIT + 1));
     expect(search.findByName).not.toHaveBeenCalled();
     expect(search.findByContent).not.toHaveBeenCalled();

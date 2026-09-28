@@ -820,6 +820,12 @@ describe("gate seams", () => {
       reply(1); expect(await s.findByContent(root, "mod02", ["*.py"], { word: false })).toEqual([]);
       expect(state.commands[1]).toBe(`git --no-optional-locks -C ${root} grep -l -z -F --untracked -e mod02 -- *.py`);
     });
+    it("QA-G-2: findByContent with regex runs git grep -E instead of -F", async () => {
+      const s = search();
+      reply(0, "tests/test_a.py\0");
+      expect(await s.findByContent(root, "(^|[^A-Za-z0-9_])app\\.app", ["*.py"], { regex: true })).toEqual([resolve(root, "tests/test_a.py")]);
+      expect(state.commands[0]).toBe(`git --no-optional-locks -C ${root} grep -l -z -E --untracked -e (^|[^A-Za-z0-9_])app\\.app -- *.py`);
+    });
     it("a deadline bounds each search and a spent or aborted one runs no git", async () => {
       const ctl = new AbortController(); reply(0, "a.test.ts\0");
       expect(await search(fakeDeadline(2_500, ctl)).findByName(root, ["a.test.ts"])).toEqual([resolve(root, "a.test.ts")]);
