@@ -341,6 +341,15 @@ A delegation that is **not** verified is never reported as verified. It carries 
     An explicit acceptance block with deterministic checks does **not** imply `required`: the
     orchestrator states the mode. The directives stay in the dispatch text, which is harmless to the
     subagent.
+
+    *Amended during implementation (QA-G-4, owner decision):* the mode only governs a DoD that
+    contains `testsPass` (§1.5-16). A DoD without `testsPass` (for example `buildPasses`, `lintClean`,
+    `run` or `fileExists` only, or criteria only) keeps the synchronous gate of the pre-plan router
+    in either mode, so for it an acceptance block does imply a synchronous gate and `VERIFY:deferred`
+    has no effect. A DoD that contains `testsPass` defers as a whole (its build, lint, `run` and
+    criteria checks too), also when the producer changed nothing (QA-G-1). The only exception is a
+    `testsPass`-only DoD whose producer provably changed nothing. It takes the required gate, which
+    passes it ("no changed files", §1.5-6) without spawning a process.
 16. **Deferred result format.** A deferred delegation's result is returned unchanged, with a
     `[router]` footer appended:
     - "unverified";
@@ -1571,7 +1580,15 @@ checkout is at `v1.15.0`; no `omr-*` worktrees or `vrb/*` branches remain.
   - **no verification process is spawned** unless a dispatch says `VERIFY:required`, the orchestrator
     calls `router_verify`, or `background: true` is configured.
 
-  Proven by the 2.4 tests and 3.1.2.f.
+  Proven by the 2.4 tests and 3.1.2.f. *Amended during implementation (QA-G-4, owner decision;
+  QA-G-1):* the exception is a DoD **without** `testsPass`. It keeps the synchronous gate, and its
+  checks (a build, lint or `run` command, or the grader) run before return, as they did before this
+  plan (§1.5-15).
+  A DoD containing `testsPass` spawns nothing before return, also when the producer changed nothing:
+  it defers as a whole with risk `low`. The one non-deferred case is a `testsPass`-only DoD whose
+  producer provably changed nothing; its required gate passes with no process ("no changed files").
+  Proven by the QA-G-1 tests in `test/integration/deferred-verification.test.ts` on both dispatch
+  paths.
 - **G8 — The orchestrator is in control and informed.** Per dispatch, the orchestrator chooses the
   mode and the wait. Every deferred result carries a deterministic risk level and a handle, and
   unverified delegations stay listed in its prompt until verified or expired. A subagent can never
