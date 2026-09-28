@@ -1,7 +1,7 @@
 import { afterAll, describe, it, expect, vi } from "vitest";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { realpath as fsRealpath } from "node:fs/promises";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import {
@@ -21,7 +21,6 @@ import {
   STEM_MATCH_LIMIT,
   JS_TEST_GLOBS,
   PY_TEST_GLOBS,
-  pyImportPattern,
   type ChangedPath,
   type DetectedRunner,
   type PlanScopedRunInput,
@@ -908,8 +907,8 @@ describe("planScopedRun: pytest", () => {
     const search = stubSearch();
     const r = await planScopedRun(input({ command: "pytest", files: pyRepo(mods), changedFiles: changed("src/pkg/mod.py", "data.json"), search }));
     expectUnmapped(r, "src/pkg/mod.py");
-    // QA-G-2: src/pkg has no __init__.py, so the bare top-level import forms are searched too.
-    expect(search.findByContent).toHaveBeenCalledWith("/r", pyImportPattern("pkg", "mod", true), [...PY_TEST_GLOBS, ":(glob)**/conftest.py"], { regex: true });
+    // QA-G-10: the module's name as a whole word, over the test files and conftest.py.
+    expect(search.findByContent).toHaveBeenCalledWith("/r", "mod", [...PY_TEST_GLOBS, ":(glob)**/conftest.py"], { word: true });
     // A data file alone is not a module: nothing to map.
     expect(await planScopedRun(input({ command: "pytest", files: pyRepo(mods), changedFiles: changed("data.json") }))).toEqual({
       noAffected: true,
@@ -920,7 +919,7 @@ describe("planScopedRun: pytest", () => {
   it("name or content search failure -> S6", async () => {
     const search = stubSearch({}, { "test_mod.py": undefined });
     expectS6(await planScopedRun(input({ command: "pytest", files: pyRepo(mods), changedFiles: changed("src/pkg/mod.py"), search })), "search-failed");
-    const content = stubSearch({ [pyImportPattern("pkg", "mod", true)]: undefined }, { "test_mod.py": ["/r/tests/test_mod.py"] });
+    const content = stubSearch({ mod: undefined }, { "test_mod.py": ["/r/tests/test_mod.py"] });
     expectS6(await planScopedRun(input({ command: "pytest", files: pyRepo(mods), changedFiles: changed("src/pkg/mod.py"), search: content })), "search-failed", "test search failed for src/pkg/mod.py");
     expect(content.findByName).not.toHaveBeenCalled();
   });
@@ -965,6 +964,7 @@ function treeSearch(files: Record<string, string>, root = "/r"): TestSearchSeam 
   };
   return {
     findByName: vi.fn(async (_r: string, names: readonly string[]) => under.filter((p) => names.includes(path.posix.basename(p)))),
+    // options.regex: the QA-G-2 seam's git grep -E, kept so these tests replay the pre-QA-G-10 planner faithfully.
     findByContent: vi.fn(async (_r: string, needle: string, globs: readonly string[], options?: { readonly word?: boolean; readonly regex?: boolean }) => {
       const esc = options?.regex === true ? needle : needle.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
       const re = options?.word === true ? new RegExp(`(?<![A-Za-z0-9_])${esc}(?![A-Za-z0-9_])`) : new RegExp(esc);
@@ -973,6 +973,42 @@ function treeSearch(files: Record<string, string>, root = "/r"): TestSearchSeam 
       return under.filter((p) => match.some((m) => m(p)) && files[p].split("\n").some((line) => re.test(line)));
     }),
   };
+}
+
+/**
+ * QA-G-10: runs `fn` with a TestSearchSeam over a real git repository holding the /r files of
+ * `files`, with the wiring's argv (git grep -l -z -F [-w] --untracked; git ls-files with bracketed
+ * names). Paths come back under /r, so memFs(files) serves the planner the same tree.
+ */
+async function withGitTree(files: Record<string, string>, fn: (search: TestSearchSeam) => Promise<void>): Promise<void> {
+  const dir = mkdtempSync(path.join(tmpdir(), "omr-qag10-"));
+  try {
+    execFileSync("git", ["init", "-q"], { cwd: dir });
+    const keys = Object.keys(files).filter((p) => p.startsWith("/r/") && p !== "/r/.git");
+    for (const p of keys) {
+      if (keys.some((q) => q.startsWith(`${p}/`))) continue; // a directory marker for memFs
+      const abs = path.join(dir, ...p.slice(3).split("/"));
+      mkdirSync(path.dirname(abs), { recursive: true });
+      writeFileSync(abs, files[p]);
+    }
+    const git = (args: string[]): string | undefined => {
+      const r = spawnSync("git", ["--no-optional-locks", "-C", dir, ...args], { encoding: "utf8" });
+      return r.status === 0 ? r.stdout : r.status === 1 && args[0] === "grep" ? "" : undefined;
+    };
+    const under = (out: string | undefined) => out?.split("\0").filter(Boolean).map((rel) => `/r/${rel}`);
+    const lit = (n: string) => n.replace(/[*?[\]\\]/g, (c) => (c === "\\" ? "[\\\\]" : `[${c}]`));
+    await fn({
+      findByName: vi.fn(async (_r: string, names: readonly string[]) =>
+        under(git(["ls-files", "-z", "--cached", "--others", "--exclude-standard", "--", ...names.map((n) => `:(glob)**/${lit(n)}`)])),
+      ),
+      // options.regex: as in treeSearch, the QA-G-2 seam's -E.
+      findByContent: vi.fn(async (_r: string, needle: string, globs: readonly string[], options?: { readonly word?: boolean; readonly regex?: boolean }) =>
+        under(git(["grep", "-l", "-z", options?.regex === true ? "-E" : "-F", ...(options?.word === true ? ["-w"] : []), "--untracked", "-e", needle, "--", ...globs])),
+      ),
+    });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 }
 
 describe("E2E-1: pytest maps a changed module to the tests that import it, and fails closed", () => {
@@ -1047,16 +1083,18 @@ describe("E2E-1: pytest maps a changed module to the tests that import it, and f
     expectUnmapped(await plan(fixture({ "/r/app/orphan.py": "" }), ["app/mod02.py", "app/orphan.py"]), "app/orphan.py");
   });
 
-  it("QA-G-2 (C1): app/app.py, named like its package, maps to the one test that imports it, not to every `from app.modNN` test", async () => {
+  it("QA-G-2 (C1): app/app.py, named like its package, maps to the tests that may import it, not to every `from app.modNN` test", async () => {
     const files = fixture({ "/r/app/app.py": "X = 1\n", "/r/tests/test_app_use.py": "from app.app import X\n" });
     expect(spec(await plan(files, ["app/app.py"])).inputs).toEqual(["/r/tests/test_app_use.py"]);
-    // Imported by no test: S6 unmapped-module (every test still names "app" as a word).
+    // Imported by no test: S6 unmapped-module (every fixture test names "app" only as `from app.modNN import`).
     expectUnmapped(await plan(fixture({ "/r/app/app.py": "X = 1\n" }), ["app/app.py"]), "app/app.py");
-    // `from app import X` loads app/__init__.py, not app/app.py (app/ is a package).
-    expectUnmapped(await plan(fixture({ "/r/app/app.py": "", "/r/tests/test_pkg.py": "from app import X\nimport app\n" }), ["app/app.py"]), "app/app.py");
+    // QA-G-10: `from app import X` and `import app` are kept (with app/ on sys.path they would load
+    // app/app.py): one over-included test, never the full set.
+    const pkg = fixture({ "/r/app/app.py": "", "/r/tests/test_pkg.py": "from app import X\nimport app\n" });
+    expect(spec(await plan(pkg, ["app/app.py"])).inputs).toEqual(["/r/tests/test_pkg.py"]);
   });
 
-  it("QA-G-2: import spellings of the dotted path, relative and multi-line forms", async () => {
+  it("QA-G-10: app/app.py drops a file only when every `app` heads a longer one-line import path; any other use keeps it", async () => {
     const files = fixture({
       "/r/app/app.py": "",
       "/r/tests/test_p1.py": "import app.app as m\n",
@@ -1064,12 +1102,29 @@ describe("E2E-1: pytest maps a changed module to the tests that import it, and f
       "/r/tests/test_p3.py": "from app import (\n    mod01,\n    app as a,\n)\n",
       "/r/tests/test_p4.py": "from app import mod01, \\\n    app\n",
       "/r/tests/test_p5.py": "import app\nx = app.app.X\n",
-      "/r/tests/test_no1.py": "from app.app_utils import X\nfrom app.mod01 import app\n",
-      "/r/tests/test_no2.py": "import app\nfrom app import application\n",
+      "/r/tests/test_p6.py": "from app.app.sub import X\n",
+      // Kept on doubt: an imported name, a bare package import, a statement the line parse does not
+      // take (`;`, a continuation, spaces around the dot), a string, a comment, an attribute chain.
+      "/r/tests/test_k1.py": "from app.app_utils import X\nfrom app.mod01 import app\n",
+      "/r/tests/test_k2.py": "import app\nfrom app import application\n",
+      "/r/tests/test_k3.py": "import app.mod01; import os\n",
+      "/r/tests/test_k4.py": "import app.mod01, \\\n    app.mod03\n",
+      "/r/tests/test_k5.py": 'import importlib\nm = importlib.import_module("app.mod01")\n',
+      "/r/tests/test_k6.py": "from app . mod01 import value01\n",
+      "/r/tests/test_k7.py": "from app.mod01 import value01  # app\n",
+      "/r/tests/test_k8.py": "import app.mod01\nvalue = app.mod01.value01(1)\n",
+      // Dropped: every `app` heads a longer import path (LF, CRLF, CR; tabs, relative, `as`, a comment).
+      "/r/tests/test_d1.py": "from app.mod01 import value01\nimport app.mod01, app.mod03 as m3  # note\n",
+      "/r/tests/test_d2.py": "from ..app.mod02 import (\r\n    value02,\r\n)\r\n\tfrom\tapp.mod01\timport(value01)\r\n",
+      "/r/tests/test_d3.py": "if True:\r    import app.mod01 as m\r    from .app.mod03 import value03\r",
     });
-    expect(spec(await plan(files, ["app/app.py"])).inputs).toEqual(
-      ["/r/tests/test_p1.py", "/r/tests/test_p2.py", "/r/tests/test_p3.py", "/r/tests/test_p4.py", "/r/tests/test_p5.py"],
-    );
+    expect(spec(await plan(files, ["app/app.py"])).inputs).toEqual([
+      ...["k1", "k2", "k3", "k4", "k5", "k6", "k7", "k8"].map((k) => `/r/tests/test_${k}.py`),
+      ...["p1", "p2", "p3", "p4", "p5", "p6"].map((k) => `/r/tests/test_${k}.py`),
+    ]);
+    // A namespace directory (no app/__init__.py) may make `app` the module itself: nothing is dropped.
+    const ns = Object.fromEntries(Object.entries(files).filter(([p]) => p !== "/r/app/__init__.py"));
+    expectS6(await plan(ns, ["app/app.py"]), "stem-too-common");
     const rel = fixture({
       "/r/tests/pkg/__init__.py": "",
       "/r/tests/pkg/util.py": "",
@@ -1091,7 +1146,6 @@ describe("E2E-1: pytest maps a changed module to the tests that import it, and f
     });
     const s = spec(await planScopedRun(input({ command: "pytest", files, changedFiles: changed("lib/helpers.py"), search: treeSearch(files) })));
     expect(s.inputs).toEqual(["/r/tests/test_h1.py", "/r/tests/test_h2.py"]);
-    expect(pyImportPattern("lib", "helpers", false)).not.toContain("^[ \t]*from[ \t]+helpers[ \t]+import");
   });
 
   it("QA-G-2: more than STEM_MATCH_LIMIT importing test files -> S6 stem-too-common; __init__.py keeps the word search", async () => {
@@ -1107,30 +1161,124 @@ describe("E2E-1: pytest maps a changed module to the tests that import it, and f
     expect(search.findByContent).toHaveBeenCalledWith("/r", "app", [...PY_TEST_GLOBS, ":(glob)**/conftest.py"], { word: true });
   });
 
-  it("QA-G-2: the pattern means the same to real git grep -E as to the in-memory search", () => {
-    const dir = mkdtempSync(path.join(tmpdir(), "omr-qag2-"));
-    try {
-      execFileSync("git", ["init", "-q"], { cwd: dir });
-      const cases: Record<string, string> = {
-        "test_y1.py": "import app.app\n",
-        "test_y2.py": "from app import mod01, app\n",
-        "test_y3.py": "from app import (\n\tmod01,\n    app,\n)\n",
-        "test_y4.py": "from . import app\n",
-        "test_y5.py": "from .app import X\n",
-        "test_y6.py": "from ..app import app\n",
-        "test_n1.py": "from app.mod02 import value02\nfrom app import X\nimport app\n",
-        "test_n2.py": "from app.app_x import X\nclient = make(app)\n",
-      };
-      for (const [n, c] of Object.entries(cases)) writeFileSync(path.join(dir, n), c);
-      const re = pyImportPattern("app", "app", false);
-      const out = execFileSync("git", ["grep", "-l", "-E", "--untracked", "-e", re, "--", "*.py"], { cwd: dir, encoding: "utf8" });
-      const got = out.split("\n").filter(Boolean).sort();
-      expect(got).toEqual(["test_y1.py", "test_y2.py", "test_y3.py", "test_y4.py", "test_y5.py", "test_y6.py"]);
-      const js = new RegExp(re);
-      expect(Object.keys(cases).filter((n) => cases[n].split("\n").some((l) => js.test(l))).sort()).toEqual(got);
-    } finally {
-      rmSync(dir, { recursive: true, force: true });
-    }
+  /**
+   * QA-G-10: the finding's corpus for app/mod02.py. Every shape imports it; QA-G-2's import-shaped
+   * git grep -E missed the first four (a false pass: `[router ✓ verified]` over a failing importer).
+   */
+  const CORPUS: Record<string, string> = {
+    paren_two_on_line: "from app import (\n    mod01, mod02,\n)\n",
+    isort_grid: "from app import (mod01, mod03, mod04,\n                 mod05, mod02)\n",
+    backslash_cont: "from app import mod01, \\\n    mod03, mod02\n",
+    paren_last_no_comma_crlf: "from app import (\r\n    mod01,\r\n    mod02\r\n)\r\n",
+    as_alias: "import app.mod02 as m\n",
+    from_as: "from app import mod02 as m\n",
+    paren_one_per_line: "from app import (\n    mod01,\n    mod02,\n)\n",
+    paren_last_no_comma_lf: "from app import (\n    mod01,\n    mod02\n)\n",
+    importlib: 'import importlib\nm = importlib.import_module("app.mod02")\n',
+    dunder_import: 'm = __import__("app.mod02")\n',
+    rel_from_pkg: "from ..app import mod02\n",
+    rel_dotted: "from ..app.mod02 import value02\n",
+    attr_chain: "import app\nx = app.mod02.value02(1)\n",
+  };
+  /** A longer name that merely contains the stem. */
+  const DECOY = "from app import mod020\nimport app.mod020x\nfrom app.mod020 import mod02x\n";
+  /** The corpus (and the decoy) as test files, with every line end rewritten to `eol` when given. */
+  const corpus = (eol?: string): Record<string, string> =>
+    Object.fromEntries(
+      Object.entries({ ...CORPUS, decoy: DECOY }).map(([k, c]) => [`/r/tests/test_q_${k}.py`, eol === undefined ? c : c.replace(/\r?\n/g, eol)]),
+    );
+  const CORPUS_HITS = [...Object.keys(CORPUS).map((k) => `/r/tests/test_q_${k}.py`), "/r/tests/test_mod02_1.py"].sort();
+
+  it.each([
+    ["as written (LF, one CRLF file)", undefined],
+    ["CRLF", "\r\n"],
+    ["CR", "\r"],
+  ])("QA-G-10: every corpus import layout selects its test, %s; the mod020 decoy does not", async (_eol, eol) => {
+    const files = fixture(corpus(eol));
+    expect(spec(await plan(files, ["app/mod02.py"])).inputs).toEqual(CORPUS_HITS);
+  });
+
+  it.each([
+    ["as written (LF, one CRLF file)", undefined],
+    ["CRLF", "\r\n"],
+  ])("QA-G-10: the same through real git grep -F -w (the wiring's argv), %s", async (_eol, eol) => {
+    const files = fixture(corpus(eol));
+    await withGitTree(files, async (search) => {
+      expect(spec(await plan(files, ["app/mod02.py"], { search })).inputs).toEqual(CORPUS_HITS);
+      expect(search.findByContent).toHaveBeenCalledWith("/r", "mod02", [...PY_TEST_GLOBS, ":(glob)**/conftest.py"], { word: true });
+    });
+  });
+
+  it("QA-G-10 (C1) through real git: app/app.py maps to its importer only, not to the fixture's `from app.modNN` tests", async () => {
+    const files = fixture({ "/r/app/app.py": "X = 1\n", "/r/tests/test_app_use.py": "from app.app import (\r\n    X,\r\n)\r\n" });
+    await withGitTree(files, async (search) => {
+      expect(spec(await plan(files, ["app/app.py"], { search })).inputs).toEqual(["/r/tests/test_app_use.py"]);
+    });
+  });
+
+  it("QA-G-10: regex metacharacter stems match literally, through real git", async () => {
+    const files = fixture({
+      "/r/app/mod+1.py": "",
+      "/r/app/mod.1.py": "",
+      "/r/app/a(b).py": "",
+      "/r/tests/test_lit_plus.py": "# mod+1\n",
+      "/r/tests/test_dec_plus.py": "# modd1 moddd1 mod1\n",
+      "/r/tests/test_lit_dot.py": "# mod.1\n",
+      "/r/tests/test_dec_dot.py": "# modx1 mod_1\n",
+      "/r/tests/test_lit_paren.py": "# a(b)\n",
+      "/r/tests/test_dec_paren.py": "# ab a b\n",
+    });
+    await withGitTree(files, async (search) => {
+      expect(spec(await plan(files, ["app/mod+1.py"], { search })).inputs).toEqual(["/r/tests/test_lit_plus.py"]);
+      expect(spec(await plan(files, ["app/mod.1.py"], { search })).inputs).toEqual(["/r/tests/test_lit_dot.py"]);
+      expect(spec(await plan(files, ["app/a(b).py"], { search })).inputs).toEqual(["/r/tests/test_lit_paren.py"]);
+    });
+  });
+
+  it("QA-G-10: index.py is searched by its own name (QA-G-2 searched app/index.py as `app.app`)", async () => {
+    const files = fixture({
+      "/r/app/index.py": "",
+      "/r/tests/test_i1.py": "from app.index import X\n",
+      "/r/tests/test_i2.py": "from app import (mod01,\n    index)\n",
+    });
+    const search = treeSearch(files);
+    expect(spec(await plan(files, ["app/index.py"], { search })).inputs).toEqual(["/r/tests/test_i1.py", "/r/tests/test_i2.py"]);
+    expect(search.findByContent).toHaveBeenCalledWith("/r", "index", [...PY_TEST_GLOBS, ":(glob)**/conftest.py"], { word: true });
+    // The name search keeps the stem (the directory name): test_app.py.
+    expect(search.findByName).toHaveBeenCalledWith("/r", ["test_app.py", "app_test.py"]);
+  });
+
+  describe("QA-G-10: app/app.py keeps a hit it cannot prove is not an importer", () => {
+    // Dropped when read: its only `app` heads `app.mod01`.
+    const X = "/r/tests/test_x.py";
+    const files = fixture({ "/r/app/app.py": "", [X]: "from app.mod01 import value01\n" });
+    const withStat = (size: (p: string) => number): PlannerFs => ({
+      ...memFs(files),
+      stat: async (p) => {
+        if (!(p in files)) throw new Error(`ENOENT ${p}`);
+        return { isFile: true, size: size(p), dev: 1, ino: 1 };
+      },
+    });
+    const kept = async (over: Partial<PlanScopedRunInput>, f = files) => expect(spec(await plan(f, ["app/app.py"], over)).inputs).toEqual([X]);
+
+    it("dropped when read, with and without fs.stat", async () => {
+      expectUnmapped(await plan(files, ["app/app.py"]), "app/app.py");
+      expectUnmapped(await plan(files, ["app/app.py"], { fs: withStat((p) => files[p].length) }), "app/app.py");
+    });
+    it("a read that fails", () => kept({ fs: memFs(files, false, {}, [X]) }));
+    it("a stat that fails", () => kept({ fs: withStat((p) => { if (p === X) throw new Error("EACCES"); return files[p].length; }) }));
+    it("a file over CONFIG_SIZE_LIMIT, by fs.stat (not read) or by its read length", async () => {
+      const fs = withStat((p) => (p === X ? CONFIG_SIZE_LIMIT + 1 : files[p].length));
+      const read = vi.spyOn(fs, "readFile");
+      await kept({ fs });
+      expect(read).not.toHaveBeenCalledWith(X);
+      const big = { ...files, [X]: files[X] + "#".repeat(CONFIG_SIZE_LIMIT) };
+      await kept({}, big);
+    });
+    it("a read that finds no occurrence git found", async () => {
+      const search: TestSearchSeam = { findByName: vi.fn(async () => []), findByContent: vi.fn(async () => [X]) };
+      await kept({ search }, { ...files, [X]: "import os\n" });
+    });
   });
 
   it("QA-G-3: a stem with glob metacharacters maps only by literal name and content", async () => {
@@ -2943,7 +3091,7 @@ describe("QA-1.3-26: process-backed searches are bounded", () => {
   it("pytest modules count too; exactly SEARCH_LIMIT still plans", async () => {
     const mods = Array.from({ length: SEARCH_LIMIT + 1 }, (_, i) => `src/m${i}.py`);
     const files = pyRepo({ ...Object.fromEntries(mods.map((m) => [`/r/${m}`, ""])), "/r/tests/test_all.py": "" });
-    const search = stubSearch(Object.fromEntries(mods.map((_, i) => [pyImportPattern("src", `m${i}`, true), ["/r/tests/test_all.py"]])));
+    const search = stubSearch(Object.fromEntries(mods.map((_, i) => [`m${i}`, ["/r/tests/test_all.py"]])));
     expectS6(await planScopedRun(input({ command: "pytest", files, changedFiles: changed(...mods), search })), "too-many-searches", why(SEARCH_LIMIT + 1));
     expect(search.findByName).not.toHaveBeenCalled();
     expect(search.findByContent).not.toHaveBeenCalled();

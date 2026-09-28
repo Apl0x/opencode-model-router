@@ -820,11 +820,37 @@ describe("gate seams", () => {
       reply(1); expect(await s.findByContent(root, "mod02", ["*.py"], { word: false })).toEqual([]);
       expect(state.commands[1]).toBe(`git --no-optional-locks -C ${root} grep -l -z -F --untracked -e mod02 -- *.py`);
     });
-    it("QA-G-2: findByContent with regex runs git grep -E instead of -F", async () => {
-      const s = search();
-      reply(0, "tests/test_a.py\0");
-      expect(await s.findByContent(root, "(^|[^A-Za-z0-9_])app\\.app", ["*.py"], { regex: true })).toEqual([resolve(root, "tests/test_a.py")]);
-      expect(state.commands[0]).toBe(`git --no-optional-locks -C ${root} grep -l -z -E --untracked -e (^|[^A-Za-z0-9_])app\\.app -- *.py`);
+    it("QA-G-10: real git grep -F -w finds every wrapped, continued and CRLF import of mod02, not mod020", async () => {
+      const dir = mkdtempSync(join(tmpdir(), "omr-qag10-"));
+      try {
+        execFileSync("git", ["init", "-q"], { cwd: dir });
+        mkdirSync(join(dir, "tests"));
+        const corpus: Record<string, string> = {
+          paren_two_on_line: "from app import (\n    mod01, mod02,\n)\n",
+          isort_grid: "from app import (mod01, mod03, mod04,\n                 mod05, mod02)\n",
+          backslash_cont: "from app import mod01, \\\n    mod03, mod02\n",
+          paren_last_no_comma_crlf: "from app import (\r\n    mod01,\r\n    mod02\r\n)\r\n",
+          as_alias: "import app.mod02 as m\n",
+          from_as: "from app import mod02 as m\n",
+          paren_one_per_line: "from app import (\n    mod01,\n    mod02,\n)\n",
+          paren_last_no_comma_lf: "from app import (\n    mod01,\n    mod02\n)\n",
+          importlib: 'import importlib\nm = importlib.import_module("app.mod02")\n',
+          dunder_import: 'm = __import__("app.mod02")\n',
+          rel_from_pkg: "from ..app import mod02\n",
+          rel_dotted: "from ..app.mod02 import value02\n",
+          attr_chain: "import app\nx = app.mod02.value02(1)\n",
+        };
+        for (const [k, c] of Object.entries(corpus)) writeFileSync(join(dir, "tests", `test_${k}.py`), c);
+        writeFileSync(join(dir, "tests", "test_decoy.py"), "from app import mod020\nimport app.mod020x\n");
+        const s = search();
+        state.argvImpl = (file, args) => new Promise(done => {
+          execFile(file, [...args], { encoding: "utf8" }, (err, stdout, stderr) => done({ code: err ? Number(err.code ?? 1) : 0, stdout, stderr, timedOut: false }));
+        });
+        const hits = await s.findByContent(dir, "mod02", [":(glob)**/test_*.py", ":(glob)**/*_test.py", ":(glob)**/conftest.py"], { word: true });
+        expect([...(hits ?? [])].sort()).toEqual(Object.keys(corpus).map(k => resolve(dir, `tests/test_${k}.py`)).sort());
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
     });
     it("QA-G-3: findByName brackets glob metacharacters, so a name is matched literally", async () => {
       const s = search();

@@ -588,17 +588,23 @@
 //          - an existing test file becomes an input, if it lies under runnerCwd and under a path
 //            scope (when path scopes exist).
 //          - an existing module (E2E-1) maps to the union of:
-//            (i) its importers: search.findByContent(gitRoot, pyImportPattern(parent dir name,
-//                stem, parent has no __init__.py), [...pytest globs (9), ":(glob)**/conftest.py"],
-//                {regex: true}), hits re-checked against python_files. QA-G-2: the lines must be
-//                import-shaped for the module's dotted path (`import app.mod02`,
-//                `from app.mod02 import x`, `from app import mod02` incl. a parenthesised or
-//                continued name list, `from .mod02 import x`, `from . import mod02`; bare
-//                `import mod02` / `from mod02 import x` only when app/ has no __init__.py); a
-//                longer name (mod020) does not match. The bare stem as a word mapped app/app.py
-//                to every `from app.modNN import` test. A package's __init__.py keeps the
-//                whole-word search for the package name ({word: true}): importing any submodule
-//                runs it. More than STEM_MATCH_LIMIT importing test files -> S6 stem-too-common.
+//            (i) its importers: search.findByContent(gitRoot, name, [...pytest globs (9),
+//                ":(glob)**/conftest.py"], {word: true}), where name is the module's Python name
+//                (the basename without ".py"; for __init__.py the package directory name). A
+//                longer name (mod020) does not match. QA-G-10: every whole-word hit is kept (any
+//                import layout: a name anywhere in a wrapped, isort-grid, backslash-continued or
+//                CRLF list, importlib strings, attribute chains). One exception, the QA-G-2
+//                over-match: for a module named like the regular package that holds it
+//                (app/app.py beside app/__init__.py), keepImporters reads each hit through the fs
+//                seam and drops it only when every whole-word occurrence of name heads a longer
+//                module path in a one-line import statement (`from app.mod01 import x`,
+//                `import app.mod01`), where name is the package. An unreadable file, one over
+//                CONFIG_SIZE_LIMIT, or one the read finds no occurrence in is kept. Other modules
+//                read nothing: a module can serve its own dotted names (six.py's
+//                `from six.moves import x`). QA-G-2's import-shaped git grep -E missed wrapped
+//                imports (a false pass). A package's __init__.py keeps every hit: importing any
+//                submodule runs it. Then conftest hits -> S6 (below); hits re-checked against
+//                python_files; more than STEM_MATCH_LIMIT -> S6 stem-too-common.
 //            (ii) the tests named after it: search.findByName(gitRoot, names), where each
 //                basename pattern with exactly one "*" and no other wildcard gives a name
 //                ("test_*.py" -> test_<stem>.py; by default ["test_<stem>.py", "<stem>_test.py"]).
@@ -1272,14 +1278,13 @@ export interface TestSearchSeam {
   /**
    * Absolute paths under gitRoot that match a pathspec in `globs` and contain `needle` literally.
    * With `options.word` the needle must stand as a whole word (git grep -w: not preceded or
-   * followed by a letter, digit or "_"). With `options.regex` (QA-G-2) the needle is a POSIX
-   * extended regex matched one line at a time (git grep -E instead of -F), as pyImportPattern builds.
+   * followed by a letter, digit or "_").
    */
   findByContent(
     gitRoot: string,
     needle: string,
     globs: readonly string[],
-    options?: { readonly word?: boolean; readonly regex?: boolean },
+    options?: { readonly word?: boolean },
   ): Promise<readonly string[] | undefined>;
 }
 
@@ -4166,38 +4171,76 @@ function stemOf(ctx: Ctx, abs: string): string {
   return stem === "index" || stem === "__init__" ? ctx.P.basename(ctx.P.dirname(abs)) : stem;
 }
 
-/** QA-G-2: escapes the ERE metacharacters (a JS RegExp reads the result alike). */
-const ereEscape = (s: string): string => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+/** git grep -w's word characters (ASCII letters, digits, "_"; a non-ASCII character is a boundary). */
+const WORD_CHAR_RE = /[A-Za-z0-9_]/;
+
+/** The whole-word occurrences of `name` in `text`, as git grep -w finds them (overlaps included). */
+function countWords(text: string, name: string): number {
+  let n = 0;
+  for (let i = text.indexOf(name); i !== -1; i = text.indexOf(name, i + 1)) {
+    if (!WORD_CHAR_RE.test(text.charAt(i - 1)) && !WORD_CHAR_RE.test(text.charAt(i + name.length))) n++;
+  }
+  return n;
+}
+
+/** `from [dots]<dotted path> import`: the path (group 2) is a module path. */
+const PY_FROM_PATH_RE = /^([ \t]*from[ \t]+\.*)([A-Za-z0-9_]+(?:\.[A-Za-z0-9_]+)*)(?=[ \t]+import(?![A-Za-z0-9_]))/;
+/** `import <items>[# comment]`. */
+const PY_IMPORT_LINE_RE = /^([ \t]*import[ \t]+)([^#]*)(.*)$/;
+/** One `<dotted path>[ as <name>]` item of an import statement. */
+const PY_IMPORT_ITEM_RE = /^([ \t]*)([A-Za-z0-9_]+(?:\.[A-Za-z0-9_]+)*)((?:[ \t]+as[ \t]+[A-Za-z0-9_]+)?[ \t]*)$/;
+
+/** A dotted module path without its first segment when that is `name` and more segments follow. */
+function dropPackageHead(dotted: string, name: string): string {
+  const dot = dotted.indexOf(".");
+  return dot > 0 && dotted.slice(0, dot) === name ? dotted.slice(dot) : dotted;
+}
 
 /**
- * QA-G-2 (G.8): an extended regex (git grep -E) for the lines that import module `stem` of the
- * package directory `parent`, instead of the bare stem as a word (`app/app.py` named every test
- * with `from app.modNN import ...`). It uses only constructs git grep -E and a JS RegExp read
- * alike: literal space/tab classes, no \b, \s or POSIX classes. The alternatives:
- *   `(^|\W)parent.stem(\W|$)`          import app.mod, from app.mod import x, from .app.mod import x, "app.mod.f"
- *   `from [prefix.]parent import … stem` from app import x, mod; from .app import mod; from app import(mod)
- *   `from .+ import … stem`             from . import mod, from .. import x, mod
- *   `from .+stem import`                from .mod import x
- *   a line holding only `stem[ as x]` then `,`, `)`, `#`, `\` or its end: one name of a parenthesised
- *                                       or continued `from app import (` (git grep reads one line at a time).
- * With `topLevel` (the parent directory has no __init__.py, so the module may be importable by its
- * bare name): also `import [a, ]stem` and `from stem import`. Over-inclusion only ever adds a test.
+ * One line with `name` blanked where it heads a longer module path of an import statement
+ * (`from app.mod01 import x`, `from ..app.mod01 import x`, `import app.mod01, os as o`). A line
+ * that is not a plain one-line `from … import` or `import a.b[ as c], …` statement is returned
+ * unchanged, so every occurrence in it still counts.
  */
-export function pyImportPattern(parent: string, stem: string, topLevel: boolean): string {
-  const W = "[^A-Za-z0-9_]";
-  const S = "[ \t]";
-  const s = ereEscape(stem);
-  const p = ereEscape(parent);
-  const end = `(${W}|$)`;
-  const alts = [
-    `(^|${W})${p}\\.${s}${end}`,
-    `from${S}+([A-Za-z0-9_.]*\\.)?${p}${S}+import(${W}.*)?${W}${s}${end}`,
-    `from${S}+\\.+${S}*import(${W}.*)?${W}${s}${end}`,
-    `from${S}+\\.+${s}${S}+import`,
-    `^${S}*${s}(${S}+as${S}+[A-Za-z0-9_]+)?${S}*(,|\\)|#|\\\\|$)`,
-  ];
-  if (topLevel) alts.push(`^${S}*import${S}(.*${W})?${s}([^A-Za-z0-9_.]|$)`, `^${S}*from${S}+${s}${S}+import`);
-  return alts.map((a) => `(${a})`).join("|");
+function withoutPackageHeads(line: string, name: string): string {
+  const from = PY_FROM_PATH_RE.exec(line);
+  if (from) return from[1] + dropPackageHead(from[2], name) + line.slice(from[0].length);
+  const imp = PY_IMPORT_LINE_RE.exec(line);
+  if (!imp) return line;
+  const items: string[] = [];
+  for (const it of imp[2].split(",")) {
+    const m = PY_IMPORT_ITEM_RE.exec(it);
+    if (!m) return line;
+    items.push(m[1] + dropPackageHead(m[2], name) + m[3]);
+  }
+  return imp[1] + items.join(",") + imp[3];
+}
+
+/**
+ * QA-G-10 (G.8): of the whole-word hits of `name`, for a module named like the regular package
+ * that holds it (app/app.py beside app/__init__.py), the files that may import it. A file is
+ * dropped only when it provably does not: every whole-word occurrence of `name` heads a longer
+ * module path in an import statement (`from app.mod01 import x`), where `name` is that package
+ * (the QA-G-2 over-match). Any doubt keeps the file: a stat or read that fails, a file over
+ * CONFIG_SIZE_LIMIT (checked with fs.stat before the read, as config reads are, and after it), or a
+ * read that finds no occurrence at all (git saw one). Lines split at CRLF, LF and CR, as Python
+ * reads them. Keeping a file only ever adds a test.
+ */
+async function keepImporters(fs: PlannerFs, hits: readonly string[], name: string): Promise<string[]> {
+  const out: string[] = [];
+  for (const h of hits) {
+    // "" (no occurrence, so kept) stands for a file too large to scan or one that cannot be read.
+    let text = "";
+    try {
+      const st = fs.stat ? await fs.stat(h) : undefined;
+      if (!st || Number(st.size) <= CONFIG_SIZE_LIMIT) text = await fs.readFile(h);
+    } catch {
+      text = "";
+    }
+    if (text.length > CONFIG_SIZE_LIMIT || countWords(text, name) === 0) out.push(h);
+    else if (countWords(text.split(/\r\n|\r|\n/).map((l) => withoutPackageHeads(l, name)).join("\n"), name) > 0) out.push(h);
+  }
+  return out;
 }
 
 /** G.3-G.5 for one path: canonical absolute path inside gitRoot, or undefined. */
@@ -4449,22 +4492,25 @@ async function classify(
     }
     for (const h of await accept(hits, false)) addInput(h);
   }
-  // G.8 (E2E-1, QA-G-2): an existing module maps to every test file that imports it (an
-  // import-shaped content search, pyImportPattern; a package's __init__.py, which every import of
-  // the package or of its submodules runs, keeps the whole-word search for the package name) plus
-  // the test files named after it. It fails closed: a module no in-scope test maps to, or one a
-  // conftest.py references (its fixtures reach tests that never name the module), is S6
-  // unmapped-module, and one more than STEM_MATCH_LIMIT test files import is S6 stem-too-common,
-  // never NoAffected.
+  // G.8 (E2E-1, QA-G-10): an existing module maps to every test file that names it as a whole
+  // word (any import layout), plus the test files named after it. Only a module named like the
+  // regular package that holds it (app/app.py) drops the files that provably name only that
+  // package (keepImporters, the QA-G-2 over-match); a package's __init__.py, which every import of
+  // the package or of its submodules runs, keeps every hit. It fails closed: a module no in-scope
+  // test maps to, or one a conftest.py references (its fixtures reach tests that never name the
+  // module), is S6 unmapped-module, and one more than STEM_MATCH_LIMIT test files reference is S6
+  // stem-too-common, never NoAffected.
   for (const f of modules) {
     const stem = stemOf(ctx, f.abs);
-    const globs = [...pyGlobs, CONFTEST_GLOB];
+    const init = P.basename(f.abs) === "__init__.py";
+    // The name a direct import spells: index.py is "index" (stemOf gives its directory's name).
+    const name = init ? stem : P.basename(f.abs, ".py");
+    const hits = await search.findByContent(gitRoot, name, [...pyGlobs, CONFTEST_GLOB], { word: true });
+    if (hits === undefined) return searchFailed(f);
+    const relevant = hits.filter((h) => P.basename(h) === "conftest.py" || isPyTestFile(ctx, pyFiles, h));
     const dir = P.dirname(f.abs);
-    const content =
-      P.basename(f.abs) === "__init__.py"
-        ? await search.findByContent(gitRoot, stem, globs, { word: true })
-        : await search.findByContent(gitRoot, pyImportPattern(P.basename(dir), stem, !(await existsCached(ctx, fs, P.join(dir, "__init__.py")))), globs, { regex: true });
-    if (content === undefined) return searchFailed(f);
+    const namedLikePackage = !init && P.basename(dir) === name && (await existsCached(ctx, fs, P.join(dir, "__init__.py")));
+    const content = namedLikePackage ? await keepImporters(fs, relevant, name) : relevant;
     // Unscoped: pytest also loads the conftest.py files above the collected tests (up to confcutdir).
     const conftests = await accept(content.filter((h) => P.basename(h) === "conftest.py"), false);
     if (conftests.length > 0) {

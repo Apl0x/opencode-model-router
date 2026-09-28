@@ -474,3 +474,67 @@ for (const r of RUNNERS) {
     }
   });
 }
+
+/**
+ * QA-G-10 (regression, the round-2 repro): the base adds combo02() to app/mod02.py, and
+ * tests/test_combo.py imports the module in isort's default grid wrap. The producer breaks combo02.
+ * QA-G-2's import-shaped search missed test_combo.py: the scoped pytest argv held only
+ * test_mod02_1.py, and the result read `[router ✓ verified: deterministic]` over a failing importer.
+ */
+d("QA-G-10: a pytest importer in isort's grid wrap is selected (real pytest-app)", () => {
+  let repo: FixtureRepo;
+  let plugin: E2EPlugin;
+  let probeLog = "";
+  const COMBO = "    return value02(x) + 1";
+
+  beforeAll(async () => {
+    await mkdir(join(root, "probe"), { recursive: true });
+    probeLog = join(root, "probe", "pytest-app-qag10.log");
+    repo = await prepareFixtureRepo("pytest-app", { root: join(root, "repos"), probeLog });
+    const mod02 = readFileSync(join(repo.dir, "app/mod02.py"), "utf8");
+    await repo.write("app/mod02.py", `${mod02}\n\ndef combo02(x):\n${COMBO}\n`);
+    await repo.write(
+      "tests/test_combo.py",
+      "from app import (mod01, mod03, mod04,\n                 mod05, mod02)\n\n\ndef test_combo02():\n    assert mod02.combo02(10) == 9\n",
+    );
+    repo.commit("base: combo02 and its isort-grid importer");
+    plugin = await createE2EPlugin({ directory: repo.dir, home: join(root, "home", "pytest-app-qag10") });
+  }, SETUP_TIMEOUT);
+
+  afterAll(async () => {
+    await plugin?.dispose();
+    await repo?.dispose();
+  }, SETUP_TIMEOUT);
+
+  it("pytest VERIFY:required, combo02 broken -> test_combo.py is in the scoped argv and the result is not a verified pass", async () => {
+    const probeStart = readProbeLog(probeLog).length;
+    const res = await plugin.task({
+      sessionID: "orch-pytest-app-qag10",
+      callID: "call-pytest-app-qag10",
+      prompt: `VERIFY:required\nBreak combo02 in pytest-app.\n${acceptance(repo.testCommand)}`,
+      produce: async () => {
+        const src = readFileSync(join(repo.dir, "app/mod02.py"), "utf8");
+        expect(src).toContain(COMBO);
+        await repo.write("app/mod02.py", src.replace(COMBO, "    return value02(x) + 100"));
+      },
+      childEdits: ["app/mod02.py"],
+    });
+    emit(`--- pytest-app QA-G-10 task() output ---\n${res.output}`);
+    const own = pathSpellings(repo.dir);
+    const mains = readProbeLog(probeLog)
+      .slice(probeStart)
+      .filter(p => p.kind === "main" && mentionsAny(p.cwd, own));
+    emit(`--- pytest-app QA-G-10 probe (${mains.length}) ---\n${mains.map(p => JSON.stringify(p.argv)).join("\n")}`);
+    expect(mains.length, "a scoped pytest run in the repo").toBeGreaterThanOrEqual(1);
+    for (const p of mains) {
+      const files = fileArgs(p.argv);
+      expect(files.some(a => /test_combo\.py$/.test(a)), JSON.stringify(p.argv)).toBe(true);
+      expect(files.some(a => /test_mod02_1\.py$/.test(a)), JSON.stringify(p.argv)).toBe(true);
+    }
+    const t = classify(res.output);
+    expect(t).not.toContain("[router ✓");
+    expect(t).not.toMatch(/✓ accepted|verified:/);
+    expect(t).toContain("[router ⚠ UNVERIFIED:");
+    expect(/observed failures: ([^\n]*)/.exec(t)?.[1] ?? "").toContain("test_combo.py::test_combo02");
+  }, TEST_TIMEOUT);
+});
