@@ -14,8 +14,20 @@ const hooks: number[] = [];
 
 afterEach(() => {
   for (const pid of hooks.splice(0)) if (alive(pid)) process.kill(pid);
-  for (const d of dirs.splice(0)) rmSync(d, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+  for (const d of dirs.splice(0)) removeScratch(d);
 });
+
+// Windows can hold a handle on the scratch repo briefly after the killed process tree exits
+// (EBUSY on rmdir). Retry, then leave the temp dir behind with a warning rather than fail the test.
+function removeScratch(d: string): void {
+  try {
+    rmSync(d, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code !== "EBUSY" && code !== "EPERM" && code !== "ENOTEMPTY") throw err;
+    console.warn(`tree-kill: left scratch dir ${d} behind after retries (${code})`);
+  }
+}
 
 function alive(pid: number): boolean {
   try {
