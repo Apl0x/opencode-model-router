@@ -37,7 +37,10 @@ describe("protocol text is not read as a directive", () => {
         assembleSystemPrompt(cfg, "openai/gpt-5", true),
         assembleSystemPrompt(cfg, "anthropic/claude-sonnet-4", true),
       ];
-      expect(texts[0]).toContain("`VERIFY:` followed by `required` or `deferred`");
+      // QA-2.3-18: one placeholder token (skipped by the parser); never the split "`VERIFY:` `required`"
+      // form, which a model copying the rendered spans turns into an unparsable directive.
+      expect(texts[0]).toContain("`VERIFY:<mode>` as one token, <mode> being `required` or `deferred`");
+      expect(texts[0]).not.toContain("`VERIFY:` ");
       expect(texts[0]).toContain("VERIFY_WAIT:<n>s");
       // QA-2.3-3: no pipe placeholder is presented as the thing to paste.
       expect(texts[0]).not.toMatch(/VERIFY:[a-z]+\|/i);
