@@ -555,3 +555,108 @@ Local runs:
 The "Code scanning AI findings" check fails on every sha with a GitHub infrastructure error,
 `CAPIError: 400 The requested model is not supported`. It is not caused by the code: the repository
 has no `codeql.yml`, and the check is not part of the Test workflow.
+
+## CI round 3 (head 8821de7, Test run 36362100353)
+
+Every job passed except `e2e (node 22, windows-latest)`, step "Windows unit coverage" (the full
+default suite with `--coverage` on a 4-core runner). Two tests of `exec.test.ts` failed there:
+
+```
+[G4 load limit, QA-1.2-14] holder not dead 3 s after the deadline; still alive; stderr: [output streams force-closed 2000 ms after the kill: a descendant still held them]
+FAIL test/unit/exec.test.ts > process lifecycle around the direct child's exit > a deadline after the direct child exited kills what it left running within 3 s (QA-1.2-1, G4)
+AssertionError: expected false to be true
+ ❯ test/unit/exec.test.ts:453:24
+FAIL test/unit/exec.test.ts > process lifecycle around the direct child's exit > an abort between the child's exit and the pipes closing kills the leftovers, not the exited PID (QA-1.2-1, QA-1.2-10)
+AssertionError: expected false to be true
+ ❯ test/unit/exec.test.ts:478:85
+```
+
+The first test failed after 18491 ms, the second after 3919 ms. The holder was still alive 18 s after
+it started, and the second test's holder was still alive 3 s after the abort.
+
+### What the logs already showed
+
+The same run's `test` jobs (no coverage) passed, but the first of these two tests was slow in all of
+them: 4038 ms (node 20), 7235 ms (node 22) and 3691 ms (node 24). On node 22 it went through the
+a325320 tolerance: `holder not dead 3 s after the deadline; killed 4229 ms after it`. The abort test,
+which runs next, took 1.0 to 1.1 s in every job. In run 36359394958 (CI2-a) it was also the first test
+that failed. The slow one is the job's first orphan sweep.
+
+### Diagnostic run (Test run 36362968435, throwaway branch `vrb/p31-diag`, deleted)
+
+An env-gated trace in `exec.ts` logged the run and sweeper events. The sweeper script printed its own
+timestamps: script start, CIM query returned, candidates with their creation times, pinned, kill.
+The branch ran the same coverage step 3 times, a plain `vitest run` once, and an idle cold
+`powershell.exe` job. Times are ms after the sweeper's spawn:
+
+| Job | Script start | CIM query back | `pinned 1` | Kill requested | Holder |
+|-----|-------------:|---------------:|-----------:|---------------:|--------|
+| cov 1 | 2200 | 3012 | 3078 | 2423 | test passed in 3817 ms |
+| cov 2 | **6584** | **30286** | 31016 | 2430 | killed at +31106, **28751 ms after the deadline** |
+| cov 3 | 1965 | 2622 | 2678 | 2408 | test passed in 3404 ms |
+| plain | 2479 | 3390 | 3451 | 2423 | test passed in 4202 ms |
+
+- **Later sweeps in the same jobs are fast.** Every later real sweeper reached its script within 182 to
+  932 ms, and its query was back by +1195 ms.
+- **Idle, a cold `powershell.exe` is fast too.** Script start took 181, 155, 155 and 155 ms, and the
+  CIM query 362, 277, 261 and 244 ms.
+- **So the cost is the first sweeper's PowerShell start and its first CIM query under the suite's
+  load:** 3 vitest workers with V8 coverage, plus their git and node children, on 4 cores. In cov 2
+  the sweep was still correct, only late. It killed 28.7 s after the kill request, **1.3 s inside the
+  30 s `SWEEP_TIMEOUT_MS`** that exists to bound only a hung sweeper.
+
+The three hypotheses:
+
+- **(i) Slow sweeper under load: confirmed**, as above.
+- **(ii) Creation window missed: rejected.** Each first sweep found its holder inside the window, for
+  example cov 2: `cand 8856 created 1790556039487` in `from 1790556039364 to 1790556039845`. The V8
+  clock (`Date.now()`) minus a fresh file's mtime (system time) was −8.0 to +12.0 ms in 278
+  measurements. That is within file-time granularity and well inside `SWEEP_CLOCK_SLACK_MS` (50 ms).
+  The one outlier, +59993 ms, was a `git worktree list` run under another test's fake clock, not a
+  sweep.
+- **(iii) Different parent: rejected.** `tree.cjs` spawns the holder from node directly, with no
+  shell. Every first query returned `n 1`, the holder, by `ParentProcessId` = the exited child.
+
+**Verdict: test defect, plus product hardening.** The failures are G4's documented load limit
+(QA-1.2-14). The deadline test's tolerance ended 18 s after the holder started, which is below the
+sweep's own bound. The abort test had no tolerance at all. In the original failure, the abort test
+started while the first sweep was probably still in its query. Its own sweep was then slow too; that
+part is inferred, because that run has no trace.
+
+The product finding: a working sweep used 96% of the limit that should only stop a hung one.
+
+### Changes
+
+- **99c7bf9 (product).** `SWEEP_TIMEOUT_MS` goes from 30 s to 60 s, still counted from the kill request.
+  It is exported for tests. A hung sweeper still never outlives opencode: it is unref'd, and it is a
+  direct child in libuv's kill-on-close job (QA-1.2-19). The only cost is that a hung PowerShell may
+  now live 30 s longer inside a running opencode.
+- **6730f0e (tests).**
+  - Both lifecycle tests now share `expectLateSweep`. The 3 s check comes first and is unchanged. The
+    tolerance applies only on Windows, and only when all of these hold:
+    - the grace settled the run (`output streams force-closed … a descendant still held them`);
+    - there is no `[orphan sweep unavailable: …]` note, so a sweep that could not run fails at once;
+    - the holder is dead within `SWEEP_TIMEOUT_MS` + 2 s of the kill.
+  - A `[G4 load limit, QA-1.2-14]` warning records the delay.
+  - The holder now self-exits after 90 s (it was 20 s), which is later than any wait. It writes
+    `holder.exit` (`released` or `timeout`) when it ends on its own. Both tests assert that the file
+    is absent, so a pass means the holder was killed.
+  - `exec-branches.test.ts` adds a stand-in sweeper that pins and never reports. It asserts that the
+    kill arms a `SWEEP_TIMEOUT_MS` limit of at least twice the 28.7 s CI sweep.
+
+### Local verification (Windows, 16 cores)
+
+- `exec.test.ts` + `exec-branches.test.ts`: 50 passed, 2 skipped, in each of 4 runs. They also passed
+  twice with 14 normal-priority `node -e "for(;;){}"` loops running (all killed afterwards), and once
+  with `--coverage`. `tsc --noEmit` is clean.
+- **Forced late sweep** (a local-only `Start-Sleep -Seconds 8` at the top of the sweeper script): both
+  tests pass through the tolerance, `dead 6828 ms after it` and `dead 8999 ms after it`.
+- **Forced sweep that never kills** (a local-only `exit 0`, so no marker): both tests fail at once on
+  `[orphan sweep unavailable: no marker]`. Before that check was added, the abort test failed at
+  `expect(dead)` after 62 982 ms.
+
+### Also seen in the diagnostic run
+
+In cov 2, `reference.test.ts > materialize / dispose > QA-1.5-12` failed with
+`Error: Hook timed out in 10000ms` in its `beforeEach` (`reference.test.ts:185`). That is the same
+load, on a different file. It is not addressed here.
