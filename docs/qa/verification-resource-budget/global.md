@@ -554,3 +554,5 @@ tests cover this (`a read that fails`, `a stat that fails`).
 **Status after round 3:** QA-G-10 is **verified resolved**. G2 is **MET**, subject to the documented residuals and the
 three minor findings above. QA-G-15 … QA-G-17 are minor and predate 29ca663. Under the owner rule they are
 recorded for acceptance.
+
+- QA-G-17 Resolution: 2d8df09 — the deleted-module content search now uses the module's own Python name, as the existing-module search does since 29ca663: a deleted `app/index.py` searches `index` (only `__init__.py` uses the package name); `findByName` keeps the stem (`test_app.py`), and the fail-closed rules are unchanged (no hit → S6 `deleted-no-tests`, more than `STEM_MATCH_LIMIT` → S6 `stem-too-common`). Tests (test/unit/runner.test.ts): deleted `app/index.py` with importers `from app.index import x` and `from .index import x` → exactly those two inputs; deleted `tests/pkg/index.py` → its relative importer; deleted `app/mod02.py` still searches `mod02`, deleted `tests/pkg/__init__.py` still searches `pkg`. On the pre-fix `src` the index case fails (`expected [ '/r/tests/test_i1.py', …(5) ] to deeply equal [ '/r/tests/test_i1.py', …(1) ]`).
