@@ -353,6 +353,38 @@ describe("QA-3.1-3: createSharedFlight", () => {
     expect(runs).toHaveLength(4);
   });
 
+  it("QA-3.1-24: a started run that ignores its abort is detached once its last sharer left, so the queued run starts at once", async () => {
+    const { share, runs, run } = harness();
+    const x = new AbortController();
+    const a = share("k", run, x.signal);
+    const b = share("k", run, live());
+    expect(runs).toHaveLength(1);
+    x.abort();
+    expect(await a).toBeUndefined();
+    expect(runs[0].signal.aborted).toBe(true);
+    // Run 1 never settles, yet b's run starts without waiting for it.
+    await vi.waitFor(() => expect(runs).toHaveLength(2));
+    runs[1].resolve("two");
+    expect(await b).toBe("two");
+    // The lane is idle again; the stuck run settling late changes nothing.
+    const c = share("k", run, live());
+    expect(runs).toHaveLength(3);
+    runs[0].resolve("late");
+    await new Promise(resolve => setTimeout(resolve, 0));
+    expect(runs).toHaveLength(3);
+    runs[2].resolve("three");
+    expect(await c).toBe("three");
+    // With no queued run, a detached lane is idle: the next request starts its own run at once.
+    const y = new AbortController();
+    void share("k", run, y.signal);
+    expect(runs).toHaveLength(4);
+    y.abort();
+    const d = share("k", run, live());
+    expect(runs).toHaveLength(5);
+    runs[4].resolve("d");
+    expect(await d).toBe("d");
+  });
+
   it("a run that rejects or throws resolves every sharer with undefined, and the next run still starts", async () => {
     const share = createSharedFlight<string>();
     let reject: (e: Error) => void = () => undefined;

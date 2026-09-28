@@ -195,6 +195,14 @@ export function applyDispatchCaveats(
  * always taken after each sharer's request began, as its own run would have been. A request's signal
  * ends only its own wait (undefined); a started run is aborted once every sharer has left, and a
  * queued run nobody waits for any more never starts. The returned function never rejects.
+ *
+ * QA-3.1-24: a started run whose last sharer left is also detached from its lane, so a run that
+ * ignores its abort (snapshotTree's lstat/readlink/realpath take no signal) cannot hold every later
+ * request with its key. Known limit: a request that arrives just after a run started waits for that
+ * run and then its own, while its timeout counts from its own request; when one snapshot or capture
+ * takes longer than half of the caller's timeout (baselineTimeoutMs, default 15 s), such an early
+ * arrival can time out before its own run ends. That fails closed: no change baseline, reference
+ * none, verdict unverifiable.
  */
 export function createSharedFlight<T>(): (
   key: string,
@@ -239,15 +247,21 @@ export function createSharedFlight<T>(): (
     };
     return flight;
   };
+  // The lane's running flight is done with (settled, or detached by its last sharer): start the
+  // queued one, or retire an idle lane.
+  const advance = (key: string, lane: Lane): void => {
+    lane.running = undefined;
+    const next = lane.next;
+    lane.next = undefined;
+    if (next !== undefined) launch(key, lane, next);
+    else if (lanes.get(key) === lane) lanes.delete(key);
+  };
   const launch = (key: string, lane: Lane, flight: Flight): void => {
     lane.running = flight;
     flight.start();
     void flight.result.then(() => {
-      lane.running = undefined;
-      const next = lane.next;
-      lane.next = undefined;
-      if (next !== undefined) launch(key, lane, next);
-      else if (lanes.get(key) === lane) lanes.delete(key);
+      // QA-3.1-24: a flight its last sharer detached no longer owns the lane.
+      if (lane.running === flight) advance(key, lane);
     });
   };
   return (key, run, signal) => {
@@ -271,8 +285,12 @@ export function createSharedFlight<T>(): (
         flight.sharers -= 1;
         if (flight.sharers === 0) {
           // Nobody waits for it any more: stop a started run; never start a queued one.
-          if (flight.started) flight.controller.abort();
-          else if (owner.next === flight) owner.next = undefined;
+          if (flight.started) {
+            flight.controller.abort();
+            // QA-3.1-24: a run that ignores its abort must not hold the lane until it settles.
+            // Detach it, so the queued run (whose sharers all asked after it started) goes now.
+            if (owner.running === flight) advance(key, owner);
+          } else if (owner.next === flight) owner.next = undefined;
         }
         settle(undefined);
       };
