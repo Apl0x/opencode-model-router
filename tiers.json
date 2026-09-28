@@ -17,8 +17,7 @@
       "graderTemperature": 0,
       "requireExplicitDoD": false,
       "delegateTimeoutMs": 600000,
-      "graderTimeoutMs": 60000,
-      "gateBudgetMs": 90000
+      "graderTimeoutMs": 60000
     },
     "escalate": {
       "ladder": ["fast", "medium", "heavy"],

@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?><testsuites name="pytest tests"><testsuite name="pytest" errors="0" failures="1" skipped="0" tests="3" time="4.431" timestamp="2026-09-26T21:16:35.999350-03:00" hostname="<HOST>"><testcase classname="tests.test_str.TestStr" name="test_bad" time="0.004"><failure message="AssertionError: assert 'A' == 'b'&#10;  &#10;  #x1B[0m#x1B[91m- b#x1B[39;49;00m#x1B[90m#x1B[39;49;00m&#10;  #x1B[92m+ A#x1B[39;49;00m#x1B[90m#x1B[39;49;00m">self = &lt;test_str.TestStr object at 0x00000198B40AF110&gt;
+
+    def test_bad(self):
+&gt;       assert up('a') == 'b'
+E       AssertionError: assert 'A' == 'b'
+E         
+E         #x1B[0m#x1B[91m- b#x1B[39;49;00m#x1B[90m#x1B[39;49;00m
+E         #x1B[92m+ A#x1B[39;49;00m#x1B[90m#x1B[39;49;00m
+
+tests\test_str.py:8: AssertionError</failure></testcase><testcase classname="tests.test_str.TestStr" name="test_ok" time="0.002" /><testcase classname="tests.test_math" name="test_adds" time="0.001" /></testsuite></testsuites>

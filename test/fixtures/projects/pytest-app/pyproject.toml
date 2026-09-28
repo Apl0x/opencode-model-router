@@ -1,0 +1,14 @@
+[project]
+name = "pytest-app"
+version = "0.0.0"
+requires-python = ">=3.9"
+dependencies = []
+
+[dependency-groups]
+dev = ["pytest>=8"]
+
+[tool.pytest.ini_options]
+# Only tests/ is collected. extra/ holds the opt-in pre-existing failure and is never collected.
+testpaths = ["tests"]
+# The project is not installed (no build system), so put the root on sys.path for "import app".
+pythonpath = ["."]

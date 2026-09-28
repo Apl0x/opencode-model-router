@@ -7,3 +7,5 @@ tmp/
 coverage/
 .opencode/
 .env
+# QA-G-9 safety: Windows PowerShell's module analysis cache, written relative to its cwd without LocalAppData
+/Microsoft/

@@ -114,7 +114,7 @@ describe("Layer-2 wiring", () => {
       expect(output.output).toContain("NOT ACCEPTED");
     });
 
-    it("CASE B: does NOT append note when deterministic DoD PASSES (file exists)", async () => {
+    it("CASE B: appends only the verified line when deterministic DoD PASSES (file exists)", async () => {
       process.env.MODEL_ROUTER_ENFORCE = "1";
       fs.writeFileSync(path.join(dir, "present-file.txt"), "ok");
       const hooks: any = await ModelRouterPlugin(makeCtx(dir, "grader/producer reply") as any);
@@ -137,7 +137,8 @@ describe("Layer-2 wiring", () => {
       await hooks["tool.execute.after"](input, output);
 
       expect(output.output).not.toContain("NOT ACCEPTED");
-      expect(output.output).toBe(original);
+      // QA-3.1-18: a clean pass appends exactly one verified line and nothing else.
+      expect(output.output).toBe(original + "\n\n[router \u2713 verified: deterministic]");
     });
 
     it("CASE C: is a no-op when enforcement is OFF (GA-1 preserved)", async () => {
@@ -183,7 +184,7 @@ describe("Layer-2 wiring", () => {
         tier: "fast",
       });
 
-      expect(out).toContain("accepted: deterministic");
+      expect(out).toContain("[router \u2713 verified: deterministic]");
     });
 
     it("CASE E: returns honest unmet on deterministic FAIL", async () => {
@@ -199,6 +200,7 @@ describe("Layer-2 wiring", () => {
 
       expect(out).toContain("status: unmet");
       expect(out).not.toContain("accepted: ");
+      expect(out).not.toMatch(/\[router \u2713|verified: /);
     });
   });
 });

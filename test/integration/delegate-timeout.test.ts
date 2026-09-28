@@ -23,7 +23,27 @@ import { invalidateConfigCache } from "../../src/router/config";
 // These tests isolate model/gate clocks. The temp directories are not Git
 // checkouts; model the unavailable snapshot without introducing real processes
 // into a fake-timer test (which would make grader start times wall-clock dependent).
-vi.mock("../../src/verify/tree", () => ({ snapshotTree: async () => undefined }));
+// `treeDelay.ms` > 0 makes the (fake-timer) snapshot take that long, to model a slow P0 preparation.
+const treeDelay = vi.hoisted(() => ({ ms: 0 }));
+vi.mock("../../src/verify/tree", () => ({
+  snapshotTree: () =>
+    treeDelay.ms > 0
+      ? new Promise<undefined>((resolve) => setTimeout(() => resolve(undefined), treeDelay.ms))
+      : Promise.resolve(undefined),
+}));
+// Record every gate deadline the plugin creates (the real implementation still runs).
+const createdDeadlines = vi.hoisted(() => [] as Array<{ budgetMs: number; signal: AbortSignal }>);
+vi.mock("../../src/verify/deterministic", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../../src/verify/deterministic")>();
+  return {
+    ...actual,
+    createDeadline: (...args: Parameters<typeof actual.createDeadline>) => {
+      const d = actual.createDeadline(...args);
+      createdDeadlines.push(d);
+      return d;
+    },
+  };
+});
 import {
   DEFAULT_DELEGATE_PROMPT_TIMEOUT_MS,
   DEFAULT_GATE_BUDGET_MS,
@@ -184,7 +204,7 @@ describe("delegate time-boxes (fake timers)", () => {
     expect(result).toContain("[router status: unmet]");
     expect(result).toContain("timed out after");
     // Honest failure, never a fabricated acceptance.
-    expect(result).not.toContain("[router ✓ accepted:");
+    expect(result).not.toContain("[router ✓");
     // A hung producer must not have been graded as if it had produced anything.
     expect(rec.graderPrompts).toBe(0);
   });
@@ -212,7 +232,7 @@ describe("delegate time-boxes (fake timers)", () => {
     await vi.advanceTimersByTimeAsync(DEFAULT_DELEGATE_PROMPT_TIMEOUT_MS);
     const result = await pending;
 
-    expect(result).toContain("[router ✓ accepted:");
+    expect(result).toContain("[router ✓ verified:");
     expect(result).toContain("producer output");
     expect(result).not.toContain("timed out");
   });
@@ -283,7 +303,7 @@ describe("delegate time-boxes (fake timers)", () => {
     const result = await pending;
 
     expect(result).toContain("[router status: unmet]");
-    expect(result).not.toContain("[router ✓ accepted:");
+    expect(result).not.toContain("[router ✓");
     expect(rec.producerPrompts).toBeGreaterThanOrEqual(3);
   });
 
@@ -331,7 +351,7 @@ describe("delegate time-boxes (fake timers)", () => {
 
     expect(result).toContain("[router status: unmet]");
     // Not accepted, and NOT reported as an inconclusive skip.
-    expect(result).not.toContain("[router ✓ accepted:");
+    expect(result).not.toContain("[router ✓");
     expect(result).not.toContain("inconclusive");
     expect(rec.graderPrompts).toBe(1);
     expect(rec.producerPrompts).toBe(1);
@@ -380,7 +400,9 @@ describe("delegate time-boxes (fake timers)", () => {
     await vi.advanceTimersByTimeAsync(1000 * 8);
     const result = await pending;
 
-    expect(result).toContain("[router ✓ accepted:");
+    // QA-3.1-21 (plan G2): still returned, but never labelled accepted or verified.
+    expect(result).toContain("[router ⚠ UNVERIFIED: checker]");
+    expect(result).not.toMatch(/\[router ✓|accepted:|verified:/);
     expect(result).toContain("Verification caveats");
     expect(rec.producerPrompts).toBe(1);
     expect(rec.graderPrompts).toBe(1);
@@ -446,7 +468,7 @@ describe("delegate time-boxes (fake timers)", () => {
 
     expect(resultA).toContain("verification gate timed out after 2000ms");
     // B was never collateral damage: it completed and was accepted.
-    expect(resultB).toContain("[router ✓ accepted:");
+    expect(resultB).toContain("[router ✓ verified:");
     expect(resultB).not.toContain("timed out");
   });
 
@@ -473,10 +495,127 @@ describe("delegate time-boxes (fake timers)", () => {
     expect(rec.graderPrompts).toBe(1);
     if (strictUnverifiable) {
       expect(result).toContain("[router status: unmet]");
-      expect(result).not.toContain("[router ✓ accepted:");
+      expect(result).not.toContain("[router ✓");
     } else {
-      expect(result).toContain("[router ✓ accepted:");
-      expect(result).toContain("Verification caveats");
+      // QA-3.1-21 (plan G2): the timed-out gate is returned, never labelled accepted or verified.
+      expect(result).toContain("[router ⚠ UNVERIFIED: none]");
+      expect(result).not.toMatch(/\[router ✓|accepted:|verified:/);
+      expect(result).toContain("Verification caveats — NOT verified");
+    }
+  });
+
+  it("aborts the delegate gate deadline when the gate budget expires", async () => {
+    writeOverrides(dir, { gateBudgetMs: 2000, graderTimeoutMs: 600000, strictUnverifiable: true });
+    createdDeadlines.length = 0;
+    const rec = newRecorder();
+    const hooks: any = await ModelRouterPlugin(
+      makeCtx(dir, rec, {
+        producer: () => Promise.resolve(textReply("producer output")),
+        grader: () => never(),
+      }) as any,
+    );
+
+    const pending: Promise<string> = hooks.tool.delegate.execute({
+      task: "do x",
+      tier: "heavy",
+      acceptance: ACCEPTANCE,
+    });
+    await vi.advanceTimersByTimeAsync(2000 * 8);
+    await pending;
+
+    const gate = createdDeadlines.filter((d) => d.budgetMs === 2000);
+    expect(gate.length).toBeGreaterThan(0);
+    for (const d of gate) expect(d.signal.aborted).toBe(true);
+  });
+
+  // -------------------------------------------------------------------------
+  // Native task gate (tool.execute.after)
+  // -------------------------------------------------------------------------
+
+  it("bounds the native task gate: a hung accept yields the unverifiable result and aborts its deadline", async () => {
+    process.env.MODEL_ROUTER_ENFORCE = "1";
+    writeOverrides(dir, { gateBudgetMs: 2000, graderTimeoutMs: 600000, strictUnverifiable: true });
+    createdDeadlines.length = 0;
+    const rec = newRecorder();
+    const hooks: any = await ModelRouterPlugin(
+      makeCtx(dir, rec, {
+        producer: () => Promise.resolve(textReply("unused")),
+        grader: () => never(),
+      }) as any,
+    );
+
+    const input = {
+      tool: "task",
+      sessionID: "orch",
+      callID: "call1",
+      args: { subagent_type: "fast", prompt: `Do the thing.\n${ACCEPTANCE}` },
+    };
+    const output = {
+      output: "<task_result>\nDONE: did the thing.\n</task_result>",
+      metadata: { sessionId: "child-native" },
+    };
+
+    let settled = false;
+    const pending = hooks["tool.execute.after"](input, output).then(() => {
+      settled = true;
+    });
+    await vi.advanceTimersByTimeAsync(1999);
+    expect(settled).toBe(false);
+    await vi.advanceTimersByTimeAsync(2000 * 4);
+    await pending;
+
+    expect(settled).toBe(true);
+    expect(rec.graderPrompts).toBe(1);
+    expect(output.output).toContain("verification gate timed out after 2000ms");
+    expect(output.output).toContain("NOT ACCEPTED");
+    // The grader this gate opened is aborted, and so is the gate's deadline.
+    expect(rec.aborted).toContain(rec.graderSessionIds[0]);
+    expect(createdDeadlines).toHaveLength(1);
+    expect(createdDeadlines[0]!.budgetMs).toBe(2000);
+    expect(createdDeadlines[0]!.signal.aborted).toBe(true);
+  });
+
+  it("QA-2.1-4: preparation time counts against gateBudgetMs (native task gate)", async () => {
+    process.env.MODEL_ROUTER_ENFORCE = "1";
+    writeOverrides(dir, { gateBudgetMs: 2000, graderTimeoutMs: 600000, strictUnverifiable: true });
+    createdDeadlines.length = 0;
+    treeDelay.ms = 1500;
+    try {
+      const rec = newRecorder();
+      const hooks: any = await ModelRouterPlugin(
+        makeCtx(dir, rec, {
+          producer: () => Promise.resolve(textReply("unused")),
+          grader: () => never(),
+        }) as any,
+      );
+      const input = {
+        tool: "task",
+        sessionID: "orch",
+        callID: "call-prep",
+        args: { subagent_type: "fast", prompt: `Do the thing.\n${ACCEPTANCE}` },
+      };
+      const output = {
+        output: "<task_result>\nDONE: did the thing.\n</task_result>",
+        metadata: { sessionId: "child-prep" },
+      };
+
+      let settled = false;
+      const pending = hooks["tool.execute.after"](input, output).then(() => {
+        settled = true;
+      });
+      // The deadline exists before the 1500 ms snapshot starts ...
+      await vi.advanceTimersByTimeAsync(10);
+      expect(createdDeadlines).toHaveLength(1);
+      await vi.advanceTimersByTimeAsync(1989);
+      expect(settled).toBe(false);
+      // ... so the gate ends at 2000 ms from its start, not 1500 + 2000 ms.
+      await vi.advanceTimersByTimeAsync(100);
+      expect(settled).toBe(true);
+      await pending;
+      expect(output.output).toContain("verification gate timed out after 2000ms");
+      expect(createdDeadlines[0]!.signal.aborted).toBe(true);
+    } finally {
+      treeDelay.ms = 0;
     }
   });
 });

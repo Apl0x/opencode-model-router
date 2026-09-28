@@ -126,7 +126,7 @@ describe("Layer-3 escalation ladder wiring", () => {
       acceptance,
     });
 
-    expect(result).toContain("[router ✓ accepted:");
+    expect(result).toContain("[router ✓ verified:");
     expect(result).not.toContain("status: unmet");
     expect(producerCalls.length).toBe(2);
     expect(producerCalls[1]!.tier).toBe("fast");
@@ -155,7 +155,7 @@ describe("Layer-3 escalation ladder wiring", () => {
       acceptance,
     });
 
-    expect(result).toContain("[router ✓ accepted:");
+    expect(result).toContain("[router ✓ verified:");
     expect(result).not.toContain("status: unmet");
     expect(producerCalls.length).toBe(3);
     expect(producerCalls[2]!.tier).toBe("medium");
@@ -184,7 +184,7 @@ describe("Layer-3 escalation ladder wiring", () => {
 
     expect(result).toContain("[router status: unmet]");
     expect(result).toContain("attempt(s)");
-    expect(result).not.toContain("[router ✓ accepted:");
+    expect(result).not.toContain("[router ✓");
     // fast(1)+fast(1)+medium(5)=7 > firstAttemptCost(1)*costMultiple(4)=4 → cost ceiling
     // fires after 3 attempts, not 4.
     expect(producerCalls.length).toBe(3);

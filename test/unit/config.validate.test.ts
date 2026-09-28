@@ -193,8 +193,14 @@ describe("validateConfig — enforcement block", () => {
   // --- Documented permissive gaps: these sub-blocks are validated ONLY when they
   // are themselves objects/arrays. Non-object shapes are silently ignored (no throw).
   // These assertions pin CURRENT behaviour so a future tightening is a conscious change.
-  it("does NOT throw when verify/escalate/perTier are non-objects (permissive skip)", () => {
-    expect(() => validateConfig(withEnf({ verify: "x" }))).not.toThrow();
+  it("throws when verify is a non-object (tightened by QA-1.1-1)", () => {
+    for (const bad of ["x", null, 5, []]) {
+      expect(() => validateConfig(withEnf({ verify: bad }))).toThrow(
+        "tiers.json: enforcement.verify must be an object",
+      );
+    }
+  });
+  it("does NOT throw when escalate/perTier are non-objects (permissive skip)", () => {
     expect(() => validateConfig(withEnf({ escalate: "x" }))).not.toThrow();
     expect(() => validateConfig(withEnf({ perTier: "x" }))).not.toThrow();
     expect(() => validateConfig(withEnf({ escalate: { costCeiling: "x" } }))).not.toThrow();

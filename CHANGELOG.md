@@ -5,6 +5,121 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+The acceptance gate no longer runs a test suite per delegation. `testsPass` now runs only
+the tests affected by the producer's changes, and the dispatch-time baseline is replaced
+by a git reference captured in well under a second. **By default, delegations are no
+longer verified unless the orchestrator asks for it**, either with `VERIFY:required` on
+the dispatch or with a `router_verify` call on the returned handle, or unless
+`enforcement.verify.background` is enabled. A deferred delegation is marked unverified,
+carries a risk signal and stays in a pending list until it is checked. The full suite is
+CI's job. See `docs/adr/0003-affected-test-verification.md`.
+
+### Added
+
+- **New `enforcement.verify` keys.** These are `testScope` (`"affected"`, or `"full"`
+  as the explicit opt-in), `maxWorkers` (default 2), `lowPriority` (default `true`),
+  `maxConcurrentVerifications` (default `max(1, floor(cores / 8))`), `defaultVerify`
+  (default `"deferred"`), `captureWaitMs` (default 5 s, never more than
+  `baselineTimeoutMs`), `background` (default `false`), `pendingTtlMs` (default 1 h),
+  `slotWaitMs` (default 60 s), `batchWindowMs` (default 2 s), `failureRecheck` (default
+  `true`) and `recheckTimeoutMs` (default 60 s). See `docs/CONFIG_REFERENCE.md`.
+
+- **`VERIFY:` and `VERIFY_WAIT:` dispatch directives.** `VERIFY:required` gates a
+  delegation synchronously and keeps the escalation ladder. `VERIFY:deferred`, the
+  default, returns at once. `VERIFY_WAIT:<n>s` sets how long the dispatch waits for the
+  reference capture before the producer starts. It never blocks beyond that.
+
+- **`router_verify` tool.** A deferred delegation returns a `vrf_…` handle together with
+  an "unverified" disclaimer and a deterministic risk signal. `router_verify` runs the
+  verification for that handle on demand, within a deadline, and returns the verdict.
+
+- **Pending list.** Unverified delegations are listed in the prompt until they are
+  verified or their handle expires (`pendingTtlMs`), so the orchestrator can see what it
+  is building on.
+
+- **Opt-in background verification.** With `background: true`, deferred verifications
+  also run in the background through the verification slot at low priority, and failures
+  reach the orchestrator as late notices. It is off by default, so no CPU is spent on
+  verdicts nobody asked for.
+
+- **pytest support.** `testsPass` scopes pytest runs by module mapping, and `pytest` and
+  `uv run pytest` are allowlisted. A green pytest scope passes. A failing one is always
+  `unverifiable`, because an editable install imports the live tree, which makes the
+  reference rerun impossible.
+
+### Changed
+
+- **Gate labels say what was verified.** A result the gate let through without verifying it
+  (unverifiable: gate timeout, slot busy, budget exhausted, no reference; or a pass carrying a
+  caveat) is headed `[router ⚠ UNVERIFIED: <method>]` above its `Verification caveats — NOT
+  verified` list, instead of `[router ✓ accepted: …]` (plan G2, QA-3.1-21). A clean pass,
+  which used to add no text on a native `Task()`, now ends with `[router ✓ verified: <method>]`,
+  and a pass with notes uses the same label (QA-3.1-18). Accept/reject policy is unchanged.
+- **`testsPass` runs only the affected tests.** The runner adapter builds the command
+  (`vitest related`, `jest --findRelatedTests`, pytest module mapping) and spawns it
+  without a shell. When scoped tests fail, only those test files are rerun in an
+  ephemeral worktree at the dispatch reference. Failures that also fail there were
+  already present, so they are excused with a note rather than blamed on the producer.
+  The router never falls back to a full suite: when scoping is impossible (an unknown
+  runner, a composite script, a config-file change) the result is `unverifiable` with a
+  caveat, which is accepted unless `strictUnverifiable` is set.
+
+- **Deferred verification is the default.** A delegation with no `VERIFY:` directive
+  returns immediately as unverified. The synchronous cost is up to `VERIFY_WAIT`
+  (default `captureWaitMs`, 5 s) at dispatch for the reference capture, paid in either
+  mode, plus at most 2 s at return for the git-only snapshot of the producer's changes
+  (measured at about 0.4–0.5 s).
+
+- **`enforcement.verify.baselineTimeoutMs` now bounds the git-only reference capture.**
+  It used to bound the dispatch-time baseline test run. Its default changed from 60 s to
+  15 s.
+
+- **The bundled `tiers.json` no longer sets `gateBudgetMs`.** The key is still supported;
+  its in-code default of 90 s (90000 ms) applies.
+
+- **Verification runs at low priority, through a machine-wide slot, in batches.**
+  Commands run at below-normal OS priority with the runner's worker cap. A cross-process
+  semaphore in the OS temp directory limits concurrent verifications across every
+  opencode process on the machine. Requests for the same runner root that arrive within
+  `batchWindowMs` are merged into one scoped run, and failures are attributed back to
+  each request.
+
+- **Deprecations.** `enforcement.verify.testBaseline` is deprecated in favour of
+  `failureRecheck`. Any value logs a once-per-process warning, and `testBaseline: false`
+  still turns the recheck off.
+
+### Fixed
+
+- **A gate that runs out of budget now kills the verification process tree.** The gate
+  budget's abort signal reaches the running command instead of abandoning it.
+
+- **The native `task` path's required gate has a budget.** `accept(…)` there was not
+  wrapped in a timeout, so a slow check could hold the `task` result indefinitely. It is
+  now bounded by `gateBudgetMs`, like the `delegate` path.
+
+- **pytest: a changed module no longer passes as "no affected tests".** A changed module
+  used to map only to test files named after it (`test_<stem>.py`, `<stem>_test.py`), so
+  a test such as `tests/test_mod02_1.py` that imports it was never run. It now maps to
+  the test files that name its stem as a whole word (`git grep -F -w`, which matches
+  every import spelling), plus the name-matched tests. When no test maps, or a
+  `conftest.py` names the module, the check is `unverifiable` (`unmapped-module`), never
+  a pass. When `testpaths` decides the collection, only tests under it are inputs.
+  Residual: only direct importers run. A test that reaches the module through another
+  source module or a dynamic import is not run, and a change to non-`.py` files alone
+  (for example a data file a module reads) still gives "no affected tests".
+
+- **An unknown tool during the dispatch capture no longer seeds the baseline.** Only
+  tools known not to write (read, glob, grep, list, ls, codesearch, webfetch, websearch,
+  lsp, todoread, todowrite, question, skill, plan_enter, plan_exit, invalid, task, the MCP
+  resource readers, delegate and router_verify) leave an in-flight snapshot or capture
+  alone. Any other tool, MCP and custom tools included, that runs in that window makes
+  the dispatch's change set unavailable and its reference none, so that dispatch is
+  `unverifiable` instead of a possible clean pass. Residual: a write with no tool event
+  (an external editor, an MCP server writing after its call returned), or a tool that
+  writes under a non-writing name, is not seen.
+
 ## [1.14.0] - 2026-09-26
 
 Test baselines could saturate every core on a machine running several delegations: a

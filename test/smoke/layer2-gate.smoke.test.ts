@@ -22,10 +22,15 @@
  *      → console.warn + SOFT-PASS; this is orchestrator non-compliance, not a
  *      gate regression — never a false CI failure.
  */
-import { describe, it } from "vitest";
+import { describe, it, expect } from "vitest";
 import { spawnSync } from "node:child_process";
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
+import {
+  prepareFixtureRepo,
+  type FixtureRepo,
+} from "../integration/e2e/fixture-repo";
 
 const RUN = process.env.RUN_OC_SMOKE === "1";
 const d = RUN ? describe : describe.skip;
@@ -319,5 +324,370 @@ d("layer-2 acceptance gate smoke", () => {
       }
     },
     185_000,
+  );
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Verification resource budget (plan 3.1.4): the required and deferred paths
+// and the router_verify tool, in a real opencode against a real vitest project.
+//
+// The project is a throwaway git copy of test/fixtures/projects/vitest-app
+// (npm ci included) built by the e2e helper. opencode runs with that copy as
+// its cwd; the plugin is loaded through the SAME repo-root opencode.json the
+// test above writes (OPENCODE_CONFIG points at it, since a cwd outside the
+// repo would not discover it), and it is removed again in `finally`.
+//
+// Evidence of what the verifier SPAWNED: the plugin does not log the runner's
+// argv, so the temp copy gets a vitest `globalSetup` probe that appends the
+// CLI's own process.argv to a log file. globalSetup runs once per vitest CLI
+// invocation, in the main process, so each line is exactly one runner spawn:
+// `related <files...>` for a scoped run, bare `run` for the full suite.
+// ─────────────────────────────────────────────────────────────────────────────
+
+const VERIFY_SPAWN_TIMEOUT_MS = 420_000;
+const VERIFY_TEST_TIMEOUT_MS = 900_000;
+
+interface VerifyProject {
+  repo: FixtureRepo;
+  argvLog: string;
+}
+
+async function prepareVerifyProject(): Promise<VerifyProject> {
+  const repo = await prepareFixtureRepo("vitest-app", {
+    root: path.join(os.tmpdir(), "omr-smoke-verify"),
+  });
+  const argvLog = path.join(repo.dir, ".omr-runner-argv.log");
+  await repo.write(
+    "argv-probe.js",
+    [
+      'import { appendFileSync } from "node:fs";',
+      "// Smoke probe: one line per vitest CLI invocation (globalSetup = main process).",
+      "export default function setup() {",
+      `  appendFileSync(${JSON.stringify(argvLog)}, JSON.stringify(process.argv.slice(2)) + "\\n");`,
+      "}",
+      "",
+    ].join("\n"),
+  );
+  await repo.write(
+    "vitest.config.js",
+    [
+      'import { defineConfig } from "vitest/config";',
+      "export default defineConfig({",
+      "  test: {",
+      '    include: ["test/**/*.test.js"],',
+      '    environment: "node",',
+      '    globalSetup: ["./argv-probe.js"],',
+      "  },",
+      "});",
+      "",
+    ].join("\n"),
+  );
+  await repo.write(".gitignore", "node_modules/\n.omr-runner-argv.log\nopencode.json\n.opencode/\n");
+  repo.commit("smoke: runner argv probe");
+  return { repo, argvLog };
+}
+
+/** Same tier override as installTierOverrides, written into the project dir. */
+function writeProjectTierOverrides(dir: string): void {
+  if (!MODEL_OVERRIDDEN) return;
+  const tiers = JSON.parse(
+    fs.readFileSync(path.join(REPO_ROOT, "tiers.json"), "utf8"),
+  ) as { activePreset?: string };
+  const preset = tiers.activePreset ?? "anthropic";
+  const tierOverride = { model: SMOKE_MODEL, variant: "" };
+  fs.mkdirSync(path.join(dir, ".opencode"), { recursive: true });
+  fs.writeFileSync(
+    path.join(dir, ".opencode", "opencode-model-router.overrides.jsonc"),
+    JSON.stringify(
+      { presets: { [preset]: { fast: tierOverride, medium: tierOverride, heavy: tierOverride } } },
+      null,
+      2,
+    ),
+    "utf8",
+  );
+}
+
+interface OcRun {
+  status: number | null;
+  elapsed: string;
+  stdout: string;
+  stderr: string;
+  runnerArgv: string[][];
+}
+
+/** One `opencode run` in the project dir, plugin loaded through the repo-root temp config. */
+function runOpencode(project: VerifyProject, prompt: string): OcRun {
+  fs.rmSync(project.argvLog, { force: true });
+  fs.writeFileSync(
+    TEMP_CONFIG,
+    JSON.stringify(
+      { $schema: "https://opencode.ai/config.json", plugin: [PLUGIN_PATH] },
+      null,
+      2,
+    ),
+    "utf8",
+  );
+  try {
+    const start = Date.now();
+    const result = spawnSync(
+      "opencode",
+      [
+        "run",
+        prompt,
+        "--model",
+        SMOKE_MODEL,
+        "--format",
+        "json",
+        "--dangerously-skip-permissions",
+        "--print-logs",
+        "--log-level",
+        "DEBUG",
+      ],
+      {
+        cwd: project.repo.dir,
+        env: {
+          ...process.env,
+          MODEL_ROUTER_ENFORCE: "1",
+          MODEL_ROUTER_DISPATCH_DEBUG: "1",
+          OPENCODE_CONFIG: TEMP_CONFIG,
+        },
+        encoding: "utf8",
+        maxBuffer: 50 * 1024 * 1024,
+        timeout: VERIFY_SPAWN_TIMEOUT_MS,
+      },
+    );
+    const runnerArgv = fs.existsSync(project.argvLog)
+      ? fs
+          .readFileSync(project.argvLog, "utf8")
+          .split("\n")
+          .filter((l) => l.trim() !== "")
+          .map((l) => JSON.parse(l) as string[])
+      : [];
+    return {
+      status: result.status,
+      elapsed: ((Date.now() - start) / 1000).toFixed(1),
+      stdout: result.stdout ?? "",
+      stderr: result.stderr ?? "",
+      runnerArgv,
+    };
+  } finally {
+    try {
+      fs.unlinkSync(TEMP_CONFIG);
+    } catch {
+      // Already absent — ignore.
+    }
+  }
+}
+
+function writeEvidence(name: string, run: OcRun, extra: Record<string, unknown>): string {
+  fs.mkdirSync(OUT_DIR, { recursive: true });
+  const file = path.join(OUT_DIR, `${name}.json`);
+  fs.writeFileSync(
+    file,
+    JSON.stringify(
+      {
+        exitCode: run.status,
+        elapsed: run.elapsed,
+        runnerArgv: run.runnerArgv,
+        ...extra,
+        stdout: run.stdout,
+        // DEBUG logs are large; keep the plugin's lines plus a head excerpt.
+        stderrRouterLines: run.stderr
+          .split("\n")
+          .filter((l) => /router|verify|vrf_/i.test(l))
+          .slice(0, 400),
+        stderrHead: run.stderr.slice(0, 4_000),
+      },
+      null,
+      2,
+    ),
+  );
+  return file;
+}
+
+function assertExited(run: OcRun): void {
+  if (run.status !== 0) {
+    throw new Error(
+      `opencode exited with code ${run.status}.\nExcerpt:\n${(run.stdout + "\n" + run.stderr.slice(-2_000)).slice(0, 2_000)}`,
+    );
+  }
+}
+
+function taskDispatched(stdout: string): boolean {
+  const lower = stdout.toLowerCase();
+  return (
+    /"tool"\s*:\s*"task"/.test(lower) ||
+    lower.includes('"name":"task"') ||
+    lower.includes("task_result")
+  );
+}
+
+/**
+ * The probe also records the SUBAGENT's own `npm test` runs (argv `["run"]`),
+ * which are the model checking its work, not the verifier. The verifier's
+ * spawns are recognisable by the JSON report it collects into an
+ * `omr-verify-*` file (observed live: `--reporter=json
+ * --outputFile=<tmp>/omr-verify-<uuid>.json`).
+ */
+const isVerifierSpawn = (argv: string[]): boolean =>
+  argv.some((t) => /^--outputFile=.*omr-verify-/.test(t));
+
+/**
+ * A runner argv is scoped when vitest was invoked with `related <files>` or
+ * with explicit test files (a rerun of named tests); a bare `run` with no file
+ * arguments is the full suite.
+ */
+const isScoped = (argv: string[]): boolean =>
+  argv.includes("related") || argv.some((t) => /\.test\.js$/.test(t));
+
+const UNVERIFIED_FOOTER = /\[router\] unverified (?:\u00b7|\\u00b7) vrf_[0-9a-f]{24}/;
+
+const EDIT_TASK = [
+  "In src/m01.js add a trailing comment line `// touched by smoke` at the end of the file.",
+  "Change nothing else.",
+];
+
+function dispatchPrompt(inner: string[]): string {
+  return (
+    'Dispatch a fast subagent using the Task tool. Use subagent_type="fast" and copy the ' +
+    "following text VERBATIM as the prompt (include EVERY line, including the acceptance " +
+    "block — do NOT modify or omit any line):\n\n" +
+    inner.join("\n") +
+    "\n\nAfter the subagent returns, reply with its final message verbatim, then the word DONE."
+  );
+}
+
+d("verification budget smoke (real vitest project)", () => {
+  it(
+    "VERIFY:required runs a scoped `vitest related`, not the full suite",
+    async () => {
+      const project = await prepareVerifyProject();
+      writeProjectTierOverrides(project.repo.dir);
+      try {
+        const run = runOpencode(
+          project,
+          dispatchPrompt([
+            "VERIFY:required",
+            ...EDIT_TASK,
+            "",
+            "[acceptance]",
+            'check: testsPass command="npm test"',
+            "[/acceptance]",
+          ]),
+        );
+        const verifier = run.runnerArgv.filter(isVerifierSpawn);
+        const scoped = verifier.filter(isScoped);
+        const full = verifier.filter((a) => !isScoped(a));
+        const agentRuns = run.runnerArgv.filter((a) => !isVerifierSpawn(a));
+        const file = writeEvidence("verify-required", run, { scoped, full, agentRuns });
+        console.log(`[verify-required smoke] ${run.elapsed}s, runner argv: ${JSON.stringify(run.runnerArgv)}; evidence ${file}`);
+        assertExited(run);
+
+        if (!taskDispatched(run.stdout)) {
+          console.warn("[verify-required smoke] no task dispatch detected — orchestrator non-compliance. SOFT-PASS.");
+          return;
+        }
+        if (verifier.length === 0) {
+          console.warn(
+            "[verify-required smoke] task dispatched but no verifier vitest run was recorded — the orchestrator " +
+              "likely dropped VERIFY:required or the acceptance block. SOFT-PASS.",
+          );
+          return;
+        }
+        // Hard assertions once a verification run is observed: every spawn scoped.
+        expect(full).toEqual([]);
+        expect(scoped.length).toBeGreaterThan(0);
+        expect(scoped.some((a) => a.some((t) => /m01\.js$/.test(t)))).toBe(true);
+      } finally {
+        await project.repo.dispose();
+      }
+    },
+    VERIFY_TEST_TIMEOUT_MS,
+  );
+
+  it(
+    "a deferred testsPass dispatch returns the unverified footer and spawns no runner",
+    async () => {
+      const project = await prepareVerifyProject();
+      writeProjectTierOverrides(project.repo.dir);
+      try {
+        const run = runOpencode(
+          project,
+          dispatchPrompt([
+            ...EDIT_TASK,
+            "",
+            "[acceptance]",
+            'check: testsPass command="npm test"',
+            "[/acceptance]",
+          ]),
+        );
+        const footer = UNVERIFIED_FOOTER.exec(run.stdout)?.[0] ?? null;
+        const verifier = run.runnerArgv.filter(isVerifierSpawn);
+        const file = writeEvidence("verify-deferred", run, { footer, verifier });
+        console.log(`[verify-deferred smoke] ${run.elapsed}s, footer=${footer}, runner argv: ${JSON.stringify(run.runnerArgv)}; evidence ${file}`);
+        assertExited(run);
+
+        if (!taskDispatched(run.stdout)) {
+          console.warn("[verify-deferred smoke] no task dispatch detected — orchestrator non-compliance. SOFT-PASS.");
+          return;
+        }
+        if (footer === null) {
+          console.warn(
+            "[verify-deferred smoke] task dispatched but no `[router] unverified · vrf_` footer — the " +
+              "orchestrator likely dropped the acceptance block. SOFT-PASS.",
+          );
+          return;
+        }
+        // The footer proves the dispatch deferred; deferral must not spawn a
+        // verifier runner (the subagent's own `npm test` runs do not count).
+        expect(verifier).toEqual([]);
+      } finally {
+        await project.repo.dispose();
+      }
+    },
+    VERIFY_TEST_TIMEOUT_MS,
+  );
+
+  it(
+    "router_verify is registered and callable with pending: true",
+    async () => {
+      const project = await prepareVerifyProject();
+      writeProjectTierOverrides(project.repo.dir);
+      try {
+        const run = runOpencode(
+          project,
+          "Call the router_verify tool exactly once with the argument pending set to true " +
+            "(no handles). Do not call any other tool. Then reply with the tool's output verbatim.",
+        );
+        // Tool parts in `--format json` carry "tool":"router_verify" and a state with an output.
+        const events = run.stdout
+          .split("\n")
+          .filter((l) => l.includes("router_verify"))
+          .map((l) => {
+            try {
+              return JSON.parse(l) as Record<string, any>;
+            } catch {
+              return null;
+            }
+          })
+          .filter((e): e is Record<string, any> => e !== null);
+        const call = events.find((e) => e.part?.tool === "router_verify");
+        const file = writeEvidence("router-verify", run, { call: call ?? null });
+        console.log(`[router-verify smoke] ${run.elapsed}s, call status=${call?.part?.state?.status}; evidence ${file}`);
+        assertExited(run);
+
+        if (!call) {
+          console.warn("[router-verify smoke] no router_verify tool call in the event stream — model non-compliance. SOFT-PASS.");
+          return;
+        }
+        expect(call.part.state?.status).toBe("completed");
+        expect(String(call.part.state?.output ?? "")).toMatch(/\[router\] router_verify/);
+        // Nothing was pending in a fresh session, so nothing may have been run.
+        expect(run.runnerArgv.filter(isVerifierSpawn)).toEqual([]);
+      } finally {
+        await project.repo.dispose();
+      }
+    },
+    VERIFY_TEST_TIMEOUT_MS,
   );
 });

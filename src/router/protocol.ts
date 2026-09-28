@@ -265,6 +265,13 @@ export const CLAUDE_ANTI_NARRATION = [
 // ---------------------------------------------------------------------------
 
 /**
+ * Description of the `delegate` tool. It is not parsed as dispatch text, so it shows the literal,
+ * working `VERIFY:required` form (QA-2.3-3).
+ */
+export const DELEGATE_TOOL_DESCRIPTION =
+  "Delegate a task to a tier subagent (fast | medium | heavy). Required-mode delegations and DoDs without testsPass are verified independently (deterministic checks, or a grader at >= the producer tier in a fresh session) before return: an accepted result on PASS, an honest 'unmet' status on FAIL. A DoD containing testsPass is deferred by default as a whole (its build, lint, run and criteria checks too) and returns UNVERIFIED with a `[router] unverified \u00b7 vrf_\u2026` footer, a risk level and a handle; verify it with router_verify, or put `VERIFY:required` in the task for a synchronous gate. Optionally pass an [acceptance]...[/acceptance] block to define the Definition of Done.";
+
+/**
  * Builds the DoD / Acceptance block protocol section shown when enforcement is ON.
  * Pure: no side-effects, no I/O.
  */
@@ -275,7 +282,7 @@ export function buildDoDProtocolSection(cfg: RouterConfig): string {
     : "If you omit the block, a minimal DoD is auto-inferred from the task type.";
   return [
     "### Acceptance / Definition of Done (enforcement is ON)",
-    "Non-trivial delegations are independently verified before their result is accepted (producer \u2260 grader; grader \u2265 producer tier). Attach an acceptance block to your dispatch so the gate knows what \"done\" means:",
+    "Non-trivial delegations are verified independently (producer \u2260 grader; grader \u2265 producer tier). Required-mode delegations and DoDs without testsPass are gated before return; a DoD containing testsPass defers by default as a whole (its build, lint, run and criteria checks too) and returns unverified with a `[router] unverified \u00b7 vrf_\u2026` footer, a risk level and a handle. Attach an acceptance block to your dispatch so the gate knows what \"done\" means:",
     "",
     "[acceptance]",
     "check: testsPass",
@@ -287,7 +294,9 @@ export function buildDoDProtocolSection(cfg: RouterConfig): string {
     "[/acceptance]",
     "",
     "- check kinds: testsPass | buildPasses | lintClean | fileExists path=\u2026 | schemaMatch path=\u2026 schema=\u2026 | run command=\"\u2026\" expect=\u2026",
-    "- Command allowlist (first-token basename): npm, npx, pnpm, yarn, bun, node, tsc, tsx, vitest, jest, eslint, prettier. No shell chaining, redirection, substitution or newlines; interpreter inline-eval/print flags are forbidden. buildPasses probes a build script, then root tsconfig.json (npx tsc --noEmit). Unavailable checks produce acceptance caveats, not producer escalation; strictUnverifiable restores rejection.",
+    "- testsPass runs only the tests affected by the producer's changes (the full suite is CI's job); prefer it over a hand-written full-suite run command. A failure that also fails at the dispatch-time reference is excused as pre-existing.",
+    "- Per dispatch you may add `VERIFY:<mode>` as one token, <mode> being `required` or `deferred` (default deferred: returns at once with a handle and a risk level) and `VERIFY_WAIT:<n>s`. Pick required when later work depends on this delegation, or call router_verify before building on a medium/high-risk deferred result; unverified delegations stay listed in the prompt until verified or expired (1 h, or a restart); absent from the list does not mean verified.",
+    "- Command allowlist (first-token basename): npm, npx, pnpm, yarn, bun, node, tsc, tsx, vitest, jest, eslint, prettier, pytest (plus exactly `uv run pytest`). No shell chaining, redirection, substitution or newlines; interpreter inline-eval/print flags are forbidden. buildPasses probes a build script, then root tsconfig.json (npx tsc --noEmit). Unavailable checks produce acceptance caveats, not producer escalation; strictUnverifiable restores rejection.",
     "- " + omitLine,
     "- A failing DoD causes the result to be rejected and retried/escalated, not silently accepted.",
   ].join("\n");

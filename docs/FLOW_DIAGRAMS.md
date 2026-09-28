@@ -445,3 +445,178 @@ Handler receives: input.arguments = "user input" or null
                         │            ││ options    │
                         └────────────┘└────────────┘
 ```
+
+---
+
+## 9. Verification: dispatch and the deferred path
+
+No test command runs at dispatch time. The dispatch captures a git-only reference, and tests run only on the required path (§10). Prose: `docs/VERIFICATION.md` → *`testsPass`: affected tests, not the whole suite*.
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│ Dispatch (task / delegate)                                      │
+│  directives in the orchestrator prompt only:                    │
+│   VERIFY:required | VERIFY:deferred (default)                   │
+│   VERIFY_WAIT:<n>s|<n>ms (default captureWaitMs,                │
+│                           capped at baselineTimeoutMs)          │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+              DoD has testsPass and failureRecheck on?
+                   │ no                        │ yes
+                   ▼                           ▼
+            no reference        ┌──────────────────────────────────┐
+                                │ reference capture (git only)     │
+                                │ dispatch waits ≤ VERIFY_WAIT,    │
+                                │ then producer starts anyway;     │
+                                │ capture continues ≤              │
+                                │ baselineTimeoutMs; failure or    │
+                                │ timeout = "no reference"         │
+                                └──────────────────────────────────┘
+                              │
+                              ▼
+                     Producer runs and returns
+                              │
+             ┌────────────────┴─────────────────┐
+             │ VERIFY:required                  │ VERIFY:deferred
+             ▼                                  ▼
+   Required path (§10)         ┌──────────────────────────────────┐
+   before the result returns   │ deferred finish (≤ 2 s)          │
+                               │ 1. git-only tree snapshot        │
+                               │    → changed files | unavailable │
+                               │ 2. static scoping (no spawn)     │
+                               │ 3. risk low | medium | high      │
+                               │ 4. per-file digests (for drift)  │
+                               │ 5. register pending vrf_<id>     │
+                               │    (TTL pendingTtlMs)            │
+                               │ 6. result returned NOW + footer  │
+                               │    [router] unverified ·         │
+                               │    vrf_<id> · risk <level>       │
+                               └──────────────────────────────────┘
+                                                │
+                     ┌──────────────────────────┼────────────────────┐
+                     ▼                          ▼                    ▼
+        orchestrator calls          background: true only     nobody asks
+        router_verify(handles |     queue → same run →        → stays unverified
+        pending: true)              late notice on fail /       until TTL; never
+                     │              unverifiable                reported verified
+                     ▼
+        Required path (§10) on the CURRENT tree,
+        against the stored reference
+        + drift notice if the producer's files changed
+        + verdict cached (a second call replays it)
+        + no automatic retry
+```
+
+---
+
+## 10. Verification: the required path (`testsPass`)
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│ gate.accept / router_verify                                     │
+│ deadline = now + gateBudgetMs (AbortController);                │
+│ every step below is bounded by the time left                    │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│ changed files                                                   │
+│  • tool edits of the producer, union of ALL retry attempts      │
+│  • files dirty at dispatch whose per-file digest changed        │
+│  • files of commits made since the dispatch                     │
+│  attribution failed → "unavailable" → unverifiable              │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│ static scoping: planScopedRun(command, changedFiles)            │
+│   no affected test ─────────────────────────► pass (note)       │
+│   scoping impossible (S6) ──────────────────► unverifiable      │
+│   scoped spec (vitest related <files> | test files) ──┐         │
+│   never widened into an unscoped run; only an explicit          │
+│   testScope "full" runs the command as written        │         │
+└───────────────────────────────────────────────────────┼─────────┘
+                                                        ▼
+                                          batching window (§11)
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│ slot acquisition: machine-wide (maxConcurrentVerifications)     │
+│   wait ≤ min(slotWaitMs, time left)                             │
+│   busy ─────────────────────────────────────► unverifiable      │
+│   one hold covers the scoped run AND the recheck                │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│ scoped run: argv (no shell), low priority, maxWorkers cap,      │
+│   abort signal (kills the process tree), report read on every   │
+│   path                                                          │
+│   timed out / aborted ──────────────────────► unverifiable      │
+│   green, complete ──────────────────────────► pass              │
+│   failures F ───┐                                               │
+└─────────────────┼───────────────────────────────────────────────┘
+                  ▼
+┌─────────────────────────────────────────────────────────────────┐
+│ recheck at the reference worktree (≤ recheckTimeoutMs)          │
+│   < 10 s left ──────────────────────────────► unverifiable      │
+│   no reference / failureRecheck off ────────► unverifiable      │
+│   pytest (runner-unsupported) ──────────────► unverifiable      │
+│   reference approximate / unusable ─────────► unverifiable      │
+│   exact: rerun the failing test files at the reference          │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│ judgeScoped verdict                                             │
+│   some f ∈ F proven introduced ─────────────► FAIL (names them) │
+│   every f ∈ F failing at the exact reference,                   │
+│     inventory complete ─────────────────────► PASS "no worse    │
+│                                                than before"     │
+│   anything else (unknown ids, incomplete) ──► unverifiable      │
+└─────────────────────────────────────────────────────────────────┘
+             │                                   │
+             │ FAIL                              │ unverifiable
+             ▼                                   ▼
+   escalation ladder (delegate)       accepted with a caveat,
+   / forcing note (task);             rejected only when
+   router_verify: verdict only        strictUnverifiable is on
+```
+
+---
+
+## 11. Verification: batching window
+
+```
+ testsPass requests with the same batch key
+ (git root, runner, entry, cwd, env, argv template)
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│ window opens (batchWindowMs, capped at gateBudgetMs / 10;       │
+│ 0 = no batching)                                                │
+│ closes at: the window deadline (never extended)                 │
+│         OR maxBatchSize members                                 │
+│         OR early: nothing else could join (a lone gate never    │
+│            waits)                                               │
+│         OR early: a member's reserve (recheck threshold +       │
+│            margin, scaled by the last run time) is reached      │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+             every member's budget covers the batch schedule?
+                   │ yes                        │ no
+                   ▼                            ▼
+   ┌───────────────────────────────┐  ┌───────────────────────────┐
+   │ pooled: one slot hold, one    │  │ split: every member runs  │
+   │ scoped run over the union of  │  │ solo, exactly as without  │
+   │ files, failures attributed    │  │ batching                  │
+   │ back per request, rechecks    │  │                           │
+   │ per request                   │  │                           │
+   └───────────────────────────────┘  └───────────────────────────┘
+                   │                            │
+                   └────────────┬───────────────┘
+                                ▼
+          each member gets its solo verdict
+          (a flaky runner may only turn a pass into unverifiable;
+           a batch never creates a pass)
+```

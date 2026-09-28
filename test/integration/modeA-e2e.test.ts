@@ -127,7 +127,7 @@ describe("Mode A end-to-end enforcement loop", () => {
       tier: "fast",
     });
 
-    expect(result).toContain("[router ✓ accepted:");
+    expect(result).toContain("[router ✓ verified:");
     expect(result).not.toContain("status: unmet");
     expect(producerCalls.length).toBe(3);
     expect(producerCalls[2]!.tier).toBe("medium");
@@ -152,7 +152,7 @@ describe("Mode A end-to-end enforcement loop", () => {
       tier: "fast",
     });
 
-    expect(result).toContain("[router ✓ accepted:");
+    expect(result).toContain("[router ✓ verified:");
     expect(producerCalls.length).toBe(1);
     expect(producerCalls[0]!.text).not.toContain("[router escalation]");
   });
@@ -176,7 +176,7 @@ describe("Mode A end-to-end enforcement loop", () => {
 
     expect(result).toContain("[router status: unmet]");
     expect(result).toContain("attempt(s)");
-    expect(result).not.toContain("[router ✓ accepted:");
+    expect(result).not.toContain("[router ✓");
     expect(producerCalls.length).toBe(3);
   });
 
