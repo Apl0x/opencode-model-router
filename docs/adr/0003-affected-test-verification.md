@@ -127,6 +127,18 @@ Each dispatch carries `VERIFY:required` or `VERIFY:deferred` (default: `defaultV
   because an editable install imports the live tree rather than the reference worktree, so the
   rerun would test the producer's code. A failing pytest scope therefore cannot be split into
   pre-existing and introduced failures. A green pytest scope passes normally.
+- **pytest scoping maps direct importers only** (Phase 3.1, E2E-1). A changed module maps to the
+  test files that name its stem as a whole word (`git grep -F -w`) plus the name-matched tests,
+  limited to `testpaths` when those decide the collection. No mapped test, or a `conftest.py` that
+  names the module, is S6 `unmapped-module` (`unverifiable`), never "no affected tests". A test
+  that reaches the module only through another source module or a dynamic import is not run, and a
+  change to non-`.py` files alone still gives "no affected tests".
+- **An unknown tool during the dispatch capture makes that dispatch `unverifiable`** (Phase 3.1,
+  E2E-3). Only the tools in `NON_WRITING_TOOLS` (`src/verify/dispatch.ts`) leave an in-flight
+  snapshot or capture alone. Any other tool in that window, MCP and custom tools included, leaves
+  the change set unavailable and the reference none, which fails closed instead of seeding the
+  baseline with the edit. A write with no tool event, or a writing tool under a non-writing name,
+  is not seen.
 - **`unverifiable` is accepted with a caveat** unless `strictUnverifiable` is set, in which case it
   is rejected. This covers scoping failures, a busy slot, a capture that did not finish, and pytest
   failures.

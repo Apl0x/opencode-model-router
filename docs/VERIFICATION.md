@@ -222,11 +222,34 @@ Unverifiable means the router could not tell whether the change broke tests. It 
 - **there is no reference**: the capture failed or timed out, had not resolved within the gate budget, the dispatch was not tracked, `failureRecheck` is off, or the reference vanished or could not be materialized;
 - **the reference is approximate**: files differ from the dispatch state in a way the reference cannot reproduce. Only inert files such as `coverage/`, `*.log` and caches are ignored;
 - **the tests are pytest failures**: a pytest reference rerun is never attempted (`runner-unsupported`), because an editable install imports the live tree's sources. Green pytest runs still pass;
+- **a pytest module maps to no test** (`unmapped-module`): see [pytest module mapping](#pytest-module-mapping);
+- **an unknown tool ran during the dispatch capture**: see [Dispatch capture and unknown tools](#dispatch-capture-and-unknown-tools);
 - **a run is incomplete**: a missing or partial report, a collection error without identifiable test files, a zero-test rerun, or failing ids that cannot be matched to a reference result;
 - **scoping is impossible**: changed files are unavailable, or no planner exists for the command (S6);
 - the command is not allowlisted, the check errored, or the lineage caveat applies.
 
 By default an unverifiable result is **accepted with a caveat** that names the reason. Set `verify.strictUnverifiable: true` to reject it instead. Unverifiable never counts as verified. It is not proof that the tests pass.
+
+### pytest module mapping
+
+pytest has no related-tests mode, so the planner maps changed files to test files itself (Phase 3.1, E2E-1):
+
+- A changed test file is an input itself.
+- A changed module maps to the test files that name its stem as a **whole word** (a `git grep -F -w` content search over the `python_files` patterns), joined with the tests named after it (`test_<stem>.py`, `<stem>_test.py`). Every import spelling contains the stem as a whole word: `import app.mod02`, `from app.mod02 import x`, `from app import mod02`, `from .mod02 import x`. A longer name such as `mod020` does not match.
+- It fails closed. When no in-scope test maps to a changed module, or a `conftest.py` names it (its fixtures reach tests that never name the module), the check is unverifiable with S6 `unmapped-module`. One unmapped module makes the whole change unverifiable. A failed search is S6 `search-failed`.
+- When `testpaths` decides the collection (no path argument, pytest started in its rootdir, every config sets `testpaths`, no `-o testpaths=`, `--pyargs` or `--rootdir`, plain entries only), only tests under it are inputs. In any other case every test under the runner directory is a candidate: an extra input can add a failure, never hide one.
+
+Residual limits: only **direct** importers run. A test that reaches the changed module only through another source module (`app/mod02.py` importing `app/mod01.py`) or a dynamic import is not run, and the scope can pass without it. A change to non-`.py` files alone (a data file a module reads, `.pyi`, `.pyx`, a binary extension) still gives "no affected tests".
+
+### Dispatch capture and unknown tools
+
+While a dispatch's tree snapshot or reference capture is still in flight (a `VERIFY_WAIT` shorter than the capture, or `VERIFY_WAIT:0s`), a write would land in the baseline and hide itself: "no changed files", or a failure that looks pre-existing at the reference. So the router fails closed (Phase 3.1, E2E-3):
+
+- Only tools known not to write leave an in-flight snapshot or capture alone: `read`, `glob`, `grep`, `list`, `ls`, `codesearch`, `webfetch`, `websearch`, `lsp`, `todoread`, `todowrite`, `question`, `skill`, `plan_enter`, `plan_exit`, `invalid`, `task`, `list_mcp_resources`, `list_mcp_resource_templates`, `read_mcp_resource`, `delegate` and `router_verify` (`NON_WRITING_TOOLS` in `src/verify/dispatch.ts`).
+- Any other tool that runs in an overlapping directory during that window counts as a write: the shells, the edit tools, and every tool the router does not know, **MCP tools** (named `<server>_<tool>`, even read-only ones) and custom or plugin tools included. A tool without a `cwd` argument overlaps every pending capture. That dispatch's change set becomes unavailable and its reference none, so its `testsPass` result is **unverifiable**, never a pass.
+- `task` and `delegate` start sessions whose own tool calls are observed, so parallel dispatches do not contaminate each other by starting. Outside the capture window nothing changes.
+
+Residual limits: a write with no tool event (an external editor, an MCP server that writes after its call returned, the user's own `!` shell) cannot be seen by any hook. A tool that writes under a non-writing name (for example a custom tool called `lsp`) is not caught.
 
 ### Windows limits
 
