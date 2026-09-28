@@ -294,3 +294,118 @@ The after hook stays inside `DEFERRED_FINISH_MS` (2 s), an accepted residual. e2
 ## Round log
 
 - Round 1 (this document): 9 findings open (QA-G-1 … QA-G-9). Status **NOT CLEAN**.
+- Round 2 (below): QA-G-1 … QA-G-9 and QA-3.1-18/-21/-23 resolved. 5 new findings (QA-G-10 … QA-G-14): 1 critical
+  (QA-G-10, a false pass introduced by the QA-G-2 fix), 1 minor, 3 nit. Status **NOT CLEAN**.
+
+---
+
+# Round 2 (re-review)
+
+**Status: NOT CLEAN** — 1 critical (QA-G-10), 1 minor (QA-G-12), 3 nit (QA-G-11, QA-G-13, QA-G-14).
+All nine round-1 findings and the three owner items are resolved. The QA-G-2 fix introduces a
+**false pass**: a pytest test that imports the changed module in a common wrapped-import layout is
+not selected, and the result reads `[router ✓ verified: deterministic]`. It was reproduced end to
+end under Node and Bun.
+
+## Scope and method (round 2)
+
+- **Change under review.** `git diff b85068b..7859b65` (b00a0e4, b5b2ce7, 28b8e3c, 5e94b13, 99ffe4c, a55dbb8,
+  dffc596, 987ad86, 32dac0a, 9d06d3c, 7859b65), plus the pre-review KNOWN fixes `3939c08..4a2fddb`. Their
+  only `src/` behaviour change is the `createSharedFlight` detach (39610c9). Following the convergence rule,
+  untouched code was not re-audited.
+- **Environment.** As in round 1: Windows 11, Bun 1.3.14, Node v24.21.0, git 2.51.0.windows.1, uv. POSIX
+  checks ran in WSL2 Ubuntu (kernel 6.18, Node v25.9.0, git 2.43.0; there is no Bun in WSL).
+- **Drivers.** Scratch drivers live in `%TEMP%\omr-g32r2\` and are not committed.
+  - `drv.ts` holds the round-1 harness shape (`createE2EPlugin`) with the real plugin factory and real
+    wiring. It also exposes the `delegate` tool, whose fake `session.prompt` runs the producer.
+    - It uses `prepareFixtureRepo` (real `npm ci` / `uv sync`) and the runner probe logs. A7's build is
+      a `build.cjs` that appends `{"kind":"build"}` to the probe log.
+    - Bun runs it through `run-bun.ts`. Node runs it through `node/r2.test.ts` under
+      `vitest run --config vitest.r2.config.mjs`.
+    - `TEMP`/`TMP` pointed at a private dir, so the slot dir and the reference dirs were private.
+  - `tree-abort.ts`, `exec-leftover.ts` and `sweeper-cwd.ts` import `src/verify/{tree,exec}.ts`
+    directly. They run under Bun, and under Node through a `module.registerHooks` resolver
+    (`ts-resolve.mjs`: extensionless relative imports → `.ts`, type stripping), both on Windows and in WSL.
+  - `grep-corpus.mjs` and `meta.mjs` run the exact `git grep -E` argv of `findByContent` with the
+    `pyImportPattern` output (`bun -e` over `src/verify/runner.ts`). They run on Windows git and on WSL git.
+  - `flight.ts` drives `createSharedFlight` (Bun).
+- **Scoped regression checks.**
+  - `npx vitest run` on the 10 test files the diff touches in `test/unit` (tree-kill, tree, runner,
+    baseline-wiring, dispatch, exec-branches, pending) and `test/integration` (deferred-verification,
+    router-verify-tool, delegate-timeout): `Test Files 10 passed (10)`, `Tests 1063 passed | 2 skipped (1065)`.
+  - `bun test/smoke/bun-runtime.smoke.ts`: `OK: 12 passed, 0 failed, 0 skipped`. There was no full-suite run.
+- **Hygiene.** After the runs, `Win32_Process` matched nothing for `omr-g32r2`, `omr-ref-`, `setInterval`,
+  `sleep 3` or `60000)` (other than the querying shell), and neither did WSL `ps`. Every driver killed its
+  own leftovers, and so did the decoys. The fixture repos were disposed. The private tmp held no `omr-ref-*`,
+  and its `verify-slots` dir was empty. No reparse point was found under the scratch root before its removal.
+  The worktree has no `Microsoft\` dir.
+
+## Per-finding verdicts
+
+| ID | Verdict | Evidence (verbatim, trimmed) |
+|---|---|---|
+| QA-G-1 | **resolved** | **Native `task`, default mode, producer changed nothing.**<br>• **A7** (`testsPass` + `buildPasses`): `afterMs 408` (Node `382`), `probes []`, output `[router] unverified · vrf_951a… · risk low (no changes attributed)`. `router_verify` on that handle: probes `["build"]` → `pass ⏎ [router ✓ verified: deterministic] ⏎ Verification notes: - no changed files, no affected tests`.<br>• **A8** (`testsPass` + `run command="npm test"`): `afterMs 356` (Node `378`), `probes []`, footer, risk low. `router_verify`: probes `["main:run"]` (the orchestrator's own full-suite `run`, now on demand only), `pass`, `✓ verified`.<br>**`delegate` tool.** A7 `762 ms` / A8 `799 ms` (Node `763` / `765`), `probes []`, output `DONE ⏎ ⏎ [router] unverified · vrf_… · risk low (no changes attributed)`. `router_verify`: A7 probes `["build"]`, A8 probes `["main:run"]`, both `pass`.<br>**Controls.**<br>• A `testsPass`-only no-change DoD takes the gate with no process: `afterMs 768` (Node `784`), `probes []`, `[router ✓ verified: deterministic] ⏎ Verification notes: - no changed files, no affected tests`.<br>• `testsPass` + a criterion is deferred (footer). Its `router_verify` spawns nothing (`probes []`, 382 ms) and passes.<br>**Result.** No no-change mixed DoD ran a check or read "verified" before `router_verify` ran its checks. A `testsPass` DoD with criteria cannot slip through: it is deferred (see QA-G-11 for the cost). |
+| QA-G-2 | **resolved (C1), with a regression** | C1: new `app/app.py` gives probes `[]` and `[router ⚠ UNVERIFIED: deterministic] ⏎ Verification caveats — NOT verified …: - testsPass: scoping impossible (unmapped-module): no test file maps to the changed module app/app.py` (Bun and Node). The full test set is no longer named. But the import-shaped pattern that replaced the whole-word search misses importers that the old search found. That yields a false pass: **QA-G-10**. |
+| QA-G-3 | **resolved** | C2 (Windows, e2e): `app/mod0[1-2]_[1-3].py` gives probes `[]` and `testsPass: scoping impossible (unmapped-module): no test file maps to the changed module app/mod0[1-2]_[1-3].py` (Bun and Node). No unrelated test is named. POSIX (WSL git 2.43, the bracketed pathspec `lit()` builds): `:(glob)**/test_[*].py` matched only `tests/test_*.py`, where the unescaped `test_*.py` matched all 5 files. `test_[[]x[]].py` matched only `tests/test_[x].py`. |
+| QA-G-4 | **resolved (amendment)** | 5e94b13 amends G7 and §1.5-15. 99ffe4c updates CONFIG_REFERENCE "Which delegations defer" and VERIFICATION.md. Both state that DoDs without `testsPass` keep the synchronous gate, and that a `testsPass` DoD defers as a whole, also with no change. This matches the QA-G-1 repro above. The protocol line (unchanged since 19dee2a) now describes the behaviour. |
+| QA-G-5 | **resolved (POSIX fix + documented limit)** | `exec-leftover.ts`, `runArgv` + 500 ms:<br>• Linux: an unref'd in-group grandchild `alive … false`, and `sleep 30 >/dev/null 2>&1 &` `alive … false`. The round-1 D4a shape (`detached: true`, i.e. `setsid`) is `alive … true` on Linux and on Windows (Bun and Node).<br>• Windows: a non-detached Node grandchild is `false` there too. The router does not sweep after a normal exit on Windows, so it ended with its parent. Inferred, not verified: libuv's kill-on-close job object for non-detached children.<br>• What survives is the stated limit: VERIFICATION.md "What a normal exit leaves running" names `setsid` / Node's `detached: true`, and Windows (no sweep after a normal exit). ADR 0003:168-171 says the same.<br>• (d) `runShell`/`runArgv` are called only from `verify/wiring.ts` (`execSeam`/`argvSeam`: checks, the reference, and `git` diff/grep/ls-files). No non-verification run goes through exec.ts. The settle-time kill keeps the late kill's guards (`!groupGone && ownsTracked(pid, trackToken) && groupAlive(pid)`, exec.ts:255). The group id cannot be reused while a member lives, and a new run that reuses the id overwrites the tracking entry. So an unowned group is not signalled. |
+| QA-G-6 | **resolved** | tree-abort (fsmonitor hook `sleep 3; false`, abort at ~0.5–1.3 s):<br>• Bun win32: `snapshot settled 8 ms after the abort … undefined`. Before the abort: `sh.exe prio=6` (below normal, so low priority is preserved). 400 ms after: none left. `decoy alive: true`.<br>• Node win32: `7 ms`, `sh.exe prio=6`, then none, `decoy alive: true`.<br>• Linux (Node 25): `1 ms`. Before: `8574 8573 10 /bin/sh -c sleep 3; false …` and `8575 8573 10 sleep 3` (pgid = git's, nice 10). After: none. `decoy alive: true`.<br>`taskkill` runs by `%SystemRoot%\System32\taskkill.exe`. See QA-G-12 and QA-G-13 for two residual edges. |
+| QA-G-7 | **resolved** | VERIFICATION.md "Residual limits (JS runners, QA-G-7)": `vitest related` and `jest --findRelatedTests` follow static imports only … "or report \"no affected tests\"". |
+| QA-G-8 | **resolved** | reference.ts:686-695 records the E1/E2 and Bun-smoke evidence on Bun 1.3.14/win32. It keeps other Bun versions, and Bun's held-dir error code, as unverified. |
+| QA-G-9 | **resolved** | `sweeper-cwd.ts` (Bun), `LOCALAPPDATA`/`APPDATA`/`USERPROFILE` pointed at a missing dir, cwd = a scratch "project", deadline plus a detached pipe-holding grandchild. Result: `cwd …\g9\proj: entries []`. PowerShell's cache went to `os.tmpdir()` (`g9\tmp\Microsoft\Windows\PowerShell`). With a normal env the sweep reports `[killed 1 process tree(s) left running by the exited command: pid 15840]`. The harness now sets `LOCALAPPDATA`/`APPDATA`. `.gitignore` has `/Microsoft/`. Observation, not a finding: with no LocalAppData the first sweep did not end the leftover within 25 s. That is an environment-only slow start. Inferred: it is unrelated to the cwd change, since before the fix the cache was rebuilt in the project cwd instead. |
+| QA-3.1-18 | **resolved** | A `VERIFY:required` clean pass on a native `Task()`: `afterMs 2618` (Node `2593`), probes `["main:related"]`, output `<task_result> ⏎ ⏎ [router ✓ verified: deterministic]`. |
+| QA-3.1-21 | **resolved** | (e) `buildAcceptedSuffix` is the only accepted-label site: index.ts:872 (`delegate`), index.ts:1428 (native) and wiring.ts:641 (`router_verify` report). It reads `verified` only for `outcome === "pass"` with no caveat. Every other outcome reads `UNVERIFIED`:<br>• a timeout, a busy slot, no reference, drift, a lineage downgrade (all `unverifiable`);<br>• a skipped verdict (no `outcome`);<br>• a pass with caveats.<br>C1/C2 above read `[router ⚠ UNVERIFIED: deterministic]`. The delegate ladder's give-up is `[router status: unmet] …` (no ✓). The deferred footer is `[router] unverified · …`.<br>Directive tokens: `parseVerifyDirectives` over both rendered labels returned `{"mode":"deferred",…,"modeSource":"default","waitSource":"default"}` and logged nothing. `\bVERIFY\s*:` does not match inside `UNVERIFIED:` or `verified:`. |
+| QA-3.1-23 | **resolved (amendment)** | 7859b65 amends G6 and the 3.1 DoD: the repository has no CodeQL workflow, and enabling CodeQL default setup is an owner repo-settings decision. |
+
+**(f) `createSharedFlight` abort-drop (39610c9): no false-pass risk.**
+
+- **Construction.** A sharer can only join a flight that has not started (`lane.next`), or the one its own
+  request launches. `advance` clears `lane.next` before it launches that flight. A detached flight is no
+  longer reachable from the lane map.
+- **Repro.** `flight.ts` uses runs that ignore their abort and take 300 ms. It printed `violations: 0`:
+  - A left at 100 ms: `B asked@61 -> run 2 started@109`.
+  - C arrived during run 2: `C asked@170 -> run 3 started@417`. D shared run 3 and left early, and C still
+    got run 3.
+  - The lane retired while E's detached run was still going: `F asked@1163 -> run 5 started@1163`.
+- No sharer received a snapshot that started before its own request.
+
+## Resolution lines
+
+- QA-G-1 Resolution: b5b2ce7 — `noChangeGateSpawnsNothing`: only a `testsPass`-only, criterion-free DoD takes the no-change gate; any other no-change DoD is deferred with risk low (docs 99ffe4c).
+- QA-G-2 Resolution: dffc596 — `pyImportPattern` import-shaped `git grep -E` plus `STEM_MATCH_LIMIT` for existing pytest modules; C1 is S6 `unmapped-module`. Superseded in part by QA-G-10.
+- QA-G-3 Resolution: 32dac0a — `findByName` brackets `* ? [ ] \` in `:(glob)` pathspecs.
+- QA-G-4 Resolution: 5e94b13, 99ffe4c — G7 and §1.5-15 amended (owner decision); CONFIG_REFERENCE/VERIFICATION.md state which delegations defer.
+- QA-G-5 Resolution: a55dbb8 — POSIX settle-time group kill; `setsid`/`detached` escapees and Windows normal-exit leftovers documented as limits.
+- QA-G-6 Resolution: 28b8e3c — `execGit` spawns git (detached on POSIX) and kills its whole tree on abort, timeout or `maxBuffer`.
+- QA-G-7 Resolution: dffc596 — VERIFICATION.md "Residual limits (JS runners)".
+- QA-G-8 Resolution: 987ad86 — reference.ts OPEN RISKS records the Bun 1.3.14 junction evidence.
+- QA-G-9 Resolution: b00a0e4 — sweeper `cwd: os.tmpdir()`; the harness sets `LOCALAPPDATA`/`APPDATA`; `.gitignore` `/Microsoft/`.
+- QA-3.1-18 Resolution: 9d06d3c — a clean pass ends with `[router ✓ verified: <method>]`.
+- QA-3.1-21 Resolution: 9d06d3c — every accepted non-clean result is headed `[router ⚠ UNVERIFIED: <method>]`.
+- QA-3.1-23 Resolution: 7859b65 — G6 amended: no CodeQL workflow; CodeQL default setup left to the owner.
+
+## New findings (round 2)
+
+| ID | Severity | Evidence | Fix |
+|---|---|---|---|
+| QA-G-10 | **critical** | **False pass: the QA-G-2 import pattern misses common wrapped imports (introduced by dffc596).**<br>**Repro** (pytest-app, Bun and Node). The base adds `combo02()` to `app/mod02.py`, and `tests/test_combo.py` imports it in isort's default grid wrap: `from app import (mod01, mod03, mod04,` / `                 mod05, mod02)`. The producer breaks `combo02` under `VERIFY:required` + `testsPass command="uv run pytest"`. The pytest argv held only `["test_mod02_1.py"]`, and the output was `<task_result> ⏎ ⏎ [router ✓ verified: deterministic]`. Then `uv run pytest tests/test_combo.py -> exit 1: 1 failed in 0.11s`.<br>**Corpus** (identical on git 2.51 Windows and git 2.43 Linux):<br>• miss: `paren_two_on_line` (`    mod01, mod02,`), `isort_grid`, `backslash_cont` (`from app import mod01, \` / `    mod03, mod02`), and `paren_last_no_comma_crlf` (`    mod02\r`: `$` does not match before a CR, and a CRLF worktree is Git for Windows' default with `core.autocrlf=true`);<br>• hit: `as_alias`, `from_as`, `paren_one_per_line`, `paren_last_no_comma_lf`, `importlib("app.mod02")`, `__import__`, `from ..app import mod02`, `from ..app.mod02 import`, `app.mod02.f()`;<br>• the `mod020` decoy is not matched.<br>The pre-fix search (`git grep -F -w -e mod02`) returns `tests/test_combo.py`, so this is a regression. It is a false pass whenever the module has at least one other importer or a `test_<stem>.py`, since S6 `unmapped-module` covers only zero hits. VERIFICATION.md promises "one name per line of a parenthesised or backslash-continued list", which the CRLF case also breaks. Regex metacharacter stems (`mod+1`, `mod.1`, `a(b)`) escape correctly: exit 0 and only the literal file, on both gits. | Make the pattern over-include, never miss.<br>• Accept the stem at **any** position of a continuation line of a name list: `^[ \t(]*([A-Za-z0-9_]+([ \t]+as[ \t]+[A-Za-z0-9_]+)?[ \t]*,[ \t]*)*<stem>…`.<br>• Allow `\r` wherever `$` ends an alternative.<br>• Or keep the whole-word `-F -w` hits and drop only files whose every occurrence is `<stem>.` followed by another name (the QA-G-2 over-match), in JS after the grep.<br>• Add the corpus above as `pyImportPattern` + `git grep` unit cases, and the repro as a fixture test. |
+| QA-G-11 | nit | **`noChangeGateSpawnsNothing` excludes criteria, although the gate never grades criteria when a check exists.** gate.ts:174-193: a DoD with any check is `kind: "deterministic"` and goes to `runDeterministic`. `runChecker` is reached only for criteria-only DoDs. So `testsPass` + criterion (the harness `acceptance()` shape) with no change is deferred. It gets a footer, a pending-list entry for up to 1 h and a `router_verify` that spawns nothing (`probes []`, 382 ms), where the gate would have passed it at once. There is no safety impact, and the behaviour is documented. The code comment's rationale ("or a criterion would be … graded by that gate synchronously", wiring.ts:1517-1519) is inaccurate for such DoDs. | Accept, or test `dod.kind === "deterministic"` plus every check being `testsPass`, and fix the comment. |
+| QA-G-12 | minor | **`killGitTree` may `taskkill /T /F` a recycled PID** (28b8e3c, code read; not reproduced). tree.ts kills whenever the call has not settled. It does not track git's `exit`, so it cannot tell a live git from one that exited while a descendant still holds its stdout pipe. In that state, a timeout, an abort or `maxBuffer` runs `taskkill /pid <git pid> /T /F` on a PID Windows may already have reused. exec.ts's own rule (exec.ts:330-331, "The direct child already exited, so its PID may be recycled: never `taskkill` it") is not applied here. The window needs a git descendant that inherits git's stdout and outlives it, which is rare for hooks, since git captures their output. POSIX is safe: the group persists while any member lives. | Record `exit` in `execGit`, and after it skip `taskkill` (Windows) or use exec.ts's `groupAlive` guard (POSIX). |
+| QA-G-13 | nit | **POSIX snapshot git now leaves opencode's process group** (28b8e3c, code read). `detached: !isWin` puts git and its hooks in their own group, and tree.ts has no exit hook, unlike exec.ts (QA-1.2-6). A terminal Ctrl-C, or an opencode crash during a snapshot, no longer signals git or a hanging fsmonitor hook. Before the change, the foreground group's SIGINT reached them. This is bounded by the hook's own runtime. | Accept (short-lived), or register the snapshot's pgid in exec.ts's exit-hook tracking. |
+| QA-G-14 | nit | **`✓ verified` also labels a pass where no test ran** (9d06d3c). Examples: TP-only no-change `[router ✓ verified: deterministic] ⏎ Verification notes: - no changed files, no affected tests`, and a JS change that no test statically imports (the QA-G-7 residual). This is documented (VERIFICATION.md verdict table: "or no test is affected → labelled `[router ✓ verified: deterministic]`"), and the note is present. But the check mark is what a model skims (the QA-3.1-21 argument). | Accept, or fold the case into the label (for example `[router ✓ verified: deterministic — no affected tests]`), as the QA-3.1-18 recommendation (`<n> affected tests passed`) suggested. |
+
+## G1–G8 after round 2
+
+| G | Verdict | Change since round 1 |
+|---|---|---|
+| G1 | **MET** | QA-G-2 (C1) and QA-G-3 (C2) resolved: both fail closed with S6, and no test file is named. |
+| G2 | **NOT MET** | QA-G-10: a constructed false pass (`[router ✓ verified: deterministic]` over a failing importer). |
+| G3 | MET, with caveat | Unchanged caveat, now documented: `setsid`/`detached` escapees on POSIX, and every normal-exit leftover on Windows (QA-G-5). |
+| G4 | **MET** | QA-G-6 resolved: the snapshot's git tree dies on abort and timeout (Windows and POSIX). |
+| G5 | MET | Not touched. |
+| G6 | MET (amended) | QA-3.1-23: G6 amended (no CodeQL workflow). |
+| G7 | **MET** | QA-G-1 resolved (no process, footer, risk low on both paths). QA-G-4: G7 amended. |
+| G8 | MET | Clean passes now carry `[router ✓ verified: …]`, and unverifiable results carry `[router ⚠ UNVERIFIED: …]`. |
+
+Under the owner rule, only QA-G-10 (critical) is for fixing. QA-G-11 … QA-G-14 (minor/nit) are recorded
+for acceptance.
