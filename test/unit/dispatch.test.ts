@@ -8,7 +8,9 @@ import {
   shouldVerifyTask,
   buildForcingNote,
   buildAcceptedSuffix,
+  type TreeSnapshot,
 } from "../../src/verify/dispatch";
+import { join, resolve } from "node:path";
 import type { RouterConfig } from "../../src/router/config";
 
 const cfg = {
@@ -239,5 +241,52 @@ describe("buildAcceptedSuffix", () => {
     expect(buildAcceptedSuffix("deterministic")).toBe(
       "\n\n[router \u2713 accepted: deterministic]",
     );
+  });
+});
+
+describe("QA-3.1-2: concurrentDispatches (dispatch windows in one git tree)", () => {
+  const snap = (root: string): TreeSnapshot => ({ cwd: root, root, head: "h", fingerprint: "f", dirty: false, files: [] });
+  const begin = (store: ReturnType<typeof createChangedFileStore>, id: string, cwd: string, root: string | null = cwd) =>
+    store.beginDispatch(id, cwd, { snapshot: async () => (root === null ? undefined : snap(root)), timeoutMs: 1_000 });
+  const repo = resolve("qa-3-1-2-repo");
+  const other = resolve("qa-3-1-2-other");
+
+  it("counts every other dispatch live at some moment of the window, in the same git root only", async () => {
+    const store = createChangedFileStore();
+    await begin(store, "a", repo);
+    expect(store.concurrentDispatches("a")).toBe(0);
+    // The same tree from a subdirectory, and another repository.
+    await begin(store, "b", join(repo, "pkg"), repo);
+    await begin(store, "c", other);
+    expect(store.concurrentDispatches("a")).toBe(1);
+    expect(store.concurrentDispatches("b")).toBe(1);
+    expect(store.concurrentDispatches("c")).toBe(0);
+    // b ends (its gate cleared it): it still overlapped a's window.
+    store.clear("b");
+    expect(store.concurrentDispatches("a")).toBe(1);
+    // d begins while a is live; b had ended before d began.
+    await begin(store, "d", repo);
+    expect(store.concurrentDispatches("a")).toBe(2);
+    expect(store.concurrentDispatches("d")).toBe(1);
+    store.clear("a");
+    await begin(store, "e", repo);
+    expect(store.concurrentDispatches("e")).toBe(1);
+    // Untracked: 0. An explicit root (the gate snapshot's) filters too: d overlapped a, c and e.
+    expect(store.concurrentDispatches("a")).toBe(0);
+    expect(store.concurrentDispatches("d", repo)).toBe(2);
+    expect(store.concurrentDispatches("d", other)).toBe(1);
+  });
+
+  it("a dispatch whose snapshot failed is matched by its cwd; its own root falls back to its cwd", async () => {
+    const store = createChangedFileStore();
+    await begin(store, "a", repo);
+    await begin(store, "b", join(repo, "sub"), null);
+    await begin(store, "c", resolve("qa-3-1-2-elsewhere"), null);
+    expect(store.concurrentDispatches("a")).toBe(1);
+    // b has no root: its cwd (inside the repo) decides, and a's root contains it.
+    expect(store.concurrentDispatches("b")).toBe(1);
+    // A cwd above the dispatch's tree overlaps it too.
+    await begin(store, "top", resolve("."), null);
+    expect(store.concurrentDispatches("top")).toBe(3);
   });
 });

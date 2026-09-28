@@ -136,6 +136,36 @@ export interface PreparedVerification {
   reference: ReferenceState;
   /** The current tree snapshot (materialize's drift check); undefined when unavailable. */
   snapshot: TreeSnapshot | undefined;
+  /**
+   * QA-3.1-2: other dispatches in the same git tree that were live during this dispatch's window
+   * (the change set holds their edits too). Absent or 0: none.
+   */
+  concurrentDispatches?: number;
+}
+
+/**
+ * QA-3.1-2: appended to a rejection that lists introduced failures when other delegations were live in
+ * the same working tree during the dispatch: the tree delta is not partitioned between them.
+ */
+export function concurrentDispatchesCaveat(count: number): string {
+  return `other delegations ran in this working tree concurrently (${count}); introduced failures may come from their edits`;
+}
+
+/**
+ * QA-3.1-2: router caveats from the dispatch's own context, on a gate result. A fail that lists
+ * introduced failures gains concurrentDispatchesCaveat when other dispatches overlapped it. The
+ * outcome and `accepted` never change. Pure; the text goes through neutralizeDirectives like all
+ * router text.
+ */
+export function applyDispatchCaveats(res: GateResult, ctx: { readonly concurrentDispatches?: number }): GateResult {
+  const verdict = res.verdict;
+  if (verdict.skipped === true) return res;
+  const outcome = verdict.outcome ?? (verdict.pass ? "pass" : "fail");
+  const concurrent = ctx.concurrentDispatches ?? 0;
+  if (outcome === "fail" && concurrent > 0 && (verdict.failures?.introduced.length ?? 0) > 0) {
+    return { ...res, verdict: { ...verdict, reasons: [...verdict.reasons, neutralizeDirectives(concurrentDispatchesCaveat(concurrent))] } };
+  }
+  return res;
 }
 
 /**
@@ -1206,7 +1236,11 @@ export function createVerificationWiring(deps: {
       controller.abort();
     }
     const committed = await committedSinceDispatch(store.baselineSnapshot(id), snapshot, deadline);
-    return { ...store.delta(id, childID, snapshot, base, committed), snapshot };
+    return {
+      ...store.delta(id, childID, snapshot, base, committed),
+      snapshot,
+      concurrentDispatches: store.concurrentDispatches(id, snapshot?.root),
+    };
   };
 
   /**
@@ -1355,6 +1389,9 @@ export function createVerificationWiring(deps: {
         changedFiles,
         risk,
         ...(digests !== undefined ? { digests } : {}),
+        // QA-3.1-2: the window ends here (the change set is fixed now); router_verify adds the
+        // caveat to its verdict.
+        ...(change.concurrentDispatches !== undefined && change.concurrentDispatches > 0 ? { concurrentDispatches: change.concurrentDispatches } : {}),
       });
       if (!reg.ok) {
         // QA-2.4-4: never a delegation without a verdict path: the caller runs the required gate.
@@ -1595,7 +1632,11 @@ export function createVerificationWiring(deps: {
   const judgeVerdict = (entry: PendingEntry, prep: ClaimPreparation, gate: ClaimGate, cfg: RouterConfig): VerificationResult => {
     if (gate.kind === "final") return gate.result;
     const { strict, retryable } = gate;
-    const res = lineageDowngrade(gate.res, { orchestratorSessionID: entry.orchestratorSessionID, root: prep.root, dispatchedAt: entry.dispatchedAt, strictUnverifiable: strict });
+    // QA-3.1-2: the dispatch's own context, recorded when the producer returned.
+    const res = applyDispatchCaveats(
+      lineageDowngrade(gate.res, { orchestratorSessionID: entry.orchestratorSessionID, root: prep.root, dispatchedAt: entry.dispatchedAt, strictUnverifiable: strict }),
+      entry,
+    );
     let verdict = res.verdict;
     if (prep.drift.kind !== "none") {
       // Section 1.5-18 and the owner's rule: a verdict on a tree that is not (provably) the

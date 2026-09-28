@@ -480,6 +480,8 @@ export interface PendingRegistration {
   readonly changedFiles: readonly ChangedPath[] | "unavailable";
   readonly risk: RiskAssessment;
   readonly digests?: Promise<FileDigests | undefined>;
+  /** QA-3.1-2: other dispatches live in the same git tree during this one's window; absent: none. */
+  readonly concurrentDispatches?: number;
 }
 
 /** What a verification of one handle produced (2.4.3 builds it from the gate result). */
@@ -527,6 +529,8 @@ export interface PendingEntry {
   readonly risk: RiskAssessment;
   /** Never rejects; undefined when not provided or released. */
   readonly digests: Promise<FileDigests | undefined> | undefined;
+  /** PendingRegistration.concurrentDispatches, as registered. */
+  readonly concurrentDispatches?: number;
   readonly createdAt: number;
   readonly state: PendingState;
   /** Set while state is "verifying". */
@@ -723,6 +727,7 @@ interface EntryRecord {
   readonly createdAt: number;
   readonly risk: RiskAssessment;
   readonly changedFilesDropped: number;
+  readonly concurrentDispatches: number | undefined;
   dod: DoD | undefined;
   reference: Promise<ReferenceState>;
   changedFiles: readonly ChangedPath[] | "unavailable";
@@ -816,6 +821,7 @@ export function createPendingRegistry(options: PendingRegistryOptions): PendingR
       changedFilesDropped: rec.changedFilesDropped,
       risk: rec.risk,
       digests: rec.digests,
+      ...(rec.concurrentDispatches !== undefined ? { concurrentDispatches: rec.concurrentDispatches } : {}),
       createdAt: rec.createdAt,
       state: rec.state,
       verifyingSince: rec.verifyingSince,
@@ -1054,6 +1060,7 @@ export function createPendingRegistry(options: PendingRegistryOptions): PendingR
       createdAt: at,
       risk: reg.risk,
       changedFilesDropped,
+      concurrentDispatches: reg.concurrentDispatches,
       dod: reg.dod,
       reference,
       changedFiles,

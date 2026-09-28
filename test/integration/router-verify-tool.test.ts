@@ -22,6 +22,7 @@ import { parseCapDirective } from "../../src/router/sessions";
 import { parseVerifyDirectives } from "../../src/verify/directives";
 import {
   backgroundOutcomes,
+  concurrentDispatchesCaveat,
   createVerificationWiring,
   digestFiles,
   DRIFT_NOTICE,
@@ -128,10 +129,12 @@ vi.mock("../../src/verify/pending", async importOriginal => {
 });
 
 vi.mock("../../src/verify/tree", () => ({
-  snapshotTree: async (_cwd: string, _signal: AbortSignal, options?: { lowPriority?: boolean }): Promise<TreeSnapshot> => {
+  snapshotTree: async (cwd: string, _signal: AbortSignal, options?: { lowPriority?: boolean }): Promise<TreeSnapshot> => {
     state.snapshots++;
     state.snapshotPriorities.push(options?.lowPriority);
     if (state.snapshotThrows) throw new Error("git status failed");
+    // Outside the project (another repository): its own, clean tree.
+    if (relative(state.root, cwd).startsWith("..")) return { cwd, root: cwd, head: "a".repeat(40), fingerprint: "other", dirty: false, files: [] };
     return { cwd: state.root, root: state.root, head: "a".repeat(40), fingerprint: state.treeFiles.length === 0 ? "now" : `now${state.treeFiles.length}`, dirty: true, files: [...state.treeFiles] };
   },
 }));
@@ -916,6 +919,47 @@ describe("router_verify edge cases (2.4.6)", () => {
     expect(report.text).not.toContain(`- ${bad} \u00b7 work a \u00b7 pass`);
   });
 
+  it("QA-3.1-2: a deferred dispatch that overlapped others in its tree is still a fail, and its rejection names them", async () => {
+    exactReference();
+    state.failing = { a: ["t2"] };
+    const { wiring } = makeWiring();
+    const store = createChangedFileStore();
+    const finish = async (id: string, x: string) => {
+      const f = await wiring.finishDeferred(store, { dispatchID: id, orchestratorSessionID: "orch", producerSessionID: `child-${id}`, producerTier: "fast", description: `work ${x}`, cwd: state.root, dod: DOD, dispatchedAt: 0 });
+      if (!f.deferred) throw new Error(f.detail);
+      return f.handle;
+    };
+    await wiring.startDispatch(store, "task:orch:a", state.root, DOD, "", false);
+    await wiring.startDispatch(store, "task:orch:b", state.root, DOD, "", false);
+    // c overlaps a and b, and ends (its required gate cleared it) before a returns: still counted.
+    await wiring.startDispatch(store, "task:orch:c", state.root, DOD, "", false);
+    store.clear("task:orch:c");
+    // Another git tree does not count.
+    await wiring.startDispatch(store, "task:orch:elsewhere", tmpdir(), DOD, "", false);
+    state.treeFiles = [{ path: src("a"), status: " M" }];
+    const a = await finish("task:orch:a", "a");
+    expect(wiring.pending.get("orch", a)).toMatchObject({ kind: "found", entry: { concurrentDispatches: 2 } });
+    const report = await wiring.verifyHandles("orch", { kind: "handles", handles: [a] });
+    const item = verdictOf(report.items[0]);
+    expect(item.result.verdict.outcome).toBe("fail");
+    expect(item.result.introduced?.length).toBe(1);
+    expect(item.result.verdict.reasons).toContain(concurrentDispatchesCaveat(2));
+    expect(report.text).toContain(`- ${concurrentDispatchesCaveat(2)}`);
+
+    // Alone in the tree: the same fail without the caveat.
+    store.clear("task:orch:b");
+    store.clear("task:orch:elsewhere");
+    // a's record goes once its reference settled (finishDeferred).
+    await vi.waitFor(() => expect(store.baselineSnapshot("task:orch:a")).toBeUndefined());
+    state.treeFiles = [];
+    await wiring.startDispatch(store, "task:orch:solo", state.root, DOD, "", false);
+    state.treeFiles = [{ path: src("a"), status: " M" }];
+    const solo = await finish("task:orch:solo", "a");
+    const alone = verdictOf((await wiring.verifyHandles("orch", { kind: "handles", handles: [solo] })).items[0]);
+    expect(alone.result.verdict.outcome).toBe("fail");
+    expect(alone.result.verdict.reasons.join(" ")).not.toContain("concurrently");
+  });
+
   it("QA-3.1-8: router_verify's current-tree snapshot runs its git at the configured priority", async () => {
     const low = makeWiring();
     await low.wiring.verifyHandles("orch", { kind: "handles", handles: [await register(low.wiring.pending, "a")] });
@@ -1475,5 +1519,47 @@ describe("the router_verify tool (2.4.3b)", () => {
     expect(out).toContain(`- ${noRef} \u00b7 work b \u00b7 unverifiable (cached verdict; nothing was run)`);
     expect(state.runs.length).toBe(runs);
     expect((await system()).some(s => s.startsWith("[router] Unverified delegations"))).toBe(false);
+  });
+
+  it("QA-3.1-2: a required native task rejected over introduced failures names the concurrent delegations in its tree; still NOT ACCEPTED", async () => {
+    exactReference();
+    // t2 of a.test.ts fails now but not at the reference: introduced.
+    state.failing = { a: ["t2"] };
+    const { hooks } = await makePlugin();
+    const prompt = `VERIFY:required\nImplement it.\n[acceptance]\ncheck: testsPass command="npm test"\n[/acceptance]`;
+    const task = (callID: string) => {
+      const input = { tool: "task", sessionID: "orch", callID, args: { subagent_type: "fast", prompt, description: `work ${callID}` } };
+      return { input, before: { args: { ...input.args } } };
+    };
+    const after = async (t: ReturnType<typeof task>, child: string): Promise<string> => {
+      const output = { output: "<task_result>\nDONE\n</task_result>", metadata: { sessionId: child } };
+      await hooks["tool.execute.after"]({ ...t.input, args: t.before.args }, output);
+      return output.output;
+    };
+    // Two parallel dispatches on one working tree; the tree then holds src/a.ts changed.
+    const c1 = task("c1");
+    const c2 = task("c2");
+    await hooks["tool.execute.before"](c1.input, c1.before);
+    await hooks["tool.execute.before"](c2.input, c2.before);
+    state.treeFiles = [{ path: src("a"), status: " M" }];
+    const caveat = concurrentDispatchesCaveat(1);
+    const first = await after(c1, "child1");
+    expect(first).toContain("[router \u26a0 NOT ACCEPTED]");
+    expect(first).toContain("introduced failures");
+    expect(first).toContain(`- ${caveat}`);
+    // c1's gate cleared its record; it still overlapped c2's window.
+    const second = await after(c2, "child2");
+    expect(second).toContain("[router \u26a0 NOT ACCEPTED]");
+    expect(second).toContain(`- ${caveat}`);
+
+    // Control: a dispatch alone in the tree is rejected without the caveat.
+    state.treeFiles = [];
+    const c3 = task("c3");
+    await hooks["tool.execute.before"](c3.input, c3.before);
+    state.treeFiles = [{ path: src("a"), status: " M" }];
+    const alone = await after(c3, "child3");
+    expect(alone).toContain("[router \u26a0 NOT ACCEPTED]");
+    expect(alone).toContain("introduced failures");
+    expect(alone).not.toContain("concurrently");
   });
 });

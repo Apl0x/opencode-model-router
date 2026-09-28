@@ -140,12 +140,27 @@ export function extractChangedFile(tool: string, args: unknown): ChangedFile | n
   return { path, status };
 }
 
+/**
+ * QA-3.1-2: one dispatch's lifetime, from beginDispatch until its record is dropped. Two windows
+ * overlap exactly when one dispatch begins while the other is live, so beginDispatch links the new
+ * window with every live one, and a dropped window keeps being counted by the live ones it overlapped.
+ */
+interface DispatchWindow {
+  readonly cwd: string;
+  /** The git top-level (TreeSnapshot.root) once the dispatch snapshot settled with one. */
+  root?: string;
+  /** The other windows that overlapped this one; emptied when this dispatch is dropped. */
+  readonly overlapping: Set<DispatchWindow>;
+}
+
 /** One tracked dispatch: its change baseline and its reference (T2 P0). */
 interface DispatchRecord {
   cwd: string;
   snapshotPending: boolean;
   /** An overlapping edit was observed while the snapshot was in flight: the snapshot is discarded. */
   snapshotContaminated: boolean;
+  /** QA-3.1-2: this dispatch's lifetime, for concurrentDispatches. */
+  window: DispatchWindow;
   snapshot?: TreeSnapshot;
   capturePending: boolean;
   /** An overlapping edit was observed while the capture was in flight: the reference is none. */
@@ -197,6 +212,18 @@ export function createChangedFileStore(options: ChangedFileStoreOptions = {}) {
     }
   }
 
+  /**
+   * QA-3.1-2: whether `w`'s dispatch worked in the git tree at `at`. Two known git roots must be the
+   * same; when either is unknown (a snapshot that found none: its cwd stands in), a directory that
+   * is the other, inside it or above it counts. Over-counting only adds a caveat.
+   */
+  function onRoot(w: DispatchWindow, at: string, atIsRoot: boolean): boolean {
+    const key = pathKey(at);
+    if (w.root !== undefined && atIsRoot) return pathKey(w.root) === key;
+    const its = pathKey(w.root ?? w.cwd);
+    return its === key || its.startsWith(key + "/") || key.startsWith(its + "/");
+  }
+
   function touch(sessionID: string): void {
     lastTouch.set(sessionID, now());
   }
@@ -217,7 +244,11 @@ export function createChangedFileStore(options: ChangedFileStoreOptions = {}) {
     for (const d of dispatches.values()) if (d.producers.has(sessionID)) fold(d, sessionID);
     bySession.delete(sessionID);
     lastTouch.delete(sessionID);
-    dispatches.get(sessionID)?.captureController.abort();
+    const d = dispatches.get(sessionID);
+    d?.captureController.abort();
+    // QA-3.1-2: the live windows it overlapped keep counting it; its own list is no longer needed
+    // (and would otherwise chain every dropped window to the next).
+    d?.window.overlapping.clear();
     dispatches.delete(sessionID);
   }
 
@@ -233,6 +264,12 @@ export function createChangedFileStore(options: ChangedFileStoreOptions = {}) {
       const existing = dispatches.get(id);
       if (existing) return existing.settled;
       bySession.delete(id);
+      const window: DispatchWindow = { cwd, overlapping: new Set() };
+      // QA-3.1-2: every live dispatch overlaps this one's window, and this one overlaps theirs.
+      for (const other of dispatches.values()) {
+        window.overlapping.add(other.window);
+        other.window.overlapping.add(window);
+      }
       const d: DispatchRecord = {
         cwd, snapshotPending: true, snapshotContaminated: false,
         capturePending: deps.capture !== undefined, captureContaminated: false,
@@ -241,6 +278,7 @@ export function createChangedFileStore(options: ChangedFileStoreOptions = {}) {
         ready: Promise.resolve(), settled: Promise.resolve(),
         // The delegate ladder's dispatch id is its first producer session.
         producers: new Set([id]), observed: new Map(),
+        window,
       };
       dispatches.set(id, d);
       d.ready = (async (): Promise<void> => {
@@ -254,6 +292,8 @@ export function createChangedFileStore(options: ChangedFileStoreOptions = {}) {
           d.snapshotPending = false;
           controller.abort();
         }
+        // A discarded snapshot still tells which git tree the dispatch works in (QA-3.1-2).
+        if (snapshot?.root !== undefined) window.root = snapshot.root;
         if (snapshot && !d.snapshotContaminated && dispatches.get(id) === d) d.snapshot = snapshot;
       })();
       const capture = deps.capture;
@@ -380,6 +420,19 @@ export function createChangedFileStore(options: ChangedFileStoreOptions = {}) {
     /** The dispatch-time snapshot (QA-2.1-2: the gate digests its listed paths); undefined until settled. */
     baselineSnapshot(id: string): TreeSnapshot | undefined {
       return dispatches.get(id)?.snapshot;
+    },
+    /**
+     * QA-3.1-2: how many other dispatches were live at some moment of this one's window so far and
+     * work in the git tree at `root` (default: this dispatch's own root, else its cwd). Their edits
+     * land in the same working tree, so they are part of this dispatch's tree delta. 0 when untracked.
+     */
+    concurrentDispatches(id: string, root?: string): number {
+      const d = dispatches.get(id);
+      if (!d) return 0;
+      const known = root ?? d.window.root;
+      let count = 0;
+      for (const w of d.window.overlapping) if (onRoot(w, known ?? d.cwd, known !== undefined)) count += 1;
+      return count;
     },
     record(sessionID: string, tool: string, args: unknown): void {
       touch(sessionID);

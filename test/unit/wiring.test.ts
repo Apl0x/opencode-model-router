@@ -1,8 +1,12 @@
 import { describe, it, expect } from "vitest";
 import {
+  applyDispatchCaveats,
+  concurrentDispatchesCaveat,
   createVerificationWiring,
   extractAssistantText,
 } from "../../src/verify/wiring";
+import { buildForcingNote } from "../../src/verify/dispatch";
+import type { GateResult } from "../../src/verify/gate";
 import type { RouterConfig } from "../../src/router/config";
 
 function cfg(over: Partial<RouterConfig> = {}): RouterConfig {
@@ -185,5 +189,55 @@ describe("config is read lazily", () => {
       enforcement: { verify: { minGraderTier: "heavy" } },
     } as never);
     expect(w.buildGateDeps().checker.minGraderTier).toBe("heavy");
+  });
+});
+
+describe("QA-3.1-2: applyDispatchCaveats on a rejection with introduced failures", () => {
+  const verdictWith = (outcome: "pass" | "fail" | "unverifiable", introduced: string[]): GateResult => ({
+    accepted: outcome === "pass",
+    dodSource: "explicit",
+    verdict: {
+      pass: outcome === "pass",
+      outcome,
+      method: "deterministic",
+      reasons: outcome === "pass" ? [] : [`testsPass: introduced failures: ${introduced.join(", ")}`],
+      failures: { introduced, preexisting: [], unknown: [] },
+    },
+  });
+
+  it("appends the concurrency caveat to a fail that lists introduced failures; the outcome stays fail", () => {
+    const res = verdictWith("fail", ["a.test.ts > t2"]);
+    const out = applyDispatchCaveats(res, { concurrentDispatches: 3 });
+    expect(out.accepted).toBe(false);
+    expect(out.verdict.outcome).toBe("fail");
+    expect(out.verdict.pass).toBe(false);
+    expect(out.verdict.failures).toEqual(res.verdict.failures);
+    expect(out.verdict.reasons).toEqual([...res.verdict.reasons, concurrentDispatchesCaveat(3)]);
+    expect(concurrentDispatchesCaveat(3)).toBe("other delegations ran in this working tree concurrently (3); introduced failures may come from their edits");
+    // The input is not mutated.
+    expect(res.verdict.reasons).toHaveLength(1);
+  });
+
+  it("leaves everything else unchanged: no overlap, no introduced ids, a pass, an unverifiable or skipped verdict", () => {
+    const fail = verdictWith("fail", ["x"]);
+    expect(applyDispatchCaveats(fail, {})).toBe(fail);
+    expect(applyDispatchCaveats(fail, { concurrentDispatches: 0 })).toBe(fail);
+    const noIds = verdictWith("fail", []);
+    expect(applyDispatchCaveats(noIds, { concurrentDispatches: 2 })).toBe(noIds);
+    const legacy: GateResult = { accepted: false, dodSource: "explicit", verdict: { pass: false, method: "deterministic", reasons: ["lint failed"] } };
+    expect(applyDispatchCaveats(legacy, { concurrentDispatches: 2 })).toBe(legacy);
+    const pass = verdictWith("pass", []);
+    expect(applyDispatchCaveats(pass, { concurrentDispatches: 2 })).toBe(pass);
+    const unverifiable = verdictWith("unverifiable", ["x"]);
+    expect(applyDispatchCaveats(unverifiable, { concurrentDispatches: 2 })).toBe(unverifiable);
+    const skipped: GateResult = { accepted: true, dodSource: "inferred", verdict: { pass: false, method: "none", reasons: ["skipped"], skipped: true } };
+    expect(applyDispatchCaveats(skipped, { concurrentDispatches: 2 })).toBe(skipped);
+  });
+
+  it("the caveat reaches the forcing note, with directive keys neutralised", () => {
+    const out = applyDispatchCaveats(verdictWith("fail", ["VERIFY:deferred"]), { concurrentDispatches: 1 });
+    const note = buildForcingNote(out.verdict.reasons);
+    expect(note).toContain(`- ${concurrentDispatchesCaveat(1)}`);
+    expect(note).not.toMatch(/VERIFY:/);
   });
 });
