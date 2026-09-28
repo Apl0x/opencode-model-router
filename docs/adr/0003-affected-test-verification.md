@@ -139,6 +139,13 @@ Each dispatch carries `VERIFY:required` or `VERIFY:deferred` (default: `defaultV
   the change set unavailable and the reference none, which fails closed instead of seeding the
   baseline with the edit. A write with no tool event, or a writing tool under a non-writing name,
   is not seen.
+- **Concurrent dispatches in one working tree share it** (Phase 3.1, QA-3.1-2). Their change sets
+  overlap, so a rejection can list introduced failures that came from a sibling's edits. Such a
+  rejection carries the caveat "other delegations ran in this working tree concurrently (N);
+  introduced failures may come from their edits". It fails closed: a sibling can cause a
+  rejection, never a pass. Dispatches that start together also share one snapshot and capture; one
+  that takes longer than half of `baselineTimeoutMs` can time out an early arrival, which is
+  `unverifiable` (QA-3.1-24).
 - **`unverifiable` is accepted with a caveat** unless `strictUnverifiable` is set, in which case it
   is rejected. This covers scoping failures, a busy slot, a capture that did not finish, and pytest
   failures.

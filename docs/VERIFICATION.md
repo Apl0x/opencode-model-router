@@ -251,6 +251,12 @@ While a dispatch's tree snapshot or reference capture is still in flight (a `VER
 
 Residual limits: a write with no tool event (an external editor, an MCP server that writes after its call returned, the user's own `!` shell) cannot be seen by any hook. A tool that writes under a non-writing name (for example a custom tool called `lsp`) is not caught.
 
+Dispatches that start together share their snapshot and capture (one run per key: directory, priority, `baselineTimeoutMs`). A dispatch that arrives just after a run started waits for that run and then its own, while its timeout counts from its own request; when one snapshot or capture takes longer than half of `baselineTimeoutMs`, such an early arrival can time out first. That fails closed: no change baseline, reference none, verdict `unverifiable` (QA-3.1-24).
+
+### Concurrent dispatches in one working tree
+
+Delegations that run at the same time in one working tree share that tree. Their change sets overlap: each dispatch's changed files can include a sibling's edits, and a failure a sibling introduced reads as introduced by this one. A rejection that lists introduced failures while other delegations overlapped it carries the caveat `other delegations ran in this working tree concurrently (N); introduced failures may come from their edits`. This fails closed: a sibling's breakage can reject a delegation, never make a broken one pass. Use separate worktrees for delegations that must be judged in isolation (QA-3.1-2).
+
 ### Process limits (all platforms)
 
 - **Unhandled signals.** Runs still in flight when opencode exits are killed from a `process.once("exit")` hook. Death by an unhandled signal (SIGTERM, SIGHUP, Ctrl-C, per the host's policy) skips that hook on every platform, POSIX process groups included, so those runs are not killed by the router.
