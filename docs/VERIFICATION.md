@@ -235,8 +235,14 @@ By default an unverifiable result is **accepted with a caveat** that names the r
 pytest has no related-tests mode, so the planner maps changed files to test files itself (Phase 3.1, E2E-1):
 
 - A changed test file is an input itself.
-- A changed module maps to the test files that name its stem as a **whole word** (a `git grep -F -w` content search over the `python_files` patterns), joined with the tests named after it (`test_<stem>.py`, `<stem>_test.py`). Every import spelling contains the stem as a whole word: `import app.mod02`, `from app.mod02 import x`, `from app import mod02`, `from .mod02 import x`. A longer name such as `mod020` does not match.
-- It fails closed. When no in-scope test maps to a changed module, or a `conftest.py` names it (its fixtures reach tests that never name the module), the check is unverifiable with S6 `unmapped-module`. One unmapped module makes the whole change unverifiable. A failed search is S6 `search-failed`.
+- A changed module maps to the test files that **import** it, joined with the tests named after it (`test_<stem>.py`, `<stem>_test.py`). The importers come from one `git grep -E` content search over the `python_files` patterns and `conftest.py`. It looks for import-shaped lines for the module's dotted path `<package>.<stem>`, where `<package>` is the name of the module's directory (QA-G-2):
+  - `import app.mod02`, `from app.mod02 import x`, or any other `app.mod02` reference;
+  - `from app import mod02` / `from .app import x, mod02`, including one name per line of a parenthesised or backslash-continued list;
+  - `from .mod02 import x`, `from . import mod02`, and `from .. import mod02`;
+  - `import mod02` and `from mod02 import x`, but only when the module's directory has no `__init__.py`, so the module may be importable by its bare name.
+
+  A longer name such as `mod020` does not match. A module named like its package (`app/app.py`) no longer maps to every `from app.modNN import …` test. A package's `__init__.py` runs on any import of the package or its submodules, so it keeps the whole-word search for the package name (`git grep -F -w`).
+- It fails closed. When no in-scope test maps to a changed module, or a `conftest.py` imports it (its fixtures reach tests that never name the module), the check is unverifiable with S6 `unmapped-module`. More than 20 importing test files (`STEM_MATCH_LIMIT`) give S6 `stem-too-common` rather than a near-full suite. One unmapped module makes the whole change unverifiable. A failed search is S6 `search-failed`.
 - When `testpaths` decides the collection (no path argument, pytest started in its rootdir, every config sets `testpaths`, no `-o testpaths=`, `--pyargs` or `--rootdir`, plain entries only), only tests under it are inputs. In any other case every test under the runner directory is a candidate: an extra input can add a failure, never hide one.
 
 Residual limits: only **direct** importers run. A test that reaches the changed module only through another source module (`app/mod02.py` importing `app/mod01.py`) or a dynamic import is not run, and the scope can pass without it. A change to non-`.py` files alone (a data file a module reads, `.pyi`, `.pyx`, a binary extension) still gives "no affected tests".

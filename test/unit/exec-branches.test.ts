@@ -4,7 +4,7 @@ import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "no
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { KILL_GRACE_MS, SWEEP_TIMEOUT_MS, runArgv, setSweeperExecutableForTests, trackingForTests } from "../../src/verify/exec";
+import { KILL_GRACE_MS, SWEEP_TIMEOUT_MS, runArgv, runShell, setSweeperExecutableForTests, trackingForTests } from "../../src/verify/exec";
 
 // Branches of src/verify/exec.ts that test/unit/exec.test.ts reaches only in a
 // separate host process (test/fixtures/exec/host.mjs), where coverage is not
@@ -263,6 +263,20 @@ describe.runIf(isWin)("orphan sweep branches (Windows-only: the sweeper runs onl
     expect(r.code).not.toBe(0);
     expect(state.taskkillFails).toBe(false);
     expect(Date.now() - start).toBeLessThan(KILL_GRACE_MS + 5000);
+  }, 20_000);
+});
+
+describe.runIf(!isWin)("QA-G-5: a normal exit ends what the run left in its process group (POSIX)", () => {
+  it.each([false, true])("a passing command's background grandchild is dead within 3 s of the settle (lowPriority %s)", async (lowPriority) => {
+    const r = await runShell("sleep 30 >/dev/null 2>&1 & echo $!", { cwd: tmpdir(), timeoutMs: 20_000, lowPriority });
+    expect(r).toMatchObject({ code: 0, stderr: "", timedOut: false });
+    const grandchild = Number(r.stdout.trim());
+    expect(grandchild).toBeGreaterThan(0);
+    try {
+      expect(await waitFor(() => !alive(grandchild), 3000)).toBe(true);
+    } finally {
+      if (alive(grandchild)) process.kill(grandchild);
+    }
   }, 20_000);
 });
 

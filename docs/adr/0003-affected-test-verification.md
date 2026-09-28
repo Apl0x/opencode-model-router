@@ -165,6 +165,10 @@ Each dispatch carries `VERIFY:required` or `VERIFY:deferred` (default: `defaultV
   - The orphan sweeper needs PowerShell in FullLanguage mode; under Constrained Language Mode
     (AppLocker/WDAC) it exits at once and kills nothing.
   - `taskkill` slowed by CPU saturation can leave part of a tree running.
+  - What a command that exits normally leaves running is not swept (QA-G-5): the orphan sweep
+    costs a PowerShell start per run, so it runs only for a deadline or an abort. Such a leftover
+    runs outside the verification slot. On POSIX the run's process group is killed when the run
+    settles; only a descendant that left the group (`setsid`) survives there.
   - `lowPriority` is applied just after spawn; a descendant spawned before that call (a narrow
     race) runs at normal priority.
 - **Unhandled signals (all platforms).** Death of opencode by an unhandled signal skips the exit
