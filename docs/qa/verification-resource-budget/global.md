@@ -636,3 +636,137 @@ QA-G-19 … QA-G-21 also predate 2d8df09.
 - QA-G-20 Resolution: 68edf52 — a deleted or renamed-away pytest test file (not `__init__.py`, which is always a gone module) keeps its note and is searched by its module name as a whole word over the test globs and `conftest.py`: in-scope importers join the inputs, a conftest hit is S6 `unmapped-module`, more than `STEM_MATCH_LIMIT` is S6 `stem-too-common`, and no hit keeps today's note-only result. Each counts as a pending search (planStaticScoping now returns `{scopable: true, pendingSearches: 1}` instead of NoAffected; more than `SEARCH_LIMIT` is S6 `too-many-searches`). Tests: X3 (rename, `test_base_case` decoy not selected), X3b with `import test_base`, `from tests.test_base import`, `from .test_base import`, the nothing-names-it NoAffected, conftest, limit, search failure, static scoping and SEARCH_LIMIT, treeSearch and real git. On the pre-fix `src`: `expected [ '/r/tests/test_a.py' ] to deeply equal [ '/r/tests/test_a.py', …(1) ]` and `expected { noAffected: true, …(1) } to deeply equal { scopable: true, …(3) }`. Real pytest: X3 4d38e63 `["tests/test_a.py"]` scoped `exit=0`, 68edf52 `["tests/test_a.py","tests/test_b.py"]` scoped `exit=2 … No module named 'test_base'`; X3b 4d38e63 `noAffected`, 68edf52 `["tests/test_b.py"]` scoped `exit=2`.
 - QA-G-21 Resolution: 68edf52 — a deleted `__init__.py` keeps its package-name search and also lists its directory through a new `TestSearchSeam.listFiles` (`git ls-files -z --cached --others --exclude-standard -- :(literal)<dir>`, `.` at the root): a `conftest.py` there is S6 `unmapped-module`; every in-scope test file at any depth joins the inputs, with every in-scope test file of the same basename (`findByName`), since pytest's prepend import mode renames `tests/pkg/test_x.py` to `test_x` and it can collide ("import file mismatch"); more than `STEM_MATCH_LIMIT` is S6 `stem-too-common`; a failed listing or name search is S6 `search-failed`. Tests: X4, X4 without the decoy, subdirectories and a namesake, out-of-scope `app/test_in.py` excluded, the root listing, `python_files = *.py`, conftest, both limits, both failures, treeSearch and real git (`tests/pkgutil` not listed); baseline-wiring covers the argv, the failure mapping and a real `ls-files` (untracked and empty files listed, ignored ones and `tests/pkgutil` not, `tests/p[k]g` literal). On the pre-fix `src`: `expected [ '/r/tests/test_other.py' ] to deeply equal [ '/r/tests/pkg/test_rel.py', …(1) ]`. Real pytest: X4 4d38e63 `["tests/test_other.py"]` scoped `exit=0`, 68edf52 `["tests/pkg/test_rel.py","tests/test_other.py"]` scoped `exit=2 … attempted relative import with no known parent package`; without the decoy 4d38e63 S6 `deleted-no-tests`, 68edf52 `["tests/pkg/test_rel.py"]` scoped `exit=2`; the namesake case (`tests/pkg/test_mod01.py` beside `tests/test_mod01.py`) 4d38e63 `["tests/pkg/test_mod01.py"]` scoped `exit=0`, 68edf52 both files, scoped `exit=2 … import file mismatch`, as the full run.
 - Verification for 68edf52: `npx vitest run --maxWorkers=2 --coverage --coverage.include=src/verify/runner.ts test/unit/runner.test.ts test/unit/baseline-wiring.test.ts` → `Test Files  2 passed (2)` / `Tests  806 passed (806)`, runner.ts `99.33 | 97.87 | 100 | 99.89` (statements, branches, functions, lines); `test/unit/tests-pass-pipeline.test.ts` → `Tests  119 passed (119)`; `npm run typecheck` clean. Five existing assertions that pinned the old deleted-module argv (the test globs without `conftest.py`) now pin the new one. No assertion was removed.
+
+---
+
+## Final verification (QA-G-18..21)
+
+**Scope.** `git diff 4d38e63..7f4798d`. This covers 68edf52: the pytest deleted-file paths of `classify` and the new
+required `TestSearchSeam.listFiles`, which the wiring implements as `git ls-files … -- :(literal)<dir>`. It also
+covers the docs commit 7f4798d. The attack had four goals:
+
+- (a) a false pass that the diff introduces;
+- (b) a regression against 4d38e63 in a case that 4d38e63 handled correctly;
+- (c) pathspec problems in `listFiles`;
+- (d) a production `TestSearchSeam` that has no `listFiles`.
+
+It also checked whether the tests that now expect the new search arguments were weakened.
+
+**Verdict: NOT CLEAN.** 68edf52 introduces two false passes, and both are confirmed with real pytest. In each one a
+deleted `__init__.py` used to give S6 `deleted-no-tests` at 4d38e63. 68edf52 turns that into a passing spec that
+misses a test the full run fails:
+
+- QA-G-22: the directory's modules shadow other modules on `sys.path`.
+- QA-G-23: the `listFiles` pathspec is case-sensitive.
+
+Two further findings are minor: QA-G-24 predates the diff, and QA-G-25 covers fail-closed regressions. Items (c) and (d)
+are clean, and no test was weakened.
+
+### Method
+
+- `npx vitest run --maxWorkers=2 test/unit/runner.test.ts test/unit/baseline-wiring.test.ts test/unit/tests-pass-pipeline.test.ts`
+  → `Test Files  3 passed (3)` / `Tests  925 passed (925)` (Duration 16.40s).
+- A scratch harness in `%TEMP%` (Bun 1.3.14) was deleted afterwards. Before the removal it held no reparse point,
+  and no process was left over. The harness worked as follows:
+  - It ran the real `planScopedRun` (`uv run pytest`) from `git archive 4d38e63 src` and from
+    `git archive 7f4798d src`.
+  - It used the wiring's exact argv for `findByName`, `findByContent` and `listFiles`, with the real worktree as
+    the fs seam.
+  - The repositories were real (Git for Windows 2.51.0, `core.ignorecase=true`).
+  - Each case ran under pytest 9.0.2 on Python 3.13.11
+    (`uv run --no-project --with pytest python -m pytest -q -p no:cacheprovider`), once as the full run and once
+    per planned input set.
+
+### (a) and (b): cases
+
+In the table, "full" is the full pytest run and "scoped" is the run of the planned inputs.
+
+| Case | 4d38e63 | 7f4798d | pytest |
+|---|---|---|---|
+| **G23** (QA-G-22): `tests/pkg/__init__.py` deleted, with no decoy | S6 `deleted-no-tests … "pkg"` | `SPEC inputs=["tests/pkg/test_p.py"]` | full `exit=1 AttributeError: module 'utils' has no attribute 'f' \| FAILED tests/test_uses.py::test_u`. Scoped `exit=0 1 passed`. |
+| G23 control: `__init__.py` kept, `test_p.py` edited | `["tests/pkg/test_p.py"]` | same | full `exit=0 2 passed` |
+| G23 with the `tests/test_other.py` decoy (`import pkgutil`) | `["tests/test_other.py"]` | `["tests/pkg/test_p.py","tests/test_other.py"]` | full `exit=1` (as G23). Scoped `exit=0` at both commits: the class predates the diff. |
+| G23 with a subpackage: `tests/api/helpers/` over `src/helpers/`, `tests/api/__init__.py` deleted | `["tests/api/test_api.py"]` | same | full `exit=2 ImportError: cannot import name 'f' from 'helpers' (…tests\api\helpers\__init__.py)`. Scoped `exit=0` at both commits: the substring `api` in the test's own name acts as the decoy. |
+| **Case drift** (QA-G-23): `tests/pkg` renamed on disk to `tests/Pkg`, `__init__.py` deleted, untracked `tests/Pkg/test_new.py` | S6 `deleted-no-tests … "Pkg"` | `SPEC inputs=["tests/Pkg/test_new.py"]` | full `exit=2 ImportError: attempted relative import with no known parent package \| ERROR tests/Pkg/test_rel.py`. Scoped `1 passed`. |
+| Case drift without the untracked test | S6 `deleted-no-tests` | S6 `deleted-no-tests` | — |
+| **G22** (QA-G-24): `app/__init__.py` holds `from .index import VERSION`; `app/tests/test_models.py` holds `from ..models import X`; the decoy `tests/test_util.py` holds `.index(`; `app/index.py` deleted | `["tests/test_util.py"]` | same | full `exit=2 ModuleNotFoundError: No module named 'app.index' \| ERROR app/tests/test_models.py`. Scoped `exit=0` at both commits. |
+| G22 without the decoy | S6 `deleted-no-tests` | S6 `deleted-no-tests` | — |
+| Two-level re-export: `app/__init__.py` holds `from .sub import V`, and `app/sub/__init__.py` holds `from .index import V` | `["tests/test_util.py"]` | same | full `exit=2`, scoped `exit=0`. A documented residual: only one `__init__.py` level is followed. |
+| Deleted `tests/test_base.py` that only `tests/support.py` imports; `test_y.py` imports `support` | NoAffected | NoAffected | full `exit=2 No module named 'test_base'`. A documented residual: the test reaches the file only through another module. |
+| `app/session.py` deleted; `tests/conftest.py` holds `@pytest.fixture(scope="session")` | `["tests/test_session_notes.py"]` | S6 `unmapped-module … tests/conftest.py references "session"` | full `exit=0 2 passed`, scoped (4d38e63) `exit=0`. QA-G-25. |
+| `app/helpers.py` deleted; `tests/conftest.py` mentions "helpers" in a comment | `["tests/test_notes.py"]` | S6 `unmapped-module` | full `exit=0`. QA-G-25. |
+| 51 unreferenced test files deleted (`tests/legacy/`) | NoAffected | S6 `too-many-searches: … 51 test searches (limit 50)` | QA-G-25. VERIFICATION.md documents it. |
+
+For deleted non-`__init__` modules and deleted test files, the new code only adds inputs or returns S6.
+
+- The gone-module content search keeps its old globs and adds `conftest.py` as one more pathspec.
+- The name search is unchanged.
+- `reExporters`, `packageTests` and the gone-test search only add inputs or return S6.
+
+So the only new false passes are the deleted-`__init__.py` conversions from S6 to a spec above.
+
+### (c) `listFiles` pathspecs
+
+**Real planner.** The planner ran at 7f4798d. Each directory had a deleted `__init__.py`, a `test_in<i>.py` that
+holds `from . import helper`, and a `sub/test_deep<i>.py`. Decoy directories were `tests/p`, `tests/k`, `tests/pkg`,
+`tests/pkg!x`, `tests/p k g2` and `tests/-pkgx`. Every one of the following directories gave exactly its own two tests:
+
+- `tests/[pkg]`, `tests/p k g`, `tests/-pkg`, `tests/pkgé`, `tests/日本`, `tests/(pkg)`;
+- `tests/pkg!`, `tests/a,b`, `tests/%x%`, `tests/(literal)y`;
+- `-root` at the git root.
+
+**Index-only probe** (`update-index --cacheinfo`, `-c core.protectNTFS=false`, for names that NTFS cannot hold):
+
+- `:(literal)tests/p*g` → `tests/p*g/test_a.py`. It does not return `tests/pXg`.
+- `tests/p?g`, `tests/a:b` and `:x` each list only themselves.
+- The pathspec always starts with `:(literal)` and follows `--`, so neither magic nor an option can be injected.
+
+**Environment variables.**
+
+- `GIT_LITERAL_PATHSPECS=1` → `[]`. Every search then matches nothing. A deleted `__init__.py` gives S6
+  `deleted-no-tests`, and a deleted test file keeps the note-only result it had at 4d38e63, so this adds no new
+  false pass.
+- `GIT_GLOB_PATHSPECS=1`: `:(literal)` still wins.
+- `GIT_ICASE_PATHSPECS=1` gives a superset.
+
+**Case.** Without icase, `:(literal)tests/PKG` → `[]` against the index entry `tests/pkg/test_f.py`, even with
+`core.ignorecase=true`. This is QA-G-23.
+
+### (d) Production seams and tests
+
+- **Production seams.** Only `testSearch` in `createVerificationWiring` (wiring.ts:1093) builds a `TestSearchSeam`.
+  It serves the direct hook (wiring.ts:1276) and the batch planner (wiring.ts:1293), and both have `listFiles`.
+  `planStaticScoping` (wiring.ts:1498, pending.ts) passes no search.
+- **A seam without `listFiles`.** Planning a deleted `__init__.py` with it rejects:
+  `search.listFiles is not a function`. Both callers fail closed:
+  - The direct hook maps a planner rejection to `{ kind: "error" }` (deterministic.ts:1330-1333). types.ts:199
+    says "Fail-closed: never a pass".
+  - The batch path maps it to `errorRun("scoped run planning failed: …")` (batch.ts:1773-1777).
+
+  The member is required, so a new implementer fails `tsc`.
+- **Tests.** The `-` lines in `test/` show no weakening:
+  - Five `toHaveBeenCalledWith` assertions are replaced one for one by the new exact argv
+    (`[...PY_TEST_GLOBS, ":(glob)**/conftest.py"]` and `[":(glob)**/*.py", ":(glob)**/check_*.py", ":(glob)**/conftest.py"]`).
+    They are still exact matchers.
+  - Six inline seam literals gain `listFiles`. Four seam helpers add it too: `stubSearch` (a third parameter),
+    `treeSearch`, `withGitTree` and the pipeline seam.
+  - No `expect` is removed, and 58 `expect` lines are added.
+  - `deleted test file -> note` (runner.test.ts:953) still asserts the exact NoAffected.
+
+  Not weakened.
+- **Repros not re-run.** The X1–X4 repros are covered by the passing runner tests, including the real-git
+  `withGitTree` runs. They were not re-run against pytest in this round.
+
+### Final findings
+
+| ID | Severity | Evidence | Fix |
+|---|---|---|---|
+| QA-G-22 | critical | **A deleted test-package `__init__.py` puts its directory on `sys.path`, and its modules shadow same-named modules for tests outside it. 68edf52 turns the old S6 into a spec that misses those tests.**<br>**Setup:** `pytest.ini` holds `pythonpath = src`, and `src/utils.py` defines `f`. `tests/pkg/__init__.py` is deleted. `tests/pkg/utils.py` defines only `g`, and `tests/pkg/test_p.py` holds `assert True`. `tests/test_uses.py` holds `import utils` and `assert utils.f() == 1`.<br>**At 4d38e63:** S6 `deleted-no-tests`.<br>**At 7f4798d:** `SPEC inputs=["tests/pkg/test_p.py"]`. The scoped run gives `exit=0`, but the full run gives `exit=1 AttributeError: module 'utils' has no attribute 'f'`. With `__init__.py` kept, the full run gives `exit=0`.<br>**Cause:** prepend mode now imports `test_p` as a top-level module and inserts `tests/pkg` at `sys.path[0]`. pytest ≥ 8 sorts files and directories together, so `tests/pkg` is collected before `tests/test_uses.py`, and `import utils` finds `tests/pkg/utils.py` ahead of `src`. A subpackage does the same (`tests/api/helpers/`).<br>**Scope:** with a decoy, both commits pass, so the class predates the diff. The no-decoy conversion is new.<br>**Preconditions:** a module or subpackage in the directory is named like a top-level module that another test imports and that is found later on `sys.path` (`pythonpath`, rootdir, site-packages). | For a deleted `__init__.py`, take each name the directory now exposes: every direct `*.py` except `__init__.py`, and every direct subdirectory (read from the listing). Search each name as a whole word over the test globs and `conftest.py` (`goneImporters`). Hits join the inputs. A conftest hit or more than `STEM_MATCH_LIMIT` hits gives S6. Count these searches against `SEARCH_LIMIT`, or give S6 above a small cap. A name that only a library imports (not a test) stays a residual; document it. |
+| QA-G-23 | critical (narrow) | **`listFiles` is case-sensitive, so a directory whose case drifted from the index lists only its untracked files.**<br>**Setup:** commit `tests/pkg/{__init__,helper,test_rel}.py`, where `test_rel.py` holds `from . import helper`. Rename the directory to `tests/Pkg` in the filesystem; git with `core.ignorecase=true` still records `tests/pkg/…`. Delete `tests/Pkg/__init__.py` and add the untracked `tests/Pkg/test_new.py`. `git status` shows ` D tests/pkg/__init__.py` and `?? tests/Pkg/test_new.py`.<br>**Cause:** the planner canonicalises the path to `tests/Pkg` and runs `ls-files … -- :(literal)tests/Pkg`. The index entries do not match, and the untracked walk does.<br>**At 4d38e63:** S6 `deleted-no-tests`.<br>**At 7f4798d:** `SPEC inputs=["tests/Pkg/test_new.py"]`. The scoped run gives `1 passed`, but the full run gives `exit=2 ImportError: attempted relative import with no known parent package \| ERROR tests/Pkg/test_rel.py`.<br>**Why narrow:** it needs a case-only directory rename made outside git, plus a new untracked test in that directory. It is critical under this round's rule: a constructed false pass that this diff introduces. | Use `:(literal,icase)<dir>` in the wiring. `isInside` already compares with the platform key, so on a case-sensitive host it drops other-case directories. `GIT_ICASE_PATHSPECS=1` with `:(literal)` matched `tests/PKG` → `tests/pkg/test_f.py`. Alternative: return S6 when the listing has no test file but `readdir` of the directory shows one. |
+| QA-G-24 | minor | **The QA-G-18 fix misses tests that live inside the re-exporting package.**<br>**Setup:** there is no `testpaths`. `app/__init__.py` holds `from .index import VERSION`. `app/tests/__init__.py` exists, and `app/tests/test_models.py` holds `from ..models import X`. The decoy `tests/test_util.py` holds `.index(`. `app/index.py` is deleted.<br>**Result:** both commits give `SPEC inputs=["tests/test_util.py"]`. The scoped run gives `exit=0`, but the full run gives `exit=2 No module named 'app.index' \| ERROR app/tests/test_models.py`.<br>**Cause:** pytest imports `app.tests.test_models`, which runs `app/__init__.py`, and `-w app` never sees a relative import.<br>**Why minor:** 4d38e63 gives the same plan, and this is the same class as QA-G-18, which was rated minor. Without the decoy, both commits give S6. | Optional: in `reExporters`, also add the in-scope test files under the package directory (`listFiles`, as in `packageTests`). |
+| QA-G-25 | minor | **Fail-closed regressions against 4d38e63 (no false pass).**<br>**(1) Substring conftest search.** The gone-module conftest search is a substring search (`-F`, no `-w`) and is unscoped, so a conftest.py that contains the name inside another word gives S6. For example, `app/session.py` is deleted and `tests/conftest.py` holds `scope="session"`. At 4d38e63 this gave `SPEC inputs=["tests/test_session_notes.py"]`, and the full run gives `exit=0`. At 7f4798d it gives S6 `unmapped-module`. A "helpers" comment behaves the same. The existing-module path uses `-w`.<br>**(2) SEARCH_LIMIT.** Deleting 51 unreferenced test files gave NoAffected at 4d38e63 and gives S6 `too-many-searches` at 7f4798d. VERIFICATION.md documents it. | Optional: search conftest.py with `-w` for a gone module, as a second `findByContent`. Keep the substring search for test files. |
+
+**Status:** QA-G-18 … QA-G-21 are resolved for their recorded repros. The final verification is **NOT CLEAN**:
+
+- QA-G-22 and QA-G-23 are critical and introduced by 68edf52. Under the owner rule they need fixes.
+- QA-G-24 and QA-G-25 are minor and are recorded.
