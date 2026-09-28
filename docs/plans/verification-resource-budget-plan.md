@@ -1447,6 +1447,10 @@ both OSes in CI.
 
 **Definition of Done** — as in 1.1; the CI `test`, `e2e`, `smoke-keyless`, CodeQL and GitGuardian
 checks are green; QA report `D:\git\opencode-model-router\docs\qa\verification-resource-budget\phase-3.1.md`.
+*Amended during implementation (QA-3.1-23):* this repository has no CodeQL workflow; the security
+gates are GitGuardian and the GitHub Advanced Security PR check, whose 'Code scanning AI findings'
+job fails on infrastructure (CAPIError 400), not on code. Enabling CodeQL default setup is an owner
+repo-settings decision.
 
 **QA review** `[tier:heavy]` CAP:none — reason: the reviewer must judge whether the e2e assertions actually prove G1–G8 or can pass vacuously.
 Adversarial focus: sampling that could miss short-lived workers (the poll interval vs worker
@@ -1574,6 +1578,10 @@ checkout is at `v1.15.0`; no `omr-*` worktrees or `vrb/*` branches remain.
   `testScope: "full"` restores full-suite semantics (still resource-bounded);
   `defaultVerify: "required"` restores synchronous gating for every `testsPass` delegation; `npm test`,
   typecheck, smoke-keyless, CodeQL and GitGuardian are green on ubuntu/windows × Node 20/22/24.
+  *Amended during implementation (QA-3.1-23):* this repository has no CodeQL workflow; the
+  security gates are GitGuardian and the GitHub Advanced Security PR check, whose 'Code scanning
+  AI findings' job fails on infrastructure (CAPIError 400), not on code. Enabling CodeQL default
+  setup is an owner repo-settings decision.
 - **G7 — Speed first, zero idle cost.** With the default config:
   - verification adds **0 ms** to the time a delegation's result reaches the orchestrator;
   - the dispatch waits at most `VERIFY_WAIT` (default 5 s) for the git-only reference capture;
