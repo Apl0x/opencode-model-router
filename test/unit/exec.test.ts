@@ -1,11 +1,11 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { execFileSync, spawn } from "node:child_process";
 import { getEventListeners } from "node:events";
-import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { DEFAULT_TIMEOUT_MS, KILL_GRACE_MS, deadlineOf, runArgv, runShell, setSweeperExecutableForTests, trackingForTests } from "../../src/verify/exec";
+import { DEFAULT_TIMEOUT_MS, KILL_GRACE_MS, SWEEP_TIMEOUT_MS, deadlineOf, runArgv, runShell, setSweeperExecutableForTests, trackingForTests } from "../../src/verify/exec";
 
 // Real processes, no mocks: the defect this guards against only exists in how
 // the OS tears a process tree down, which a fake child_process cannot model.
@@ -396,6 +396,8 @@ function tree(mode: "early-exit" | "unreachable" | "broken-tree") {
     args: [TREE, mode, dir],
     file,
     pid: (name: "child" | "middle" | "holder") => Number(readFileSync(file(name), "utf8")),
+    /** How the holder ended on its own ("released" or "timeout"); undefined while alive or when killed. */
+    holderExit: (): string | undefined => (existsSync(join(dir, "holder.exit")) ? readFileSync(join(dir, "holder.exit"), "utf8") : undefined),
     /**
      * The direct child is gone and the run has seen its `exit`. The OS reports
      * the death before libuv delivers `exit` (up to a loop iteration later);
@@ -424,6 +426,30 @@ function tree(mode: "early-exit" | "unreachable" | "broken-tree") {
  */
 const LEFTOVER_KILLED = /left running by the exited command|output streams force-closed \d+ ms after the kill: a descendant still held them|orphan sweep still reporting at settle/;
 
+/**
+ * G4's documented load limit (QA-1.2-14): under normal-priority CPU saturation
+ * the Windows sweep can miss the 3 s. The first sweep of a CI job is the worst
+ * case: on the 4-core runner, with the suite's workers and V8 coverage,
+ * PowerShell took 6.6 s to start and its first CIM query 23.7 s, so the holder
+ * died 28.7 s after the deadline (phase 3.1, CI round 3). Called only once the
+ * holder outlived the 3 s, and it tolerates that only with the limit's
+ * signature:
+ * - Windows (POSIX has no sweeper, so no slack there);
+ * - the grace, not a sweep report, settled the run: the pipes were force-closed,
+ *   and the sweep had not reported that it could not run;
+ * - the holder still dies within the sweep's own bound (SWEEP_TIMEOUT_MS after
+ *   the kill, plus 2 s), before the fixture's 90 s self-exit; the caller then
+ *   checks that it was killed, not ended on its own.
+ */
+async function expectLateSweep(holder: number, killAt: number, r: { stderr: string }): Promise<void> {
+  expect(isWin, r.stderr).toBe(true);
+  expect(r.stderr).toMatch(/output streams force-closed \d+ ms after the kill: a descendant still held them/);
+  expect(r.stderr).not.toMatch(/orphan sweep unavailable/);
+  const dead = await waitForExit(holder, Math.max(0, killAt + SWEEP_TIMEOUT_MS + 2000 - Date.now()));
+  console.warn(`[G4 load limit, QA-1.2-14] holder not dead 3 s after the kill; ${dead ? `dead ${Date.now() - killAt} ms after it` : "still alive"}; stderr: ${r.stderr.trim()}`);
+  expect(dead).toBe(true);
+}
+
 describe("process lifecycle around the direct child's exit", () => {
   // The holder inherits the run's stdout/stderr, so `close` cannot fire while it lives.
 
@@ -437,21 +463,9 @@ describe("process lifecycle around the direct child's exit", () => {
       const holder = t.pid("holder");
       // G4: dead within 3 s of the deadline. The run may settle first, when the
       // grace (2 s) ends before a slow sweep has reported (QA-1.2-26).
-      if (!(await waitForExit(holder, Math.max(0, deadlineAt + 3000 - Date.now())))) {
-        // G4's documented limit (QA-1.2-14): under normal-priority CPU
-        // saturation (CI runs the suite on 2 workers of a 4-core runner) the
-        // PowerShell sweep can take longer than 3 s. Tolerated only with that
-        // signature: the grace, not a sweep (or taskkill) report, settled the
-        // run, and the kill still reaches the holder before its own 20 s
-        // self-exit, well inside SWEEP_TIMEOUT_MS (30 s). POSIX has no
-        // sweeper, so no slack there.
-        expect(isWin, r.stderr).toBe(true);
-        expect(r.stderr).toMatch(/output streams force-closed \d+ ms after the kill/);
-        const holderStartedAt = statSync(t.file("holder")).mtimeMs;
-        const killed = await waitForExit(holder, Math.max(0, holderStartedAt + 18_000 - Date.now()));
-        console.warn(`[G4 load limit, QA-1.2-14] holder not dead 3 s after the deadline; ${killed ? `killed ${Date.now() - deadlineAt} ms after it` : "still alive"}; stderr: ${r.stderr.trim()}`);
-        expect(killed).toBe(true);
-      }
+      if (!(await waitForExit(holder, Math.max(0, deadlineAt + 3000 - Date.now())))) await expectLateSweep(holder, deadlineAt, r);
+      // Killed, not ended on its own: the holder records its own exits.
+      expect(t.holderExit()).toBeUndefined();
       expect(settledIn).toBeLessThan(3000 + 3000);
       // The direct child exited 0, but the deadline had to end its leftovers.
       expect(r).toMatchObject({ code: 1, timedOut: true });
@@ -459,7 +473,7 @@ describe("process lifecycle around the direct child's exit", () => {
     } finally {
       await t.release();
     }
-  }, 45000);
+  }, SWEEP_TIMEOUT_MS + 30_000);
 
   it("an abort between the child's exit and the pipes closing kills the leftovers, not the exited PID (QA-1.2-1, QA-1.2-10)", async () => {
     const t = tree("early-exit");
@@ -475,7 +489,9 @@ describe("process lifecycle around the direct child's exit", () => {
       const r = await pending;
       const settledIn = Date.now() - abortedAt;
       // G4: dead within 3 s of the abort, not necessarily when the run settles (QA-1.2-26).
-      expect(await waitForExit(holder, Math.max(0, abortedAt + 3000 - Date.now()))).toBe(true);
+      if (!(await waitForExit(holder, Math.max(0, abortedAt + 3000 - Date.now())))) await expectLateSweep(holder, abortedAt, r);
+      // Killed, not ended on its own: the holder records its own exits.
+      expect(t.holderExit()).toBeUndefined();
       expect(settledIn).toBeLessThan(3000);
       expect(r).toMatchObject({ code: 1, timedOut: true });
       expect(r.stderr).toMatch(LEFTOVER_KILLED);
@@ -483,7 +499,7 @@ describe("process lifecycle around the direct child's exit", () => {
       await t.release();
       await pending;
     }
-  }, 30000);
+  }, SWEEP_TIMEOUT_MS + 30_000);
 
   it.runIf(isWin).each([
     ["a missing executable", join(tmpdir(), "omr-no-such-powershell.exe"), /\[orphan sweep unavailable: spawn error: [^\]]*ENOENT[^\]]*\]/],
@@ -610,7 +626,7 @@ describe("process lifecycle around the direct child's exit", () => {
       expect(out.result.stderr).toMatch(/output streams force-closed/);
       const exited = await h.exited;
       expect(exited.code).toBe(0);
-      // Before QA-1.2-19 the host stayed up until SWEEP_TIMEOUT_MS (30 s) ended the sweeper.
+      // Before QA-1.2-19 the host stayed up until SWEEP_TIMEOUT_MS (30 s then) ended the sweeper.
       expect(exited.at - first.at).toBeLessThan(5000);
       // Nor did the sweeper outlive the host: a direct child, it dies with libuv's job.
       expect(await waitForExit(standIn, 3000)).toBe(true);

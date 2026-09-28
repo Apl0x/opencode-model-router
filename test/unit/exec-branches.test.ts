@@ -4,7 +4,7 @@ import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "no
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { KILL_GRACE_MS, runArgv, setSweeperExecutableForTests, trackingForTests } from "../../src/verify/exec";
+import { KILL_GRACE_MS, SWEEP_TIMEOUT_MS, runArgv, setSweeperExecutableForTests, trackingForTests } from "../../src/verify/exec";
 
 // Branches of src/verify/exec.ts that test/unit/exec.test.ts reaches only in a
 // separate host process (test/fixtures/exec/host.mjs), where coverage is not
@@ -220,6 +220,33 @@ describe.runIf(isWin)("orphan sweep branches (Windows-only: the sweeper runs onl
       expect(alive(t.pid("holder"))).toBe(false);
     } finally {
       await t.release();
+    }
+  }, 30_000);
+
+  it("gives a sweep that pinned trees SWEEP_TIMEOUT_MS after the kill, over twice the slowest CI sweep, before abandoning it (QA-1.2-14)", async () => {
+    // Phase 3.1, CI round 3: the first sweep of a saturated CI job killed
+    // 28.7 s after the kill request, 1.3 s inside the former 30 s limit.
+    expect(SWEEP_TIMEOUT_MS).toBeGreaterThanOrEqual(2 * 28_700);
+    const t = earlyExit();
+    // Pins "1 tree", then never kills nor exits: only the limit ends it.
+    standIn("process.stdout.write('pinned 1\\n'); process.stdin.resume();");
+    const controller = new AbortController();
+    const pending = runArgv(process.execPath, t.args, { cwd: tmpdir(), timeoutMs: 30_000, signal: controller.signal });
+    const timers = vi.spyOn(globalThis, "setTimeout");
+    try {
+      await t.childExited();
+      timers.mockClear();
+      controller.abort();
+      const r = await pending;
+      // The grace settled the run, so the sweep's limit alone bounds the sweeper.
+      expect(r).toMatchObject({ code: 1, timedOut: true });
+      expect(r.stderr).toMatch(/output streams force-closed \d+ ms after the kill: a descendant still held them/);
+      expect(timers.mock.calls.some(([, ms]) => ms === SWEEP_TIMEOUT_MS)).toBe(true);
+    } finally {
+      timers.mockRestore();
+      if (state.standInPid > 0 && alive(state.standInPid)) process.kill(state.standInPid);
+      await t.release();
+      await pending;
     }
   }, 30_000);
 
