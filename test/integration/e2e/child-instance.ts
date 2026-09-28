@@ -30,6 +30,8 @@ export interface ChildConfig {
   /** Producer think time before the edit. */
   produceDelayMs: number;
   edits: ChildEdit[];
+  /** enforcement.verify overrides for this child's plugin; default {} (the defaults). */
+  verify?: Record<string, unknown>;
 }
 
 export interface ChildDispatchSummary {
@@ -70,7 +72,7 @@ async function main(): Promise<void> {
   const configPath = process.argv[2];
   if (configPath === undefined) throw new Error("usage: child-instance <config.json>");
   const cfg = JSON.parse(await readFile(configPath, "utf8")) as ChildConfig;
-  const plugin = await createE2EPlugin({ directory: cfg.repoDir, home: cfg.home, verify: {} });
+  const plugin = await createE2EPlugin({ directory: cfg.repoDir, home: cfg.home, verify: cfg.verify ?? {} });
   try {
     const wait = cfg.startAt - Date.now();
     if (wait > 0) await sleep(wait);
