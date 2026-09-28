@@ -335,6 +335,23 @@ describe("createScopeOpener", () => {
     expect(s.argv).not.toHaveBeenCalled();
   });
 
+  it("labels a busy wait the deadline bounded as a deadline cut even when the wait's timer fired before remaining() read 0 (QA-3.1-12, 9053dd8)", async () => {
+    // The deadline leaves 2 500 ms, less than slotWaitMs, so it bounds the wait. The slot's own
+    // timer fires a few ms early: the busy answer arrives while remaining() still reads 3 ms.
+    let t = 10_000;
+    const d = fakeDeadline(2_500);
+    const s = setup({ now: () => t, acquire: async () => { t += 2_497; d.left = 3; return { busy: true }; } });
+    expect(await s.scope.execute(SPEC, d)).toEqual({ kind: "slot-busy", waitedMs: 2_497, deadlineCut: true });
+    expect(s.acquire.mock.calls[0]?.[0]).toMatchObject({ waitMs: 2_500 });
+    expect(d.signal.aborted).toBe(false);
+    expect(s.argv).not.toHaveBeenCalled();
+    // The same early answer to a wait that slotWaitMs bounded (the deadline leaves more) is busy.
+    let u = 10_000;
+    const roomy = fakeDeadline(BUDGET.slotWaitMs + 10_000);
+    const busy = setup({ now: () => u, acquire: async () => { u += BUDGET.slotWaitMs - 3; roomy.left = 10_003; return { busy: true }; } });
+    expect(await busy.scope.execute(SPEC, roomy)).toEqual({ kind: "slot-busy", waitedMs: BUDGET.slotWaitMs - 3, deadlineCut: false });
+  });
+
   it("hold() takes the scope's one hold without spawning; the next execute reuses it, and a failed hold answers it (QA-2.2-25)", async () => {
     const held = setup();
     const d = fakeDeadline(100_000);
