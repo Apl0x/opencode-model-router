@@ -301,3 +301,8 @@ code. The DoD (zero open findings) is **not met** until QA-1.1-7 is fixed.
     QA-1.1-1 deviation in `config.validate.test.ts`.
 - **deferred by plan (2.3), unchanged:** the §1.3 S3 "(default 1)" wording.
 - **deferred by plan (1.6 / 2.4), unchanged:** the `captureWaitMs > baselineTimeoutMs` clamp.
+
+**Closing note (phase 3.2).** The plan text now records the 1.1.1.b/c split and the approved
+QA-1.1-1 deviation, and §1.3 S3 gives the `max(1, floor(cores/8))` default (07ab9d9).
+
+Status: CLEAN (closed 2026-09-28, phase 3.2).

@@ -238,7 +238,7 @@ A delegation that is **not** verified is never reported as verified. It carries 
 |---|---|---|
 | S1 | **Affected-test scoping.** `testsPass` runs only the tests related to the producer's changed files (`vitest related`, `jest --findRelatedTests`, pytest module mapping). The command is built by a runner adapter and spawned **without a shell**. | full-suite `npm test` |
 | S2 | **Failure-only recheck at a dispatch reference.** At dispatch, only a git reference is captured (`git stash create` or HEAD, plus hashes of untracked files) — no tests. Only when scoped tests fail are **those failing test files** re-run in an ephemeral worktree at the reference, to separate pre-existing failures from introduced ones. | dispatch-time full-suite baseline |
-| S3 | **Machine-wide verification slot.** A cross-process semaphore (lock files in the OS temp dir) allows at most `maxConcurrentVerifications` (default 1) verification commands at a time, across every opencode process on the machine. | per-process, per-cwd mutex only |
+| S3 | **Machine-wide verification slot.** A cross-process semaphore (lock files in the OS temp dir) allows at most `maxConcurrentVerifications` (default `max(1, floor(cores/8))`, as in §1.4; *amended during implementation*) verification commands at a time, across every opencode process on the machine. | per-process, per-cwd mutex only |
 | S4 | **Per-run resource caps.** The adapter adds the runner's worker cap (`--maxWorkers=N`, default 2). Every verification command runs at below-normal OS priority. The gate budget's abort signal reaches the process tree. | uncapped workers at normal priority; gate timeout that abandons the command without killing it |
 | S5 | **Batching.** Verification requests (from `VERIFY:required` gates, `router_verify` calls, or background runs if enabled) for the same runner root that arrive within `batchWindowMs` are merged into one scoped run over the union of changed files. Failures are attributed back per request. | one run per producer |
 | S6 | **The full suite is CI's job.** The router never falls back to a full suite. When scoping is impossible (unknown runner, composite script, config-file change), the result is `unverifiable` with a caveat. A full suite runs only with explicit `testScope: "full"`. | silent full-suite fallback |
@@ -279,6 +279,13 @@ A delegation that is **not** verified is never reported as verified. It carries 
    `test_<stem>.py`/`<stem>_test.py` files for changed modules. A change to `conftest.py`,
    `pyproject.toml`, `pytest.ini`, `setup.cfg` or `tox.ini` makes scoping impossible → S6
    `unverifiable`.
+   *Amended during implementation (phase-1.3.md, QA-1.3-4, -5, -8, -23; phase 3.1 E2E-1):* the
+   trigger list also holds `.pytest.ini`, `pytest.toml`, `.pytest.toml`, a `-c`/`--config-file`
+   value, the Python lock and dependency files (`uv.lock`, `poetry.lock`, `pdm.lock`,
+   `Pipfile.lock`, `Pipfile`, `setup.py`, `requirements*.txt`, `requirements*.in`,
+   `constraints*.txt`, and any `*.txt`/`*.in` below a directory named `requirements`). The affected
+   set honours `python_files` and maps a changed module to every test that names its stem as a whole
+   word, plus the name-matched tests; a module no test maps to is S6 `unmapped-module`.
 4. **Package-script resolution.** `npm|pnpm|yarn|bun test` resolves `scripts.test` from the nearest
    `package.json`. A single `vitest …`/`jest …` invocation is rewritten into its scoped form. A
    leading `cross-env K=V …` prefix is supported: its assignments go into the spec's `env`. A
@@ -334,6 +341,15 @@ A delegation that is **not** verified is never reported as verified. It carries 
     An explicit acceptance block with deterministic checks does **not** imply `required`: the
     orchestrator states the mode. The directives stay in the dispatch text, which is harmless to the
     subagent.
+
+    *Amended during implementation (QA-G-4, owner decision):* the mode only governs a DoD that
+    contains `testsPass` (§1.5-16). A DoD without `testsPass` (for example `buildPasses`, `lintClean`,
+    `run` or `fileExists` only, or criteria only) keeps the synchronous gate of the pre-plan router
+    in either mode, so for it an acceptance block does imply a synchronous gate and `VERIFY:deferred`
+    has no effect. A DoD that contains `testsPass` defers as a whole (its build, lint, `run` and
+    criteria checks too), also when the producer changed nothing (QA-G-1). The only exception is a
+    `testsPass`-only DoD whose producer provably changed nothing. It takes the required gate, which
+    passes it ("no changed files", §1.5-6) without spawning a process.
 16. **Deferred result format.** A deferred delegation's result is returned unchanged, with a
     `[router]` footer appended:
     - "unverified";
@@ -527,6 +543,13 @@ deprecated keys map correctly.
     are listed in the QA report for Phase 2.1 to switch over; 1.1 does not edit those files (§2).
   - 1.1.1.c Emit the deprecation warning once per process through the plugin logger seam that
     config already uses. Do not use `console`.
+  - *Amended during implementation (phase-1.1.md, QA-1.1-1, QA-1.1-7):* the warning lives in
+    `warnDeprecatedVerifyKeys(cfg, logger)` (required logger, once-per-process flag reset by
+    `resetVerifyBudgetWarnings()`), so `resolveVerifyBudget(cfg, { cores? })` stays pure. A non-object
+    `enforcement.verify` (`null`, a string, a number, an array, or a `verify: null` override) now
+    throws `tiers.json: enforcement.verify must be an object`. This is an approved deviation from the
+    acceptance line "existing config tests pass unchanged": the permissive-skip test in
+    `config.validate.test.ts` was split so `verify` throws while `escalate`/`perTier` are unchanged.
 - **1.1.2** `[tier:medium]` Tests in `D:\git\opencode-model-router\test\unit\config-verify-budget.test.ts`.
 
 **New tests (coverage ≥ 90% lines and branches for the new code; edge cases required)**
@@ -614,6 +637,10 @@ string.
   (which only runs git with a timeout and is out of scope). New modules (`reference.ts`,
   `runner.ts`, `batch.ts`, `slot.ts`) must receive `ArgvSeam` by injection and never import
   `child_process`. Phase 3.2 re-checks this across the final tree.
+  *Amended during implementation (QA-1.2-12, phase 3.2):* the unused `exec as nodeExec` import in
+  `src/index.ts` predated this plan and is deleted. `rg "import .*child_process" src` now lists only
+  `exec.ts` and `tree.ts`; the other `child_process` hits (`reference.ts`, `runner.ts`, `wiring.ts`)
+  are comments stating the module does not import it.
 - A killed run reports `timedOut: true` and a non-zero code on both platforms.
 
 **Definition of Done** — as in 1.1; QA report `D:\git\opencode-model-router\docs\qa\verification-resource-budget\phase-1.2.md`.
@@ -875,6 +902,11 @@ spawns a process.
   source: "directive" | "default" }`. It follows §1.5-15 exactly and reuses the same
   "ignore router-injected examples" rule as `parseCapDirective`: import the shared helper if one
   exists; otherwise add the rule here and **do not** edit `sessions.ts`.
+  *Amended during implementation (phase-1.6.md, QA-1.6-18, QA-1.6-33):* `source` is split into
+  `modeSource` and `waitSource` (each `"directive" | "default"`). Unlike `CAP:`, a non-upper-case
+  `VERIFY`/`VERIFY_WAIT` key counts only when its value ends the line (or is followed by another
+  directive key or a table pipe, QA-1.6-27), so prose such as "please verify: required that …" is
+  not a directive.
 - **1.6.2** `[tier:medium]` `D:\git\opencode-model-router\src\verify\risk.ts`:
   `assessRisk({ changedFiles, reference, producerTier, scopingPlan })` →
   `{ level: "low" | "medium" | "high", reasons: string[] }`. It uses the fixed table from §1.5-17,
@@ -1105,6 +1137,10 @@ commit. Task 2.2.3 (wiring) starts only after 2.1 is merged, because it writes
 **Acceptance criteria**
 - In the wiring test with 5 concurrent `testsPass` gates, the argv seam sees ≤ 1 scoped run + ≤ 1
   recheck per window.
+  *Amended during implementation (phase-2.2.md, D2 and D4):* that bound holds for a passing batch
+  and for a shared reference. A failing vitest/jest union costs 1 + n runs (mode B: the pooled run,
+  then each member's own attribution run). The maximum window size is a coordinator option
+  (`BATCH_MAX_REQUESTS`, default 8), not a config key.
 - Verdicts are identical to running each request alone (property test over random change sets and
   failure assignments, using the fake runner seam).
 
@@ -1222,6 +1258,12 @@ Tasks 2.4.2–2.4.6 start after 2.2.3 is merged, because they write
   processes and add at most `VERIFY_WAIT` (≤ 5 s by default, usually under 1 s) to dispatch latency
   and **0 ms** to result latency.
 - Every deferred result carries the footer; no deferred result is ever labelled accepted or verified.
+- *Amended during implementation (phase-2.1.md QA-2.1-6, phase-2.4.md; T11 residual):* a native
+  `task` re-dispatch after a rejection captures a reference that already contains the rejected
+  attempt, so a failure that attempt introduced would read as pre-existing. Accepted as a residual,
+  mitigated by the per-session rejection lineage: proven-introduced ids are remembered and such a
+  pass becomes `unverifiable` with a caveat naming the earlier delegation. The ledger matches ids
+  only, so a renamed test escapes it. The `delegate` ladder keeps its first reference.
 
 **Definition of Done** — as in 2.1; QA report `D:\git\opencode-model-router\docs\qa\verification-resource-budget\phase-2.4.md`.
 
@@ -1351,7 +1393,9 @@ bound holds.
     - the total number of runs is ≤ 1 per batch window + rechecks.
   - 3.1.2.c **Two plugin instances** (two child processes, simulating two opencode sessions) → the
     slot limits them jointly.
-  - 3.1.2.d **No orphans:** force the gate budget to expire mid-run; 3 s later no descendant is alive.
+  - 3.1.2.d **No orphans:** force the gate budget to expire mid-run; 3 s later no attributable
+    descendant is alive. *Amended during implementation (phase-1.2.md round 2):* "no descendant"
+    became "no attributable descendant" (see G4 and its known limits).
   - 3.1.2.e **Cleanup:** after the suite, no `omr-ref-*` worktrees remain, and the fixture's real
     `node_modules` sentinel file still exists.
   - 3.1.2.f **Deferred costs nothing:** 20 parallel deferred implementation delegations on
@@ -1359,6 +1403,12 @@ bound holds.
     slot files. Each result returns with the footer within 50 ms of the producer finishing, and each
     dispatch waits ≤ `VERIFY_WAIT` for the capture (with a real repo, measured and reported; expected
     < 1 s).
+    *Amended during implementation (phase-3.1.md, QA-3.1-3):* the after-hook is bounded by the 2 s
+    git-only snapshot (`DEFERRED_FINISH_MS`), not 50 ms. With 20 parallel dispatches the capture
+    wait p50 is about 1.0 s (measured 964 ms), not < 1 s. A 100 ms sampler interval is unreachable on
+    Windows (one `Get-CimInstance` poll takes longer); the tests assert a median interval ≤ 500 ms
+    on Windows and ≤ 250 ms on POSIX (`SAMPLER_MEDIAN_INTERVAL_MAX_MS`, QA-3.1-5), and a capture
+    wait p50 ≤ 1.5 s.
   - 3.1.2.g **Orchestrator control:** a dispatch with `VERIFY_WAIT:0s` starts the producer without
     waiting; `VERIFY:required` blocks until a verdict; `router_verify` after drift reports the drift.
   - 3.1.2.h **Background opt-in:** with `background: true`, an introduced failure in a deferred
@@ -1397,6 +1447,10 @@ both OSes in CI.
 
 **Definition of Done** — as in 1.1; the CI `test`, `e2e`, `smoke-keyless`, CodeQL and GitGuardian
 checks are green; QA report `D:\git\opencode-model-router\docs\qa\verification-resource-budget\phase-3.1.md`.
+*Amended during implementation (QA-3.1-23):* this repository has no CodeQL workflow; the security
+gates are GitGuardian and the GitHub Advanced Security PR check, whose 'Code scanning AI findings'
+job fails on infrastructure (CAPIError 400), not on code. Enabling CodeQL default setup is an owner
+repo-settings decision.
 
 **QA review** `[tier:heavy]` CAP:none — reason: the reviewer must judge whether the e2e assertions actually prove G1–G8 or can pass vacuously.
 Adversarial focus: sampling that could miss short-lived workers (the poll interval vs worker
@@ -1488,22 +1542,61 @@ checkout is at `v1.15.0`; no `omr-*` worktrees or `vrb/*` branches remain.
   processes, all at below-normal priority. Proven by 3.1.2.b and 3.1.2.c on Windows and Linux.
 - **G4 — Nothing outlives its budget.** Every synchronous verification (a required gate in the
   `delegate` and the native `task` paths, and each `router_verify` call) has one deadline
-  (`gateBudgetMs`). No slot wait, run, recheck or batch step outlives it. Its expiry kills the whole
-  process tree; no orphans after 3 s. Proven by 1.2, the 2.1 deadline and native-`task` tests, the
-  2.4 `router_verify` deadline test, and 3.1.2.d.
+  (`gateBudgetMs`). No slot wait, run, recheck or batch step outlives it by more than the 2 s kill
+  grace: the run resolves and releases its slot at most 2 s after the deadline, even when a
+  descendant still holds its output pipes. Its expiry kills every process still attributable to the
+  run, and no attributable process is alive 3 s after the deadline on a machine that is not
+  saturated by normal-priority load. Attributable means:
+  - on POSIX, a member of the run's process group;
+  - on Windows, a descendant reachable from the live direct child or, once the direct child has
+    exited, a child it created during its lifetime and that child's live tree, found by the
+    creation-time sweep.
+
+  `timedOut: true` means the deadline or abort fired while something still held the run, so a kill
+  was attempted; it does not prove that anything was killed. A case that cannot be told apart counts
+  as a kill (fail-closed): on Windows, the grace settling the run while a sweep that pinned trees is
+  still reporting, even if the leftover exited on its own (QA-1.2-28).
+
+  Known limits, each still bounded by the 2 s grace for the run and its slot:
+  - (a) a descendant whose parent died before the kill (Windows; for example an MSYS `sleep.exe`
+    started by a git filter, which escaped `taskkill /T`) or that left the process group with
+    `setsid` (POSIX) is not killed;
+  - (b) the Windows sweep needs Windows PowerShell 5.1 in FullLanguage mode; where PowerShell is
+    blocked or under Constrained Language Mode it kills nothing (reported on stderr);
+  - (c) under normal-priority CPU saturation the Windows sweep can finish after 3 s: it may complete
+    up to 60 s after the kill request (`SWEEP_TIMEOUT_MS`, QA-3.1-19), and host exit's `taskkill`
+    can be cut at its limit;
+  - (d) on Windows, opencode's exit reaches in-flight descendants only through the exit hook; death
+    by an unhandled signal skips that hook on every platform.
+
+  Proven by 1.2, the 2.1 deadline and native-`task` tests, the 2.4 `router_verify` deadline test,
+  and 3.1.2.d. *Amended during implementation (phase-1.2.md round 2, QA-1.2-14, -21, -28;
+  QA-3.1-19):* the original text claimed "kills the whole process tree; no orphans after 3 s".
 - **G5 — Safe cleanup.** No reference worktree survives a run or a crash (GC). No cleanup path
   touches real `node_modules` or user files. Proven by 1.5 and 3.1.2.e.
 - **G6 — Compatibility.** Existing configs load unchanged; the deprecated keys work with a warning;
   `testScope: "full"` restores full-suite semantics (still resource-bounded);
   `defaultVerify: "required"` restores synchronous gating for every `testsPass` delegation; `npm test`,
   typecheck, smoke-keyless, CodeQL and GitGuardian are green on ubuntu/windows × Node 20/22/24.
+  *Amended during implementation (QA-3.1-23):* this repository has no CodeQL workflow; the
+  security gates are GitGuardian and the GitHub Advanced Security PR check, whose 'Code scanning
+  AI findings' job fails on infrastructure (CAPIError 400), not on code. Enabling CodeQL default
+  setup is an owner repo-settings decision.
 - **G7 — Speed first, zero idle cost.** With the default config:
   - verification adds **0 ms** to the time a delegation's result reaches the orchestrator;
   - the dispatch waits at most `VERIFY_WAIT` (default 5 s) for the git-only reference capture;
   - **no verification process is spawned** unless a dispatch says `VERIFY:required`, the orchestrator
     calls `router_verify`, or `background: true` is configured.
 
-  Proven by the 2.4 tests and 3.1.2.f.
+  Proven by the 2.4 tests and 3.1.2.f. *Amended during implementation (QA-G-4, owner decision;
+  QA-G-1):* the exception is a DoD **without** `testsPass`. It keeps the synchronous gate, and its
+  checks (a build, lint or `run` command, or the grader) run before return, as they did before this
+  plan (§1.5-15).
+  A DoD containing `testsPass` spawns nothing before return, also when the producer changed nothing:
+  it defers as a whole with risk `low`. The one non-deferred case is a `testsPass`-only DoD whose
+  producer provably changed nothing; its required gate passes with no process ("no changed files").
+  Proven by the QA-G-1 tests in `test/integration/deferred-verification.test.ts` on both dispatch
+  paths.
 - **G8 — The orchestrator is in control and informed.** Per dispatch, the orchestrator chooses the
   mode and the wait. Every deferred result carries a deterministic risk level and a handle, and
   unverified delegations stay listed in its prompt until verified or expired. A subagent can never
@@ -1542,6 +1635,7 @@ re-reviewed until clean. The global DoD cannot be ticked before it closes.
 | Cross-process lock left behind by a crash blocks verification | Stale detection by PID, hostname and age; compare-before-delete; the busy result after `slotWaitMs` is `unverifiable`, never a hang. |
 | Runner CLI differences across versions | Spike C pins the behaviour; the reporter-file parsing falls back to text; an unknown shape → `unverifiable`. |
 | Deferred-by-default lets the orchestrator build on broken work (the "instructed models false-finish" risk from the router's own motivation) | The owner's explicit trade-off (§1.1), stated in the ADR and CHANGELOG. Mitigated by the risk level on every deferred result, the pending list in the prompt, `router_verify`, `VERIFY:required` for fundamental work, `defaultVerify: "required"` and `background: true` as opt-ins, and CI as the final gate. |
+| A descendant escapes the deadline kill: its parent died first (Windows), it called `setsid` (POSIX), PowerShell is blocked or under Constrained Language Mode, normal-priority load starves the Windows sweep, or opencode dies by an unhandled signal (the exit hook is skipped) | *Amended during implementation (phase-1.2.md round 2).* The run and its slot are released 2 s after the deadline anyway (force-closed pipes, `timedOut: true` and a stderr note). POSIX process groups and pinned Windows trees are killed, and Node-forked workers die with their parent (libuv job). On Windows, host exit reaches descendants only through the exit hook. Verification descendants run below normal priority, so a survivor cannot starve the machine. Under load the Windows sweep may complete up to 60 s after the kill request (`SWEEP_TIMEOUT_MS`, QA-3.1-19). The sweep's own failure is reported on stderr (QA-1.2-15). 3.1.2.d asserts the 3 s no-orphans rule for an attributable tree. |
 | The executing session's own plugin runs full suites during execution | Phase 0.P syncs to `1.14.0`; §0.5 forbids `check: testsPass` in dispatches until `1.15.0`. |
 
 ## 6. Out of scope

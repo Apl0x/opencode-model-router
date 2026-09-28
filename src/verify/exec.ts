@@ -25,6 +25,12 @@
  *   that pinned trees is still reporting, even if the leftover exited on its
  *   own during the grace (QA-1.2-24, QA-1.2-28). An abort that finds nothing
  *   left running is a no-op: the natural result stands.
+ * - POSIX: when a run settles, whatever the command left in its process group
+ *   (a background job, an unref'd child) is killed, so a normal exit leaves
+ *   nothing running outside the slot either (QA-G-5). A `setsid` escapee is
+ *   not reached. Windows sweeps only for a deadline or abort (the sweep costs a
+ *   PowerShell start per run), so there a normal exit's leftovers survive
+ *   (a documented limit, docs/VERIFICATION.md "Process limits").
  * - Runs still in flight when opencode exits are killed from one
  *   `process.once("exit")` hook: on POSIX their process groups (QA-1.2-6), on
  *   Windows the tree of each direct child that has not exited (QA-1.2-18).
@@ -37,7 +43,7 @@
  *   reaches that).
  */
 import { execFile, spawn, spawnSync, type ChildProcess } from "node:child_process";
-import { constants as osConstants, setPriority } from "node:os";
+import { constants as osConstants, setPriority, tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ArgvSeam, ExecOptions, ExecSeam } from "./types";
 
@@ -240,7 +246,15 @@ function run(file: string, args: string[], shell: boolean, opts: RunOptions, nic
       opts.signal?.removeEventListener("abort", kill);
       // Windows keeps the child tracked until its `exit`: one that outlived
       // the grace is exactly what the exit hook must still end.
-      if (!isWin && pid) untrack(pid, trackToken);
+      if (!isWin && pid) {
+        // QA-G-5: a run that ended normally may have left background members
+        // in its group (`cmd &`, an unref'd child). They would keep running
+        // outside the slot, so they are ended with the run. The same guards
+        // as the late kill: the group was not seen empty and the entry is
+        // still ours (QA-1.2-27). A `setsid` escapee is not in the group.
+        if (!groupGone && ownsTracked(pid, trackToken) && groupAlive(pid)) signalGroup(pid, "SIGKILL");
+        untrack(pid, trackToken);
+      }
       // A sweep that is killing must finish, but must not keep opencode alive
       // (QA-1.2-19); one that is only armed is released.
       if (sweeper && sweepPending) sweeper.unref();
@@ -627,6 +641,9 @@ function armSweeper(pid: number, spawnedAt: number, exitedAt: number): Sweeper {
   let ps: ChildProcess | undefined;
   try {
     ps = spawn(powershell, ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], {
+      // QA-G-9: not the host's cwd (the user's project). PowerShell writes its
+      // module analysis cache relative to its cwd when LocalAppData is missing.
+      cwd: tmpdir(),
       windowsHide: true,
       stdio: ["pipe", "pipe", "ignore"],
     });

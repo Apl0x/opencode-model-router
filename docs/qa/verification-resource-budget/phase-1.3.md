@@ -1226,3 +1226,7 @@ fresh directory with its own `git init` and commit, and the changed file was the
 Cleanup: the junctions under `%TEMP%\omr-fix13r6` were removed with `rmdir` first, the check found 0 reparse points left, and then the
 directory was deleted, including the uv venvs. The link targets are intact, and the Spike C venv and jest project were not modified. The
 final check found 0 `omr-verify-*` files and 0 `bun-node-*` directories in `%TEMP%`, and no process referring to `omr-fix13r6`.
+
+**Closing note (phase 3.2).** After the round-6 resolutions above, phase 1.3 was closed under the owner's final-round rule: no further re-review round was run. The §1.5-3 trigger amendment (QA-1.3-4, -8, -23) is recorded in the plan (07ab9d9); the fixtures listed for 3.2 stay with the 3.2 global QA.
+
+Status: CLEAN (closed 2026-09-28 under the owner rule, after round 6).

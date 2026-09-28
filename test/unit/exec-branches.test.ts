@@ -4,7 +4,7 @@ import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "no
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { KILL_GRACE_MS, SWEEP_TIMEOUT_MS, runArgv, setSweeperExecutableForTests, trackingForTests } from "../../src/verify/exec";
+import { KILL_GRACE_MS, SWEEP_TIMEOUT_MS, runArgv, runShell, setSweeperExecutableForTests, trackingForTests } from "../../src/verify/exec";
 
 // Branches of src/verify/exec.ts that test/unit/exec.test.ts reaches only in a
 // separate host process (test/fixtures/exec/host.mjs), where coverage is not
@@ -19,6 +19,8 @@ const state = vi.hoisted(() => ({
   standIn: { script: "", args: [] as string[] },
   /** PID of the last stand-in started. */
   standInPid: 0,
+  /** The cwd the last stand-in was spawned with (QA-G-9). */
+  standInCwd: undefined as unknown,
   /** The last direct child spawned through exec.ts (not a stand-in). */
   lastChild: undefined as ChildProcess | undefined,
   /** Make the next `taskkill` report a failure without running it. */
@@ -31,6 +33,7 @@ vi.mock("node:child_process", async (importOriginal) => {
     if (file === STAND_IN) {
       const standIn = real.spawn(process.execPath, ["-e", state.standIn.script, ...state.standIn.args], options);
       state.standInPid = standIn.pid ?? 0;
+      state.standInCwd = options.cwd;
       return standIn;
     }
     const child = real.spawn(file, args, options);
@@ -193,6 +196,8 @@ describe.runIf(isWin)("orphan sweep branches (Windows-only: the sweeper runs onl
     try {
       await t.childExited();
       expect(state.standInPid).toBeGreaterThan(0);
+      // QA-G-9: never the host's cwd (the user's project).
+      expect(state.standInCwd).toBe(tmpdir());
       writeFileSync(join(t.dir, "release"), "");
       expect(await pending).toEqual({ code: 0, stdout: "", stderr: "", timedOut: false });
       // dispose() ended the hung stand-in rather than leaving it for 60 s.
@@ -261,6 +266,20 @@ describe.runIf(isWin)("orphan sweep branches (Windows-only: the sweeper runs onl
   }, 20_000);
 });
 
+describe.runIf(!isWin)("QA-G-5: a normal exit ends what the run left in its process group (POSIX)", () => {
+  it.each([false, true])("a passing command's background grandchild is dead within 3 s of the settle (lowPriority %s)", async (lowPriority) => {
+    const r = await runShell("sleep 30 >/dev/null 2>&1 & echo $!", { cwd: tmpdir(), timeoutMs: 20_000, lowPriority });
+    expect(r).toMatchObject({ code: 0, stderr: "", timedOut: false });
+    const grandchild = Number(r.stdout.trim());
+    expect(grandchild).toBeGreaterThan(0);
+    try {
+      expect(await waitFor(() => !alive(grandchild), 3000)).toBe(true);
+    } finally {
+      if (alive(grandchild)) process.kill(grandchild);
+    }
+  }, 20_000);
+});
+
 describe("kill and exit-hook edges", () => {
   it("an abort that arrives before a failed spawn reports its error counts as a kill (no PID: direct kill only)", async () => {
     const controller = new AbortController();
@@ -270,7 +289,10 @@ describe("kill and exit-hook edges", () => {
     const r = await pending;
     expect(r.code).toBe(1);
     expect(r.timedOut).toBe(true);
-    expect(r.stderr).toMatch(/ENOENT/);
+    // Which error settles the run is a race: the spawn's ENOENT, or (seen on Linux, node 20) the
+    // direct kill of the never-started child, which Node may report as an `error` event
+    // ("Error: kill EPERM") before the ENOENT tick. Either way it is a kill with code 1.
+    expect(r.stderr).toMatch(/ENOENT|Error: kill E[A-Z]+/);
   });
 
   it("the exit hook does nothing when no run is in flight", () => {

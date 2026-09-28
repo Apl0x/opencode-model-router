@@ -211,7 +211,9 @@ Verification has three outcomes: `pass` means checks ran successfully, `fail` me
 the work did not satisfy a performed check, and `unverifiable` carries the reason
 a check could not be performed. The gate accepts when there is no genuine failure,
 appending a **Verification caveats — NOT verified** list for every unavailable check;
-acceptance does not turn those checks into passes. Mixed failure/unavailable results
+acceptance does not turn those checks into passes. Such a result is headed
+`[router ⚠ UNVERIFIED: <method>]`, never "accepted" or "verified"; only a clean pass
+reads `[router ✓ verified: <method>]` (`deterministic` or `checker`). Mixed failure/unavailable results
 still reject and may escalate. Strict mode rejects unavailable-only results without
 escalation. `run`, build and lint exit failures remain genuine failures. `testsPass`
 runs only the affected tests and rechecks their failures against a dispatch-time
@@ -332,14 +334,28 @@ All of these must hold:
   is not `"never"` **and** (the start-time enforcement mode is not `off` **or** the
   `delegate` tool is enabled);
 - the caller is a proven root orchestrator (a subagent cannot defer its own work);
+- on the native `task` path, the enforcement mode at dispatch time is not `off` (for
+  example after `/router enforce off`);
 - the DoD carries a `testsPass` check, and the dispatch is not a trivial dispatch with
   an inferred DoD;
 - on the `delegate` path, the producer did not error;
-- the producer changed files. Only an attributed, empty change set falls back; a change
-  set that cannot be attributed still defers, with risk `high`.
+- the producer changed files, **or** the DoD has any check besides `testsPass`, or a
+  criterion. Only a `testsPass`-only DoD with an attributed, empty change set falls
+  back: the required gate passes it ("no changed files") without running a process. A
+  change set that cannot be attributed still defers, with risk `high`.
+
+A DoD with a `testsPass` check defers **as a whole**: its build, lint, `run` and
+criteria checks are deferred too, and run only when the handle is verified. This holds
+when the producer changed nothing: the delegation is deferred with risk `low` (no
+changes attributed), and its build, lint, `run` and criteria checks never run before
+the result returns.
 
 Otherwise the dispatch is handled as before deferred verification: the required
-(synchronous) gate, or no gate when `require` is `"never"`.
+(synchronous) gate, or no gate when `require` is `"never"` or, on the native `task`
+path, when the enforcement mode at dispatch time is `off`. In particular, a DoD
+**without** `testsPass` (for example `buildPasses` or `fileExists` only) is gated
+before return in either mode, and its checks run synchronously; `VERIFY:deferred`
+does not change that.
 
 When registration fails (for example a handle collision), the delegation falls
 back to the required gate. It is never marked accepted or verified by that failure.

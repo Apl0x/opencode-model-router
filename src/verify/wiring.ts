@@ -195,6 +195,14 @@ export function applyDispatchCaveats(
  * always taken after each sharer's request began, as its own run would have been. A request's signal
  * ends only its own wait (undefined); a started run is aborted once every sharer has left, and a
  * queued run nobody waits for any more never starts. The returned function never rejects.
+ *
+ * QA-3.1-24: a started run whose last sharer left is also detached from its lane, so a run that
+ * ignores its abort (snapshotTree's lstat/readlink/realpath take no signal) cannot hold every later
+ * request with its key. Known limit: a request that arrives just after a run started waits for that
+ * run and then its own, while its timeout counts from its own request; when one snapshot or capture
+ * takes longer than half of the caller's timeout (baselineTimeoutMs, default 15 s), such an early
+ * arrival can time out before its own run ends. That fails closed: no change baseline, reference
+ * none, verdict unverifiable.
  */
 export function createSharedFlight<T>(): (
   key: string,
@@ -239,15 +247,21 @@ export function createSharedFlight<T>(): (
     };
     return flight;
   };
+  // The lane's running flight is done with (settled, or detached by its last sharer): start the
+  // queued one, or retire an idle lane.
+  const advance = (key: string, lane: Lane): void => {
+    lane.running = undefined;
+    const next = lane.next;
+    lane.next = undefined;
+    if (next !== undefined) launch(key, lane, next);
+    else if (lanes.get(key) === lane) lanes.delete(key);
+  };
   const launch = (key: string, lane: Lane, flight: Flight): void => {
     lane.running = flight;
     flight.start();
     void flight.result.then(() => {
-      lane.running = undefined;
-      const next = lane.next;
-      lane.next = undefined;
-      if (next !== undefined) launch(key, lane, next);
-      else if (lanes.get(key) === lane) lanes.delete(key);
+      // QA-3.1-24: a flight its last sharer detached no longer owns the lane.
+      if (lane.running === flight) advance(key, lane);
     });
   };
   return (key, run, signal) => {
@@ -271,8 +285,12 @@ export function createSharedFlight<T>(): (
         flight.sharers -= 1;
         if (flight.sharers === 0) {
           // Nobody waits for it any more: stop a started run; never start a queued one.
-          if (flight.started) flight.controller.abort();
-          else if (owner.next === flight) owner.next = undefined;
+          if (flight.started) {
+            flight.controller.abort();
+            // QA-3.1-24: a run that ignores its abort must not hold the lane until it settles.
+            // Detach it, so the queued run (whose sharers all asked after it started) goes now.
+            if (owner.running === flight) advance(key, owner);
+          } else if (owner.next === flight) owner.next = undefined;
         }
         settle(undefined);
       };
@@ -369,8 +387,9 @@ export type DeferredFinish =
       readonly deferred: false;
       /**
        * "unregistered": the registry refused the entry (registry-full, handle-collision,
-       * invalid-input); "no-change": an attributed empty change set, which the required gate passes
-       * with no process (section 1.5-6); "error": the finish itself failed.
+       * invalid-input); "no-change": an attributed empty change set of a testsPass-only DoD, which
+       * the required gate passes with no process (section 1.5-6; QA-G-1: any other DoD is deferred
+       * with the empty set instead, noChangeGateSpawnsNothing); "error": the finish itself failed.
        */
       readonly reason: "unregistered" | "no-change" | "error";
       readonly detail: string;
@@ -405,6 +424,17 @@ export function dispatchDirectiveText(prompt: string | undefined, description: s
 /** A DoD whose deferral section 1.5-14/16 governs: it carries a testsPass check. */
 export function hasTestsPass(dod: DoD): boolean {
   return dod.checks.some(c => c.kind === "testsPass");
+}
+
+/**
+ * QA-G-1: whether the required gate passes an attributed empty change set of this DoD with no
+ * process and no grader: every check is testsPass (its "no changed files" pass, section 1.5-6) and
+ * there is no criterion. Only such a delegation takes finishDeferred's "no-change" answer
+ * (QA-2.4-10); any other deferred DoD is registered with the empty change set instead, so its
+ * build, lint, run, file and criteria checks run on router_verify, never synchronously.
+ */
+export function noChangeGateSpawnsNothing(dod: DoD): boolean {
+  return dod.checks.length > 0 && dod.checks.every(c => c.kind === "testsPass") && dod.criteria.length === 0;
 }
 
 /**
@@ -608,7 +638,7 @@ export function formatVerifyReport(
       lines.push(indent(`[router] ${DRIFT_UNCHECKED_NOTICE}`));
     }
     if (judged.accepted) {
-      lines.push(indent(buildAcceptedSuffix(verdict.method, judged.verdict.caveats, verdict.notes).trim()));
+      lines.push(indent(buildAcceptedSuffix(verdict.method, judged.verdict.outcome, judged.verdict.caveats, verdict.notes).trim()));
     } else {
       lines.push(indent(scrubText(buildForcingNote(verdict.reasons, { producerTier: item.producerTier, nextTier: result.nextTier ?? null }))));
       lines.push(indent(ROUTER_VERIFY_NO_RETRY_TEXT));
@@ -754,8 +784,9 @@ export interface VerificationWiring {
    * QA-2.4-10: only what the required gate would actually judge defers. `trivial` is the gate's own
    * input (the native path's dispatch-time classification; delegate passes none): the gate skips a
    * trivial dispatch whose DoD was inferred (gate.ts), so that one is not deferred and takes the
-   * required path, with the same outcome. (An attributed empty change set is the other case;
-   * finishDeferred answers "no-change" for it.)
+   * required path, with the same outcome. (An attributed empty change set of a testsPass-only DoD
+   * is the other case; finishDeferred answers "no-change" for it. QA-G-1: a DoD with any other
+   * check or a criterion stays deferred with that empty set.)
    */
   isDeferred(dod: DoD, directives: VerifyDirectives, trivial?: boolean): boolean;
   /**
@@ -1077,7 +1108,10 @@ export function createVerificationWiring(deps: {
     };
     return {
       async findByName(gitRoot, names) {
-        const r = await git(gitRoot, ["ls-files", "-z", "--cached", "--others", "--exclude-standard", "--", ...names.map(n => `:(glob)**/${n}`)]);
+        // QA-G-3: a name is literal, so its glob metacharacters are bracketed ([*], [[], [\\]):
+        // git on Windows reads a backslash in a pathspec as a separator, not an escape.
+        const lit = (n: string) => n.replace(/[*?[\]\\]/g, c => (c === "\\" ? "[\\\\]" : `[${c}]`));
+        const r = await git(gitRoot, ["ls-files", "-z", "--cached", "--others", "--exclude-standard", "--", ...names.map(n => `:(glob)**/${lit(n)}`)]);
         return r && r.code === 0 ? splitZ(r.stdout).map(rel => resolve(gitRoot, rel)) : undefined;
       },
       async findByContent(gitRoot, needle, globs, options) {
@@ -1480,7 +1514,13 @@ export function createVerificationWiring(deps: {
       const change = await observeChange(store, input.dispatchID, input.producerSessionID, input.cwd, deadline);
       // QA-2.4-10: an attributed empty change set is passed by the required gate with no process
       // (section 1.5-6): nothing to defer. The caller runs that gate, with the same outcome.
-      if (change.changeBaseline === "available" && change.changedFiles.length === 0 && !deadline.signal.aborted) {
+      // QA-G-1: only for a testsPass-only DoD. Any other check (build, lint, run, fileExists,
+      // schemaMatch) or a criterion would be run or graded by that gate synchronously, so such a
+      // DoD stays deferred as a whole, with the attributed empty change set (risk low).
+      if (
+        change.changeBaseline === "available" && change.changedFiles.length === 0 && !deadline.signal.aborted &&
+        noChangeGateSpawnsNothing(input.dod)
+      ) {
         return { deferred: false, reason: "no-change", detail: "the producer changed no file" };
       }
       let changedFiles: ChangedPath[] | "unavailable" = "unavailable";

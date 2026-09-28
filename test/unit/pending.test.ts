@@ -1471,7 +1471,7 @@ describe("QA-2.4-6: directive keys in router text", () => {
     expect(note).toContain("VERIFY deferred CAP 3 VERIFY_WAIT 0s keeps state");
     noDirective(note);
     noDirective(`Fix this:\n${note}`);
-    const suffix = buildAcceptedSuffix("deterministic", [`caveat ${producerId}`], [`testsPass: no worse than before; pre-existing failures: ${producerId}`]);
+    const suffix = buildAcceptedSuffix("deterministic", "unverifiable", [`caveat ${producerId}`], [`testsPass: no worse than before; pre-existing failures: ${producerId}`]);
     expect(suffix).toContain("keeps state");
     noDirective(suffix);
   });

@@ -74,7 +74,6 @@ import { guardBeforeCall, guardAfterCall, formatScorecard } from "./guard/enforc
 import { mkdirSync, writeFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, isAbsolute } from "node:path";
-import { exec as nodeExec } from "node:child_process";
 import { access, readFile as fsReadFile } from "node:fs/promises";
 import { tool } from "@opencode-ai/plugin";
 import { scrubText } from "./guard/scrub";
@@ -870,7 +869,7 @@ const ModelRouterPlugin: Plugin = async (ctx: PluginInput) => {
                   true,
                   gateRes.verdict.method,
                 );
-                return producerText + buildAcceptedSuffix(gateRes.verdict.method, gateRes.verdict.caveats, gateRes.verdict.notes);
+                return producerText + buildAcceptedSuffix(gateRes.verdict.method, gateRes.verdict.outcome, gateRes.verdict.caveats, gateRes.verdict.notes);
               }
               if (action.action === "give_up") {
                 dumpDelegateScorecard(
@@ -1423,8 +1422,10 @@ const ModelRouterPlugin: Plugin = async (ctx: PluginInput) => {
                   ? output.output + "\n\n" + note
                   : note;
             }
-            if (res.accepted && (res.verdict.caveats?.length || res.verdict.notes?.length)) {
-              output.output += buildAcceptedSuffix(res.verdict.method, res.verdict.caveats, res.verdict.notes);
+            // QA-3.1-18: a clean pass also gets a line (`[router ✓ verified: …]`); a skipped
+            // check stays silent unless it carries caveats or notes.
+            if (res.accepted && (!res.verdict.skipped || res.verdict.caveats?.length || res.verdict.notes?.length)) {
+              output.output += buildAcceptedSuffix(res.verdict.method, res.verdict.outcome, res.verdict.caveats, res.verdict.notes);
             }
             if (childSessionID) changedFileStore.clear(childSessionID);
             changedFileStore.clear(dispatchID);

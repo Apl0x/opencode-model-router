@@ -201,7 +201,15 @@ afterEach(async () => {
   for (const c of children.splice(0)) if (c.exitCode === null && c.signalCode === null) killHard(c);
 });
 afterAll(() => {
-  for (const d of dirs.splice(0)) rmSync(d, { recursive: true, force: true });
+  // A hard-killed child may still hold a lock or ticket for a moment (EBUSY/EPERM on Windows):
+  // retry, and never let one busy directory strand the rest (omr-slot-* leaked otherwise).
+  for (const d of dirs.splice(0)) {
+    try {
+      rmSync(d, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+    } catch {
+      // Best effort: a directory still busy after the retries is left to the OS temp cleanup.
+    }
+  }
 });
 
 function intervals(log: string): Array<[number, number]> {

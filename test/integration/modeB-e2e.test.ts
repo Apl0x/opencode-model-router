@@ -129,7 +129,7 @@ describe("Mode B end-to-end (plan-annotation)", () => {
       acceptance,
     });
 
-    expect(result).toContain("[router ✓ accepted:");
+    expect(result).toContain("[router ✓ verified:");
     expect(result).not.toContain("status: unmet");
     expect(producerCalls.length).toBe(1);
   });
@@ -159,7 +159,7 @@ describe("Mode B end-to-end (plan-annotation)", () => {
       acceptance,
     });
 
-    expect(result).toContain("[router ✓ accepted:");
+    expect(result).toContain("[router ✓ verified:");
     expect(producerCalls.length).toBe(3);
     expect(producerCalls[2]!.tier).toBe("medium");
     expect(producerCalls[1]!.text).toContain("[router escalation]");

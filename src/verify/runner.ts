@@ -588,11 +588,23 @@
 //          - an existing test file becomes an input, if it lies under runnerCwd and under a path
 //            scope (when path scopes exist).
 //          - an existing module (E2E-1) maps to the union of:
-//            (i) its importers: search.findByContent(gitRoot, stem, [...pytest globs (9),
-//                ":(glob)**/conftest.py"], {word: true}), hits re-checked against python_files.
-//                Every import spelling holds the stem as a whole word (`import app.mod02`,
-//                `from app.mod02 import x`, `from app import mod02`, `from .mod02 import x`,
-//                `from . import mod02`); a longer name (mod020) does not match.
+//            (i) its importers: search.findByContent(gitRoot, name, [...pytest globs (9),
+//                ":(glob)**/conftest.py"], {word: true}), where name is the module's Python name
+//                (the basename without ".py"; for __init__.py the package directory name). A
+//                longer name (mod020) does not match. QA-G-10: every whole-word hit is kept (any
+//                import layout: a name anywhere in a wrapped, isort-grid, backslash-continued or
+//                CRLF list, importlib strings, attribute chains). One exception, the QA-G-2
+//                over-match: for a module named like the regular package that holds it
+//                (app/app.py beside app/__init__.py), keepImporters reads each hit through the fs
+//                seam and drops it only when every whole-word occurrence of name heads a longer
+//                module path in a one-line import statement (`from app.mod01 import x`,
+//                `import app.mod01`), where name is the package. An unreadable file, one over
+//                CONFIG_SIZE_LIMIT, or one the read finds no occurrence in is kept. Other modules
+//                read nothing: a module can serve its own dotted names (six.py's
+//                `from six.moves import x`). QA-G-2's import-shaped git grep -E missed wrapped
+//                imports (a false pass). A package's __init__.py keeps every hit: importing any
+//                submodule runs it. Then conftest hits -> S6 (below); hits re-checked against
+//                python_files; more than STEM_MATCH_LIMIT -> S6 stem-too-common.
 //            (ii) the tests named after it: search.findByName(gitRoot, names), where each
 //                basename pattern with exactly one "*" and no other wildcard gives a name
 //                ("test_*.py" -> test_<stem>.py; by default ["test_<stem>.py", "<stem>_test.py"]).
@@ -619,7 +631,32 @@
 //            one. Without this, extra/test_preexisting.py (outside testpaths = ["tests"], never
 //            collected by `uv run pytest`) became an input of every app/mod01.py change.
 //          - a gone test file adds a note. A gone module uses the stem search plus findByName,
-//            and gets S6 when both find nothing.
+//            and gets S6 when both find nothing. QA-G-17: its content search uses the module's
+//            Python name, as for an existing module (a deleted app/index.py searches "index",
+//            not "app"); findByName keeps the stem. The deleted-file rules below fail closed.
+//            QA-G-19: the content search covers ":(glob)**/conftest.py" too; a conftest hit that
+//            exists -> S6 unmapped-module (unscoped, as for an existing module).
+//            QA-G-20: a gone test file is a module other tests may import (`from test_base import
+//            Base`): search.findByContent(gitRoot, <basename without .py>, [...pytest globs,
+//            conftest glob], {word: true}); in-scope test hits join the inputs, a conftest hit
+//            -> S6 unmapped-module, more than STEM_MATCH_LIMIT -> S6 stem-too-common, no hit ->
+//            the note only.
+//            QA-G-21..23: a gone __init__.py (deleted, or the source of a rename; compared with
+//            ctx.key), anywhere in the change set -> S6 unmapped-module "package structure
+//            changed: <rel> deleted; pytest import paths may shift", decided while classifying,
+//            before any search, so planStaticScoping returns it too. It is checked before
+//            python_files, so a python_files pattern that matches __init__.py changes nothing.
+//            Removing it changes how pytest's rootdir-based import (prepend mode by default)
+//            names and imports every module under the directory: a relative `from . import
+//            helper` fails (QA-G-21), each test module becomes top-level and can collide with a
+//            namesake ("import file mismatch"), and the directory goes to the front of sys.path,
+//            where its modules shadow same-named ones that tests anywhere import (QA-G-22). No
+//            static mapping of those effects was trustworthy: 68edf52's per-directory listing
+//            missed the shadowed importers (QA-G-22) and a directory whose case drifted from the
+//            index (QA-G-23).
+//            QA-G-18: a gone module whose package's __init__.py still exists and names it as a
+//            whole word (unreadable or over CONFIG_SIZE_LIMIT counts as naming it) adds the
+//            importers of the package name: the QA-G-20 search with that name.
 //        stem = the basename without its last extension. "index" and "__init__" use the parent
 //        directory name instead.
 //   9. Stem search (section 1.5-5): search.findByContent(gitRoot, stem, globs), with JS_TEST_GLOBS
@@ -631,7 +668,8 @@
 //        more than STEM_MATCH_LIMIT files -> S6 stem-too-common.
 //        otherwise               -> the existing, inside-root results join the inputs.
 //   9a. (QA-1.3-26) The searches run one process each, in sequence (a pytest module, gone or
-//      existing, runs a content search and a name search but counts once). More than SEARCH_LIMIT (50)
+//      existing, runs a content search and a name search, and a gone one up to one more, but
+//      counts once; a gone pytest test file counts once). More than SEARCH_LIMIT (50)
 //      pending searches (the count below) -> S6 too-many-searches, decided before the first
 //      search. 5000 changed pytest modules made 5000 git calls (about 26 minutes at 0.3 s each).
 //      Batching (one git grep with several -e, one ls-files) would need a TestSearchSeam change;
@@ -639,8 +677,9 @@
 //   10. Inputs empty after steps 8 and 9 -> NoAffected, with the note from M.2. Every pytest
 //      module has added an input or returned S6 by then (E2E-1), so this only happens when no
 //      changed file is a module or an in-scope test input.
-//   planStaticScoping stops before every search. Each gone non-test source, and each existing
-//   pytest module, counts as a pending search. It applies 9a, and (QA-1.3-27) runs the spec-time
+//   planStaticScoping stops before every search. A gone pytest __init__.py is S6 there too
+//   (QA-G-22). Each gone non-test source, each pytest module (existing or gone), and each gone
+//   pytest test file (QA-G-20) counts as a pending search. It applies 9a, and (QA-1.3-27) runs the spec-time
 //   pytest config lookup (D.4) over the test inputs it already knows, so an addopts S6 there is
 //   seen by 1.6 too. When nothing is decidable, the result is {scopable: true, runner,
 //   pendingSearches}.
@@ -906,6 +945,8 @@
 //     unmapped-module          no test file maps to the changed module <rel>   (G.8, E2E-1)
 //                              changed module <rel> is referenced by <conftest rel>: the tests
 //                              its fixtures reach cannot be mapped
+//                              package structure changed: <rel> deleted; pytest import paths
+//                              may shift   (G.8, QA-G-22; <rel> ends in __init__.py)
 //   M.2 NoAffected notes:
 //     "no changed files, no affected tests"                          (section 1.5-6, exactly)
 //     "no affected tests: no changed file is a test input"           (docs only, dropped paths,
@@ -1266,10 +1307,14 @@ export interface TestSearchSeam {
   /**
    * Absolute paths under gitRoot that match a pathspec in `globs` and contain `needle` literally.
    * With `options.word` the needle must stand as a whole word (git grep -w: not preceded or
-   * followed by a letter, digit or "_"), as a Python module name does in every import spelling
-   * (`import a.mod`, `from a.mod import x`, `from a import mod`, `from .mod import x`).
+   * followed by a letter, digit or "_").
    */
-  findByContent(gitRoot: string, needle: string, globs: readonly string[], options?: { readonly word?: boolean }): Promise<readonly string[] | undefined>;
+  findByContent(
+    gitRoot: string,
+    needle: string,
+    globs: readonly string[],
+    options?: { readonly word?: boolean },
+  ): Promise<readonly string[] | undefined>;
 }
 
 export type CommandSource =
@@ -4155,6 +4200,86 @@ function stemOf(ctx: Ctx, abs: string): string {
   return stem === "index" || stem === "__init__" ? ctx.P.basename(ctx.P.dirname(abs)) : stem;
 }
 
+/** git grep -w's word characters (ASCII letters, digits, "_"; a non-ASCII character is a boundary). */
+const WORD_CHAR_RE = /[A-Za-z0-9_]/;
+
+/** The whole-word occurrences of `name` in `text`, as git grep -w finds them (overlaps included). */
+function countWords(text: string, name: string): number {
+  let n = 0;
+  for (let i = text.indexOf(name); i !== -1; i = text.indexOf(name, i + 1)) {
+    if (!WORD_CHAR_RE.test(text.charAt(i - 1)) && !WORD_CHAR_RE.test(text.charAt(i + name.length))) n++;
+  }
+  return n;
+}
+
+/** `from [dots]<dotted path> import`: the path (group 2) is a module path. */
+const PY_FROM_PATH_RE = /^([ \t]*from[ \t]+\.*)([A-Za-z0-9_]+(?:\.[A-Za-z0-9_]+)*)(?=[ \t]+import(?![A-Za-z0-9_]))/;
+/** `import <items>[# comment]`. */
+const PY_IMPORT_LINE_RE = /^([ \t]*import[ \t]+)([^#]*)(.*)$/;
+/** One `<dotted path>[ as <name>]` item of an import statement. */
+const PY_IMPORT_ITEM_RE = /^([ \t]*)([A-Za-z0-9_]+(?:\.[A-Za-z0-9_]+)*)((?:[ \t]+as[ \t]+[A-Za-z0-9_]+)?[ \t]*)$/;
+
+/** A dotted module path without its first segment when that is `name` and more segments follow. */
+function dropPackageHead(dotted: string, name: string): string {
+  const dot = dotted.indexOf(".");
+  return dot > 0 && dotted.slice(0, dot) === name ? dotted.slice(dot) : dotted;
+}
+
+/**
+ * One line with `name` blanked where it heads a longer module path of an import statement
+ * (`from app.mod01 import x`, `from ..app.mod01 import x`, `import app.mod01, os as o`). A line
+ * that is not a plain one-line `from … import` or `import a.b[ as c], …` statement is returned
+ * unchanged, so every occurrence in it still counts.
+ */
+function withoutPackageHeads(line: string, name: string): string {
+  const from = PY_FROM_PATH_RE.exec(line);
+  if (from) return from[1] + dropPackageHead(from[2], name) + line.slice(from[0].length);
+  const imp = PY_IMPORT_LINE_RE.exec(line);
+  if (!imp) return line;
+  const items: string[] = [];
+  for (const it of imp[2].split(",")) {
+    const m = PY_IMPORT_ITEM_RE.exec(it);
+    if (!m) return line;
+    items.push(m[1] + dropPackageHead(m[2], name) + m[3]);
+  }
+  return imp[1] + items.join(",") + imp[3];
+}
+
+/**
+ * QA-G-10 (G.8): of the whole-word hits of `name`, for a module named like the regular package
+ * that holds it (app/app.py beside app/__init__.py), the files that may import it. A file is
+ * dropped only when it provably does not: every whole-word occurrence of `name` heads a longer
+ * module path in an import statement (`from app.mod01 import x`), where `name` is that package
+ * (the QA-G-2 over-match). Any doubt keeps the file: a stat or read that fails, a file over
+ * CONFIG_SIZE_LIMIT (checked with fs.stat before the read, as config reads are, and after it), or a
+ * read that finds no occurrence at all (git saw one). Lines split at CRLF, LF and CR, as Python
+ * reads them. Keeping a file only ever adds a test.
+ */
+async function keepImporters(fs: PlannerFs, hits: readonly string[], name: string): Promise<string[]> {
+  const out: string[] = [];
+  for (const h of hits) {
+    const text = await readBounded(fs, h);
+    if (text === undefined || countWords(text, name) === 0) out.push(h);
+    else if (countWords(text.split(/\r\n|\r|\n/).map((l) => withoutPackageHeads(l, name)).join("\n"), name) > 0) out.push(h);
+  }
+  return out;
+}
+
+/**
+ * A file's text through the fs seam, or undefined when the stat or the read fails or the file is
+ * over CONFIG_SIZE_LIMIT (by fs.stat, checked before the read, or by the read's length).
+ */
+async function readBounded(fs: PlannerFs, abs: string): Promise<string | undefined> {
+  try {
+    const st = fs.stat ? await fs.stat(abs) : undefined;
+    if (st && Number(st.size) > CONFIG_SIZE_LIMIT) return undefined;
+    const text = await fs.readFile(abs);
+    return text.length > CONFIG_SIZE_LIMIT ? undefined : text;
+  } catch {
+    return undefined;
+  }
+}
+
 /** G.3-G.5 for one path: canonical absolute path inside gitRoot, or undefined. */
 function canonicalize(ctx: Ctx, cwd: string, gitRoot: string, p: string): FileRef | undefined {
   const abs = ctx.P.resolve(cwd, p);
@@ -4322,6 +4447,7 @@ async function classify(
   const goneSources: FileRef[] = [];
   const modules: FileRef[] = [];
   const goneModules: FileRef[] = [];
+  const goneTests: FileRef[] = [];
   let skipped = 0;
   // G.8b (E2E-1): without path scopes, pytest's testpaths (when they decide collection) bound the
   // test inputs: a test file the user's run never collects is not one of its tests.
@@ -4341,8 +4467,18 @@ async function classify(
       if (exists && isTest) {
         if (inScope(f.abs)) addInput(f.abs);
       } else if (exists) modules.push(f);
-      else if (isTest) notes.push(`deleted test file not run: ${f.rel}`);
-      else goneModules.push(f);
+      else if (ctx.key(base) === "__init__.py") {
+        // QA-G-22/23: a deleted (or renamed-away) __init__.py changes how pytest's rootdir-based
+        // import names every module under its directory and where on sys.path they sit (relative
+        // imports fail, test modules become top-level namesakes, its modules shadow same-named
+        // ones that tests anywhere import). No static mapping of that is trustworthy: fail closed,
+        // before any search, even when python_files match it.
+        return s6("unmapped-module", `package structure changed: ${f.rel} deleted; pytest import paths may shift`);
+      } else if (isTest) {
+        // QA-G-20: other tests may import it; it is searched below.
+        notes.push(`deleted test file not run: ${f.rel}`);
+        goneTests.push(f);
+      } else goneModules.push(f);
     } else {
       const isTest = JS_TEST_RE.test(base) || f.rel.split("/").includes("__tests__");
       if (exists) addInput(f.abs);
@@ -4352,7 +4488,7 @@ async function classify(
   }
   if (skipped > 0) notes.push(`non-input files skipped: ${skipped}`);
 
-  const pending = det.kind === "pytest" ? modules.length + goneModules.length : goneSources.length;
+  const pending = det.kind === "pytest" ? modules.length + goneModules.length + goneTests.length : goneSources.length;
   // G.9a (QA-1.3-26): the searches are sequential processes (a git grep costs ~0.3 s in a large
   // repo), so their number is bounded. Decided before any search, so static scoping agrees.
   if (pending > SEARCH_LIMIT) {
@@ -4404,42 +4540,108 @@ async function classify(
     }
     for (const h of await accept(hits, false)) addInput(h);
   }
-  // G.8 (E2E-1): an existing module maps to every test file that imports it (a whole-word content
-  // search for its stem, which every import spelling contains) plus the test files named after it.
-  // It fails closed: a module no in-scope test maps to, or one a conftest.py references (its
-  // fixtures reach tests that never name the module), is S6 unmapped-module, never NoAffected.
+  // G.8 (E2E-1, QA-G-10): an existing module maps to every test file that names it as a whole
+  // word (any import layout), plus the test files named after it. Only a module named like the
+  // regular package that holds it (app/app.py) drops the files that provably name only that
+  // package (keepImporters, the QA-G-2 over-match); a package's __init__.py, which every import of
+  // the package or of its submodules runs, keeps every hit. It fails closed: a module no in-scope
+  // test maps to, or one a conftest.py references (its fixtures reach tests that never name the
+  // module), is S6 unmapped-module, and one more than STEM_MATCH_LIMIT test files reference is S6
+  // stem-too-common, never NoAffected.
   for (const f of modules) {
     const stem = stemOf(ctx, f.abs);
-    const content = await search.findByContent(gitRoot, stem, [...pyGlobs, CONFTEST_GLOB], { word: true });
-    if (content === undefined) return searchFailed(f);
+    const init = P.basename(f.abs) === "__init__.py";
+    // The name a direct import spells: index.py is "index" (stemOf gives its directory's name).
+    const name = init ? stem : P.basename(f.abs, ".py");
+    const hits = await search.findByContent(gitRoot, name, [...pyGlobs, CONFTEST_GLOB], { word: true });
+    if (hits === undefined) return searchFailed(f);
+    const relevant = hits.filter((h) => P.basename(h) === "conftest.py" || isPyTestFile(ctx, pyFiles, h));
+    const dir = P.dirname(f.abs);
+    const namedLikePackage = !init && P.basename(dir) === name && (await existsCached(ctx, fs, P.join(dir, "__init__.py")));
+    const content = namedLikePackage ? await keepImporters(fs, relevant, name) : relevant;
     // Unscoped: pytest also loads the conftest.py files above the collected tests (up to confcutdir).
     const conftests = await accept(content.filter((h) => P.basename(h) === "conftest.py"), false);
     if (conftests.length > 0) {
       const rel = toSlash(ctx, P.relative(gitRoot, conftests[0]));
       return s6("unmapped-module", `changed module ${f.rel} is referenced by ${rel}: the tests its fixtures reach cannot be mapped`);
     }
+    const tests = content.filter((h) => isPyTestFile(ctx, pyFiles, h));
+    if (tests.length > STEM_MATCH_LIMIT) {
+      return s6("stem-too-common", `changed module ${f.rel}: ${tests.length} test files import it (limit ${STEM_MATCH_LIMIT})`);
+    }
     const named = await byName(stem);
     if (named === undefined) return searchFailed(f);
-    const ok = await accept([...content.filter((h) => isPyTestFile(ctx, pyFiles, h)), ...named], true);
+    const ok = await accept([...tests, ...named], true);
     if (ok.length === 0) return s6("unmapped-module", `no test file maps to the changed module ${f.rel}`);
     for (const h of ok) addInput(h);
   }
+  /**
+   * The test files that name a deleted file's `name` (word: as a whole word), re-checked against
+   * python_files. QA-G-19: conftest.py files are searched with them, and a hit is S6
+   * unmapped-module, as for an existing module: a nested conftest.py's fixtures reach tests that
+   * never name the file. More than STEM_MATCH_LIMIT test files -> S6 stem-too-common.
+   */
+  const goneImporters = async (f: FileRef, what: string, name: string, word: boolean): Promise<readonly string[] | Unverifiable> => {
+    const globs = [...pyGlobs, CONFTEST_GLOB];
+    const hits = await (word ? search.findByContent(gitRoot, name, globs, { word: true }) : search.findByContent(gitRoot, name, globs));
+    if (hits === undefined) return searchFailed(f);
+    // Unscoped: pytest also loads the conftest.py files above the collected tests (up to confcutdir).
+    const conftests = await accept(hits.filter((h) => P.basename(h) === "conftest.py"), false);
+    if (conftests.length > 0) {
+      const rel = toSlash(ctx, P.relative(gitRoot, conftests[0]));
+      return s6("unmapped-module", `${what} ${f.rel}: ${rel} references "${name}": the tests its fixtures reach cannot be mapped`);
+    }
+    const tests = hits.filter((h) => isPyTestFile(ctx, pyFiles, h));
+    if (tests.length > STEM_MATCH_LIMIT) {
+      return s6("stem-too-common", `${what} ${f.rel}: "${name}" appears in ${tests.length} test files (limit ${STEM_MATCH_LIMIT})`);
+    }
+    return tests;
+  };
+  /**
+   * QA-G-18: a deleted module that its package's __init__.py still names as a whole word (`from
+   * .index import VERSION`) breaks every import of the package, so the package name's importers
+   * are inputs too (goneImporters, with the package name as a whole word). An __init__.py that
+   * cannot be read, or one over CONFIG_SIZE_LIMIT, is taken to name it.
+   */
+  const reExporters = async (f: FileRef, name: string): Promise<readonly string[] | Unverifiable> => {
+    const dir = P.dirname(f.abs);
+    const init = P.join(dir, "__init__.py");
+    if (!(await existsCached(ctx, fs, init))) return [];
+    const text = await readBounded(fs, init);
+    if (text !== undefined && countWords(text, name) === 0) return [];
+    return goneImporters(f, "deleted source", P.basename(dir), true);
+  };
+
+  // QA-G-17: a deleted module is searched by the name its importers spell, as an existing one is:
+  // a deleted app/index.py by "index" (`from app.index import x`, `from .index import x`), not by
+  // its directory's name. The name search keeps the stem. (A deleted __init__.py never gets here:
+  // it is S6 above, QA-G-22.) QA-G-18: plus its package's importers.
   for (const f of goneModules) {
     const stem = stemOf(ctx, f.abs);
-    const content = await search.findByContent(gitRoot, stem, pyGlobs);
+    const name = P.basename(f.abs, ".py");
+    const tests = await goneImporters(f, "deleted source", name, false);
+    if (isS6(tests)) return tests;
     const named = await byName(stem);
-    if (content === undefined || named === undefined) return searchFailed(f);
-    const tests = content.filter((h) => isPyTestFile(ctx, pyFiles, h));
-    if (tests.length > STEM_MATCH_LIMIT) {
-      return s6("stem-too-common", `deleted source ${f.rel}: "${stem}" appears in ${tests.length} test files (limit ${STEM_MATCH_LIMIT})`);
-    }
-    const ok = await accept([...tests, ...named], true);
-    if (ok.length === 0) return s6("deleted-no-tests", `deleted source ${f.rel}: no test file references "${stem}"`);
+    if (named === undefined) return searchFailed(f);
+    const extra = await reExporters(f, name);
+    if (isS6(extra)) return extra;
+    const ok = await accept([...tests, ...named, ...extra], true);
+    if (ok.length === 0) return s6("deleted-no-tests", `deleted source ${f.rel}: no test file references "${name}"`);
     for (const h of ok) addInput(h);
+  }
+  // QA-G-20: a deleted test file is a module too, and other tests may import it (`from test_base
+  // import Base`, `from .test_base import x`): its Python name is searched as a whole word, and its
+  // importers are inputs. A conftest.py that names it is S6 unmapped-module. A deleted test file
+  // nothing names keeps only its note (a test file is a leaf).
+  for (const f of goneTests) {
+    const tests = await goneImporters(f, "deleted test file", P.basename(f.abs, ".py"), true);
+    if (isS6(tests)) return tests;
+    for (const h of await accept(tests, true)) addInput(h);
   }
 
   // Every pytest module and gone module above added an input or returned S6, so an empty set here
-  // means no changed file was a test input or a module (docs, dropped paths, deleted tests).
+  // means no changed file was a test input or a module (docs, dropped paths, deleted test files
+  // nothing imports).
   if (inputs.size === 0) return noAffected(NOTE_NO_INPUT);
   const pre = await preflight(ctx, det, fs);
   if (isS6(pre)) return pre;

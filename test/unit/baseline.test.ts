@@ -64,7 +64,8 @@ describe("reference-aware testsPass", () => {
     expect(r.accepted).toBe(true);
     expect(r.verdict.outcome).toBe("pass");
     expect(r.verdict.failures).toEqual({ introduced: [], preexisting: [id("old-test")], unknown: [] });
-    const output = buildAcceptedSuffix(r.verdict.method, r.verdict.caveats, r.verdict.notes);
+    const output = buildAcceptedSuffix(r.verdict.method, r.verdict.outcome, r.verdict.caveats, r.verdict.notes);
+    expect(output).toContain("[router \u2713 verified: deterministic]");
     expect(output).toContain("no worse than before");
     expect(output).toContain("NOT green");
     expect(output).toContain("exact dispatch reference");
@@ -88,7 +89,10 @@ describe("reference-aware testsPass", () => {
     expect(r.verdict.outcome).toBe("unverifiable");
     expect(r.verdict.caveats?.join()).toContain("observed-test");
     expect(r.verdict.caveats?.join()).toContain("no reference");
-    const output = buildAcceptedSuffix(r.verdict.method, r.verdict.caveats, r.verdict.notes);
+    const output = buildAcceptedSuffix(r.verdict.method, r.verdict.outcome, r.verdict.caveats, r.verdict.notes);
+    // QA-3.1-21 (plan G2): an unverifiable result is never labelled accepted or verified.
+    expect(output).toContain("[router \u26a0 UNVERIFIED: deterministic]");
+    expect(output).not.toMatch(/\u2713|accepted|\bverified:/);
     expect(output).toContain("Verification caveats — NOT verified");
     expect(output).toContain("observed-test");
   });

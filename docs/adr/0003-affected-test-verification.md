@@ -139,6 +139,13 @@ Each dispatch carries `VERIFY:required` or `VERIFY:deferred` (default: `defaultV
   the change set unavailable and the reference none, which fails closed instead of seeding the
   baseline with the edit. A write with no tool event, or a writing tool under a non-writing name,
   is not seen.
+- **Concurrent dispatches in one working tree share it** (Phase 3.1, QA-3.1-2). Their change sets
+  overlap, so a rejection can list introduced failures that came from a sibling's edits. Such a
+  rejection carries the caveat "other delegations ran in this working tree concurrently (N);
+  introduced failures may come from their edits". It fails closed: a sibling can cause a
+  rejection, never a pass. Dispatches that start together also share one snapshot and capture; one
+  that takes longer than half of `baselineTimeoutMs` can time out an early arrival, which is
+  `unverifiable` (QA-3.1-24).
 - **`unverifiable` is accepted with a caveat** unless `strictUnverifiable` is set, in which case it
   is rejected. This covers scoping failures, a busy slot, a capture that did not finish, and pytest
   failures.
@@ -158,9 +165,14 @@ Each dispatch carries `VERIFY:required` or `VERIFY:deferred` (default: `defaultV
   - The orphan sweeper needs PowerShell in FullLanguage mode; under Constrained Language Mode
     (AppLocker/WDAC) it exits at once and kills nothing.
   - `taskkill` slowed by CPU saturation can leave part of a tree running.
-  - Death of opencode by an unhandled signal skips the exit hook, so in-flight runs are not killed.
+  - What a command that exits normally leaves running is not swept (QA-G-5): the orphan sweep
+    costs a PowerShell start per run, so it runs only for a deadline or an abort. Such a leftover
+    runs outside the verification slot. On POSIX the run's process group is killed when the run
+    settles; only a descendant that left the group (`setsid`) survives there.
   - `lowPriority` is applied just after spawn; a descendant spawned before that call (a narrow
     race) runs at normal priority.
+- **Unhandled signals (all platforms).** Death of opencode by an unhandled signal skips the exit
+  hook, so in-flight runs are not killed, on POSIX as on Windows.
 - **Deprecations.** `enforcement.verify.testBaseline` logs a once-per-process warning and maps onto
   `failureRecheck`.
 - **Bundled defaults.** The bundled `tiers.json` no longer sets `gateBudgetMs`. The key is still

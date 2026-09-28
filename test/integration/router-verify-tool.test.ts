@@ -503,7 +503,7 @@ describe("verifyHandles (2.4.3a)", () => {
     expect(item.result.verdict.outcome).toBe("pass");
     expect(item.result.retryable).toBe(false);
     expect(first.text).toContain(`- ${h} \u00b7 work a \u00b7 pass`);
-    expect(first.text).toContain("[router \u2713 accepted: deterministic]");
+    expect(first.text).toContain("[router \u2713 verified: deterministic]");
     expect(wiring.pending.get("orch", h)).toMatchObject({ kind: "found", entry: { state: "verified" } });
     expect(inputsOf("a")).toBe(1);
     expect(client.session.create).not.toHaveBeenCalled();
@@ -573,7 +573,9 @@ describe("verifyHandles (2.4.3a)", () => {
     expect(item.result.verdict.outcome).toBe("unverifiable");
     expect(item.result.retryable).toBe(false);
     expect(report.text).toContain(`- ${h} \u00b7 work a \u00b7 unverifiable`);
-    expect(report.text).toContain("[router \u2713 accepted: deterministic]");
+    // QA-3.1-21 (plan G2): returned with its caveat, never labelled accepted or verified.
+    expect(report.text).toContain("[router \u26a0 UNVERIFIED: deterministic]");
+    expect(report.text).not.toMatch(/\[router \u2713|accepted:|verified:/);
     expect(wiring.pending.get("orch", h)).toMatchObject({ kind: "found", entry: { state: "verified" } });
   });
 
@@ -755,6 +757,7 @@ describe("verifyHandles (2.4.3a)", () => {
       const redoBlock = report.text.slice(report.text.indexOf(`- ${d2} `));
       expect(redoBlock).toContain("[router \u26a0 NOT ACCEPTED]");
       expect(redoBlock).not.toContain("accepted: deterministic");
+      expect(redoBlock).not.toMatch(/\[router \u2713|verified: /);
     });
 
     it("one background run with both as riders: the redo is unverifiable and noticed, never a silent pass", async () => {

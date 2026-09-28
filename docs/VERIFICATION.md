@@ -171,14 +171,16 @@ A `VERIFY:required` delegation, and every `router_verify` or background run, goe
 
 | outcome | when | gate result |
 |---|---|---|
-| **pass** | the scoped run is complete, has no collection error and no failing test; or no test is affected | accepted |
-| **pass — "no worse than before"** | every failing test id also fails at an **exact** reference, and the scoped inventory is complete | accepted, with the note `no worse than before; pre-existing failures: …; suite is NOT green` |
+| **pass** | the scoped run is complete, has no collection error and no failing test; or no test is affected | accepted, labelled `[router ✓ verified: deterministic]` |
+| **pass — "no worse than before"** | every failing test id also fails at an **exact** reference, and the scoped inventory is complete | accepted, labelled `[router ✓ verified: deterministic]` with the note `no worse than before; pre-existing failures: …; suite is NOT green` |
 | **fail** | at least one failing id is **proven** introduced against an exact recheck: it fails now and passed at the reference, or its test file did not exist at dispatch | rejected; only the introduced ids are named |
-| **unverifiable** | anything else (below) | accepted **with a caveat**, or rejected when `strictUnverifiable` is on |
+| **unverifiable** | anything else (below) | returned **with a caveat** under `[router ⚠ UNVERIFIED: <method>]`, or rejected when `strictUnverifiable` is on |
 
 A fail is always backed by a proven id. A result that cannot be decided either way is unverifiable, never fail and never pass.
 
 8. **Escalation.** A rejection follows the existing `onFailure` handling and the escalation ladder (`docs/ESCALATION.md`). The `delegate` tool retries up the ladder. The native `task` path appends a forcing note.
+
+Residual limits (JS runners, QA-G-7): `vitest related` and `jest --findRelatedTests` follow **static** imports only. A test that reaches the changed file only through a file read (a fixture, a JSON or data file loaded from disk), a dynamic `import()` or `require()` with a non-literal specifier, or a cross-package effect is not run, and the scope can pass without it, or report "no affected tests". Config and global-setup changes are reported as unverifiable. See ADR 0003, "Consequences".
 
 ### Deferred path (the default)
 
@@ -187,7 +189,7 @@ The mode is chosen by directives in the orchestrator's dispatch prompt. A subage
 - `VERIFY:required`, or `VERIFY:deferred` (the default).
 - `VERIFY_WAIT:<n>s` or `VERIFY_WAIT:<n>ms`: `0` is allowed, and the value is capped at `baselineTimeoutMs`. A malformed value falls back to `captureWaitMs` and is logged.
 
-Deferral applies to delegations whose DoD has a `testsPass` check.
+Deferral applies to delegations whose DoD has a `testsPass` check. Such a DoD defers **as a whole**: its build, lint, `run` and criteria checks are deferred too, also when the producer changed nothing (then with risk `low`). The one exception is a `testsPass`-only DoD whose producer provably changed nothing: it takes the required gate, which passes it ("no changed files") without running a process. A DoD **without** `testsPass` (for example `buildPasses` only) is gated synchronously in either mode, and its checks run before return. On the native `task` path, a dispatch made while the enforcement mode is `off` gets no gate at all. The full list of conditions is in `docs/CONFIG_REFERENCE.md` → "Which delegations defer".
 
 1. **Dispatch.** When the DoD has `testsPass` and `failureRecheck` is on, the router starts a **git-only** reference capture of the working tree. It never runs the test command at dispatch time. The dispatch waits for the capture for at most `VERIFY_WAIT` (default `captureWaitMs`), then starts the producer anyway. The capture keeps running for up to `baselineTimeoutMs`. A capture that fails or times out means "no reference". It never blocks or fails the dispatch.
 2. **Producer returns.** The deferred finish takes a git-only tree snapshot, bounded at 2 s (`DEFERRED_FINISH_MS`). From that snapshot it computes:
@@ -222,24 +224,39 @@ Unverifiable means the router could not tell whether the change broke tests. It 
 - **there is no reference**: the capture failed or timed out, had not resolved within the gate budget, the dispatch was not tracked, `failureRecheck` is off, or the reference vanished or could not be materialized;
 - **the reference is approximate**: files differ from the dispatch state in a way the reference cannot reproduce. Only inert files such as `coverage/`, `*.log` and caches are ignored;
 - **the tests are pytest failures**: a pytest reference rerun is never attempted (`runner-unsupported`), because an editable install imports the live tree's sources. Green pytest runs still pass;
-- **a pytest module maps to no test** (`unmapped-module`): see [pytest module mapping](#pytest-module-mapping);
+- **a pytest module maps to no test, or a package `__init__.py` was deleted** (`unmapped-module`): see [pytest module mapping](#pytest-module-mapping);
 - **an unknown tool ran during the dispatch capture**: see [Dispatch capture and unknown tools](#dispatch-capture-and-unknown-tools);
 - **a run is incomplete**: a missing or partial report, a collection error without identifiable test files, a zero-test rerun, or failing ids that cannot be matched to a reference result;
 - **scoping is impossible**: changed files are unavailable, or no planner exists for the command (S6);
 - the command is not allowlisted, the check errored, or the lineage caveat applies.
 
-By default an unverifiable result is **accepted with a caveat** that names the reason. Set `verify.strictUnverifiable: true` to reject it instead. Unverifiable never counts as verified. It is not proof that the tests pass.
+By default an unverifiable result is **returned with a caveat** that names the reason. Set `verify.strictUnverifiable: true` to reject it instead. Unverifiable never counts as verified. It is not proof that the tests pass, and it is never labelled accepted or verified (plan G2). A gate that timed out, for example, renders:
+
+```
+[router ⚠ UNVERIFIED: none]
+Verification caveats — NOT verified (acceptance is not a passing check):
+- verification gate timed out after 6000ms
+```
+
+A clean pass renders the single line `[router ✓ verified: <method>]` (`deterministic` or `checker`), on the `delegate` tool and on a native `Task()` alike. A pass that carries a caveat (for example concurrent delegations in the same tree) is labelled `UNVERIFIED` too.
 
 ### pytest module mapping
 
 pytest has no related-tests mode, so the planner maps changed files to test files itself (Phase 3.1, E2E-1):
 
 - A changed test file is an input itself.
-- A changed module maps to the test files that name its stem as a **whole word** (a `git grep -F -w` content search over the `python_files` patterns), joined with the tests named after it (`test_<stem>.py`, `<stem>_test.py`). Every import spelling contains the stem as a whole word: `import app.mod02`, `from app.mod02 import x`, `from app import mod02`, `from .mod02 import x`. A longer name such as `mod020` does not match.
-- It fails closed. When no in-scope test maps to a changed module, or a `conftest.py` names it (its fixtures reach tests that never name the module), the check is unverifiable with S6 `unmapped-module`. One unmapped module makes the whole change unverifiable. A failed search is S6 `search-failed`.
+- A changed module maps to every test file that **names** it, joined with the tests named after it (`test_<stem>.py`, `<stem>_test.py`). The names come from one whole-word content search (`git grep -F -w`) for the module's name (its file name without `.py`; for a package's `__init__.py`, the package name) over the `python_files` patterns and `conftest.py`. Any import layout therefore selects the test: a name anywhere in a parenthesised, isort grid-wrapped or backslash-continued list, CRLF or CR line ends, `import app.mod02 as m`, relative imports, `importlib.import_module("app.mod02")`, `__import__`, and `app.mod02.f()`. A longer name such as `mod020` does not match, and a name with regex metacharacters (`mod+1`) is matched literally. The search over-includes (a comment or a string that names the module selects its file too) and never drops a file for its import layout (QA-G-10: the import-shaped `git grep -E` of QA-G-2 missed wrapped imports and passed over a failing importer).
+- One exception keeps a module named like the regular package that holds it (`app/app.py` beside `app/__init__.py`) from mapping to every `from app.modNN import …` test (QA-G-2). For such a module only, each hit is read, and a file is dropped when every whole-word `app` in it heads a longer module path in a one-line import statement (`from app.mod01 import x`, `from ..app.mod01 import x`, `import app.mod01, app.mod03 as m`). Every other use keeps the file: `from app import x`, `import app`, `from app.mod01 import app`, `app.mod01.f()`, a string, a comment, a statement split over lines or joined with `;`. A file that cannot be read, is over 1 MiB, or no longer holds the name is kept too. Other modules read nothing, since a module can serve its own dotted names (`six.py` and `from six.moves import x`). A package's `__init__.py` keeps every hit: any import of the package or its submodules runs it.
+- It fails closed. When no in-scope test maps to a changed module, or a `conftest.py` names it (its fixtures reach tests that never name the module), the check is unverifiable with S6 `unmapped-module`. More than 20 test files that name it (`STEM_MATCH_LIMIT`, counted after the `app/app.py` exception) give S6 `stem-too-common` rather than a near-full suite. One unmapped module makes the whole change unverifiable. A failed search is S6 `search-failed`.
+- Test names are matched literally. Glob metacharacters in a stem (`app/mod0[1-2]_[1-3].py`) are bracketed in the `git ls-files` pathspec, so they never match other tests (QA-G-3).
+- Deleted files fail closed too:
+  - A deleted or renamed-away `__init__.py`, anywhere in the change set, makes the check unverifiable: S6 `unmapped-module` with `package structure changed: <path> deleted; pytest import paths may shift`. This is decided before any search, so static scoping reports it too, and it applies even when `python_files` matches `__init__.py` (on Windows the name is compared case-insensitively). Without its `__init__.py`, pytest's rootdir-based import (the default `prepend` mode) names and places every module under the directory differently. A relative import there (`from . import helper`) fails. Each test module becomes top-level and can collide with another of the same basename ("import file mismatch"). The directory also goes to the front of `sys.path`, so its modules shadow same-named modules that tests anywhere else import. No static mapping of that is trustworthy. The earlier directory listing ran the package's own tests, but missed the tests broken by shadowing (QA-G-22) and missed a directory whose case differed from the index (QA-G-23), so it was replaced (QA-G-21..23).
+  - A deleted module is searched by its own Python name (`index` for `app/index.py`) as a substring (`git grep -F`) over the `python_files` patterns **and `conftest.py`**, joined with the tests named after its stem (QA-G-17). A `conftest.py` that names it gives S6 `unmapped-module`, as for a changed module, since its fixtures reach tests that never name the module (QA-G-19). No test at all gives S6 `deleted-no-tests`, and more than 20 give S6 `stem-too-common`.
+  - When the deleted module's package `__init__.py` still exists and names it as a whole word (`from .index import VERSION`), every import of the package now fails, so the importers of the package name (a whole-word search, `conftest.py` included) join the inputs. An `__init__.py` that cannot be read counts as naming it (QA-G-18).
+  - A deleted or renamed-away test file is not always a leaf: other tests may import it (`from test_base import Base`, `from .test_base import x`). Its module name is searched as a whole word over the test files and `conftest.py`. The tests that import it run, a `conftest.py` that names it gives S6 `unmapped-module`, and more than 20 give S6 `stem-too-common`. A test file that nothing names only adds the note `deleted test file not run: <path>`, as before (QA-G-20). Each deleted test file counts as one pending search, in static scoping and against the 50-search limit.
 - When `testpaths` decides the collection (no path argument, pytest started in its rootdir, every config sets `testpaths`, no `-o testpaths=`, `--pyargs` or `--rootdir`, plain entries only), only tests under it are inputs. In any other case every test under the runner directory is a candidate: an extra input can add a failure, never hide one.
 
-Residual limits: only **direct** importers run. A test that reaches the changed module only through another source module (`app/mod02.py` importing `app/mod01.py`) or a dynamic import is not run, and the scope can pass without it. A change to non-`.py` files alone (a data file a module reads, `.pyi`, `.pyx`, a binary extension) still gives "no affected tests".
+Residual limits: only tests that **name** the module run. A test that reaches the changed module only through another source module (`app/mod02.py` importing `app/mod01.py`), a package re-export (`from app import *`), or a dynamic import that never spells its name (`import_module("app." + n)`) is not run, and the scope can pass without it. For a deleted module, only its own package's `__init__.py` is followed (one level, and only when it names the module). The `app/app.py` exception assumes `app` in `from app.mod01 import x` is the package: it would drop an importer only if `app/app.py` served submodules itself (as `six.py` serves `six.moves`) and a test reached them as `app.<x>` with `app/` on `sys.path` ahead of its parent, or as `.app.<x>` from inside `app/`. A change to non-`.py` files alone (a data file a module reads, `.pyi`, `.pyx`, a binary extension) still gives "no affected tests".
 
 ### Dispatch capture and unknown tools
 
@@ -251,6 +268,17 @@ While a dispatch's tree snapshot or reference capture is still in flight (a `VER
 
 Residual limits: a write with no tool event (an external editor, an MCP server that writes after its call returned, the user's own `!` shell) cannot be seen by any hook. A tool that writes under a non-writing name (for example a custom tool called `lsp`) is not caught.
 
+Dispatches that start together share their snapshot and capture (one run per key: directory, priority, `baselineTimeoutMs`). A dispatch that arrives just after a run started waits for that run and then its own, while its timeout counts from its own request; when one snapshot or capture takes longer than half of `baselineTimeoutMs`, such an early arrival can time out first. That fails closed: no change baseline, reference none, verdict `unverifiable` (QA-3.1-24).
+
+### Concurrent dispatches in one working tree
+
+Delegations that run at the same time in one working tree share that tree. Their change sets overlap: each dispatch's changed files can include a sibling's edits, and a failure a sibling introduced reads as introduced by this one. A rejection that lists introduced failures while other delegations overlapped it carries the caveat `other delegations ran in this working tree concurrently (N); introduced failures may come from their edits`. This fails closed: a sibling's breakage can reject a delegation, never make a broken one pass. Use separate worktrees for delegations that must be judged in isolation (QA-3.1-2).
+
+### Process limits (all platforms)
+
+- **What a normal exit leaves running** (QA-G-5). When a verification command exits on its own, what it left in the background is ended with it on POSIX: the run's process group is killed when the run settles (`cmd &`, a child that was not waited for). A descendant that left the group (`setsid`, Node's `detached: true`) is not reached. On Windows nothing is swept after a normal exit: the orphan sweep (a PowerShell start, 0.2–6 s of CPU) runs only for a deadline or an abort, so a detached or background descendant of a passing command keeps running outside the verification slot, and repeated verifications can accumulate them.
+- **Unhandled signals.** Runs still in flight when opencode exits are killed from a `process.once("exit")` hook. Death by an unhandled signal (SIGTERM, SIGHUP, Ctrl-C, per the host's policy) skips that hook on every platform, POSIX process groups included, so those runs are not killed by the router.
+
 ### Windows limits
 
 - **Junction-based `node_modules` at the reference.** The reference worktree links the live tree's `node_modules` with directory junctions. A reference rerun therefore uses today's installed dependencies, not the dependencies from dispatch time. Cleanup takes care not to follow those junctions into the live tree.
@@ -258,7 +286,6 @@ Residual limits: a write with no tool event (an external editor, an MCP server t
 - **Orphan processes.** Abort kills the process tree of the run. A descendant whose parent died before it was pinned, such as a detached grandchild of a short-lived middle process, cannot be attributed safely and is **not** killed. The run still resolves within the 2 s kill grace (`KILL_GRACE_MS`), and the report notes any force-closed output streams.
 - **Orphan sweep needs FullLanguage PowerShell.** The sweeper runs Windows PowerShell 5.1 and needs FullLanguage mode. Under Constrained Language Mode (AppLocker/WDAC) it exits at once and kills nothing; the run appends `[orphan sweep unavailable: <reason>]` to stderr if it has not settled yet.
 - **`taskkill` under CPU saturation.** A load that slows `taskkill /T` past its time limit can leave part of a tree running.
-- **Unhandled signals.** Runs still in flight when opencode exits are killed from a `process.once("exit")` hook. Death by an unhandled signal (SIGTERM, SIGHUP, Ctrl-C, per the host's policy) skips that hook, so those runs are not killed by the router.
 - **Low priority is applied after spawn.** On Windows, `lowPriority` lowers the direct child right after it is spawned; descendants inherit the class when created. Anything the child spawns before that call runs at normal priority. The window is tiny, but it is not a guarantee.
 
 ## Checker (Independent Grader) Verifier
@@ -292,7 +319,7 @@ The plugin-owned `delegate` tool produces via the OpenCode client, runs the gate
 | `graderTimeoutMs` | `60000` (1 min) | one grader `session.prompt` turn |
 | `gateBudgetMs` | `90000` (90 s) | the whole acceptance gate, grader ladder included |
 
-**Fail-closed, in both directions.** A gate that runs out of budget is `unmet` with the reason `verification gate timed out after <n>ms` — never accepted, because the one thing worse than a slow verifier is a fast fabricated pass. And an unusable configured value (zero, negative, non-finite, non-numeric) falls back to the *default* ceiling, never to "no ceiling"; `validateEnforcement` already rejects those in `tiers.json`, so `timeoutMs()` is defence in depth for config that reaches the runtime through an override layer or a hand-built `RouterConfig`.
+**Fail-closed, in both directions.** A gate that runs out of budget never passes: it is `unverifiable` with the reason `verification gate timed out after <n>ms`, rendered `[router ⚠ UNVERIFIED: none]` (returned with that caveat by default, rejected under `strictUnverifiable`), and a failure the gate had already observed before the timeout still rejects it — because the one thing worse than a slow verifier is a fast fabricated pass. And an unusable configured value (zero, negative, non-finite, non-numeric) falls back to the *default* ceiling, never to "no ceiling"; `validateEnforcement` already rejects those in `tiers.json`, so `timeoutMs()` is defence in depth for config that reaches the runtime through an override layer or a hand-built `RouterConfig`.
 
 **A real cancellation, not an abandoned wait.** Every call site pairs the rejection with `session.abort` — directly, or via `disposeChildSession`, which aborts before it deletes. The abort is a genuine server-side call, so the underlying turn actually stops.
 

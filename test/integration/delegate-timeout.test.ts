@@ -204,7 +204,7 @@ describe("delegate time-boxes (fake timers)", () => {
     expect(result).toContain("[router status: unmet]");
     expect(result).toContain("timed out after");
     // Honest failure, never a fabricated acceptance.
-    expect(result).not.toContain("[router ✓ accepted:");
+    expect(result).not.toContain("[router ✓");
     // A hung producer must not have been graded as if it had produced anything.
     expect(rec.graderPrompts).toBe(0);
   });
@@ -232,7 +232,7 @@ describe("delegate time-boxes (fake timers)", () => {
     await vi.advanceTimersByTimeAsync(DEFAULT_DELEGATE_PROMPT_TIMEOUT_MS);
     const result = await pending;
 
-    expect(result).toContain("[router ✓ accepted:");
+    expect(result).toContain("[router ✓ verified:");
     expect(result).toContain("producer output");
     expect(result).not.toContain("timed out");
   });
@@ -303,7 +303,7 @@ describe("delegate time-boxes (fake timers)", () => {
     const result = await pending;
 
     expect(result).toContain("[router status: unmet]");
-    expect(result).not.toContain("[router ✓ accepted:");
+    expect(result).not.toContain("[router ✓");
     expect(rec.producerPrompts).toBeGreaterThanOrEqual(3);
   });
 
@@ -351,7 +351,7 @@ describe("delegate time-boxes (fake timers)", () => {
 
     expect(result).toContain("[router status: unmet]");
     // Not accepted, and NOT reported as an inconclusive skip.
-    expect(result).not.toContain("[router ✓ accepted:");
+    expect(result).not.toContain("[router ✓");
     expect(result).not.toContain("inconclusive");
     expect(rec.graderPrompts).toBe(1);
     expect(rec.producerPrompts).toBe(1);
@@ -400,7 +400,9 @@ describe("delegate time-boxes (fake timers)", () => {
     await vi.advanceTimersByTimeAsync(1000 * 8);
     const result = await pending;
 
-    expect(result).toContain("[router ✓ accepted:");
+    // QA-3.1-21 (plan G2): still returned, but never labelled accepted or verified.
+    expect(result).toContain("[router ⚠ UNVERIFIED: checker]");
+    expect(result).not.toMatch(/\[router ✓|accepted:|verified:/);
     expect(result).toContain("Verification caveats");
     expect(rec.producerPrompts).toBe(1);
     expect(rec.graderPrompts).toBe(1);
@@ -466,7 +468,7 @@ describe("delegate time-boxes (fake timers)", () => {
 
     expect(resultA).toContain("verification gate timed out after 2000ms");
     // B was never collateral damage: it completed and was accepted.
-    expect(resultB).toContain("[router ✓ accepted:");
+    expect(resultB).toContain("[router ✓ verified:");
     expect(resultB).not.toContain("timed out");
   });
 
@@ -493,10 +495,12 @@ describe("delegate time-boxes (fake timers)", () => {
     expect(rec.graderPrompts).toBe(1);
     if (strictUnverifiable) {
       expect(result).toContain("[router status: unmet]");
-      expect(result).not.toContain("[router ✓ accepted:");
+      expect(result).not.toContain("[router ✓");
     } else {
-      expect(result).toContain("[router ✓ accepted:");
-      expect(result).toContain("Verification caveats");
+      // QA-3.1-21 (plan G2): the timed-out gate is returned, never labelled accepted or verified.
+      expect(result).toContain("[router ⚠ UNVERIFIED: none]");
+      expect(result).not.toMatch(/\[router ✓|accepted:|verified:/);
+      expect(result).toContain("Verification caveats — NOT verified");
     }
   });
 
