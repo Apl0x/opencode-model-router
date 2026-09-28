@@ -270,7 +270,10 @@ describe("kill and exit-hook edges", () => {
     const r = await pending;
     expect(r.code).toBe(1);
     expect(r.timedOut).toBe(true);
-    expect(r.stderr).toMatch(/ENOENT/);
+    // Which error settles the run is a race: the spawn's ENOENT, or (seen on Linux, node 20) the
+    // direct kill of the never-started child, which Node may report as an `error` event
+    // ("Error: kill EPERM") before the ENOENT tick. Either way it is a kill with code 1.
+    expect(r.stderr).toMatch(/ENOENT|Error: kill E[A-Z]+/);
   });
 
   it("the exit hook does nothing when no run is in flight", () => {
