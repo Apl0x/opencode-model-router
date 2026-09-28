@@ -1088,6 +1088,20 @@ describe("G.8b: testpaths decide which test inputs the user's run collects", () 
     expect(await inputsOf(TP('["tests"]'), { command: "pytest extra" })).toEqual(["/r/extra/test_m_extra.py"]);
   });
 
+  it("a glob entry beside a literal one drops the testpaths bound, so an importer the glob collects still runs (QA-3.1-13)", async () => {
+    // pytest expands `pkg*/tests` to /r/pkgA/tests. Keeping only the literal `tests` would never run
+    // pkgA's importer of app.m, which could hide its failure.
+    const pkg = { "/r/pkgA/tests": "", "/r/pkgA/tests/test_m_pkg.py": "import app.m\n" };
+    const withPkg = [...ALL, "/r/pkgA/tests/test_m_pkg.py"].sort();
+    for (const tp of ['["tests", "pkg*/tests"]', '["pkg?/tests", "tests"]', '["tests", "pkg[A]/tests"]']) {
+      expect((await inputsOf({ ...pkg, ...TP(tp) })).slice().sort()).toEqual(withPkg);
+      expect((await detect("pytest", pyRepo({ ...TREE, ...pkg, ...TP(tp) }))).collectScopes).toBeUndefined();
+    }
+    expect(await inputsOf({ ...pkg, "/r/pytest.ini": "[pytest]\ntestpaths =\n    tests\n    pkg*/tests\n" })).toEqual(expect.arrayContaining(["/r/pkgA/tests/test_m_pkg.py"]));
+    // Control: the literal entries alone keep the bound.
+    expect(await inputsOf({ ...pkg, ...TP('["tests"]') })).toEqual(["/r/tests/test_m.py"]);
+  });
+
   it("testpaths apply only when pytest starts in its rootdir, and on every release line", async () => {
     // Started from /r/tests with the config at /r: the rootdir is /r, so pytest collects /r/tests.
     const sub = await plan(TP('["it"]'), {}, "/r/tests");
