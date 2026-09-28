@@ -15,24 +15,31 @@ vi.mock("node:os", async importOriginal => ({
     if (state.priorityThrows) throw new Error("ESRCH");
   },
 }));
-vi.mock("node:child_process", () => ({
-  execFile: (binary: string, rawArgs: string[], options: { cwd: string }, callback: (error: Error | null, stdout: string) => void) => {
-    state.binaries.push(binary);
-    // POSIX low priority: `nice -n 10 -- git …`; record git's own argv either way.
-    const args = binary === "nice" ? rawArgs.slice(4) : rawArgs;
-    state.calls.push(args);
-    state.directories.push(options.cwd);
-    const command = args.slice(1).join(" ");
-    const output = command === "rev-parse --show-toplevel" ? process.cwd()
-      : command === "rev-parse HEAD" ? state.head
-      : command.startsWith("status") ? state.status
-      : command.startsWith("diff HEAD") ? state.diff
-      : command.startsWith("diff --cached") ? state.index
-      : command === "ls-files --stage" ? state.stage : state.untracked;
-    callback(state.error ? new Error("unavailable") : null, output);
-    return { pid: 4242 };
-  },
-}));
+vi.mock("node:child_process", async () => {
+  const { EventEmitter } = await import("node:events");
+  return {
+    spawn: (binary: string, rawArgs: string[], options: { cwd: string }) => {
+      state.binaries.push(binary);
+      // POSIX low priority: `nice -n 10 -- git …`; record git's own argv either way.
+      const args = binary === "nice" ? rawArgs.slice(4) : rawArgs;
+      state.calls.push(args);
+      state.directories.push(options.cwd);
+      const command = args.slice(1).join(" ");
+      const output = command === "rev-parse --show-toplevel" ? process.cwd()
+        : command === "rev-parse HEAD" ? state.head
+        : command.startsWith("status") ? state.status
+        : command.startsWith("diff HEAD") ? state.diff
+        : command.startsWith("diff --cached") ? state.index
+        : command === "ls-files --stage" ? state.stage : state.untracked;
+      const child = Object.assign(new EventEmitter(), { pid: 4242, stdout: new EventEmitter() });
+      setImmediate(() => {
+        if (output) child.stdout.emit("data", Buffer.from(output));
+        child.emit("close", state.error ? 1 : 0, null);
+      });
+      return child;
+    },
+  };
+});
 vi.mock("node:fs/promises", () => ({
   realpath: async (path: string) => path,
   lstat: async () => ({ mode: 33188, size: 4, isFile: () => true, isSymbolicLink: () => false }),
