@@ -154,12 +154,13 @@ interface DispatchWindow {
 }
 
 /**
- * QA-3.1-3: a tool name as router text names it: at most 64 characters of [A-Za-z0-9_.-], anything
- * else as "?". Tool names reach the plugin from MCP servers and custom tools.
+ * QA-3.1-3: a tool name as router text names it: [A-Za-z0-9_.-] kept, anything else as "?".
+ * QA-3.1-27: at most 64 characters in total; a longer name keeps 63 and ends in "…". Tool names
+ * reach the plugin from MCP servers and custom tools.
  */
 export function toolLabel(tool: string): string {
   const label = tool.replace(/[^A-Za-z0-9_.-]/g, "?");
-  return label.length > 64 ? `${label.slice(0, 64)}…` : label;
+  return label.length > 64 ? `${label.slice(0, 63)}…` : label;
 }
 
 /** QA-3.1-3: REFERENCE_NONE.contaminated, naming the tool whose call discarded the capture. */

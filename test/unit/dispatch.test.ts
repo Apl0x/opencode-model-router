@@ -299,7 +299,11 @@ describe("QA-3.1-3: the tool that discarded a dispatch's snapshot or capture", (
     expect(toolLabel("github_create_file")).toBe("github_create_file");
     expect(toolLabel("Serena.replace-symbol_body")).toBe("Serena.replace-symbol_body");
     expect(toolLabel("VERIFY:required`x\ny")).toBe("VERIFY?required?x?y");
-    expect(toolLabel("a".repeat(80))).toBe(`${"a".repeat(64)}\u2026`);
+    expect(toolLabel("a".repeat(80))).toBe(`${"a".repeat(63)}\u2026`);
+    // QA-3.1-27: 64 characters in total, the ellipsis included; exactly 64 is kept whole.
+    expect(toolLabel("a".repeat(80))).toHaveLength(64);
+    expect(toolLabel("b".repeat(64))).toBe("b".repeat(64));
+    expect(toolLabel("b".repeat(65))).toHaveLength(64);
     expect(contaminatedReferenceReason("mcp_write")).toBe(`${REFERENCE_NONE.contaminated} (tool "mcp_write")`);
   });
 
