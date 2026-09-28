@@ -17,15 +17,19 @@
 //
 // Writes <dir>/child.pid (this process), <dir>/middle.pid and <dir>/holder.pid
 // (holder.pid last, so the others exist once it does). The holder exits
-// when <dir>/release appears, or after 20 s, so nothing outlives a failed test.
+// when <dir>/release appears, or after 90 s, so nothing outlives a failed test;
+// either way it first writes <dir>/holder.exit ("released" or "timeout"), so a
+// holder that is dead without that file was killed. 90 s outlasts the longest
+// wait for a late sweep (exec.test.ts: the kill + SWEEP_TIMEOUT_MS + 2 s).
 const { spawn } = require("node:child_process");
 const fs = require("node:fs");
 const path = require("node:path");
 
 const [mode, dir] = process.argv.slice(2);
 const HOLDER =
-  "const fs = require('node:fs'); const end = Date.now() + 20000;" +
-  "setInterval(() => { if (fs.existsSync(process.argv[1]) || Date.now() > end) process.exit(0); }, 50);";
+  "const fs = require('node:fs'); const path = require('node:path'); const end = Date.now() + 90000;" +
+  "setInterval(() => { const released = fs.existsSync(process.argv[1]); if (!released && Date.now() <= end) return;" +
+  " fs.writeFileSync(path.join(path.dirname(process.argv[1]), 'holder.exit'), released ? 'released' : 'timeout'); process.exit(0); }, 50);";
 
 function spawnHolder(detached) {
   const holder = spawn(process.execPath, ["-e", HOLDER, path.join(dir, "release")], { stdio: "inherit", detached });

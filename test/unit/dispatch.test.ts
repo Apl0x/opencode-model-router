@@ -8,7 +8,12 @@ import {
   shouldVerifyTask,
   buildForcingNote,
   buildAcceptedSuffix,
+  contaminatedReferenceReason,
+  toolLabel,
+  type TreeSnapshot,
 } from "../../src/verify/dispatch";
+import { REFERENCE_NONE } from "../../src/verify/baseline";
+import { join, resolve } from "node:path";
 import type { RouterConfig } from "../../src/router/config";
 
 const cfg = {
@@ -239,5 +244,84 @@ describe("buildAcceptedSuffix", () => {
     expect(buildAcceptedSuffix("deterministic")).toBe(
       "\n\n[router \u2713 accepted: deterministic]",
     );
+  });
+});
+
+describe("QA-3.1-2: concurrentDispatches (dispatch windows in one git tree)", () => {
+  const snap = (root: string): TreeSnapshot => ({ cwd: root, root, head: "h", fingerprint: "f", dirty: false, files: [] });
+  const begin = (store: ReturnType<typeof createChangedFileStore>, id: string, cwd: string, root: string | null = cwd) =>
+    store.beginDispatch(id, cwd, { snapshot: async () => (root === null ? undefined : snap(root)), timeoutMs: 1_000 });
+  const repo = resolve("qa-3-1-2-repo");
+  const other = resolve("qa-3-1-2-other");
+
+  it("counts every other dispatch live at some moment of the window, in the same git root only", async () => {
+    const store = createChangedFileStore();
+    await begin(store, "a", repo);
+    expect(store.concurrentDispatches("a")).toBe(0);
+    // The same tree from a subdirectory, and another repository.
+    await begin(store, "b", join(repo, "pkg"), repo);
+    await begin(store, "c", other);
+    expect(store.concurrentDispatches("a")).toBe(1);
+    expect(store.concurrentDispatches("b")).toBe(1);
+    expect(store.concurrentDispatches("c")).toBe(0);
+    // b ends (its gate cleared it): it still overlapped a's window.
+    store.clear("b");
+    expect(store.concurrentDispatches("a")).toBe(1);
+    // d begins while a is live; b had ended before d began.
+    await begin(store, "d", repo);
+    expect(store.concurrentDispatches("a")).toBe(2);
+    expect(store.concurrentDispatches("d")).toBe(1);
+    store.clear("a");
+    await begin(store, "e", repo);
+    expect(store.concurrentDispatches("e")).toBe(1);
+    // Untracked: 0. An explicit root (the gate snapshot's) filters too: d overlapped a, c and e.
+    expect(store.concurrentDispatches("a")).toBe(0);
+    expect(store.concurrentDispatches("d", repo)).toBe(2);
+    expect(store.concurrentDispatches("d", other)).toBe(1);
+  });
+
+  it("a dispatch whose snapshot failed is matched by its cwd; its own root falls back to its cwd", async () => {
+    const store = createChangedFileStore();
+    await begin(store, "a", repo);
+    await begin(store, "b", join(repo, "sub"), null);
+    await begin(store, "c", resolve("qa-3-1-2-elsewhere"), null);
+    expect(store.concurrentDispatches("a")).toBe(1);
+    // b has no root: its cwd (inside the repo) decides, and a's root contains it.
+    expect(store.concurrentDispatches("b")).toBe(1);
+    // A cwd above the dispatch's tree overlaps it too.
+    await begin(store, "top", resolve("."), null);
+    expect(store.concurrentDispatches("top")).toBe(3);
+  });
+});
+
+describe("QA-3.1-3: the tool that discarded a dispatch's snapshot or capture", () => {
+  it("toolLabel keeps [A-Za-z0-9_.-], turns anything else into ?, and caps at 64 characters", () => {
+    expect(toolLabel("github_create_file")).toBe("github_create_file");
+    expect(toolLabel("Serena.replace-symbol_body")).toBe("Serena.replace-symbol_body");
+    expect(toolLabel("VERIFY:required`x\ny")).toBe("VERIFY?required?x?y");
+    expect(toolLabel("a".repeat(80))).toBe(`${"a".repeat(64)}\u2026`);
+    expect(contaminatedReferenceReason("mcp_write")).toBe(`${REFERENCE_NONE.contaminated} (tool "mcp_write")`);
+  });
+
+  it("snapshotContaminatedBy is the first tool seen while the snapshot was in flight; none after it settled", async () => {
+    const store = createChangedFileStore();
+    let settle: (s: TreeSnapshot) => void = () => undefined;
+    const begun = store.beginDispatch("d", resolve("qa-3-1-3"), {
+      snapshot: () => new Promise<TreeSnapshot>(ok => { settle = ok; }),
+      timeoutMs: 1_000,
+    });
+    store.observeEdit("read");
+    expect(store.snapshotContaminatedBy("d")).toBeUndefined();
+    store.observeEdit("github_create_file");
+    store.observeEdit("bash");
+    expect(store.snapshotContaminatedBy("d")).toBe("github_create_file");
+    settle({ cwd: "x", root: "x", head: "h", fingerprint: "f", dirty: false, files: [] });
+    await begun;
+    expect(store.baselineSnapshot("d")).toBeUndefined();
+    const clean = createChangedFileStore();
+    await clean.beginDispatch("e", resolve("qa-3-1-3"), { snapshot: async () => undefined, timeoutMs: 1_000 });
+    clean.observeEdit("edit");
+    expect(clean.snapshotContaminatedBy("e")).toBeUndefined();
+    expect(clean.snapshotContaminatedBy("untracked")).toBeUndefined();
   });
 });

@@ -147,6 +147,11 @@ function expectS6(x: object, code: string, reason?: string): void {
   if (reason !== undefined) expect(u.reason).toBe(reason);
 }
 
+/** E2E-1: a changed pytest module that no test maps to is S6, never NoAffected (so: classified as a module). */
+function expectUnmapped(x: object, rel: string): void {
+  expectS6(x, "unmapped-module", `no test file maps to the changed module ${rel}`);
+}
+
 function spec(x: object): ScopedSpec {
   expect(isScopedSpec(x), JSON.stringify(x)).toBe(true);
   return x as ScopedSpec;
@@ -897,14 +902,24 @@ describe("planScopedRun: pytest", () => {
     expectS6(await planScopedRun(input({ command: "pytest", files: pyRepo(), changedFiles: changed("tests/conftest.py") })), "config-changed", "config file changed: tests/conftest.py");
   });
 
-  it("module with no named tests -> NoAffected pytest note; non-py skipped", async () => {
-    const r = await planScopedRun(input({ command: "pytest", files: pyRepo(mods), changedFiles: changed("src/pkg/mod.py", "data.json") }));
-    expect(r).toEqual({ noAffected: true, note: "no affected tests: no test files map to the changed modules" });
+  it("E2E-1: a module no test maps to -> S6 unmapped-module, never NoAffected; non-py skipped", async () => {
+    const search = stubSearch();
+    const r = await planScopedRun(input({ command: "pytest", files: pyRepo(mods), changedFiles: changed("src/pkg/mod.py", "data.json"), search }));
+    expectUnmapped(r, "src/pkg/mod.py");
+    expect(search.findByContent).toHaveBeenCalledWith("/r", "mod", [...PY_TEST_GLOBS, ":(glob)**/conftest.py"], { word: true });
+    // A data file alone is not a module: nothing to map.
+    expect(await planScopedRun(input({ command: "pytest", files: pyRepo(mods), changedFiles: changed("data.json") }))).toEqual({
+      noAffected: true,
+      note: "no affected tests: no changed file is a test input",
+    });
   });
 
-  it("name search failure -> S6", async () => {
+  it("name or content search failure -> S6", async () => {
     const search = stubSearch({}, { "test_mod.py": undefined });
     expectS6(await planScopedRun(input({ command: "pytest", files: pyRepo(mods), changedFiles: changed("src/pkg/mod.py"), search })), "search-failed");
+    const content = stubSearch({ mod: undefined }, { "test_mod.py": ["/r/tests/test_mod.py"] });
+    expectS6(await planScopedRun(input({ command: "pytest", files: pyRepo(mods), changedFiles: changed("src/pkg/mod.py"), search: content })), "search-failed", "test search failed for src/pkg/mod.py");
+    expect(content.findByName).not.toHaveBeenCalled();
   });
 
   it("path scopes and runnerCwd filter test inputs", async () => {
@@ -931,6 +946,171 @@ describe("planScopedRun: pytest", () => {
   it("deleted test file -> note", async () => {
     const r = await planScopedRun(input({ command: "pytest", files: pyRepo(), changedFiles: changed("tests/test_gone.py") }));
     expect(r).toEqual({ noAffected: true, note: "no affected tests: no changed file is a test input" });
+  });
+});
+
+/**
+ * A git-like TestSearchSeam over an in-memory tree, as the wiring runs it (git ls-files by basename;
+ * git grep -F, -w with options.word, over ":(glob)**<slash><basename pattern>" pathspecs).
+ */
+function treeSearch(files: Record<string, string>, root = "/r"): TestSearchSeam {
+  const under = Object.keys(files).filter((p) => p.startsWith(`${root}/`) && p !== `${root}/.git`);
+  const glob = (g: string) => {
+    const pat = g.replace(/^:\(glob\)\*\*\//, "").replace(/[.+^${}()|\\]/g, "\\$&").replace(/\*/g, "[^/]*").replace(/\?/g, "[^/]");
+    const re = new RegExp(`^${pat}$`);
+    return (p: string) => re.test(path.posix.basename(p));
+  };
+  return {
+    findByName: vi.fn(async (_r: string, names: readonly string[]) => under.filter((p) => names.includes(path.posix.basename(p)))),
+    findByContent: vi.fn(async (_r: string, needle: string, globs: readonly string[], options?: { readonly word?: boolean }) => {
+      const esc = needle.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      const re = options?.word === true ? new RegExp(`(?<![A-Za-z0-9_])${esc}(?![A-Za-z0-9_])`) : new RegExp(esc);
+      const match = globs.map(glob);
+      return under.filter((p) => match.some((m) => m(p)) && re.test(files[p]));
+    }),
+  };
+}
+
+describe("E2E-1: pytest maps a changed module to the tests that import it, and fails closed", () => {
+  // The e2e fixture's layout and contents (test/fixtures/projects/pytest-app), in memory under /r.
+  const PYAPP = path.resolve(__dirname, "../fixtures/projects/pytest-app");
+  const rels = [
+    "pyproject.toml", "app/__init__.py", "app/mod01.py", "app/mod02.py", "tests/conftest.py",
+    "tests/test_mod01_1.py", "tests/test_mod01_2.py", "tests/test_mod01_3.py", "tests/test_mod02_1.py", "tests/test_mod03_1.py",
+    "extra/test_preexisting.py",
+  ];
+  // memFs knows files only; "/r/tests" makes the testpaths directory exist (PlannerFs.fileExists accepts directories).
+  const fixture = (extra: Record<string, string> = {}): Record<string, string> =>
+    pyRepo({ "/r/tests": "", ...Object.fromEntries(rels.map((r) => [`/r/${r}`, readFileSync(path.join(PYAPP, r), "utf8")])), ...extra });
+  const plan = (files: Record<string, string>, paths: string[], over: Partial<PlanScopedRunInput> = {}) =>
+    planScopedRun(input({ command: "uv run pytest", files, changedFiles: changed(...paths), search: treeSearch(files), ...over }));
+
+  it("the fixture really has the layout under test", () => {
+    expect(readFileSync(path.join(PYAPP, "pyproject.toml"), "utf8")).toMatch(/testpaths = \["tests"\]/);
+    expect(readFileSync(path.join(PYAPP, "tests/test_mod02_1.py"), "utf8")).toContain("from app.mod02 import value02");
+    expect(readFileSync(path.join(PYAPP, "extra/test_preexisting.py"), "utf8")).toContain("from app.mod01 import value01");
+  });
+
+  it("app/mod02.py -> tests/test_mod02_1.py (was NoAffected: no test is named test_mod02.py)", async () => {
+    const r = await plan(fixture(), ["app/mod02.py"]);
+    expect(isNoAffected(r), JSON.stringify(r)).toBe(false);
+    const s = spec(r);
+    expect(s.inputs).toEqual(["/r/tests/test_mod02_1.py"]);
+    expect(s.file).toBe("/usr/bin/uv");
+    expect(s.args.slice(0, 2)).toEqual(["run", "pytest"]);
+    expect(s.args.slice(s.args.indexOf("--"))).toEqual(["--", "/r/tests/test_mod02_1.py"]);
+  });
+
+  it("testpaths bound the inputs: extra/test_preexisting.py imports app.mod01 but the user's run never collects it", async () => {
+    const s = spec(await plan(fixture(), ["app/mod01.py"]));
+    expect(s.inputs).toEqual(["/r/tests/test_mod01_1.py", "/r/tests/test_mod01_2.py", "/r/tests/test_mod01_3.py"]);
+    // Once it is copied into tests/ (the e2e pre-existing failure), it is one of the module's tests.
+    const pre = fixture({ "/r/tests/test_preexisting.py": readFileSync(path.join(PYAPP, "extra/test_preexisting.py"), "utf8") });
+    expect(spec(await plan(pre, ["app/mod01.py"])).inputs).toContain("/r/tests/test_preexisting.py");
+    // A changed test file outside testpaths is not one of the run's tests either.
+    expect(await plan(fixture(), ["extra/test_preexisting.py"])).toEqual({ noAffected: true, note: "no affected tests: no changed file is a test input" });
+  });
+
+  it("every import spelling maps; a longer name that merely contains the stem does not", async () => {
+    const files = fixture({
+      "/r/tests/test_a.py": "import app.mod02\n",
+      "/r/tests/test_b.py": "from app import mod01, mod02 as m\n",
+      "/r/tests/test_c.py": "from app import (\n    mod02,\n)\n",
+      "/r/tests/pkg/__init__.py": "",
+      "/r/tests/pkg/helper.py": "X = 1\n",
+      "/r/tests/pkg/test_d.py": "from .helper import X\nfrom . import helper\n",
+      "/r/tests/test_e.py": "from app.mod020 import x\nimport app.mod02x\n",
+    });
+    expect(spec(await plan(files, ["app/mod02.py"])).inputs).toEqual([
+      "/r/tests/test_a.py", "/r/tests/test_b.py", "/r/tests/test_c.py", "/r/tests/test_mod02_1.py",
+    ]);
+    expect(spec(await plan(files, ["tests/pkg/helper.py"])).inputs).toEqual(["/r/tests/pkg/test_d.py"]);
+  });
+
+  it("fails closed: no test maps, a conftest.py references the module, or the search fails -> S6", async () => {
+    expectUnmapped(await plan(fixture({ "/r/app/orphan.py": "" }), ["app/orphan.py"]), "app/orphan.py");
+    // A module only extra/ (outside testpaths) imports maps to nothing the user's run collects.
+    expectUnmapped(await plan(fixture({ "/r/app/mod09.py": "", "/r/extra/test_nine.py": "import app.mod09\n" }), ["app/mod09.py"]), "app/mod09.py");
+    const viaFixture = fixture({ "/r/tests/conftest.py": "import pytest\nfrom app.mod02 import value02\n" });
+    expectS6(
+      await plan(viaFixture, ["app/mod02.py"]),
+      "unmapped-module",
+      "changed module app/mod02.py is referenced by tests/conftest.py: the tests its fixtures reach cannot be mapped",
+    );
+    const failing: TestSearchSeam = { findByName: vi.fn(async () => []), findByContent: vi.fn(async () => undefined) };
+    expectS6(await plan(fixture(), ["app/mod02.py"], { search: failing }), "search-failed", "test search failed for app/mod02.py");
+    // One unmapped module in a change makes the whole change S6, even when another one maps.
+    expectUnmapped(await plan(fixture({ "/r/app/orphan.py": "" }), ["app/mod02.py", "app/orphan.py"]), "app/orphan.py");
+  });
+});
+
+describe("G.8b: testpaths decide which test inputs the user's run collects", () => {
+  const TP = (v: string) => ({ "/r/pyproject.toml": `[tool.pytest.ini_options]\ntestpaths = ${v}\n` });
+  const TREE = {
+    // memFs knows files only: these make the directories exist.
+    "/r/tests": "",
+    "/r/it": "",
+    "/r/extra": "",
+    "/r/app/m.py": "",
+    "/r/tests/test_m.py": "import app.m\n",
+    "/r/extra/test_m_extra.py": "import app.m\n",
+    "/r/it/test_m_it.py": "from app import m\n",
+  };
+  const plan = (files: Record<string, string>, over: Partial<PlanScopedRunInput> = {}, cwd = "/r") => {
+    const all = pyRepo({ ...TREE, ...files });
+    return planScopedRun(input({ command: "pytest", cwd, files: all, changedFiles: changed("/r/app/m.py"), search: treeSearch(all), ...over }));
+  };
+  const inputsOf = async (...a: Parameters<typeof plan>) => spec(await plan(...a)).inputs;
+  const ALL = ["/r/extra/test_m_extra.py", "/r/it/test_m_it.py", "/r/tests/test_m.py"];
+
+  it("TOML arrays and strings, ini values; the union of the entries that exist", async () => {
+    expect(await inputsOf(TP('["tests"]'))).toEqual(["/r/tests/test_m.py"]);
+    expect(await inputsOf(TP('"tests it"'))).toEqual(["/r/it/test_m_it.py", "/r/tests/test_m.py"]);
+    expect(await inputsOf({ "/r/pytest.ini": "[pytest]\ntestpaths =\n    tests\n    gone\n" })).toEqual(["/r/tests/test_m.py"]);
+    expect(await inputsOf({ "/r/tox.ini": "[pytest]\ntestpaths = it\n" })).toEqual(["/r/it/test_m_it.py"]);
+    expect((await detect("pytest", pyRepo({ ...TREE, ...TP('["tests", "it"]') }))).collectScopes).toEqual(["/r/tests", "/r/it"]);
+  });
+
+  it("anything that makes pytest collect elsewhere keeps every test under runnerCwd", async () => {
+    // No testpaths, empty, only missing entries, a glob, or an unreadable value.
+    expect(await inputsOf({})).toEqual(ALL);
+    expect(await inputsOf(TP("[]"))).toEqual(ALL);
+    expect(await inputsOf(TP('["gone"]'))).toEqual(ALL);
+    expect(await inputsOf(TP('["test*"]'))).toEqual(ALL);
+    expect(await inputsOf({ "/r/pytest.ini": "[pytest]\ntestpaths = 'open\n" })).toEqual(ALL);
+    // Overrides on the command line, in addopts and in PYTEST_ADDOPTS; --pyargs; --rootdir.
+    expect(await inputsOf(TP('["tests"]'), { command: "pytest -o testpaths=extra" })).toEqual(ALL);
+    expect(await inputsOf({ "/r/pytest.ini": "[pytest]\ntestpaths = tests\naddopts = -o testpaths=extra\n" })).toEqual(ALL);
+    expect(await inputsOf(TP('["tests"]'), { host: { ...POSIX_HOST, pathEnv: "/usr/bin", pytestAddopts: "--override-ini=testpaths=it" } })).toEqual(ALL);
+    expect(await inputsOf(TP('["tests"]'), { command: "pytest --pyargs" })).toEqual(ALL);
+    expect(await inputsOf(TP('["tests"]'), { command: "pytest --rootdir=." })).toEqual(ALL);
+    // A path argument replaces testpaths.
+    expect(await inputsOf(TP('["tests"]'), { command: "pytest extra" })).toEqual(["/r/extra/test_m_extra.py"]);
+  });
+
+  it("a glob entry beside a literal one drops the testpaths bound, so an importer the glob collects still runs (QA-3.1-13)", async () => {
+    // pytest expands `pkg*/tests` to /r/pkgA/tests. Keeping only the literal `tests` would never run
+    // pkgA's importer of app.m, which could hide its failure.
+    const pkg = { "/r/pkgA/tests": "", "/r/pkgA/tests/test_m_pkg.py": "import app.m\n" };
+    const withPkg = [...ALL, "/r/pkgA/tests/test_m_pkg.py"].sort();
+    for (const tp of ['["tests", "pkg*/tests"]', '["pkg?/tests", "tests"]', '["tests", "pkg[A]/tests"]']) {
+      expect((await inputsOf({ ...pkg, ...TP(tp) })).slice().sort()).toEqual(withPkg);
+      expect((await detect("pytest", pyRepo({ ...TREE, ...pkg, ...TP(tp) }))).collectScopes).toBeUndefined();
+    }
+    expect(await inputsOf({ ...pkg, "/r/pytest.ini": "[pytest]\ntestpaths =\n    tests\n    pkg*/tests\n" })).toEqual(expect.arrayContaining(["/r/pkgA/tests/test_m_pkg.py"]));
+    // Control: the literal entries alone keep the bound.
+    expect(await inputsOf({ ...pkg, ...TP('["tests"]') })).toEqual(["/r/tests/test_m.py"]);
+  });
+
+  it("testpaths apply only when pytest starts in its rootdir, and on every release line", async () => {
+    // Started from /r/tests with the config at /r: the rootdir is /r, so pytest collects /r/tests.
+    const sub = await plan(TP('["it"]'), {}, "/r/tests");
+    expect(spec(sub).inputs).toEqual(["/r/tests/test_m.py"]);
+    // pytest 9 reads pytest.toml (testpaths = tests); pytest 7/8 read pytest.ini (no testpaths): union.
+    const lines = { "/r/pytest.toml": '[pytest]\ntestpaths = ["tests"]\n', "/r/pytest.ini": "[pytest]\n" };
+    expect(await inputsOf(lines)).toEqual(ALL);
+    const agree = { "/r/pytest.toml": '[pytest]\ntestpaths = ["tests"]\n', "/r/pytest.ini": "[pytest]\ntestpaths = it\n" };
+    expect(await inputsOf(agree)).toEqual(["/r/it/test_m_it.py", "/r/tests/test_m.py"]);
   });
 });
 
@@ -2665,13 +2845,15 @@ describe("QA-1.3-26: process-backed searches are bounded", () => {
 
   it("pytest modules count too; exactly SEARCH_LIMIT still plans", async () => {
     const mods = Array.from({ length: SEARCH_LIMIT + 1 }, (_, i) => `src/m${i}.py`);
-    const files = pyRepo(Object.fromEntries(mods.map((m) => [`/r/${m}`, ""])));
-    const search = stubSearch();
+    const files = pyRepo({ ...Object.fromEntries(mods.map((m) => [`/r/${m}`, ""])), "/r/tests/test_all.py": "" });
+    const search = stubSearch(Object.fromEntries(mods.map((_, i) => [`m${i}`, ["/r/tests/test_all.py"]])));
     expectS6(await planScopedRun(input({ command: "pytest", files, changedFiles: changed(...mods), search })), "too-many-searches", why(SEARCH_LIMIT + 1));
     expect(search.findByName).not.toHaveBeenCalled();
-    const ok = await planScopedRun(input({ command: "pytest", files, changedFiles: changed(...mods.slice(1)), search }));
-    expect(ok).toEqual({ noAffected: true, note: "no affected tests: no test files map to the changed modules" });
+    expect(search.findByContent).not.toHaveBeenCalled();
+    const ok = spec(await planScopedRun(input({ command: "pytest", files, changedFiles: changed(...mods.slice(1)), search })));
+    expect(ok.inputs).toEqual(["/r/tests/test_all.py"]);
     expect(search.findByName).toHaveBeenCalledTimes(SEARCH_LIMIT);
+    expect(search.findByContent).toHaveBeenCalledTimes(SEARCH_LIMIT);
     expect(await st({ command: "pytest", files, changedFiles: changed(...mods.slice(1)) })).toMatchObject({ scopable: true, pendingSearches: SEARCH_LIMIT });
   });
 });
@@ -2798,8 +2980,7 @@ describe("QA-1.3-33: pytest's python_files decides which changed files are tests
     const s = spec(await planPy(files, ["pkg/tests.py", "pkg/str_tests.py"]));
     expect(s.inputs).toEqual(["/r/pkg/str_tests.py", "/r/pkg/tests.py"]);
     // Without the setting they are modules, and no test is named after them.
-    const plain = await planPy({ "/r/pkg/tests.py": "" }, ["pkg/tests.py"]);
-    expect(plain).toEqual({ noAffected: true, note: "no affected tests: no test files map to the changed modules" });
+    expectUnmapped(await planPy({ "/r/pkg/tests.py": "" }, ["pkg/tests.py"]), "pkg/tests.py");
   });
 
   it("modules are looked up by the names python_files gives them; a literal name gives none", async () => {
@@ -2809,7 +2990,7 @@ describe("QA-1.3-33: pytest's python_files decides which changed files are tests
     expect(search.findByName).toHaveBeenCalledWith("/r", ["test_models.py", "models_tests.py"]);
     const only = { "/r/pytest.ini": "[pytest]\npython_files = tests.py\n", "/r/pkg/models.py": "" };
     const none = stubSearch();
-    expect(isNoAffected(await planPy(only, ["pkg/models.py"], { search: none }))).toBe(true);
+    expectUnmapped(await planPy(only, ["pkg/models.py"], { search: none }), "pkg/models.py");
     expect(none.findByName).not.toHaveBeenCalled();
   });
 
@@ -2861,7 +3042,7 @@ describe("QA-1.3-33: pytest's python_files decides which changed files are tests
   it("with a path argument the config above it counts as well", async () => {
     const files = { "/r/tests/pytest.ini": "[pytest]\npython_files = check_*.py\n", "/r/tests/check_a.py": "" };
     expect(spec(await planPy(files, ["tests/check_a.py"], { command: "pytest tests" })).inputs).toEqual(["/r/tests/check_a.py"]);
-    expect(isNoAffected(await planPy(files, ["tests/check_a.py"]))).toBe(true);
+    expectUnmapped(await planPy(files, ["tests/check_a.py"]), "tests/check_a.py");
   });
 
   it("path patterns match the whole path; content hits are re-checked; globs follow the patterns", async () => {
@@ -2880,7 +3061,10 @@ describe("QA-1.3-33: pytest's python_files decides which changed files are tests
     const tests = ["tast_b1.py", "yx_1.py", "foo[.py", "a_b_spec.py", "]z.py", "r-.py"];
     const modules = ["tast_d1.py", "xx_1.py", "foo.py", "spec.py", "bz.py", "rb.py"];
     for (const f of [...tests, ...modules]) files[`/r/p/${f}`] = "";
-    const s = spec(await planPy(files, [...tests, ...modules].map((f) => `p/${f}`)));
+    // Every module maps to one of the tests (E2E-1: an unmapped module is S6), so the inputs are the tests.
+    const search: TestSearchSeam = { findByContent: vi.fn(async () => ["/r/p/tast_b1.py"]), findByName: vi.fn(async () => []) };
+    const s = spec(await planPy(files, [...tests, ...modules].map((f) => `p/${f}`), { search }));
+    expect(search.findByContent).toHaveBeenCalledTimes(modules.length);
     expect(s.inputs.map((p) => path.posix.basename(p)).sort()).toEqual([...tests].sort());
   });
 
@@ -3347,7 +3531,7 @@ describe("QA-1.3-39: -c, -o, -p and --rootdir in PYTEST_ADDOPTS count like the c
     const s = spec(await planPy(CI, ["tests/check_math.py"], { host: H("-c ci/ci.ini --rootdir=.") }));
     expect(s.inputs).toEqual(["/r/tests/check_math.py"]);
     expect(xdistArgs(s)).toEqual(["-n", "2"]);
-    expect(isNoAffected(await planPy(CI, ["tests/check_math.py"]))).toBe(true);
+    expectUnmapped(await planPy(CI, ["tests/check_math.py"]), "tests/check_math.py");
   });
 
   it("cross-env PYTEST_ADDOPTS -c through a package script", async () => {
@@ -3359,9 +3543,9 @@ describe("QA-1.3-39: -c, -o, -p and --rootdir in PYTEST_ADDOPTS count like the c
 
   it("the command's -c wins; a host value that cross-env replaces does not choose the config", async () => {
     const files = { ...CI, "/r/other.ini": "[pytest]\n" };
-    expect(isNoAffected(await planPy(files, ["tests/check_math.py"], { command: "pytest -c other.ini", host: H("-c ci/ci.ini") }))).toBe(true);
-    expect(isNoAffected(await planPy(files, ["tests/check_math.py"], { command: "cross-env PYTEST_ADDOPTS=-q pytest", host: H("-c ci/ci.ini") }))).toBe(true);
-    expect(isNoAffected(await planPy(files, ["tests/check_math.py"], { command: "cross-env PYTEST_ADDOPTS= pytest", host: H("-c ci/ci.ini") }))).toBe(true);
+    expectUnmapped(await planPy(files, ["tests/check_math.py"], { command: "pytest -c other.ini", host: H("-c ci/ci.ini") }), "tests/check_math.py");
+    expectUnmapped(await planPy(files, ["tests/check_math.py"], { command: "cross-env PYTEST_ADDOPTS=-q pytest", host: H("-c ci/ci.ini") }), "tests/check_math.py");
+    expectUnmapped(await planPy(files, ["tests/check_math.py"], { command: "cross-env PYTEST_ADDOPTS= pytest", host: H("-c ci/ci.ini") }), "tests/check_math.py");
   });
 
   it("-o addopts= and -o python_files= in PYTEST_ADDOPTS override the config's keys", async () => {
@@ -3402,7 +3586,7 @@ describe("QA-1.3-40: pytest's per-argument config fallback (determine_setup)", (
     const s = spec(await planPy(files, ["tests/b/check_math.py"], { command: AB }));
     expect(s.inputs).toEqual(["/r/tests/b/check_math.py"]);
     expect(pinOf(s)).toEqual(["-c", "/r/tests/a/pytest.ini", "--rootdir=/r/tests/a"]);
-    expect(isNoAffected(await planPy(files, ["tests/b/check_math.py"], { command: "pytest tests/b" }))).toBe(true);
+    expectUnmapped(await planPy(files, ["tests/b/check_math.py"], { command: "pytest tests/b" }), "tests/b/check_math.py");
   });
 
   it("(b) the user's plain pytest never falls back, and the pinned --rootdir keeps the spawn from falling back", async () => {

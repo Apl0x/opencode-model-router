@@ -222,16 +222,39 @@ Unverifiable means the router could not tell whether the change broke tests. It 
 - **there is no reference**: the capture failed or timed out, had not resolved within the gate budget, the dispatch was not tracked, `failureRecheck` is off, or the reference vanished or could not be materialized;
 - **the reference is approximate**: files differ from the dispatch state in a way the reference cannot reproduce. Only inert files such as `coverage/`, `*.log` and caches are ignored;
 - **the tests are pytest failures**: a pytest reference rerun is never attempted (`runner-unsupported`), because an editable install imports the live tree's sources. Green pytest runs still pass;
+- **a pytest module maps to no test** (`unmapped-module`): see [pytest module mapping](#pytest-module-mapping);
+- **an unknown tool ran during the dispatch capture**: see [Dispatch capture and unknown tools](#dispatch-capture-and-unknown-tools);
 - **a run is incomplete**: a missing or partial report, a collection error without identifiable test files, a zero-test rerun, or failing ids that cannot be matched to a reference result;
 - **scoping is impossible**: changed files are unavailable, or no planner exists for the command (S6);
 - the command is not allowlisted, the check errored, or the lineage caveat applies.
 
 By default an unverifiable result is **accepted with a caveat** that names the reason. Set `verify.strictUnverifiable: true` to reject it instead. Unverifiable never counts as verified. It is not proof that the tests pass.
 
+### pytest module mapping
+
+pytest has no related-tests mode, so the planner maps changed files to test files itself (Phase 3.1, E2E-1):
+
+- A changed test file is an input itself.
+- A changed module maps to the test files that name its stem as a **whole word** (a `git grep -F -w` content search over the `python_files` patterns), joined with the tests named after it (`test_<stem>.py`, `<stem>_test.py`). Every import spelling contains the stem as a whole word: `import app.mod02`, `from app.mod02 import x`, `from app import mod02`, `from .mod02 import x`. A longer name such as `mod020` does not match.
+- It fails closed. When no in-scope test maps to a changed module, or a `conftest.py` names it (its fixtures reach tests that never name the module), the check is unverifiable with S6 `unmapped-module`. One unmapped module makes the whole change unverifiable. A failed search is S6 `search-failed`.
+- When `testpaths` decides the collection (no path argument, pytest started in its rootdir, every config sets `testpaths`, no `-o testpaths=`, `--pyargs` or `--rootdir`, plain entries only), only tests under it are inputs. In any other case every test under the runner directory is a candidate: an extra input can add a failure, never hide one.
+
+Residual limits: only **direct** importers run. A test that reaches the changed module only through another source module (`app/mod02.py` importing `app/mod01.py`) or a dynamic import is not run, and the scope can pass without it. A change to non-`.py` files alone (a data file a module reads, `.pyi`, `.pyx`, a binary extension) still gives "no affected tests".
+
+### Dispatch capture and unknown tools
+
+While a dispatch's tree snapshot or reference capture is still in flight (a `VERIFY_WAIT` shorter than the capture, or `VERIFY_WAIT:0s`), a write would land in the baseline and hide itself: "no changed files", or a failure that looks pre-existing at the reference. So the router fails closed (Phase 3.1, E2E-3):
+
+- Only tools known not to write leave an in-flight snapshot or capture alone: `read`, `glob`, `grep`, `list`, `ls`, `codesearch`, `webfetch`, `websearch`, `lsp`, `todoread`, `todowrite`, `question`, `skill`, `plan_enter`, `plan_exit`, `invalid`, `task`, `list_mcp_resources`, `list_mcp_resource_templates`, `read_mcp_resource`, `delegate` and `router_verify` (`NON_WRITING_TOOLS` in `src/verify/dispatch.ts`).
+- Any other tool that runs in an overlapping directory during that window counts as a write: the shells, the edit tools, and every tool the router does not know, **MCP tools** (named `<server>_<tool>`, even read-only ones) and custom or plugin tools included. A tool without a `cwd` argument overlaps every pending capture. That dispatch's change set becomes unavailable and its reference none, so its `testsPass` result is **unverifiable**, never a pass.
+- `task` and `delegate` start sessions whose own tool calls are observed, so parallel dispatches do not contaminate each other by starting. Outside the capture window nothing changes.
+
+Residual limits: a write with no tool event (an external editor, an MCP server that writes after its call returned, the user's own `!` shell) cannot be seen by any hook. A tool that writes under a non-writing name (for example a custom tool called `lsp`) is not caught.
+
 ### Windows limits
 
 - **Junction-based `node_modules` at the reference.** The reference worktree links the live tree's `node_modules` with directory junctions. A reference rerun therefore uses today's installed dependencies, not the dependencies from dispatch time. Cleanup takes care not to follow those junctions into the live tree.
-- **8.3 short paths.** When the project directory opencode hands the plugin (`ctx.directory`) is an 8.3 short path (`C:\Users\MARQUI~1\…`), every reference rerun is unplannable (`rerun-unplannable`, QA-2.4-23). Scoped failures are then always `unverifiable` (accepted with a caveat unless `strictUnverifiable`), so `testsPass` cannot reject an introduced failure on such a setup. Open the project through its long path. Whether the host actually passes short paths is still to be confirmed by the Phase 3.1 live check.
+- **8.3 short paths.** A project directory (`ctx.directory`) or `%TEMP%` spelled as an 8.3 short path (`C:\Users\ABCDEF~1\…`, the default `%TEMP%` spelling on many hosts) is supported. The recheck resolves the runner and maps paths with the native realpath (long form). Before Phase 3.1 (QA-2.4-23, E2E-2), every reference rerun on such a setup was unplannable (`runner not installed`), so introduced failures were accepted with a caveat.
 - **Orphan processes.** Abort kills the process tree of the run. A descendant whose parent died before it was pinned, such as a detached grandchild of a short-lived middle process, cannot be attributed safely and is **not** killed. The run still resolves within the 2 s kill grace (`KILL_GRACE_MS`), and the report notes any force-closed output streams.
 - **Orphan sweep needs FullLanguage PowerShell.** The sweeper runs Windows PowerShell 5.1 and needs FullLanguage mode. Under Constrained Language Mode (AppLocker/WDAC) it exits at once and kills nothing; the run appends `[orphan sweep unavailable: <reason>]` to stderr if it has not settled yet.
 - **`taskkill` under CPU saturation.** A load that slows `taskkill /T` past its time limit can leave part of a tree running.

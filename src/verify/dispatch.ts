@@ -97,9 +97,24 @@ export interface ChangedFileStoreOptions {
 
 /** Tools that mutate the workspace (mirrors the guard taxonomy). */
 const WRITE_TOOLS = new Set(["write", "edit", "patch", "multiedit", "apply_patch"]);
-// Shell commands can edit too. Without a command-level proof of read-onlyness,
-// discarding a capture is safer than allowing an unobserved shell edit to seed it.
-const MAY_WRITE_TOOLS = new Set([...WRITE_TOOLS, "bash", "shell", "powershell", "exec"]);
+/**
+ * E2E-3: the tools known never to write the workspace themselves. observeEdit treats EVERY other
+ * tool as a possible write: the shells (no command-level proof of read-onlyness), the write tools,
+ * and any tool it does not know. opencode fires tool.execute.before for MCP tools too (named
+ * `<server>_<tool>`) and for plugin and custom tools, so an MCP `write_file`, a custom editor or
+ * `batch` reach the plugin under names no allowlist of writers can list. Such an edit landing
+ * while a dispatch snapshot or capture is still in flight (VERIFY_WAIT:0s, or a snapshot slower
+ * than the wait) would seed the change baseline, which then hides it ("no changed files": a clean
+ * pass), or the reference, where the failure it causes looks pre-existing and is excused.
+ * `task` and `delegate` start producer sessions whose own tool calls are observed; `router_verify`
+ * only runs checks.
+ */
+const NON_WRITING_TOOLS = new Set([
+  "read", "glob", "grep", "list", "ls", "codesearch", "webfetch", "websearch", "lsp",
+  "todoread", "todowrite", "question", "skill", "plan_enter", "plan_exit", "invalid", "task",
+  "list_mcp_resources", "list_mcp_resource_templates", "read_mcp_resource",
+  "delegate", "router_verify",
+]);
 
 export interface ChangedFile {
   path: string;
@@ -125,12 +140,45 @@ export function extractChangedFile(tool: string, args: unknown): ChangedFile | n
   return { path, status };
 }
 
+/**
+ * QA-3.1-2: one dispatch's lifetime, from beginDispatch until its record is dropped. Two windows
+ * overlap exactly when one dispatch begins while the other is live, so beginDispatch links the new
+ * window with every live one, and a dropped window keeps being counted by the live ones it overlapped.
+ */
+interface DispatchWindow {
+  readonly cwd: string;
+  /** The git top-level (TreeSnapshot.root) once the dispatch snapshot settled with one. */
+  root?: string;
+  /** The other windows that overlapped this one; emptied when this dispatch is dropped. */
+  readonly overlapping: Set<DispatchWindow>;
+}
+
+/**
+ * QA-3.1-3: a tool name as router text names it: at most 64 characters of [A-Za-z0-9_.-], anything
+ * else as "?". Tool names reach the plugin from MCP servers and custom tools.
+ */
+export function toolLabel(tool: string): string {
+  const label = tool.replace(/[^A-Za-z0-9_.-]/g, "?");
+  return label.length > 64 ? `${label.slice(0, 64)}…` : label;
+}
+
+/** QA-3.1-3: REFERENCE_NONE.contaminated, naming the tool whose call discarded the capture. */
+export function contaminatedReferenceReason(tool: string): string {
+  return `${REFERENCE_NONE.contaminated} (tool "${toolLabel(tool)}")`;
+}
+
 /** One tracked dispatch: its change baseline and its reference (T2 P0). */
 interface DispatchRecord {
   cwd: string;
   snapshotPending: boolean;
   /** An overlapping edit was observed while the snapshot was in flight: the snapshot is discarded. */
   snapshotContaminated: boolean;
+  /** QA-3.1-3: the first tool whose call discarded the snapshot. */
+  snapshotContaminatedBy?: string;
+  /** QA-3.1-3: the first tool whose call discarded the capture. */
+  captureContaminatedBy?: string;
+  /** QA-3.1-2: this dispatch's lifetime, for concurrentDispatches. */
+  window: DispatchWindow;
   snapshot?: TreeSnapshot;
   capturePending: boolean;
   /** An overlapping edit was observed while the capture was in flight: the reference is none. */
@@ -166,19 +214,36 @@ export function createChangedFileStore(options: ChangedFileStoreOptions = {}) {
   const dispatches = new Map<string, DispatchRecord>();
 
   function observeEdit(tool: string, cwd?: string): void {
-    if (!MAY_WRITE_TOOLS.has(tool.toLowerCase())) return;
+    // E2E-3: fail closed. Only a tool known not to write leaves an in-flight snapshot or capture alone.
+    if (NON_WRITING_TOOLS.has(tool.toLowerCase())) return;
     // Unknown directory is conservatively treated as overlapping every capture.
     const overlaps = (other: string) => !cwd || pathKey(cwd) === pathKey(other)
       || pathKey(cwd).startsWith(pathKey(other) + "/") || pathKey(other).startsWith(pathKey(cwd) + "/");
     for (const d of dispatches.values()) {
       if (!overlaps(d.cwd)) continue;
-      if (d.snapshotPending) d.snapshotContaminated = true;
+      if (d.snapshotPending) {
+        d.snapshotContaminated = true;
+        d.snapshotContaminatedBy ??= tool;
+      }
       // The capture would describe a tree that already holds the edit: discard it, and stop it.
       if (d.capturePending && !d.captureContaminated) {
         d.captureContaminated = true;
+        d.captureContaminatedBy = tool;
         d.captureController.abort();
       }
     }
+  }
+
+  /**
+   * QA-3.1-2: whether `w`'s dispatch worked in the git tree at `at`. Two known git roots must be the
+   * same; when either is unknown (a snapshot that found none: its cwd stands in), a directory that
+   * is the other, inside it or above it counts. Over-counting only adds a caveat.
+   */
+  function onRoot(w: DispatchWindow, at: string, atIsRoot: boolean): boolean {
+    const key = pathKey(at);
+    if (w.root !== undefined && atIsRoot) return pathKey(w.root) === key;
+    const its = pathKey(w.root ?? w.cwd);
+    return its === key || its.startsWith(key + "/") || key.startsWith(its + "/");
   }
 
   function touch(sessionID: string): void {
@@ -201,7 +266,11 @@ export function createChangedFileStore(options: ChangedFileStoreOptions = {}) {
     for (const d of dispatches.values()) if (d.producers.has(sessionID)) fold(d, sessionID);
     bySession.delete(sessionID);
     lastTouch.delete(sessionID);
-    dispatches.get(sessionID)?.captureController.abort();
+    const d = dispatches.get(sessionID);
+    d?.captureController.abort();
+    // QA-3.1-2: the live windows it overlapped keep counting it; its own list is no longer needed
+    // (and would otherwise chain every dropped window to the next).
+    d?.window.overlapping.clear();
     dispatches.delete(sessionID);
   }
 
@@ -217,6 +286,12 @@ export function createChangedFileStore(options: ChangedFileStoreOptions = {}) {
       const existing = dispatches.get(id);
       if (existing) return existing.settled;
       bySession.delete(id);
+      const window: DispatchWindow = { cwd, overlapping: new Set() };
+      // QA-3.1-2: every live dispatch overlaps this one's window, and this one overlaps theirs.
+      for (const other of dispatches.values()) {
+        window.overlapping.add(other.window);
+        other.window.overlapping.add(window);
+      }
       const d: DispatchRecord = {
         cwd, snapshotPending: true, snapshotContaminated: false,
         capturePending: deps.capture !== undefined, captureContaminated: false,
@@ -225,6 +300,7 @@ export function createChangedFileStore(options: ChangedFileStoreOptions = {}) {
         ready: Promise.resolve(), settled: Promise.resolve(),
         // The delegate ladder's dispatch id is its first producer session.
         producers: new Set([id]), observed: new Map(),
+        window,
       };
       dispatches.set(id, d);
       d.ready = (async (): Promise<void> => {
@@ -238,6 +314,8 @@ export function createChangedFileStore(options: ChangedFileStoreOptions = {}) {
           d.snapshotPending = false;
           controller.abort();
         }
+        // A discarded snapshot still tells which git tree the dispatch works in (QA-3.1-2).
+        if (snapshot?.root !== undefined) window.root = snapshot.root;
         if (snapshot && !d.snapshotContaminated && dispatches.get(id) === d) d.snapshot = snapshot;
       })();
       const capture = deps.capture;
@@ -252,7 +330,9 @@ export function createChangedFileStore(options: ChangedFileStoreOptions = {}) {
             d.capturePending = false;
             d.captureController.abort();
           }
-          if (d.captureContaminated) return none(REFERENCE_NONE.contaminated);
+          if (d.captureContaminated) {
+            return none(d.captureContaminatedBy !== undefined ? contaminatedReferenceReason(d.captureContaminatedBy) : REFERENCE_NONE.contaminated);
+          }
           return captured ? { kind: "captured", reference: captured } : none(REFERENCE_NONE.failed);
         })();
       }
@@ -364,6 +444,23 @@ export function createChangedFileStore(options: ChangedFileStoreOptions = {}) {
     /** The dispatch-time snapshot (QA-2.1-2: the gate digests its listed paths); undefined until settled. */
     baselineSnapshot(id: string): TreeSnapshot | undefined {
       return dispatches.get(id)?.snapshot;
+    },
+    /**
+     * QA-3.1-2: how many other dispatches were live at some moment of this one's window so far and
+     * work in the git tree at `root` (default: this dispatch's own root, else its cwd). Their edits
+     * land in the same working tree, so they are part of this dispatch's tree delta. 0 when untracked.
+     */
+    concurrentDispatches(id: string, root?: string): number {
+      const d = dispatches.get(id);
+      if (!d) return 0;
+      const known = root ?? d.window.root;
+      let count = 0;
+      for (const w of d.window.overlapping) if (onRoot(w, known ?? d.cwd, known !== undefined)) count += 1;
+      return count;
+    },
+    /** QA-3.1-3: the tool whose call discarded this dispatch's snapshot (the change baseline), if one did. */
+    snapshotContaminatedBy(id: string): string | undefined {
+      return dispatches.get(id)?.snapshotContaminatedBy;
     },
     record(sessionID: string, tool: string, args: unknown): void {
       touch(sessionID);

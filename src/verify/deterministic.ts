@@ -405,7 +405,8 @@ export function resolveRepoCommand(
 //     g. For each failing file f (absolute live path): r = toRefPath(f). undefined (outside the
 //        root) -> f stays unclassified. !fileExists(r) -> absentFiles. Else -> the rerun list.
 //     h. Rerun list empty -> { kind: "exact", result: undefined, ranFiles: [], absentFiles }.
-//     i. entry = resolveEntry(runner, liveCwd) on the LIVE tree (the reference links its
+//     i. entry = resolveEntry(runner, runner.runnerCwd) on the LIVE tree, the canonical start
+//        the scoped plan used (E2E-2: the raw liveCwd may be an 8.3 short path; the reference links its
 //        node_modules); spec = planRerun(runner, rerunList, toRefPath(runner.runnerCwd), budget,
 //        { fs, entry, host }). S6, or NoAffected (contradicts g) -> unusable "rerun-unplannable".
 //     j. Run it exactly as P5/P6 with timeoutMs = rd.bound(recheckTimeoutMs). A timeout or an
@@ -950,10 +951,14 @@ export function createScopeOpener(deps: ScopeOpenerDeps): OpenCheckScope {
         return { ok: false, outcome: { kind: "slot-busy", waitedMs: 0, deadlineCut: true } };
       }
       const started = now();
+      // The deadline bounds the wait when it leaves less than slotWaitMs: a busy answer then ends
+      // at the deadline, even when the wait's own timer fires a few ms before remaining() reads 0.
+      const waitMs = deadline.bound(budget.slotWaitMs);
+      const cutByDeadline = waitMs < budget.slotWaitMs;
       try {
         const r = await acquire({
           max: budget.maxConcurrentVerifications,
-          waitMs: deadline.bound(budget.slotWaitMs),
+          waitMs,
           signal: deadline.signal,
           meta: { cwd: meta.cwd, command: meta.command },
           onLost,
@@ -961,7 +966,7 @@ export function createScopeOpener(deps: ScopeOpenerDeps): OpenCheckScope {
         if ("busy" in r) {
           return {
             ok: false,
-            outcome: { kind: "slot-busy", waitedMs: Math.max(0, now() - started), deadlineCut: deadline.remaining() === 0 },
+            outcome: { kind: "slot-busy", waitedMs: Math.max(0, now() - started), deadlineCut: cutByDeadline || deadline.remaining() === 0 },
           };
         }
         return { ok: true, handle: r };
@@ -1072,7 +1077,10 @@ export function createScopeOpener(deps: ScopeOpenerDeps): OpenCheckScope {
       }
       if (rerunList.length === 0) return { kind: "exact", result: undefined, ranFiles: [], absentFiles, notes: [] };
 
-      const entry = await seams.resolveEntry(runner, liveCwd, fs, host);
+      // E2E-2: from runner.runnerCwd, the canonical start the scoped plan resolved its own entry
+      // from (runner.ts planScopedRun). liveCwd is the request's spelling (the plugin directory
+      // may be an 8.3 short path); resolveEntry canonicalises it too.
+      const entry = await seams.resolveEntry(runner, runner.runnerCwd, fs, host);
       if (isUnverifiable(entry)) return unusable("rerun-unplannable", entry.reason);
       const refCwd = ref.toRefPath(runner.runnerCwd);
       if (refCwd === undefined) return unusable("rerun-unplannable", "the runner cwd is outside the reference root");

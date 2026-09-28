@@ -93,6 +93,27 @@ CI's job. See `docs/adr/0003-affected-test-verification.md`.
   wrapped in a timeout, so a slow check could hold the `task` result indefinitely. It is
   now bounded by `gateBudgetMs`, like the `delegate` path.
 
+- **pytest: a changed module no longer passes as "no affected tests".** A changed module
+  used to map only to test files named after it (`test_<stem>.py`, `<stem>_test.py`), so
+  a test such as `tests/test_mod02_1.py` that imports it was never run. It now maps to
+  the test files that name its stem as a whole word (`git grep -F -w`, which matches
+  every import spelling), plus the name-matched tests. When no test maps, or a
+  `conftest.py` names the module, the check is `unverifiable` (`unmapped-module`), never
+  a pass. When `testpaths` decides the collection, only tests under it are inputs.
+  Residual: only direct importers run. A test that reaches the module through another
+  source module or a dynamic import is not run, and a change to non-`.py` files alone
+  (for example a data file a module reads) still gives "no affected tests".
+
+- **An unknown tool during the dispatch capture no longer seeds the baseline.** Only
+  tools known not to write (read, glob, grep, list, ls, codesearch, webfetch, websearch,
+  lsp, todoread, todowrite, question, skill, plan_enter, plan_exit, invalid, task, the MCP
+  resource readers, delegate and router_verify) leave an in-flight snapshot or capture
+  alone. Any other tool, MCP and custom tools included, that runs in that window makes
+  the dispatch's change set unavailable and its reference none, so that dispatch is
+  `unverifiable` instead of a possible clean pass. Residual: a write with no tool event
+  (an external editor, an MCP server writing after its call returned), or a tool that
+  writes under a non-writing name, is not seen.
+
 ## [1.14.0] - 2026-09-26
 
 Test baselines could saturate every core on a machine running several delegations: a

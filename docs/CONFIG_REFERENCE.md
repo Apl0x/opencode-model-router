@@ -258,16 +258,20 @@ Outcomes: a scoped failure that is not pre-existing rejects and can escalate. An
 **pytest.** A green pytest run passes. A failing pytest run is always
 `unverifiable`: the reference rerun is not supported for pytest, because an
 editable install imports the live tree rather than the reference worktree, so the
-rerun could not prove anything.
+rerun could not prove anything. A changed module maps to the test files that name
+its stem as a whole word (a `git grep -w` content search), plus the tests named after
+it. When no test maps to it, or a `conftest.py` names it, the check is
+`unverifiable` (`unmapped-module`), never "no affected tests". When `testpaths`
+decides the collection, only tests under it are inputs. Only direct importers run: a
+test that reaches the module through another source module is not run, and a change
+to non-`.py` files alone gives "no affected tests". See
+`docs/VERIFICATION.md` → "pytest module mapping".
 
 **Windows.** The reference worktree links `node_modules` with directory junctions,
-which need no elevation. When the project directory opencode hands the plugin
-(`ctx.directory`) is an 8.3 short path (for example `C:\Users\ABCDEF~1\…`), every
-reference rerun is unplannable (`rerun-unplannable`, QA-2.4-23). Scoped failures are
-then always `unverifiable` (accepted with a caveat unless `strictUnverifiable`), so
-`testsPass` cannot reject an introduced failure on such a setup. Open the project
-through its long path. Whether the host actually passes short paths is still to be
-confirmed by the Phase 3.1 live check.
+which need no elevation. A project directory (`ctx.directory`) or `%TEMP%` spelled as
+an 8.3 short path (for example `C:\Users\ABCDEF~1\…`) is supported: the recheck
+resolves the runner and maps paths with the native realpath. Before Phase 3.1
+(QA-2.4-23, E2E-2), every reference rerun on such a setup was unplannable.
 
 **Deprecations.** `testBaseline` is deprecated (`false` maps to
 `failureRecheck: false`; a one-time warning is logged).
@@ -343,6 +347,15 @@ In either mode, the dispatch first waits up to `VERIFY_WAIT` (default
 `captureWaitMs`, 5 s) for the reference capture before the producer starts. The
 deferred return then adds up to 2 s (typically ~0.4–0.5 s) for a git-only snapshot
 of the producer's changes.
+
+While that snapshot or capture is still in flight, only tools known not to write
+(`NON_WRITING_TOOLS` in `src/verify/dispatch.ts`: read, glob, grep, list, ls,
+codesearch, webfetch, websearch, lsp, todoread, todowrite, question, skill,
+plan_enter, plan_exit, invalid, task, the MCP resource readers, delegate,
+router_verify) leave it alone. Any other tool in that window, MCP and custom tools
+included, makes that dispatch's change set unavailable and its reference none, so it
+is `unverifiable`, never a pass. A write with no tool event (an external editor) is
+not seen. See `docs/VERIFICATION.md` → "Dispatch capture and unknown tools".
 
 ### Directives
 

@@ -2,8 +2,53 @@
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import { lstat, readFile, readlink, realpath } from "node:fs/promises";
+import { constants as osConstants, setPriority } from "node:os";
 import { resolve } from "node:path";
 import { ABSENT_DIGEST, FILE_DIGEST_PREFIX, LINK_DIGEST_PREFIX, type TreeSnapshot, type ChangedFile } from "./dispatch";
+
+/** Each git process of a snapshot. */
+export const SNAPSHOT_GIT_TIMEOUT_MS = 10_000;
+/** Each git process's stdout, in bytes (execFile's maxBuffer). */
+export const SNAPSHOT_GIT_MAX_BUFFER = 32 * 1024 * 1024;
+
+/** What one git process of a snapshot is spawned with. */
+export interface SnapshotGitOptions {
+  readonly cwd: string;
+  readonly signal: AbortSignal;
+  readonly timeoutMs: number;
+  readonly maxBuffer: number;
+  /** QA-3.1-8: below-normal OS priority (VerifyBudget.lowPriority), like every other verification process. */
+  readonly lowPriority: boolean;
+}
+
+/**
+ * One git process of a snapshot: `git` with `args`, never a shell. Resolves its stdout; rejects on a
+ * non-zero exit, a timeout, an abort or a spawn error.
+ */
+export type SnapshotGit = (args: readonly string[], opts: SnapshotGitOptions) => Promise<string>;
+
+/** Windows: lowers a spawned child's priority class; false when it could not (the child may have exited). */
+function lowerPriority(pid: number): boolean {
+  try {
+    setPriority(pid, osConstants.priority.PRIORITY_BELOW_NORMAL);
+    return true;
+  } catch {
+    return false; // The run itself is unaffected, as in exec.ts.
+  }
+}
+
+/**
+ * The default SnapshotGit, over execFile. QA-3.1-8: `lowPriority` applies exec.ts's rule: on POSIX
+ * `nice -n 10 -- git …` (inherited from birth), on Windows PRIORITY_BELOW_NORMAL set on the child
+ * right after the spawn (its descendants inherit the class).
+ */
+export const execGit: SnapshotGit = (args, opts) => new Promise<string>((ok, fail) => {
+  const nice = opts.lowPriority && process.platform !== "win32";
+  const child = execFile(nice ? "nice" : "git", nice ? ["-n", "10", "--", "git", ...args] : [...args], {
+    cwd: opts.cwd, signal: opts.signal, timeout: opts.timeoutMs, maxBuffer: opts.maxBuffer, windowsHide: true,
+  }, (error, stdout) => error ? fail(error) : ok(stdout));
+  if (opts.lowPriority && process.platform === "win32" && child?.pid !== undefined) lowerPriority(child.pid);
+});
 
 /**
  * QA-2.1-2: above this many paths to digest, a snapshot's per-file digests are "unavailable".
@@ -24,6 +69,13 @@ export interface SnapshotOptions {
   maxDigestFiles?: number;
   /** Default MAX_DIGEST_BYTES. */
   maxDigestBytes?: number;
+  /**
+   * QA-3.1-8: run the snapshot's git processes at below-normal priority. The wiring passes
+   * VerifyBudget.lowPriority (default true). Default false.
+   */
+  lowPriority?: boolean;
+  /** The git process seam (tests). Default execGit. */
+  git?: SnapshotGit;
 }
 
 function errorCode(err: unknown): unknown {
@@ -81,10 +133,10 @@ async function digestPaths(
 
 export async function snapshotTree(cwd: string, signal: AbortSignal, options: SnapshotOptions = {}): Promise<TreeSnapshot | undefined> {
   let gitCwd = cwd;
-  const git = (args: string[]) => new Promise<string>((ok, fail) => {
-    execFile("git", ["--no-pager", ...args], {
-      cwd: gitCwd, signal, timeout: 10000, maxBuffer: 32 * 1024 * 1024, windowsHide: true,
-    }, (error, stdout) => error ? fail(error) : ok(stdout));
+  const run = options.git ?? execGit;
+  const lowPriority = options.lowPriority === true;
+  const git = (args: string[]) => run(["--no-pager", ...args], {
+    cwd: gitCwd, signal, timeoutMs: SNAPSHOT_GIT_TIMEOUT_MS, maxBuffer: SNAPSHOT_GIT_MAX_BUFFER, lowPriority,
   });
   try {
     const root = (await git(["rev-parse", "--show-toplevel"])).trim();

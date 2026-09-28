@@ -1,4 +1,4 @@
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { appendFileSync, chmodSync, existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
@@ -1107,14 +1107,52 @@ describe("slot: waiting", () => {
       }
     }
     expect([nextBackoffMs(0, 0, lo, hi), nextBackoffMs(0, 0.999999, lo, hi), nextBackoffMs(1, 0, lo, hi), nextBackoffMs(3, 0, lo, hi)]).toEqual([250, 375, 500, 2_000]);
-    // The wait loop uses it: with random = 0 the first wake-up is not earlier than backoffMinMs.
+    // The wait loop uses it: with random = 0 no wake-up comes earlier than its backoff step, and no
+    // sleep it asks for exceeds the cap. The wait is long and ended by an abort once 3 attempts are
+    // stamped, so a loaded runner still sees 2 gaps (a short waitMs gave it only one attempt).
+    const floor = 100;
+    const cap = 800;
     const dir = freshDir();
     held(await acquireSlot({ max: 1, waitMs: 0, meta }, fast(dir, { heartbeatMs: 1_000_000 })));
     const stamps: number[] = [];
-    await acquireSlot({ max: 1, waitMs: 300, meta }, { dir, backoffMinMs: 100, backoffMaxMs: 800, random: () => 0, onAttempt: () => stamps.push(performance.now()) });
-    expect(stamps.length).toBeGreaterThanOrEqual(2);
-    expect(stamps[1]! - stamps[0]!).toBeGreaterThanOrEqual(95);
-  });
+    const ac = new AbortController();
+    const sleeps: number[] = [];
+    const realSetTimeout = globalThis.setTimeout;
+    const spy = vi.spyOn(globalThis, "setTimeout").mockImplementation(((fn: () => void, ms?: number) => {
+      // Only the timers armed between the first and the third attempt: the loop's backoff sleeps.
+      if (stamps.length >= 1 && stamps.length < 3) sleeps.push(ms ?? 0);
+      return realSetTimeout(fn, ms);
+    }) as typeof setTimeout);
+    let r: Awaited<ReturnType<typeof acquireSlot>> | undefined;
+    try {
+      r = await acquireSlot(
+        { max: 1, waitMs: 20_000, meta, signal: ac.signal },
+        {
+          dir,
+          backoffMinMs: floor,
+          backoffMaxMs: cap,
+          random: () => 0,
+          onAttempt: () => {
+            stamps.push(performance.now());
+            if (stamps.length >= 3) ac.abort();
+          },
+        },
+      );
+    } finally {
+      spy.mockRestore();
+    }
+    expect(r).toEqual({ busy: true });
+    expect(stamps).toHaveLength(3);
+    // Wall-clock gaps: load only lengthens them, so the floor side is deterministic (5 ms timer slack).
+    expect(stamps[1]! - stamps[0]!).toBeGreaterThanOrEqual(nextBackoffMs(0, 0, floor, cap) - 5);
+    expect(stamps[2]! - stamps[1]!).toBeGreaterThanOrEqual(nextBackoffMs(1, 0, floor, cap) - 5);
+    // The sleeps the loop asked for: exactly the two backoff steps, each within [floor, cap].
+    expect(sleeps).toEqual([nextBackoffMs(0, 0, floor, cap), nextBackoffMs(1, 0, floor, cap)]);
+    for (const ms of sleeps) {
+      expect(ms).toBeGreaterThanOrEqual(floor);
+      expect(ms).toBeLessThanOrEqual(cap);
+    }
+  }, 30_000);
 });
 
 describe("slot: unwritable temp dir", () => {

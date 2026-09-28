@@ -587,12 +587,37 @@
 //        pytest: only .py files count; others are skipped.
 //          - an existing test file becomes an input, if it lies under runnerCwd and under a path
 //            scope (when path scopes exist).
-//          - an existing module is looked up with search.findByName(gitRoot, names), where each
-//            basename pattern with exactly one "*" and no other wildcard gives a name
-//            ("test_*.py" -> test_<stem>.py; by default ["test_<stem>.py", "<stem>_test.py"]).
-//            A literal pattern (tests.py) or a path pattern gives none; with no names at all
-//            there is no search. Hits are filtered the same way. No hits -> note `no tests named
-//            for <rel>`. undefined -> S6 search-failed.
+//          - an existing module (E2E-1) maps to the union of:
+//            (i) its importers: search.findByContent(gitRoot, stem, [...pytest globs (9),
+//                ":(glob)**/conftest.py"], {word: true}), hits re-checked against python_files.
+//                Every import spelling holds the stem as a whole word (`import app.mod02`,
+//                `from app.mod02 import x`, `from app import mod02`, `from .mod02 import x`,
+//                `from . import mod02`); a longer name (mod020) does not match.
+//            (ii) the tests named after it: search.findByName(gitRoot, names), where each
+//                basename pattern with exactly one "*" and no other wildcard gives a name
+//                ("test_*.py" -> test_<stem>.py; by default ["test_<stem>.py", "<stem>_test.py"]).
+//                A literal pattern (tests.py) or a path pattern gives none; with no names at all
+//                there is no name search.
+//            Both keep only in-scope hits (G.8b). It fails closed, never NoAffected: either search
+//            undefined -> S6 search-failed; a conftest.py anywhere in gitRoot that names the stem
+//            -> S6 unmapped-module (its fixtures reach tests that never name the module); no
+//            in-scope test at all -> S6 unmapped-module. One unmapped module makes the whole
+//            change S6. Before E2E-1 an existing module was looked up by name only and "no hits"
+//            was a note, so tests/test_mod02_1.py (`from app.mod02 import ...`) was never found
+//            and a broken app/mod02.py passed as NoAffected.
+//            Residual (not mapped, documented): a test that reaches the module only through
+//            another source module (app/mod02.py imports app/mod01.py, test_mod02_1 uses it) or
+//            through a dynamic import. The direct importers run; the indirect ones do not.
+//          - G.8b (E2E-1) "in scope" for a pytest test input: under runnerCwd and under a path
+//            scope; with no path scopes, under DetectedRunner.collectScopes when testpaths decide
+//            the user's collection (Config._decide_args: no path argument, pytest started in its
+//            rootdir). They apply only when every release line's config sets testpaths, its
+//            rootdir is runnerCwd, no source gives -o testpaths=, --pyargs or --rootdir, and every
+//            entry is a plain path; the scopes are the entries that exist (none -> runnerCwd, as
+//            pytest does). An unreadable testpaths value is dropped, never S6. Anything else
+//            keeps every test under runnerCwd: an extra input can only add a failure, never hide
+//            one. Without this, extra/test_preexisting.py (outside testpaths = ["tests"], never
+//            collected by `uv run pytest`) became an input of every app/mod01.py change.
 //          - a gone test file adds a note. A gone module uses the stem search plus findByName,
 //            and gets S6 when both find nothing.
 //        stem = the basename without its last extension. "index" and "__init__" use the parent
@@ -605,12 +630,15 @@
 //        []                      -> S6 deleted-no-tests.
 //        more than STEM_MATCH_LIMIT files -> S6 stem-too-common.
 //        otherwise               -> the existing, inside-root results join the inputs.
-//   9a. (QA-1.3-26) The searches run one process each, in sequence. More than SEARCH_LIMIT (50)
+//   9a. (QA-1.3-26) The searches run one process each, in sequence (a pytest module, gone or
+//      existing, runs a content search and a name search but counts once). More than SEARCH_LIMIT (50)
 //      pending searches (the count below) -> S6 too-many-searches, decided before the first
 //      search. 5000 changed pytest modules made 5000 git calls (about 26 minutes at 0.3 s each).
 //      Batching (one git grep with several -e, one ls-files) would need a TestSearchSeam change;
 //      the cap is the simpler bound, and planStaticScoping applies it identically.
-//   10. Inputs empty after steps 8 and 9 -> NoAffected, with the note from M.2.
+//   10. Inputs empty after steps 8 and 9 -> NoAffected, with the note from M.2. Every pytest
+//      module has added an input or returned S6 by then (E2E-1), so this only happens when no
+//      changed file is a module or an in-scope test input.
 //   planStaticScoping stops before every search. Each gone non-test source, and each existing
 //   pytest module, counts as a pending search. It applies 9a, and (QA-1.3-27) runs the spec-time
 //   pytest config lookup (D.4) over the test inputs it already knows, so an addopts S6 there is
@@ -875,11 +903,16 @@
 //                              (QA-1.3-34)
 //                              too many setup references in <path> (limit 1000)   (G.7a,
 //                              QA-1.3-42; <path> is "the inline jest --config" for QA-1.3-41)
+//     unmapped-module          no test file maps to the changed module <rel>   (G.8, E2E-1)
+//                              changed module <rel> is referenced by <conftest rel>: the tests
+//                              its fixtures reach cannot be mapped
 //   M.2 NoAffected notes:
 //     "no changed files, no affected tests"                          (section 1.5-6, exactly)
 //     "no affected tests: no changed file is a test input"           (docs only, dropped paths,
-//                                                                     deleted tests)
-//     "no affected tests: no test files map to the changed modules"  (pytest)
+//                                                                     deleted tests, test files
+//                                                                     outside the scopes (G.8b))
+//     (E2E-1 removed "no affected tests: no test files map to the changed modules": a changed
+//      pytest module is never NoAffected.)
 //     "no changed lintable files"                                    (lint)
 //     "no rerun: none of the test files exist in this tree"          (planRerun)
 //   M.3 Unscoped (lint) reasons: the B/C/D texts above with "S6" read as "Unscoped", plus the K
@@ -1113,7 +1146,8 @@ export type S6Code =
   | "argv-too-long"
   | "node-not-found"
   | "too-many-searches"
-  | "config-too-large";
+  | "config-too-large"
+  | "unmapped-module";
 
 /** S6: scoping is impossible. The reason names the construct (section M.1) and never triggers a full suite. */
 export interface Unverifiable {
@@ -1229,8 +1263,13 @@ export interface RunnerFs extends PlannerFs {
 export interface TestSearchSeam {
   /** Absolute paths under gitRoot whose basename is one of `names`. */
   findByName(gitRoot: string, names: readonly string[]): Promise<readonly string[] | undefined>;
-  /** Absolute paths under gitRoot that match a pathspec in `globs` and contain `needle` literally. */
-  findByContent(gitRoot: string, needle: string, globs: readonly string[]): Promise<readonly string[] | undefined>;
+  /**
+   * Absolute paths under gitRoot that match a pathspec in `globs` and contain `needle` literally.
+   * With `options.word` the needle must stand as a whole word (git grep -w: not preceded or
+   * followed by a letter, digit or "_"), as a Python module name does in every import spelling
+   * (`import a.mod`, `from a.mod import x`, `from a import mod`, `from .mod import x`).
+   */
+  findByContent(gitRoot: string, needle: string, globs: readonly string[], options?: { readonly word?: boolean }): Promise<readonly string[] | undefined>;
 }
 
 export type CommandSource =
@@ -1279,6 +1318,13 @@ export interface DetectedRunner {
    * `-o python_files=` override. Undefined means DEFAULT_PYTHON_FILES.
    */
   readonly pythonFiles?: readonly string[];
+  /**
+   * pytest (G.8b, E2E-1): the directories and files the user's run collects from when that is
+   * decided by `testpaths`: no path argument, and every pytest release line reads a config that
+   * sets testpaths and has runnerCwd as its rootdir. Test inputs outside them are never collected
+   * by the user's run. Undefined: the run collects from runnerCwd (or the path scopes).
+   */
+  readonly collectScopes?: readonly string[];
 }
 
 /** The pytest command's own worker, xdist and config facts (D.4, QA-1.3-3). */
@@ -2149,6 +2195,8 @@ interface ArgResult {
   readonly overrideAddopts: string | undefined;
   /** pytest: the values of every `-o python_files=<v>` (QA-1.3-33). */
   readonly overridePythonFiles: string[];
+  /** pytest: a `-o testpaths=<v>` or `--pyargs` was seen, so the config's testpaths do not decide collection (G.8b). */
+  readonly collectOverride: boolean;
   /** pytest: the last `--rootdir` value (QA-1.3-40: it turns off the per-argument config fallback). */
   readonly rootdir: string | undefined;
   /** pytest: the free arguments of pytest's config lookup, in order (QA-1.3-48). */
@@ -2196,6 +2244,7 @@ async function processArgs(
   let cov = false;
   let overrideAddopts: string | undefined;
   const overridePythonFiles: string[] = [];
+  let collectOverride = false;
   let rootdir: string | undefined;
   const early: PytestFreeArg[] = [];
   let firstPositional = true;
@@ -2247,6 +2296,7 @@ async function processArgs(
       if (kind === "pytest" && (m.name === "-o" || m.name === "--override-ini") && value !== undefined) {
         if (value.startsWith("addopts=")) overrideAddopts = value.slice("addopts=".length);
         if (value.startsWith("python_files=")) overridePythonFiles.push(value.slice("python_files=".length));
+        if (value.startsWith("testpaths=")) collectOverride = true;
       }
       if (kind === "pytest" && m.name === "--rootdir" && value !== undefined) rootdir = value;
       if (kind === "pytest" && PY_PLUGIN_VALUE_OPTIONS.has(m.name)) {
@@ -2326,7 +2376,9 @@ async function processArgs(
     userWorkers = parseCap(kind, capRaw);
     if (!userWorkers) notes.add(`invalid worker cap "${capRaw}" ignored`);
   }
-  return { kept, capRaw, userWorkers, pathScopes, noXdist, xdistArg, cov, configs, overrideAddopts, overridePythonFiles, rootdir, early, notes: [...notes] };
+  // G.8b: with --pyargs pytest reads testpaths (and positionals) as module names.
+  if (kind === "pytest" && kept.includes("--pyargs")) collectOverride = true;
+  return { kept, capRaw, userWorkers, pathScopes, noXdist, xdistArg, cov, configs, overrideAddopts, overridePythonFiles, collectOverride, rootdir, early, notes: [...notes] };
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -2346,13 +2398,18 @@ const PYTEST_CONFIG_LINES: readonly { readonly names: readonly string[]; readonl
   { names: ["pytest.ini", "pyproject.toml", "tox.ini", "setup.cfg"], legacy: true },
 ];
 
-/** The pytest ini keys the adapter reads (D.4): addopts (QA-1.3-3) and python_files (QA-1.3-33). */
-const PY_KEYS = ["addopts", "python_files"] as const;
+/**
+ * The pytest ini keys the adapter reads (D.4): addopts (QA-1.3-3), python_files (QA-1.3-33) and
+ * testpaths (G.8b, E2E-1). An unreadable testpaths is never S6: it only narrows test inputs, so it
+ * is dropped (the run is then taken to collect from runnerCwd, which only ever adds inputs).
+ */
+const PY_KEYS = ["addopts", "python_files", "testpaths"] as const;
 type PyKey = (typeof PY_KEYS)[number];
 
 interface ConfigValues {
   readonly addopts?: readonly string[];
   readonly pythonFiles?: readonly string[];
+  readonly testpaths?: readonly string[];
 }
 
 /**
@@ -2382,7 +2439,7 @@ function parsePytestConfig(ctx: Ctx, file: string, text: string, explicit: boole
     if (!r.found && base !== "pytest.ini" && base !== ".pytest.ini" && !explicit) return undefined;
     raw = r.values;
   }
-  const values: { addopts?: readonly string[]; pythonFiles?: readonly string[] } = {};
+  const values: { addopts?: readonly string[]; pythonFiles?: readonly string[]; testpaths?: readonly string[] } = {};
   for (const k of PY_KEYS) {
     const v = raw[k];
     if (v === undefined || bad.includes(k)) continue;
@@ -2390,9 +2447,11 @@ function parsePytestConfig(ctx: Ctx, file: string, text: string, explicit: boole
     const tokens = typeof v === "string" ? tokenize(v.replace(/\r?\n/g, " ")) : v;
     if (tokens === undefined) bad.push(k);
     else if (k === "addopts") values.addopts = tokens;
-    else values.pythonFiles = tokens;
+    else if (k === "python_files") values.pythonFiles = tokens;
+    else values.testpaths = tokens;
   }
-  return { values, bad };
+  // G.8b: an unreadable testpaths is dropped, never S6 (see PY_KEYS).
+  return { values, bad: bad.filter((b) => b !== "testpaths") };
 }
 
 /**
@@ -2855,6 +2914,44 @@ interface PytestRun {
   readonly ignore: ReadonlySet<string>;
   /** QA-1.3-48: the existing plugin option values in the PYTEST_ADDOPTS the spawn sees: free arguments of its lookup too. */
   readonly envArgs: readonly string[];
+  /** G.8b: what a run with no path arguments collects, when testpaths decide it (DetectedRunner.collectScopes). */
+  readonly collect?: readonly string[];
+}
+
+/**
+ * G.8b (E2E-1): pytest's Config._decide_args. With no path arguments, a run started from its
+ * rootdir collects `testpaths` (each globbed relative to the rootdir; missing ones are skipped, and
+ * when none is left it collects the invocation directory). Anything else collects runnerCwd. The
+ * scopes are returned only when every release line agrees that testpaths apply: its config sets
+ * them, its rootdir is `cwd`, no source overrides them (-o testpaths=, --pyargs), no --rootdir is
+ * given, and every entry is a plain path (no glob characters). Otherwise undefined, which keeps
+ * every input under runnerCwd: an extra test input can only fail, never hide a failure.
+ */
+async function testpathScopes(
+  ctx: Ctx,
+  fs: PlannerFs,
+  setups: readonly PytestSetup[],
+  cwd: string,
+  overridden: boolean,
+): Promise<string[] | undefined> {
+  if (overridden) return undefined;
+  const out = new Map<string, string>();
+  for (const s of setups) {
+    const tp = s.config?.testpaths;
+    if (s.rootdir === undefined || ctx.key(s.rootdir) !== ctx.key(cwd) || tp === undefined || tp.length === 0) return undefined;
+    let found = 0;
+    for (const t of tp) {
+      if (/[*?[]/.test(t)) return undefined;
+      const abs = ctx.P.resolve(s.rootdir, t);
+      if (await existsCached(ctx, fs, abs)) {
+        const real = await realOf(ctx, fs, abs);
+        out.set(ctx.key(real), real);
+        found++;
+      }
+    }
+    if (found === 0) return undefined;
+  }
+  return [...out.values()];
 }
 
 /**
@@ -2963,7 +3060,10 @@ async function pytestEvidence(
     pythonFiles: [...pythonFiles],
     ...(configFile !== undefined ? { configFile } : {}),
   };
-  return { evidence, setups, explicit: configFile !== undefined, rootdirGiven, ignore, envArgs };
+  // G.8b: the command's own -o testpaths=/--pyargs is the caller's to check (detectImpl).
+  const overridden = args.length > 0 || rootdirGiven || sources.some((s) => s.r.collectOverride);
+  const collect = await testpathScopes(ctx, fs, setups, cwd, overridden);
+  return { evidence, setups, explicit: configFile !== undefined, rootdirGiven, ignore, envArgs, ...(collect ? { collect } : {}) };
 }
 
 /**
@@ -3350,6 +3450,7 @@ async function finishDetection<K extends ToolKind>(
   let covInConfig = false;
   let pytestFacts: PytestFacts | undefined;
   let pythonFiles: readonly string[] | undefined;
+  let collectScopes: readonly string[] | undefined;
   if (kind === "pytest") {
     const configFile = configFiles.at(-1);
     const pf = pythonFilesOverride(a.overridePythonFiles, where);
@@ -3370,6 +3471,8 @@ async function finishDetection<K extends ToolKind>(
     if (isS6(run)) return run;
     const ev = run.evidence;
     ({ xdist, covInConfig, userWorkers } = ev);
+    // G.8b (E2E-1): testpaths decide the user's collection only without path arguments.
+    if (pathScopes.length === 0 && !a.collectOverride) collectScopes = run.collect;
     // QA-1.3-39: a -c/--config-file from PYTEST_ADDOPTS is a config trigger like the command's.
     const envConfig = ev.configFile;
     if (envConfig !== undefined && !configFiles.some((c) => ctx.key(c) === ctx.key(envConfig))) configFiles.push(envConfig);
@@ -3402,6 +3505,7 @@ async function finishDetection<K extends ToolKind>(
     ...(inlineConfigs.length > 0 ? { inlineConfigs } : {}),
     ...(pytestFacts ? { pytestFacts } : {}),
     ...(pythonFiles ? { pythonFiles } : {}),
+    ...(collectScopes ? { collectScopes } : {}),
   };
 }
 
@@ -4032,7 +4136,8 @@ function isReferencedSetup(ctx: Ctx, facts: JsConfigFacts, abs: string): boolean
 
 const NOTE_NO_CHANGES = "no changed files, no affected tests";
 const NOTE_NO_INPUT = "no affected tests: no changed file is a test input";
-const NOTE_NO_PY_MAP = "no affected tests: no test files map to the changed modules";
+/** G.8 (E2E-1): conftest.py files are searched with the test files: a module one references is S6. */
+const CONFTEST_GLOB = ":(glob)**/conftest.py";
 const NOTE_NO_LINT = "no changed lintable files";
 const NOTE_NO_RERUN = "no rerun: none of the test files exist in this tree";
 
@@ -4218,8 +4323,10 @@ async function classify(
   const modules: FileRef[] = [];
   const goneModules: FileRef[] = [];
   let skipped = 0;
-  const inScope = (abs: string) =>
-    isInside(ctx, det.runnerCwd, abs) && (det.pathScopes.length === 0 || det.pathScopes.some((s) => isInside(ctx, s, abs)));
+  // G.8b (E2E-1): without path scopes, pytest's testpaths (when they decide collection) bound the
+  // test inputs: a test file the user's run never collects is not one of its tests.
+  const scopes = det.pathScopes.length > 0 ? det.pathScopes : (det.collectScopes ?? []);
+  const inScope = (abs: string) => isInside(ctx, det.runnerCwd, abs) && (scopes.length === 0 || scopes.some((s) => isInside(ctx, s, abs)));
   const pyFiles = det.pythonFiles ?? DEFAULT_PYTHON_FILES;
 
   for (const f of sorted) {
@@ -4246,7 +4353,6 @@ async function classify(
   if (skipped > 0) notes.push(`non-input files skipped: ${skipped}`);
 
   const pending = det.kind === "pytest" ? modules.length + goneModules.length : goneSources.length;
-  const emptyNote = det.kind === "pytest" && modules.length + goneModules.length > 0 ? NOTE_NO_PY_MAP : NOTE_NO_INPUT;
   // G.9a (QA-1.3-26): the searches are sequential processes (a git grep costs ~0.3 s in a large
   // repo), so their number is bounded. Decided before any search, so static scoping agrees.
   if (pending > SEARCH_LIMIT) {
@@ -4254,7 +4360,7 @@ async function classify(
   }
 
   if (!search) {
-    if (inputs.size === 0 && pending === 0) return noAffected(emptyNote);
+    if (inputs.size === 0 && pending === 0) return noAffected(NOTE_NO_INPUT);
     const pre = await preflight(ctx, det, fs);
     if (isS6(pre)) return pre;
     const staticNotes = [...notes, ...pre.notes];
@@ -4298,11 +4404,24 @@ async function classify(
     }
     for (const h of await accept(hits, false)) addInput(h);
   }
+  // G.8 (E2E-1): an existing module maps to every test file that imports it (a whole-word content
+  // search for its stem, which every import spelling contains) plus the test files named after it.
+  // It fails closed: a module no in-scope test maps to, or one a conftest.py references (its
+  // fixtures reach tests that never name the module), is S6 unmapped-module, never NoAffected.
   for (const f of modules) {
-    const hits = await byName(stemOf(ctx, f.abs));
-    if (hits === undefined) return searchFailed(f);
-    const ok = await accept(hits, true);
-    if (ok.length === 0) notes.push(`no tests named for ${f.rel}`);
+    const stem = stemOf(ctx, f.abs);
+    const content = await search.findByContent(gitRoot, stem, [...pyGlobs, CONFTEST_GLOB], { word: true });
+    if (content === undefined) return searchFailed(f);
+    // Unscoped: pytest also loads the conftest.py files above the collected tests (up to confcutdir).
+    const conftests = await accept(content.filter((h) => P.basename(h) === "conftest.py"), false);
+    if (conftests.length > 0) {
+      const rel = toSlash(ctx, P.relative(gitRoot, conftests[0]));
+      return s6("unmapped-module", `changed module ${f.rel} is referenced by ${rel}: the tests its fixtures reach cannot be mapped`);
+    }
+    const named = await byName(stem);
+    if (named === undefined) return searchFailed(f);
+    const ok = await accept([...content.filter((h) => isPyTestFile(ctx, pyFiles, h)), ...named], true);
+    if (ok.length === 0) return s6("unmapped-module", `no test file maps to the changed module ${f.rel}`);
     for (const h of ok) addInput(h);
   }
   for (const f of goneModules) {
@@ -4319,7 +4438,9 @@ async function classify(
     for (const h of ok) addInput(h);
   }
 
-  if (inputs.size === 0) return noAffected(emptyNote);
+  // Every pytest module and gone module above added an input or returned S6, so an empty set here
+  // means no changed file was a test input or a module (docs, dropped paths, deleted tests).
+  if (inputs.size === 0) return noAffected(NOTE_NO_INPUT);
   const pre = await preflight(ctx, det, fs);
   if (isS6(pre)) return pre;
   const F = [...inputs.entries()].sort(byKey).map(([, v]) => v);
@@ -4445,14 +4566,22 @@ export async function detectRunner(
   return detectImpl(makeCtx(host), command, cwd, fs, TEST_HEADS);
 }
 
-/** 1.3.2.b: locate the JS bin entry or the native executable (F), walking from cwd up to runner.gitRoot. */
+/**
+ * 1.3.2.b: locate the JS bin entry or the native executable (F), walking from cwd up to runner.gitRoot.
+ * E2E-2: cwd and gitRoot are canonicalised first (G.3a), as every internal caller does. detectRunner
+ * returns a realpath'd gitRoot, so a caller's cwd spelled differently (a win32 8.3 short name such as
+ * C:\Users\ABCDEF~1\..., a junction) was never inside it: the walk found nothing and every reference
+ * recheck reported "runner not installed".
+ */
 export async function resolveEntry(
   runner: EntryRequest,
   cwd: string,
-  fs: FsSeam,
+  fs: PlannerFs,
   host?: Partial<RunnerHost>,
 ): Promise<ResolvedEntry | Unverifiable> {
-  const r = await resolveEntryImpl(makeCtx(host), runner, cwd, fs);
+  const ctx = makeCtx(host);
+  const req: EntryRequest = { kind: runner.kind, launcher: runner.launcher, gitRoot: await canonicalCwd(ctx, fs, runner.gitRoot) };
+  const r = await resolveEntryImpl(ctx, req, await canonicalCwd(ctx, fs, cwd), fs);
   return isS6(r) ? r : r.entry;
 }
 

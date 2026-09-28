@@ -295,6 +295,26 @@ describe("wiring (2.4.2a)", () => {
       expect(done).toBe(true);
     });
 
+    it("counts the wait from the dispatch's start: a slow synchronous capture start-up is inside VERIFY_WAIT (CI round 1)", async () => {
+      vi.useFakeTimers();
+      state.captureDelayMs = 20_000;
+      // The snapshot's synchronous start-up (a git spawn on a loaded runner) takes 300 ms.
+      state.snapshotImpl = () => {
+        vi.setSystemTime(Date.now() + 300);
+        return Promise.resolve(state.snapshot);
+      };
+      const { wiring, store } = makeWiring();
+      let done = false;
+      const started = wiring.startDispatch(store, "d4", root, TESTS_DOD, "VERIFY_WAIT:5s", false).then(() => {
+        done = true;
+      });
+      await vi.advanceTimersByTimeAsync(4_699);
+      expect(done).toBe(false);
+      await vi.advanceTimersByTimeAsync(1);
+      await started;
+      expect(done).toBe(true);
+    });
+
     it("a capture that resolves at 2 s under a 5 s wait releases the dispatch at 2 s", async () => {
       vi.useFakeTimers();
       state.captureDelayMs = 2_000;
@@ -308,6 +328,63 @@ describe("wiring (2.4.2a)", () => {
       await vi.advanceTimersByTimeAsync(1);
       await started;
       expect(done).toBe(true);
+    });
+  });
+
+  describe("QA-3.1-3: dispatches starting together share one snapshot and one capture", () => {
+    /** Each snapshot run is held until the test settles it. */
+    const holdSnapshots = (): Array<(s: TreeSnapshot) => void> => {
+      const held: Array<(s: TreeSnapshot) => void> = [];
+      state.snapshotImpl = () => new Promise<TreeSnapshot>(settle => held.push(settle));
+      return held;
+    };
+
+    it("20 parallel dispatches take 2 snapshots and 2 captures; none shares a snapshot started before it began", async () => {
+      const held = holdSnapshots();
+      const { wiring, store } = makeWiring();
+      await Promise.all(Array.from({ length: 20 }, (_, i) => wiring.startDispatch(store, `d${i}`, root, TESTS_DOD, "VERIFY_WAIT:0s", false)));
+      // d0 started run 1 at once; d1..d19 began while it was in flight, so they wait for run 2.
+      expect(held).toHaveLength(1);
+      held[0](snap([], "first"));
+      await vi.waitFor(() => expect(held).toHaveLength(2));
+      // A dispatch that begins while run 2 is in flight waits for run 3.
+      await wiring.startDispatch(store, "late", root, TESTS_DOD, "VERIFY_WAIT:0s", false);
+      held[1](snap([], "second"));
+      await vi.waitFor(() => expect(store.baselineSnapshot("d19")?.fingerprint).toBe("second"));
+      expect(store.baselineSnapshot("d0")?.fingerprint).toBe("first");
+      for (let i = 1; i < 20; i += 1) expect(store.baselineSnapshot(`d${i}`)?.fingerprint).toBe("second");
+      await vi.waitFor(() => expect(held).toHaveLength(3));
+      held[2](snap([], "third"));
+      await vi.waitFor(() => expect(store.baselineSnapshot("late")?.fingerprint).toBe("third"));
+      // The capture is shared the same way (it resolves at once, so d0 runs alone and d1..d19 share one).
+      expect(state.captures).toBe(3);
+      for (let i = 0; i < 20; i += 1) expect((await store.reference(`d${i}`)).kind).toBe("captured");
+      expect(state.commands).toEqual([]);
+    });
+
+    it("a tool outside NON_WRITING_TOOLS during a shared snapshot discards it for every sharer, and the deferred entry names the tool", async () => {
+      const held = holdSnapshots();
+      const { wiring, store } = makeWiring();
+      await wiring.startDispatch(store, "task:orch:1", root, TESTS_DOD, "VERIFY_WAIT:0s", false);
+      await wiring.startDispatch(store, "task:orch:2", root, TESTS_DOD, "VERIFY_WAIT:0s", false);
+      store.observeEdit("github_create_file");
+      held[0](snap([], "first"));
+      await vi.waitFor(() => expect(held).toHaveLength(2));
+      held[1](snap([], "second"));
+      for (const id of ["task:orch:1", "task:orch:2"]) {
+        await vi.waitFor(() => expect(store.snapshotContaminatedBy(id)).toBe("github_create_file"));
+        expect(store.baselineSnapshot(id)).toBeUndefined();
+      }
+      state.snapshotImpl = async () => snap([{ path: path.join(root, "src", "a.ts"), status: " M" }], "after");
+      const finish = await wiring.finishDeferred(store, {
+        dispatchID: "task:orch:2", orchestratorSessionID: "orch", producerSessionID: "child", producerTier: "fast",
+        description: "add the parser", cwd: root, dod: TESTS_DOD, dispatchedAt: 0,
+      });
+      if (!finish.deferred) throw new Error(finish.detail);
+      expect(wiring.pending.get("orch", finish.handle)).toMatchObject({
+        kind: "found",
+        entry: { changedFiles: "unavailable", contaminatedBy: "github_create_file", concurrentDispatches: 1 },
+      });
     });
   });
 

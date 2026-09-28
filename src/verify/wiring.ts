@@ -65,6 +65,7 @@ import {
   buildAcceptedSuffix,
   buildForcingNote,
   tierModel,
+  toolLabel,
   type ChangedFile,
   type createChangedFileStore,
   type DispatchCaptureDeps,
@@ -72,7 +73,7 @@ import {
 } from "./dispatch";
 import { runArgv, runShell } from "./exec";
 import { snapshotTree } from "./tree";
-import { captureReference, DEFAULT_CAPTURE_TIMEOUT_MS, gcStaleReferences, nodeReferenceFs } from "./reference";
+import { captureReference, DEFAULT_CAPTURE_TIMEOUT_MS, gcStaleReferences, nodeReferenceFs, type DispatchReference } from "./reference";
 import type { PluginLogger } from "../router/logger";
 import { REFERENCE_NONE } from "./baseline";
 import { scrubText } from "../guard/scrub";
@@ -136,6 +137,152 @@ export interface PreparedVerification {
   reference: ReferenceState;
   /** The current tree snapshot (materialize's drift check); undefined when unavailable. */
   snapshot: TreeSnapshot | undefined;
+  /**
+   * QA-3.1-2: other dispatches in the same git tree that were live during this dispatch's window
+   * (the change set holds their edits too). Absent or 0: none.
+   */
+  concurrentDispatches?: number;
+  /** QA-3.1-3: the tool whose call discarded the dispatch snapshot, which left the change set unavailable. */
+  contaminatedBy?: string;
+}
+
+/**
+ * QA-3.1-2: appended to a rejection that lists introduced failures when other delegations were live in
+ * the same working tree during the dispatch: the tree delta is not partitioned between them.
+ */
+export function concurrentDispatchesCaveat(count: number): string {
+  return `other delegations ran in this working tree concurrently (${count}); introduced failures may come from their edits`;
+}
+
+/** QA-3.1-3: an unverifiable verdict whose change baseline a tool call discarded names that tool. */
+export function contaminatedBaselineCaveat(tool: string): string {
+  return `the dispatch-time change baseline was discarded: tool "${toolLabel(tool)}" ran in an overlapping directory before it resolved`;
+}
+
+/**
+ * QA-3.1-2 / QA-3.1-3: router caveats from the dispatch's own context, on a gate result. A fail that
+ * lists introduced failures gains concurrentDispatchesCaveat when other dispatches overlapped it; an
+ * unverifiable verdict gains contaminatedBaselineCaveat (reasons and caveats) when a tool call
+ * discarded its change baseline. The outcome and `accepted` never change. Pure; the text goes through
+ * neutralizeDirectives like all router text.
+ */
+export function applyDispatchCaveats(
+  res: GateResult,
+  ctx: { readonly concurrentDispatches?: number; readonly contaminatedBy?: string },
+): GateResult {
+  const verdict = res.verdict;
+  if (verdict.skipped === true) return res;
+  const outcome = verdict.outcome ?? (verdict.pass ? "pass" : "fail");
+  const concurrent = ctx.concurrentDispatches ?? 0;
+  if (outcome === "fail" && concurrent > 0 && (verdict.failures?.introduced.length ?? 0) > 0) {
+    return { ...res, verdict: { ...verdict, reasons: [...verdict.reasons, neutralizeDirectives(concurrentDispatchesCaveat(concurrent))] } };
+  }
+  if (outcome === "unverifiable" && ctx.contaminatedBy !== undefined) {
+    const caveat = neutralizeDirectives(contaminatedBaselineCaveat(ctx.contaminatedBy));
+    return { ...res, verdict: { ...verdict, reasons: [...verdict.reasons, caveat], caveats: [...(verdict.caveats ?? []), caveat] } };
+  }
+  return res;
+}
+
+/**
+ * QA-3.1-3: single flight for the dispatch-time snapshot and capture. Each dispatch spawns 7 git
+ * processes for its snapshot and 8 for its capture; 20 parallel dispatches spawned 300, and on
+ * Windows each then took 130-560 ms instead of ~60 ms (p50 2.9 s per dispatch).
+ *
+ * Requests with one key share one run, but a run is only ever shared by requests made BEFORE it
+ * started: a request that arrives while a run is in flight waits for the next run, which starts when
+ * the current one settled and serves every request that arrived meanwhile. A shared result is so
+ * always taken after each sharer's request began, as its own run would have been. A request's signal
+ * ends only its own wait (undefined); a started run is aborted once every sharer has left, and a
+ * queued run nobody waits for any more never starts. The returned function never rejects.
+ */
+export function createSharedFlight<T>(): (
+  key: string,
+  run: (signal: AbortSignal) => Promise<T | undefined>,
+  signal: AbortSignal,
+) => Promise<T | undefined> {
+  interface Flight {
+    readonly controller: AbortController;
+    readonly result: Promise<T | undefined>;
+    readonly start: () => void;
+    sharers: number;
+    started: boolean;
+  }
+  interface Lane {
+    running?: Flight;
+    next?: Flight;
+  }
+  const lanes = new Map<string, Lane>();
+  const makeFlight = (run: (signal: AbortSignal) => Promise<T | undefined>): Flight => {
+    const controller = new AbortController();
+    let settle = (_value: T | undefined): void => undefined;
+    const result = new Promise<T | undefined>(ok => {
+      settle = ok;
+    });
+    const flight: Flight = {
+      controller,
+      result,
+      // Synchronous: the run's own start-up (the first git spawn) happens inside the call that
+      // starts it, so a VERIFY_WAIT counted from the dispatch's start covers it (ab81633).
+      start: () => {
+        flight.started = true;
+        let running: Promise<T | undefined>;
+        try {
+          running = run(controller.signal);
+        } catch {
+          running = Promise.resolve(undefined);
+        }
+        running.then(settle, () => settle(undefined));
+      },
+      sharers: 0,
+      started: false,
+    };
+    return flight;
+  };
+  const launch = (key: string, lane: Lane, flight: Flight): void => {
+    lane.running = flight;
+    flight.start();
+    void flight.result.then(() => {
+      lane.running = undefined;
+      const next = lane.next;
+      lane.next = undefined;
+      if (next !== undefined) launch(key, lane, next);
+      else if (lanes.get(key) === lane) lanes.delete(key);
+    });
+  };
+  return (key, run, signal) => {
+    if (signal.aborted) return Promise.resolve(undefined);
+    let lane = lanes.get(key);
+    if (lane === undefined) {
+      lane = {};
+      lanes.set(key, lane);
+    }
+    let flight: Flight;
+    if (lane.next !== undefined) flight = lane.next;
+    else if (lane.running !== undefined) flight = lane.next = makeFlight(run);
+    else {
+      flight = makeFlight(run);
+      launch(key, lane, flight);
+    }
+    flight.sharers += 1;
+    const owner = lane;
+    return new Promise<T | undefined>(settle => {
+      const onAbort = (): void => {
+        flight.sharers -= 1;
+        if (flight.sharers === 0) {
+          // Nobody waits for it any more: stop a started run; never start a queued one.
+          if (flight.started) flight.controller.abort();
+          else if (owner.next === flight) owner.next = undefined;
+        }
+        settle(undefined);
+      };
+      signal.addEventListener("abort", onAbort, { once: true });
+      void flight.result.then(value => {
+        signal.removeEventListener("abort", onAbort);
+        settle(value);
+      });
+    });
+  };
 }
 
 /**
@@ -581,8 +728,9 @@ export interface VerificationWiring {
   resolveDirectives(text: string): VerifyDirectives;
   /**
    * 2.4.2a: resolveDirectives, then beginVerificationBounded for at most the directives' waitMs
-   * (section 1.5-14: VERIFY_WAIT, 0 allowed). `remember` keeps the start for takeDispatch (the
-   * native `task` after hook). Never rejects.
+   * (section 1.5-14: VERIFY_WAIT, 0 allowed), counted from this call, so the directive read and
+   * the capture's synchronous start-up are inside it. `remember` keeps the start for takeDispatch
+   * (the native `task` after hook). Never rejects.
    */
   startDispatch(
     store: ReturnType<typeof createChangedFileStore>,
@@ -813,6 +961,20 @@ export function createVerificationWiring(deps: {
    * the promise object (the store returns the same one), so it holds nothing once the store drops it.
    */
   const settledReferences = new WeakMap<Promise<ReferenceState>, ReferenceState>();
+  /**
+   * QA-3.1-8: VerifyBudget.lowPriority for the tree snapshots; the section 1.4 default (true) when
+   * the config cannot be read, so a snapshot never fails over it.
+   */
+  const configuredLowPriority = (): boolean => {
+    try {
+      return resolveVerifyBudget(getConfig()).lowPriority;
+    } catch {
+      return true;
+    }
+  };
+  /** QA-3.1-3: dispatches starting together share their snapshot and capture (createSharedFlight). */
+  const sharedSnapshots = createSharedFlight<TreeSnapshot>();
+  const sharedCaptures = createSharedFlight<DispatchReference>();
 
   const abs = (p: string): string => (isAbsolute(p) ? p : join(directory, p));
 
@@ -918,8 +1080,9 @@ export function createVerificationWiring(deps: {
         const r = await git(gitRoot, ["ls-files", "-z", "--cached", "--others", "--exclude-standard", "--", ...names.map(n => `:(glob)**/${n}`)]);
         return r && r.code === 0 ? splitZ(r.stdout).map(rel => resolve(gitRoot, rel)) : undefined;
       },
-      async findByContent(gitRoot, needle, globs) {
-        const r = await git(gitRoot, ["grep", "-l", "-z", "-F", "--untracked", "-e", needle, "--", ...globs]);
+      async findByContent(gitRoot, needle, globs, options) {
+        const word = options?.word === true ? ["-w"] : [];
+        const r = await git(gitRoot, ["grep", "-l", "-z", "-F", ...word, "--untracked", "-e", needle, "--", ...globs]);
         if (!r) return undefined;
         if (r.code === 1) return [];
         return r.code === 0 ? splitZ(r.stdout).map(rel => resolve(gitRoot, rel)) : undefined;
@@ -1028,14 +1191,23 @@ export function createVerificationWiring(deps: {
     const judgedByTests = cfg.enforcement?.verify?.require !== "never" && dod.checks.some(
       c => c.kind === "testsPass" && isCommandAllowed(resolveRepoCommand(c, "testsPass", undefined), DEFAULT_ALLOWLIST),
     );
-    const base = { snapshot: snapshotTree, timeoutMs: budget.baselineTimeoutMs };
+    // QA-3.1-3: one run per key serves every dispatch that asked before it started (same cwd and
+    // the same priority and bound, so the same git processes).
+    const flightKey = (at: string): string => `${budget.lowPriority ? "low" : "normal"}\0${budget.baselineTimeoutMs}\0${at}`;
+    const base = {
+      // QA-3.1-8: the snapshot's git processes run at the configured priority, as the capture's do.
+      snapshot: (at: string, signal: AbortSignal) =>
+        sharedSnapshots(flightKey(at), shared => snapshotTree(at, shared, { lowPriority: budget.lowPriority }), signal),
+      timeoutMs: budget.baselineTimeoutMs,
+    };
     if (!judgedByTests) return { ...base, uncaptured: { kind: "none", reason: REFERENCE_NONE.notRequested } };
     if (!budget.failureRecheck) return { ...base, uncaptured: { kind: "disabled" } };
     // QA-1.2-13: the capture's git processes run at the configured priority too.
     const argv: ArgvSeam = (file, args, opts) => argvSeam(file, args, { ...opts, lowPriority: budget.lowPriority });
     return {
       ...base,
-      capture: (at, signal) => captureReference(at, signal, { argv, fs: nodeReferenceFs, timeoutMs: budget.baselineTimeoutMs }),
+      capture: (at, signal) =>
+        sharedCaptures(flightKey(at), shared => captureReference(at, shared, { argv, fs: nodeReferenceFs, timeoutMs: budget.baselineTimeoutMs }), signal),
     };
   };
 
@@ -1137,9 +1309,10 @@ export function createVerificationWiring(deps: {
     try {
       deps = captureDepsFor(dod);
     } catch (err) {
-      // Never blocks or fails the dispatch: snapshot only, and no reference.
+      // Never blocks or fails the dispatch: snapshot only (at the section 1.4 default low priority,
+      // QA-3.1-8), and no reference.
       deps = {
-        snapshot: snapshotTree,
+        snapshot: (at, signal) => snapshotTree(at, signal, { lowPriority: true }),
         timeoutMs: DEFAULT_CAPTURE_TIMEOUT_MS,
         uncaptured: { kind: "none", reason: `${REFERENCE_NONE.failed} (${errorText(err)})` },
       };
@@ -1173,7 +1346,11 @@ export function createVerificationWiring(deps: {
       // QA-2.1-2: digest exactly the paths the dispatch snapshot digested (<= MAX_DIGEST_FILES),
       // so delta can tell which already-dirty file a shell edit changed.
       const digests = store.baselineSnapshot(id)?.digests;
-      const options = digests === undefined ? {} : { digestPaths: digests === "unavailable" ? [] : [...digests.keys()] };
+      // QA-3.1-8: at the configured priority, like every other verification process.
+      const lowPriority = configuredLowPriority();
+      const options = digests === undefined
+        ? { lowPriority }
+        : { lowPriority, digestPaths: digests === "unavailable" ? [] : [...digests.keys()] };
       snapshot = bound > 0 && !controller.signal.aborted
         ? await withTimeout(snapshotTree(base, controller.signal, options), bound, "grade fingerprint")
         : undefined;
@@ -1184,10 +1361,31 @@ export function createVerificationWiring(deps: {
       controller.abort();
     }
     const committed = await committedSinceDispatch(store.baselineSnapshot(id), snapshot, deadline);
-    return { ...store.delta(id, childID, snapshot, base, committed), snapshot };
+    const contaminatedBy = store.snapshotContaminatedBy(id);
+    return {
+      ...store.delta(id, childID, snapshot, base, committed),
+      snapshot,
+      concurrentDispatches: store.concurrentDispatches(id, snapshot?.root),
+      ...(contaminatedBy !== undefined ? { contaminatedBy } : {}),
+    };
   };
 
-  const beginVerificationBounded: VerificationWiring["beginVerificationBounded"] = async (store, id, cwd, dod, waitOverrideMs) => {
+  /**
+   * beginVerificationBounded, with the wait counted from `startedAt` (a Date.now() value): the
+   * dispatch waits at most `waitMs` from its start, not `waitMs` after the capture's synchronous
+   * start-up returned. That start-up (config, the snapshot's first git spawn) is the dispatch's
+   * time too, and under load it is not negligible (CI round 1, 3.1.2.f: 20 parallel dispatches on
+   * a 4-core runner held their before hooks up to 104 ms past VERIFY_WAIT). Date.now rather than
+   * performance.now, so fake clocks drive it together with the timer.
+   */
+  const boundedCaptureWait = async (
+    store: ReturnType<typeof createChangedFileStore>,
+    id: string,
+    cwd: string | undefined,
+    dod: DoD,
+    waitOverrideMs: number | undefined,
+    startedAt: number,
+  ): Promise<void> => {
     let waitMs: number;
     let begun: Promise<void>;
     try {
@@ -1197,13 +1395,18 @@ export function createVerificationWiring(deps: {
       logger.warn("[verify] dispatch reference capture could not start", { id, error: errorText(err) });
       return;
     }
-    const outcome = await awaitBounded(begun, waitMs);
+    // A clock stepped backwards never lengthens the wait past waitMs.
+    const remaining = Math.min(waitMs, Math.max(0, waitMs - (Date.now() - startedAt)));
+    const outcome = await awaitBounded(begun, remaining);
     if (outcome.kind === "timeout") {
       logger.debug?.("[verify] dispatch reference not ready; proceeding without waiting further", { id, waitMs });
     } else if (outcome.kind === "error") {
       logger.warn("[verify] dispatch reference capture failed; proceeding without a reference", { id, error: errorText(outcome.error) });
     }
   };
+
+  const beginVerificationBounded: VerificationWiring["beginVerificationBounded"] = (store, id, cwd, dod, waitOverrideMs) =>
+    boundedCaptureWait(store, id, cwd, dod, waitOverrideMs, Date.now());
 
   const resolveDirectives = (text: string): VerifyDirectives => {
     try {
@@ -1313,6 +1516,10 @@ export function createVerificationWiring(deps: {
         changedFiles,
         risk,
         ...(digests !== undefined ? { digests } : {}),
+        // QA-3.1-2 / QA-3.1-3: the window ends here (the change set is fixed now); router_verify
+        // adds the caveats to its verdict.
+        ...(change.concurrentDispatches !== undefined && change.concurrentDispatches > 0 ? { concurrentDispatches: change.concurrentDispatches } : {}),
+        ...(change.contaminatedBy !== undefined ? { contaminatedBy: change.contaminatedBy } : {}),
       });
       if (!reg.ok) {
         // QA-2.4-4: never a delegation without a verdict path: the caller runs the required gate.
@@ -1393,7 +1600,7 @@ export function createVerificationWiring(deps: {
   };
 
   /** 2.4.3a: the current tree for one call, once per cwd (the materialize same-repository guard, P0). */
-  const snapshotFor = async (cwd: string, deadline: Deadline): Promise<TreeSnapshot | undefined> => {
+  const snapshotFor = async (cwd: string, deadline: Deadline, lowPriority: boolean): Promise<TreeSnapshot | undefined> => {
     const controller = new AbortController();
     const onAbort = (): void => controller.abort();
     deadline.signal.addEventListener("abort", onAbort, { once: true });
@@ -1401,7 +1608,7 @@ export function createVerificationWiring(deps: {
       const bound = deadline.bound(GRADE_SNAPSHOT_TIMEOUT_MS);
       if (bound <= 0 || controller.signal.aborted) return undefined;
       // No digests: the drift check digests the producer's files itself (checkDrift).
-      return await withTimeout(snapshotTree(cwd, controller.signal, { digestPaths: [] }), bound, "router_verify fingerprint");
+      return await withTimeout(snapshotTree(cwd, controller.signal, { digestPaths: [], lowPriority }), bound, "router_verify fingerprint");
     } catch {
       return undefined; // No current tree: materialize skips its same-repository guard, as without a snapshot.
     } finally {
@@ -1442,10 +1649,11 @@ export function createVerificationWiring(deps: {
     entry: PendingEntry,
     deadline: Deadline,
     snapshots: Map<string, Promise<TreeSnapshot | undefined>>,
+    lowPriority: boolean,
   ): Promise<ClaimPreparation> => {
     let snapshot = snapshots.get(entry.cwd);
     if (snapshot === undefined) {
-      snapshot = snapshotFor(entry.cwd, deadline);
+      snapshot = snapshotFor(entry.cwd, deadline, lowPriority);
       snapshots.set(entry.cwd, snapshot);
     }
     const [reference, drift, tree] = await Promise.all([
@@ -1552,7 +1760,11 @@ export function createVerificationWiring(deps: {
   const judgeVerdict = (entry: PendingEntry, prep: ClaimPreparation, gate: ClaimGate, cfg: RouterConfig): VerificationResult => {
     if (gate.kind === "final") return gate.result;
     const { strict, retryable } = gate;
-    const res = lineageDowngrade(gate.res, { orchestratorSessionID: entry.orchestratorSessionID, root: prep.root, dispatchedAt: entry.dispatchedAt, strictUnverifiable: strict });
+    // QA-3.1-2 / QA-3.1-3: the dispatch's own context, recorded when the producer returned.
+    const res = applyDispatchCaveats(
+      lineageDowngrade(gate.res, { orchestratorSessionID: entry.orchestratorSessionID, root: prep.root, dispatchedAt: entry.dispatchedAt, strictUnverifiable: strict }),
+      entry,
+    );
     let verdict = res.verdict;
     if (prep.drift.kind !== "none") {
       // Section 1.5-18 and the owner's rule: a verdict on a tree that is not (provably) the
@@ -1670,7 +1882,8 @@ export function createVerificationWiring(deps: {
       // 4. Every preparation first, then every gate at once: the testsPass requests share the
       //    deadline and reach the S5 coordinator together (one window, one batch).
       const snapshots = new Map<string, Promise<TreeSnapshot | undefined>>();
-      const preparations = claims.map(c => prepareClaim(c.entry, owned, snapshots));
+      // QA-3.1-8: the current-tree snapshot at the configured priority; a background run's always low.
+      const preparations = claims.map(c => prepareClaim(c.entry, owned, snapshots, budget.lowPriority || options.background === true));
       const allPrepared = Promise.allSettled(preparations);
       const gates = claims.map(async (c, i): Promise<{ readonly prep: ClaimPreparation | undefined; readonly gate: ClaimGate }> => {
         let prep: ClaimPreparation | undefined;
@@ -1758,6 +1971,8 @@ export function createVerificationWiring(deps: {
     beginVerification,
     resolveDirectives,
     async startDispatch(store, id, cwd, dod, text, remember) {
+      // VERIFY_WAIT counts from here, the dispatch's start (see boundedCaptureWait).
+      const startedAt = Date.now();
       const start: DispatchStart = { directives: resolveDirectives(text), dispatchedAt: pendingNow() };
       if (remember) {
         dispatchStarts.delete(id);
@@ -1768,7 +1983,7 @@ export function createVerificationWiring(deps: {
           dispatchStarts.delete(oldest.value);
         }
       }
-      await beginVerificationBounded(store, id, cwd, dod, start.directives.waitMs);
+      await boundedCaptureWait(store, id, cwd, dod, start.directives.waitMs, startedAt);
       return start;
     },
     takeDispatch(id, text) {

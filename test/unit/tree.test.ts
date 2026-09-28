@@ -1,10 +1,25 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { resolve } from "node:path";
-import { snapshotTree } from "../../src/verify/tree";
+import { constants as osConstants } from "node:os";
+import { execGit, snapshotTree, SNAPSHOT_GIT_MAX_BUFFER, SNAPSHOT_GIT_TIMEOUT_MS, type SnapshotGitOptions } from "../../src/verify/tree";
 
-const state = vi.hoisted(() => ({ head: "head1", status: "", diff: "", index: "", untracked: "", content: "", stage: "", error: false, calls: [] as string[][], directories: [] as string[] }));
+const state = vi.hoisted(() => ({
+  head: "head1", status: "", diff: "", index: "", untracked: "", content: "", stage: "", error: false,
+  calls: [] as string[][], directories: [] as string[], binaries: [] as string[],
+  priorities: [] as [number, number][], priorityThrows: false,
+}));
+vi.mock("node:os", async importOriginal => ({
+  ...(await importOriginal<typeof import("node:os")>()),
+  setPriority: (pid: number, priority: number) => {
+    state.priorities.push([pid, priority]);
+    if (state.priorityThrows) throw new Error("ESRCH");
+  },
+}));
 vi.mock("node:child_process", () => ({
-  execFile: (_binary: string, args: string[], options: { cwd: string }, callback: (error: Error | null, stdout: string) => void) => {
+  execFile: (binary: string, rawArgs: string[], options: { cwd: string }, callback: (error: Error | null, stdout: string) => void) => {
+    state.binaries.push(binary);
+    // POSIX low priority: `nice -n 10 -- git …`; record git's own argv either way.
+    const args = binary === "nice" ? rawArgs.slice(4) : rawArgs;
     state.calls.push(args);
     state.directories.push(options.cwd);
     const command = args.slice(1).join(" ");
@@ -15,6 +30,7 @@ vi.mock("node:child_process", () => ({
       : command.startsWith("diff --cached") ? state.index
       : command === "ls-files --stage" ? state.stage : state.untracked;
     callback(state.error ? new Error("unavailable") : null, output);
+    return { pid: 4242 };
   },
 }));
 vi.mock("node:fs/promises", () => ({
@@ -23,7 +39,10 @@ vi.mock("node:fs/promises", () => ({
   readFile: async () => state.content,
   readlink: async () => "target",
 }));
-beforeEach(() => Object.assign(state, { head: "head1", status: "", diff: "", index: "", untracked: "", content: "", stage: "", error: false, calls: [], directories: [] }));
+beforeEach(() => Object.assign(state, {
+  head: "head1", status: "", diff: "", index: "", untracked: "", content: "", stage: "", error: false,
+  calls: [], directories: [], binaries: [], priorities: [], priorityThrows: false,
+}));
 const capture = () => snapshotTree(process.cwd(), new AbortController().signal);
 describe("Git tree fingerprint adapter", () => {
   it("fingerprints the whole repository even when tests run in a subdirectory", async () => {
@@ -51,5 +70,44 @@ describe("Git tree fingerprint adapter", () => {
     expect(await capture()).toBeUndefined(); state.stage = "";
     const controller = new AbortController(); controller.abort();
     expect(await snapshotTree(process.cwd(), controller.signal)).toBeUndefined();
+  });
+  it("QA-3.1-8: every git process of a snapshot gets lowPriority through the seam (default off)", async () => {
+    const seen: SnapshotGitOptions[] = [];
+    const git = async (args: readonly string[], opts: SnapshotGitOptions) => {
+      seen.push(opts);
+      return execGit(args, opts);
+    };
+    const signal = new AbortController().signal;
+    expect(await snapshotTree(process.cwd(), signal, { lowPriority: true, git })).toBeDefined();
+    // rev-parse x2, status, diff x2, ls-files --stage, ls-files --others.
+    expect(seen).toHaveLength(7);
+    for (const opts of seen) {
+      expect(opts).toMatchObject({ lowPriority: true, timeoutMs: SNAPSHOT_GIT_TIMEOUT_MS, maxBuffer: SNAPSHOT_GIT_MAX_BUFFER });
+      expect(opts.signal).toBe(signal);
+    }
+    seen.length = 0;
+    expect(await snapshotTree(process.cwd(), signal, { git })).toBeDefined();
+    expect(seen.map(o => o.lowPriority)).toEqual(Array(7).fill(false));
+  });
+  it("QA-3.1-8: the default git seam lowers the process's priority as exec.ts does", async () => {
+    const opts = { cwd: process.cwd(), signal: new AbortController().signal, timeoutMs: 5, maxBuffer: 5, lowPriority: true };
+    expect(await execGit(["--no-pager", "rev-parse", "HEAD"], opts)).toBe("head1");
+    if (process.platform === "win32") {
+      // The child is spawned as git and lowered right after the spawn.
+      expect(state.binaries).toEqual(["git"]);
+      expect(state.priorities).toEqual([[4242, osConstants.priority.PRIORITY_BELOW_NORMAL]]);
+      // A child that already exited cannot be lowered: the run itself is unaffected.
+      state.priorityThrows = true;
+      expect(await execGit(["--no-pager", "rev-parse", "HEAD"], opts)).toBe("head1");
+    } else {
+      expect(state.binaries).toEqual(["nice"]);
+      expect(state.priorities).toEqual([]);
+    }
+    expect(state.calls[0]).toEqual(["--no-pager", "rev-parse", "HEAD"]);
+    // Normal priority: plain git, nothing lowered.
+    state.binaries = []; state.priorities = [];
+    expect(await execGit(["--no-pager", "rev-parse", "HEAD"], { ...opts, lowPriority: false })).toBe("head1");
+    expect(state.binaries).toEqual(["git"]);
+    expect(state.priorities).toEqual([]);
   });
 });

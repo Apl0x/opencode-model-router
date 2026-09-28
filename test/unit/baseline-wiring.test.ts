@@ -99,7 +99,10 @@ function harness() {
   const store = createChangedFileStore();
   return { cfg, wiring, store };
 }
-describe("tree snapshot against a real git repository", () => {
+// Real git on a loaded Windows runner outlasts the 5 s default.
+const REAL_GIT_TIMEOUT_MS = 60_000;
+
+describe("tree snapshot against a real git repository", { timeout: REAL_GIT_TIMEOUT_MS }, () => {
   const withRepo = async (body: (repo: string) => Promise<void>) => {
     const repo = mkdtempSync(join(tmpdir(), "omr-tree-"));
     const git = (...args: string[]) => execFileSync("git", args, { cwd: repo, windowsHide: true });
@@ -142,7 +145,7 @@ describe("tree snapshot against a real git repository", () => {
   });
 });
 
-describe("shell edits to files already dirty at dispatch, against a real git repository (QA-2.1-2)", () => {
+describe("shell edits to files already dirty at dispatch, against a real git repository (QA-2.1-2)", { timeout: REAL_GIT_TIMEOUT_MS }, () => {
   const real = () => vi.importActual<typeof import("../../src/verify/tree")>("../../src/verify/tree");
   const sha = (text: string) => `file:${createHash("sha256").update(text).digest("hex")}`;
   const key = (p: string) => resolve(p).toLowerCase();
@@ -259,10 +262,10 @@ describe("shell edits to files already dirty at dispatch, against a real git rep
       expect(scoped).toHaveLength(1);
       expect(scoped[0]).toContain(join(repo, "src", "a.js"));
     });
-  });
+  }); // Real git over 501 untracked files: the describe's REAL_GIT_TIMEOUT_MS.
 });
 
-describe("commits made since dispatch, against a real git repository (QA-2.1-12)", () => {
+describe("commits made since dispatch, against a real git repository (QA-2.1-12)", { timeout: REAL_GIT_TIMEOUT_MS }, () => {
   const real = () => vi.importActual<typeof import("../../src/verify/tree")>("../../src/verify/tree");
   const key = (p: string) => resolve(p).toLowerCase();
   /** A clean repository: src/a.js and src/b.js committed. */
@@ -307,8 +310,11 @@ describe("commits made since dispatch, against a real git repository (QA-2.1-12)
       expect(prepared.changeBaseline).toBe("available");
       expect(prepared.changedFiles.map(f => ({ ...f, path: key(f.path) }))).toEqual([{ path: key(join(repo, "src", "b.js")), status: "M" }]);
       // One git diff, through the argv seam, at low priority, bounded, rooted at the repository.
-      expect(state.commands).toEqual([`git --no-optional-locks -C ${repo} diff --name-status -z -M ${head} HEAD`]);
-      expect(state.execOpts[0]).toMatchObject({ cwd: repo, timeoutMs: COMMIT_DIFF_TIMEOUT_MS, lowPriority: resolveVerifyBudget(harness().cfg).lowPriority });
+      // Only the spawns rooted at this test's repository: a timed-out earlier test's gate can still
+      // record into the shared state after beforeEach reset it.
+      const ours = state.commands.map((command, i) => ({ command, opts: state.execOpts[i] })).filter(c => c.opts?.cwd === repo);
+      expect(ours.map(c => c.command)).toEqual([`git --no-optional-locks -C ${repo} diff --name-status -z -M ${head} HEAD`]);
+      expect(ours[0].opts).toMatchObject({ cwd: repo, timeoutMs: COMMIT_DIFF_TIMEOUT_MS, lowPriority: resolveVerifyBudget(harness().cfg).lowPriority });
     });
   });
 
@@ -539,7 +545,7 @@ describe("dispatch reference wiring", () => {
     state.finish?.();
     await begun;
     expect((await wiring.prepareVerification(store, "dispatch", "child")).reference)
-      .toEqual({ kind: "none", reason: REFERENCE_NONE.contaminated });
+      .toEqual({ kind: "none", reason: `${REFERENCE_NONE.contaminated} (tool "bash")` });
   });
   it("the capture's argv seam runs at the configured priority", async () => {
     const { cfg, wiring, store } = harness();
@@ -547,6 +553,34 @@ describe("dispatch reference wiring", () => {
     await state.captureArgv!("git", ["rev-parse", "HEAD"], { cwd });
     expect(state.commands).toEqual(["git rev-parse HEAD"]);
     expect(state.execOpts[0]).toMatchObject({ cwd, lowPriority: resolveVerifyBudget(cfg).lowPriority });
+  });
+  it("QA-3.1-8: the dispatch and gate tree snapshots run their git at the configured priority", async () => {
+    const seen: (boolean | undefined)[] = [];
+    state.snapshotImpl = async (_cwd, _signal, options) => {
+      seen.push(options?.lowPriority);
+      return state.snapshot;
+    };
+    const { cfg, wiring, store } = harness();
+    expect(resolveVerifyBudget(cfg).lowPriority).toBe(true);
+    await wiring.beginVerification(store, "dispatch", undefined, dod);
+    await wiring.prepareVerification(store, "dispatch", "child");
+    // A DoD without testsPass still snapshots at dispatch (read-only fan-outs capture nothing).
+    await wiring.beginVerification(store, "readonly", undefined, { ...dod, checks: [] });
+    expect(seen).toEqual([true, true, true]);
+
+    seen.length = 0;
+    const normal: RouterConfig = { ...cfg, enforcement: { verify: { ...cfg.enforcement?.verify, lowPriority: false } } };
+    const off = createVerificationWiring({ client: {}, directory: cwd, getConfig: () => normal, logger: { warn: () => {} } });
+    await off.beginVerification(store, "normal", undefined, dod);
+    await off.prepareVerification(store, "normal", "child");
+    expect(seen).toEqual([false, false]);
+
+    // An unreadable config keeps the section 1.4 default (low).
+    seen.length = 0;
+    const broken = createVerificationWiring({ client: {}, directory: cwd, getConfig: () => { throw new Error("config broke"); }, logger: { warn: () => {} } });
+    await broken.beginVerification(store, "broken", undefined, dod);
+    await broken.prepareVerification(store, "broken", "child");
+    expect(seen).toEqual([true, true]);
   });
   it("QA-2.1-5: the recheck's reference argv seam (GC, materialize, dispose) runs at the configured priority", async () => {
     const { cfg, wiring } = harness();
@@ -777,6 +811,14 @@ describe("gate seams", () => {
       reply(1, "", true); expect(await s.findByContent(root, "needle", ["*.test.ts"])).toBeUndefined();
       state.argvImpl = async () => { throw new Error("spawn ENOENT"); };
       expect(await s.findByContent(root, "needle", ["*.test.ts"])).toBeUndefined();
+    });
+    it("E2E-1: findByContent with word adds git grep -w (a pytest module name as a whole word)", async () => {
+      const s = search();
+      reply(0, "tests/test_mod02_1.py\0");
+      expect(await s.findByContent(root, "mod02", [":(glob)**/test_*.py", ":(glob)**/conftest.py"], { word: true })).toEqual([resolve(root, "tests/test_mod02_1.py")]);
+      expect(state.commands[0]).toBe(`git --no-optional-locks -C ${root} grep -l -z -F -w --untracked -e mod02 -- :(glob)**/test_*.py :(glob)**/conftest.py`);
+      reply(1); expect(await s.findByContent(root, "mod02", ["*.py"], { word: false })).toEqual([]);
+      expect(state.commands[1]).toBe(`git --no-optional-locks -C ${root} grep -l -z -F --untracked -e mod02 -- *.py`);
     });
     it("a deadline bounds each search and a spent or aborted one runs no git", async () => {
       const ctl = new AbortController(); reply(0, "a.test.ts\0");

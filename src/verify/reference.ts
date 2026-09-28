@@ -319,9 +319,12 @@
 //      caller abort returns ok:false "aborted".
 //   8. Return { ok: true, reference: { dir, exact, inexactReasons,
 //      unreproduced, links, toRefPath, dispose } }. toRefPath(p) maps an
-//      absolute live path under root to the same relative path under dir, or
-//      returns undefined when p is outside root. The recheck uses it for the
-//      runner cwd and the failing test files.
+//      absolute live path under root, or under realpath(root), to the same
+//      relative path under dir, or returns undefined when p is outside both.
+//      The recheck uses it for the runner cwd and the failing test files, which
+//      the planner canonicalises with the native realpath (E2E-2: a root
+//      reached through an 8.3 name, a junction or a subst drive is spelled
+//      differently by git and by realpath).
 //   Repository effects of materialize, dispose and GC: they write only the
 //   admin entry .git/worktrees/<name> and the dir itself. The main index
 //   content, the refs and the stash list are never touched.
@@ -717,6 +720,11 @@ export interface ReferenceStats {
  */
 export interface ReferenceFs {
   lstat(path: string): Promise<ReferenceStats>;
+  /**
+   * The NATIVE realpath (fs.promises.realpath, as nodeReferenceFs): it resolves links, junctions
+   * and win32 8.3 short names. The JS fs.realpathSync keeps 8.3 names, and the tmp root, the
+   * reference dir and every inside-dir check would then disagree on the spelling (E2E-2).
+   */
   realpath(path: string): Promise<string>;
   readFile(path: string, options: { signal?: AbortSignal }): Promise<Uint8Array>;
   writeFile(path: string, data: Uint8Array, options: { mode: number; flag: "wx" }): Promise<void>;
@@ -813,7 +821,11 @@ export interface MaterializedReference {
   readonly unreproduced: readonly string[];
   /** Absolute paths of the node_modules links created inside dir. */
   readonly links: readonly string[];
-  /** Maps an absolute live path under ref.root to the same relative path under dir; undefined outside root. */
+  /**
+   * Maps an absolute live path under ref.root, or under the native realpath of ref.root, to the
+   * same relative path under dir; undefined outside both. Lexical below the root: pass the
+   * canonical (realpath'd) spelling, as the planner produces it.
+   */
   toRefPath(livePath: string): string | undefined;
   /** Section 6. Idempotent, never rejects; call only after the recheck process tree has exited. */
   dispose(): Promise<void>;
@@ -1882,9 +1894,14 @@ export async function materialize(
       toRefPath(livePath: string) {
         if (!p.isAbsolute(livePath)) return undefined;
         const absolute = p.resolve(livePath);
-        if (comparable(absolute, platform) === comparable(root, platform)) return refDir;
-        if (!isStrictlyInside(absolute, root, platform)) return undefined;
-        return p.join(refDir, p.relative(root, absolute));
+        // E2E-2: the root as git spelled it, or its native realpath. The recheck passes the
+        // planner's canonical paths (runnerCwd, failing files), which are realpath'd: a root
+        // reached through a junction, a subst drive or an 8.3 name matched neither otherwise.
+        for (const base of [root, realRoot]) {
+          if (comparable(absolute, platform) === comparable(base, platform)) return refDir;
+          if (isStrictlyInside(absolute, base, platform)) return p.join(refDir, p.relative(base, absolute));
+        }
+        return undefined;
       },
       dispose() {
         disposing ??= cleanup();

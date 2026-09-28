@@ -1,8 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { execFile, spawn } from "node:child_process";
+import { execFile, spawn, spawnSync } from "node:child_process";
 import * as fsp from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join, relative } from "node:path";
+import { dirname, join, relative } from "node:path";
 import {
   assertSafeRefDir,
   captureReference,
@@ -1208,6 +1208,94 @@ describe("gcStaleReferences", { timeout: 60_000 }, () => {
     }
     await new Promise((resolve) => setTimeout(resolve, 250));
     expect(warnings).toEqual([]);
+  });
+});
+
+/**
+ * E2E-2: the win32 8.3 spelling of an existing path (cmd's `%~sI`, spawned with an argv), or
+ * undefined when the volume has 8.3 name generation disabled (the spelling comes back unchanged).
+ */
+function shortPathOf(path: string): string | undefined {
+  const r = spawnSync("cmd.exe", ["/d", "/s", "/c", `"for %I in ("${path}") do @echo %~sI"`], {
+    encoding: "utf8",
+    windowsHide: true,
+    windowsVerbatimArguments: true,
+  });
+  if (r.status !== 0) throw new Error(`cmd.exe %~sI failed for ${path}: ${r.stderr}`);
+  const short = r.stdout.trim();
+  return short.toLowerCase() === path.toLowerCase() ? undefined : short;
+}
+
+// E2E-2 (phase 3.1): os.tmpdir() and the plugin directory are 8.3 short paths on many Windows
+// hosts (C:\Users\ABCDEF~1\AppData\Local\Temp). Real git, a real node_modules junction.
+describe("8.3 short paths (E2E-2)", { timeout: 60_000 }, () => {
+  it("captures from an 8.3 cwd, links a junctioned node_modules under realpath(tmpdir) and maps both root spellings", async (ctx) => {
+    if (!isWin) return ctx.skip("8.3 short names exist on win32 only");
+    // ASCII-only long names, so cmd's output code page cannot garble the short spelling.
+    const longRoot = await fsp.mkdtemp(join(await fsp.realpath(tmpdir()), "omr-e2e2-long-directory-"));
+    const longRepo = join(longRoot, "repository-long-name");
+    const longTmp = join(longRoot, "temporary-long-name");
+    const store = join(longRoot, "dependency-store", "node_modules");
+    const junction = join(longRepo, "node_modules");
+    try {
+      await fsp.mkdir(longRepo);
+      await fsp.mkdir(longTmp);
+      const shortRepo = shortPathOf(longRepo);
+      const shortTmp = shortPathOf(longTmp);
+      if (shortRepo === undefined || shortTmp === undefined) {
+        console.warn(`[E2E-2] SKIPPED: 8.3 short names are disabled on the volume of ${longRoot}`);
+        return ctx.skip("8.3 short names are disabled on this volume");
+      }
+      expect(shortRepo).toMatch(/~\d/);
+      await git(longRepo, "init", "-q");
+      for (const [k, v] of [["user.email", "t@example.com"], ["user.name", "t"], ["commit.gpgsign", "false"], ["core.autocrlf", "false"]]) {
+        await git(longRepo, "config", k, v);
+      }
+      await fsp.mkdir(join(longRepo, "src"));
+      await fsp.writeFile(join(longRepo, "src", "a.test.js"), "a0\n");
+      await fsp.writeFile(join(longRepo, ".gitignore"), "node_modules/\n");
+      await git(longRepo, "add", "-A");
+      await git(longRepo, "commit", "-q", "-m", "init");
+      // node_modules is a junction into a store outside the repository, as in the e2e fixtures.
+      await fsp.mkdir(join(store, "vitest"), { recursive: true });
+      await fsp.writeFile(join(store, "vitest", "package.json"), '{"name":"vitest","version":"1.0.0","bin":{"vitest":"vitest.mjs"}}\n');
+      await fsp.writeFile(join(store, "vitest", "vitest.mjs"), "\n");
+      await fsp.symlink(store, junction, "junction");
+
+      const ref = await captureReference(shortRepo, new AbortController().signal, captureDeps({ tmpdir: shortTmp }));
+      if (!ref) throw new Error("capture from the 8.3 cwd returned undefined");
+      const realTmp = await fsp.realpath(shortTmp);
+      expect(realTmp.toLowerCase()).toBe(longTmp.toLowerCase());
+      const realStore = await fsp.realpath(store);
+
+      // The root as git spells it, and the 8.3 spelling a caller may hold (the plugin directory).
+      for (const root of [ref.root, shortRepo]) {
+        const m = await mat({ ...ref, root }, { tmpdir: shortTmp });
+        try {
+          expect(dirname(m.dir)).toBe(realTmp); // created directly under realpath(tmpdir) (section 4 step 2)
+          expect(m.exact).toBe(true);
+          expect(m.unreproduced).toEqual([]);
+          expect(m.links).toEqual([join(m.dir, "node_modules")]);
+          expect(await fsp.realpath(join(m.dir, "node_modules"))).toBe(realStore);
+          expect(JSON.parse(await fsp.readFile(join(m.dir, "node_modules", "vitest", "package.json"), "utf8"))).toMatchObject({ name: "vitest" });
+          // The planner's canonical (realpath'd) paths map whichever spelling the root has.
+          expect(m.toRefPath(longRepo)).toBe(m.dir);
+          expect(m.toRefPath(join(longRepo, "src", "a.test.js"))).toBe(join(m.dir, "src", "a.test.js"));
+          expect(m.toRefPath(join(root, "src", "a.test.js"))).toBe(join(m.dir, "src", "a.test.js"));
+          expect(m.toRefPath(join(longRoot, "elsewhere.test.js"))).toBeUndefined();
+        } finally {
+          await m.dispose();
+        }
+      }
+      // Disposal never went through the junction (R1), and nothing is left behind.
+      expect(await fsp.readFile(join(store, "vitest", "package.json"), "utf8")).toContain('"vitest"');
+      expect(await worktreeCount(longRepo)).toBe(1);
+      expect(await refDirsIn(longTmp)).toEqual([]);
+      expect(warnings).toEqual([]);
+    } finally {
+      if ((await fsp.lstat(junction).catch(() => undefined))?.isSymbolicLink()) await fsp.unlink(junction);
+      await fsp.rm(longRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
+    }
   });
 });
 
