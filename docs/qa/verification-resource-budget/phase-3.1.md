@@ -1008,3 +1008,62 @@ Not recorded here: a full unit-suite run (this dispatch was limited to targeted 
   (sampler, harness, fixture-repo, deferred test) during these runs. Sampler interval median was
   282–306 ms.
 
+- **QA-3.1-4** (d00f7e0): the deferred file's runner predicate matches every spelling of the repo
+  dir and of the `omr-ref-` prefix (`pathSpellings`: raw + `realpathSync.native`, both separators,
+  case-folded on win32; now exported from `e2e/sampler.ts`). It checks descendants and, through
+  `seenAnywhere`, every process on the machine, so an orphan is caught too. Positive control in
+  3.1.2.h (background on): `runners seen (repo predicate)=7 machine-wide=7` in both runs (was 0
+  under the 8.3 temp dir); the probe logged 2 vitest mains (`related …src\m19.js`, then the
+  reference `run …omr-ref-…\test\m19-1.test.js …m19-2.test.js`).
+- **QA-3.1-5** (d00f7e0): 3.1.2.f and both 3.1.2.h tests assert the sampler's median interval
+  ≤ `SAMPLER_MEDIAN_INTERVAL_MAX_MS` (500 ms on win32, 250 ms on POSIX). **Deviation:** the plan's
+  100 ms can't be reached on Windows. One `Get-CimInstance Win32_Process` query costs ~250 ms idle on
+  this host (~550 processes, 10 queries: 250 ms full, 240 ms with a `ProcessId=` WQL filter, 244 ms
+  without CommandLine). A WQL filter therefore buys no rate. A `Name`/`CreationDate` filter would
+  drop parent-chain processes and orphans started before the sampler, so none was added. Measured
+  medians: f 352/377 ms, h bg-off 260/269 ms, h bg-on 273/277 ms. `lifetimePeak` (lifetimes
+  `[createdMs, lastSeen]`) is added and reported (bg-on lifetime peak=3). The zero-runner checks no
+  longer rely on sampling alone: they also rely on the runner probe (QA-3.1-9).
+- **QA-3.1-9** (d00f7e0): `prepareFixtureRepo({ probeLog })` installs a probe in the temp copy
+  before its first commit, so every base and reference worktree has it. The fixture files and
+  lockfiles are unchanged. vitest uses a `globalSetup`, jest a `globalSetup` plus a line from
+  `jest.setup.js`, and pytest a `pytest_configure` hook in `tests/conftest.py`. Each writes
+  `{kind, t, pid, cwd, argv}` to a log outside the repo. Every matrix cell requires each probe line
+  to fall inside the verdict's window: the after hook for required, `router_verify` for deferred.
+  Nothing may run at dispatch. Source-edit cells need ≥ 1 main in the repo itself with file
+  arguments (vitest `related`/`run <files>`, jest `--findRelatedTests -- <file>` or `--runTestsByPath`,
+  pytest test paths), and never a bare full-suite run. Docs, config and setup cells must start no
+  runner. The vacuous `(\d+) tests? ran` check is removed. 3.1.2.f and h bg-off also assert that
+  nothing was probed. 3.1.2.g required asserts its mains ran inside its after hook.
+- **QA-3.1-10** (d00f7e0): 3.1.2.f asserts after-hook max ≤ `DEFERRED_FINISH_MS` + 150 ms timer
+  slack. It also asserts that no footer carries a cap reason (`UNATTRIBUTED_RISK_REASON`, the S6
+  reason, `STATIC_SCOPING_UNFINISHED_REASON`), and it reports the dispatches at ≥ 1 950 ms. Capture
+  wait is tightened to p50 ≤ 1 500 ms. Measured: `beforeMs p50=987ms`/`1006ms`, `afterMs
+  p50=1511ms max=1571ms` / `p50=1508ms max=1565ms`, `at >= 1950ms=0`, `capped footers=0`.
+  **Observation:** in one earlier deferred-only run, every 3.1.2.f after hook ran to the cap
+  (`p50=1998ms max=2001ms`) and no footer showed it. So the cut fell after the change set and
+  scoping, most likely in the drift digest. This is not a false pass: without digests, drift is
+  "unchecked" and `router_verify` downgrades a pass to unverifiable. Hence the slack bound, not
+  `< cap`.
+- **QA-3.1-11** (d00f7e0): 3.1.2.f asserts that the slot dir is absent before the dispatches. It
+  polls every 20 ms during the run (`slot dir seen in 0/128` and `0/136` polls) and checks again at
+  the end.
+- **QA-3.1-15** (d00f7e0). (b) jest-app: every source-edit cell requires a `setupAfterEnv` probe line
+  from the scoped run, so `jest.setup.js` ran. A new jest-only cell edits `jest.setup.js` and gets
+  unverifiable with no runner started. Every jest-app test reaches `src/a01.js`, so an a01 edit
+  relates all 22 files. (c) A new vitest-only cell breaks `src/m07.js`. Measured: `vitest related`
+  (4.1.11) **does** run `test/dynamic.test.js`, and its "loads a module through a computed specifier"
+  is listed among the failures. Vite resolves the template-literal specifier to a glob over
+  `src/*.js`, so plan §5's blind spot does not arise for this shape; the cell asserts it (both
+  modes). (d) The harness takes `childEdits`. It fires `tool.execute.before/after("edit")` from the
+  child session `child-<callID>`, whose parent is now the dispatching session. It is used in every
+  matrix cell and in 3.1.2.g required/drift. A new 3.1.2.g case (`VERIFY_WAIT:0s`, child edit at
+  once) gives `· unverifiable` with `the dispatch-time change baseline was discarded: tool "edit"
+  ran in an overlapping directory before it resolved`. (a) pnpm/monorepo layout: **accepted
+  residual**. Runner cwd below the git root and the path-spelling surface are covered by the runner
+  unit tests (`runner.test.ts` monorepo/packages cases); there is no e2e fixture.
+- Runs for these: `npm run typecheck` clean. `$env:RUN_VERIFY_E2E='1'; npx vitest run
+  --maxWorkers=1 test/integration/verify-resource-budget.test.ts
+  test/integration/verify-resource-budget.deferred.test.ts test/integration/e2e`, twice (before and
+  after d00f7e0's final bound): `Test Files  4 passed (4)`, `Tests  66 passed (66)`, `Duration
+  223.63s` / `223.72s`, exit 0.
