@@ -81,6 +81,8 @@ const state = vi.hoisted(() => ({
   holds: 0,
   maxHolds: 0,
   snapshots: 0,
+  /** QA-3.1-8: SnapshotOptions.lowPriority of every snapshotTree call. */
+  snapshotPriorities: [] as (boolean | undefined)[],
   deadlines: 0,
   /** acquireSlot answers busy while set. */
   slotBusy: false,
@@ -126,8 +128,9 @@ vi.mock("../../src/verify/pending", async importOriginal => {
 });
 
 vi.mock("../../src/verify/tree", () => ({
-  snapshotTree: async (): Promise<TreeSnapshot> => {
+  snapshotTree: async (_cwd: string, _signal: AbortSignal, options?: { lowPriority?: boolean }): Promise<TreeSnapshot> => {
     state.snapshots++;
+    state.snapshotPriorities.push(options?.lowPriority);
     if (state.snapshotThrows) throw new Error("git status failed");
     return { cwd: state.root, root: state.root, head: "a".repeat(40), fingerprint: state.treeFiles.length === 0 ? "now" : `now${state.treeFiles.length}`, dirty: true, files: [...state.treeFiles] };
   },
@@ -353,7 +356,7 @@ function makeWiring(
 
 function resetCounters(): void {
   Object.assign(state, {
-    runs: [], git: 0, shells: 0, acquires: 0, releases: 0, holds: 0, maxHolds: 0, snapshots: 0, deadlines: 0, planGate: undefined, killed: 0, queues: 0,
+    runs: [], git: 0, shells: 0, acquires: 0, releases: 0, holds: 0, maxHolds: 0, snapshots: 0, snapshotPriorities: [], deadlines: 0, planGate: undefined, killed: 0, queues: 0,
   });
 }
 
@@ -911,6 +914,16 @@ describe("router_verify edge cases (2.4.6)", () => {
     expect([...item.result.verdict.reasons, ...(item.result.verdict.caveats ?? [])].join(" ")).toContain(REFERENCE_NONE.contaminated);
     expect(report.text).toContain(`- ${bad} \u00b7 work a \u00b7 unverifiable`);
     expect(report.text).not.toContain(`- ${bad} \u00b7 work a \u00b7 pass`);
+  });
+
+  it("QA-3.1-8: router_verify's current-tree snapshot runs its git at the configured priority", async () => {
+    const low = makeWiring();
+    await low.wiring.verifyHandles("orch", { kind: "handles", handles: [await register(low.wiring.pending, "a")] });
+    expect(state.snapshotPriorities).toEqual([true]);
+    state.snapshotPriorities = [];
+    const normal = makeWiring({ lowPriority: false });
+    await normal.wiring.verifyHandles("orch", { kind: "handles", handles: [await register(normal.wiring.pending, "b")] });
+    expect(state.snapshotPriorities).toEqual([false]);
   });
 });
 

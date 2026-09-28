@@ -554,6 +554,34 @@ describe("dispatch reference wiring", () => {
     expect(state.commands).toEqual(["git rev-parse HEAD"]);
     expect(state.execOpts[0]).toMatchObject({ cwd, lowPriority: resolveVerifyBudget(cfg).lowPriority });
   });
+  it("QA-3.1-8: the dispatch and gate tree snapshots run their git at the configured priority", async () => {
+    const seen: (boolean | undefined)[] = [];
+    state.snapshotImpl = async (_cwd, _signal, options) => {
+      seen.push(options?.lowPriority);
+      return state.snapshot;
+    };
+    const { cfg, wiring, store } = harness();
+    expect(resolveVerifyBudget(cfg).lowPriority).toBe(true);
+    await wiring.beginVerification(store, "dispatch", undefined, dod);
+    await wiring.prepareVerification(store, "dispatch", "child");
+    // A DoD without testsPass still snapshots at dispatch (read-only fan-outs capture nothing).
+    await wiring.beginVerification(store, "readonly", undefined, { ...dod, checks: [] });
+    expect(seen).toEqual([true, true, true]);
+
+    seen.length = 0;
+    const normal: RouterConfig = { ...cfg, enforcement: { verify: { ...cfg.enforcement?.verify, lowPriority: false } } };
+    const off = createVerificationWiring({ client: {}, directory: cwd, getConfig: () => normal, logger: { warn: () => {} } });
+    await off.beginVerification(store, "normal", undefined, dod);
+    await off.prepareVerification(store, "normal", "child");
+    expect(seen).toEqual([false, false]);
+
+    // An unreadable config keeps the section 1.4 default (low).
+    seen.length = 0;
+    const broken = createVerificationWiring({ client: {}, directory: cwd, getConfig: () => { throw new Error("config broke"); }, logger: { warn: () => {} } });
+    await broken.beginVerification(store, "broken", undefined, dod);
+    await broken.prepareVerification(store, "broken", "child");
+    expect(seen).toEqual([true, true]);
+  });
   it("QA-2.1-5: the recheck's reference argv seam (GC, materialize, dispose) runs at the configured priority", async () => {
     const { cfg, wiring } = harness();
     wiring.buildGateDeps();

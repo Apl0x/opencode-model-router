@@ -814,6 +814,17 @@ export function createVerificationWiring(deps: {
    * the promise object (the store returns the same one), so it holds nothing once the store drops it.
    */
   const settledReferences = new WeakMap<Promise<ReferenceState>, ReferenceState>();
+  /**
+   * QA-3.1-8: VerifyBudget.lowPriority for the tree snapshots; the section 1.4 default (true) when
+   * the config cannot be read, so a snapshot never fails over it.
+   */
+  const configuredLowPriority = (): boolean => {
+    try {
+      return resolveVerifyBudget(getConfig()).lowPriority;
+    } catch {
+      return true;
+    }
+  };
 
   const abs = (p: string): string => (isAbsolute(p) ? p : join(directory, p));
 
@@ -1030,7 +1041,11 @@ export function createVerificationWiring(deps: {
     const judgedByTests = cfg.enforcement?.verify?.require !== "never" && dod.checks.some(
       c => c.kind === "testsPass" && isCommandAllowed(resolveRepoCommand(c, "testsPass", undefined), DEFAULT_ALLOWLIST),
     );
-    const base = { snapshot: snapshotTree, timeoutMs: budget.baselineTimeoutMs };
+    const base = {
+      // QA-3.1-8: the snapshot's git processes run at the configured priority, as the capture's do.
+      snapshot: (at: string, signal: AbortSignal) => snapshotTree(at, signal, { lowPriority: budget.lowPriority }),
+      timeoutMs: budget.baselineTimeoutMs,
+    };
     if (!judgedByTests) return { ...base, uncaptured: { kind: "none", reason: REFERENCE_NONE.notRequested } };
     if (!budget.failureRecheck) return { ...base, uncaptured: { kind: "disabled" } };
     // QA-1.2-13: the capture's git processes run at the configured priority too.
@@ -1139,9 +1154,10 @@ export function createVerificationWiring(deps: {
     try {
       deps = captureDepsFor(dod);
     } catch (err) {
-      // Never blocks or fails the dispatch: snapshot only, and no reference.
+      // Never blocks or fails the dispatch: snapshot only (at the section 1.4 default low priority,
+      // QA-3.1-8), and no reference.
       deps = {
-        snapshot: snapshotTree,
+        snapshot: (at, signal) => snapshotTree(at, signal, { lowPriority: true }),
         timeoutMs: DEFAULT_CAPTURE_TIMEOUT_MS,
         uncaptured: { kind: "none", reason: `${REFERENCE_NONE.failed} (${errorText(err)})` },
       };
@@ -1175,7 +1191,11 @@ export function createVerificationWiring(deps: {
       // QA-2.1-2: digest exactly the paths the dispatch snapshot digested (<= MAX_DIGEST_FILES),
       // so delta can tell which already-dirty file a shell edit changed.
       const digests = store.baselineSnapshot(id)?.digests;
-      const options = digests === undefined ? {} : { digestPaths: digests === "unavailable" ? [] : [...digests.keys()] };
+      // QA-3.1-8: at the configured priority, like every other verification process.
+      const lowPriority = configuredLowPriority();
+      const options = digests === undefined
+        ? { lowPriority }
+        : { lowPriority, digestPaths: digests === "unavailable" ? [] : [...digests.keys()] };
       snapshot = bound > 0 && !controller.signal.aborted
         ? await withTimeout(snapshotTree(base, controller.signal, options), bound, "grade fingerprint")
         : undefined;
@@ -1415,7 +1435,7 @@ export function createVerificationWiring(deps: {
   };
 
   /** 2.4.3a: the current tree for one call, once per cwd (the materialize same-repository guard, P0). */
-  const snapshotFor = async (cwd: string, deadline: Deadline): Promise<TreeSnapshot | undefined> => {
+  const snapshotFor = async (cwd: string, deadline: Deadline, lowPriority: boolean): Promise<TreeSnapshot | undefined> => {
     const controller = new AbortController();
     const onAbort = (): void => controller.abort();
     deadline.signal.addEventListener("abort", onAbort, { once: true });
@@ -1423,7 +1443,7 @@ export function createVerificationWiring(deps: {
       const bound = deadline.bound(GRADE_SNAPSHOT_TIMEOUT_MS);
       if (bound <= 0 || controller.signal.aborted) return undefined;
       // No digests: the drift check digests the producer's files itself (checkDrift).
-      return await withTimeout(snapshotTree(cwd, controller.signal, { digestPaths: [] }), bound, "router_verify fingerprint");
+      return await withTimeout(snapshotTree(cwd, controller.signal, { digestPaths: [], lowPriority }), bound, "router_verify fingerprint");
     } catch {
       return undefined; // No current tree: materialize skips its same-repository guard, as without a snapshot.
     } finally {
@@ -1464,10 +1484,11 @@ export function createVerificationWiring(deps: {
     entry: PendingEntry,
     deadline: Deadline,
     snapshots: Map<string, Promise<TreeSnapshot | undefined>>,
+    lowPriority: boolean,
   ): Promise<ClaimPreparation> => {
     let snapshot = snapshots.get(entry.cwd);
     if (snapshot === undefined) {
-      snapshot = snapshotFor(entry.cwd, deadline);
+      snapshot = snapshotFor(entry.cwd, deadline, lowPriority);
       snapshots.set(entry.cwd, snapshot);
     }
     const [reference, drift, tree] = await Promise.all([
@@ -1692,7 +1713,8 @@ export function createVerificationWiring(deps: {
       // 4. Every preparation first, then every gate at once: the testsPass requests share the
       //    deadline and reach the S5 coordinator together (one window, one batch).
       const snapshots = new Map<string, Promise<TreeSnapshot | undefined>>();
-      const preparations = claims.map(c => prepareClaim(c.entry, owned, snapshots));
+      // QA-3.1-8: the current-tree snapshot at the configured priority; a background run's always low.
+      const preparations = claims.map(c => prepareClaim(c.entry, owned, snapshots, budget.lowPriority || options.background === true));
       const allPrepared = Promise.allSettled(preparations);
       const gates = claims.map(async (c, i): Promise<{ readonly prep: ClaimPreparation | undefined; readonly gate: ClaimGate }> => {
         let prep: ClaimPreparation | undefined;
