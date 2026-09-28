@@ -660,3 +660,37 @@ The product finding: a working sweep used 96% of the limit that should only stop
 In cov 2, `reference.test.ts > materialize / dispose > QA-1.5-12` failed with
 `Error: Hook timed out in 10000ms` in its `beforeEach` (`reference.test.ts:185`). That is the same
 load, on a different file. It is not addressed here.
+
+## Known follow-ups (non-blocking CI)
+
+**Owner decision:** Windows CI gates that are too hard to stabilise now are **non-blocking for now, to be
+fixed later**. Since the commit `ci(verify): make the windows e2e leg non-blocking and keep the coverage gate running`:
+
+- The **Windows leg of the `e2e` job** is `continue-on-error`. Its Ubuntu leg, the whole `test` matrix
+  (Windows included), `bun-smoke` (both OSes) and `coverage` stay blocking.
+- The Windows leg still produces coverage when a test fails. Both Windows coverage commands pass
+  `--coverage.reportOnFailure`, because vitest 4.1.11 defaults it to `false` and
+  `OMR_COVERAGE_ARTIFACT=1` only turns thresholds off. The `e2e` step also runs after a failed
+  "Windows unit coverage" step. The `coverage-windows` upload runs `always()`, with
+  `if-no-files-found: warn`.
+- `coverage-merge` runs whenever `coverage` succeeded, whatever the Windows e2e leg did. It requires
+  `linux-unit` and `linux-e2e` and accepts 2–4 inputs. The per-file ≥ 90 % gate **blocks only when all
+  4 inputs are present**. With Windows inputs missing, it prints
+  `::warning::Windows coverage inputs missing; merged gate is Linux-only for this run` and still prints
+  the table, but a gate failure is only a warning. The data requires this. On run 36364312868's Linux
+  artifacts alone, `src/verify/exec.ts` is at 65.11 % lines (168/258) and 57.54 % branches (122/212),
+  because its win32 branches are uncovered. The other seven gated files pass (slot 98.46/98.05,
+  reference 97.79/97.27, runner 99.88/97.94).
+
+Open items to fix later:
+
+1. **`harness.e2e-check.test.ts:214` sampler snapshots:** `expected 3 to be ≥ 5`. Seen in Windows e2e
+   run 36364312868, attempts 1 and 2. The e2e step took 591–629 s there, against 466 s earlier, and
+   fixture prep doubled.
+2. **`reference.test.ts` QA-1.5-12:** `Hook timed out in 10000ms` in `beforeEach` (`:185`). Seen once, in
+   the diagnostic job (see above).
+3. **G4 late-sweep tolerance:** the first PowerShell sweep under coverage load took 6.6 s to start and
+   23.7 s to query. The tolerance added in 6730f0e covers it, but the load limit (QA-1.2-14) remains.
+4. **The merged coverage gate depends on Windows.** The gate is only fully enforced when the
+   non-blocking Windows leg delivers both of its inputs. Make the Windows e2e leg blocking again once
+   items 1–3 are fixed.
