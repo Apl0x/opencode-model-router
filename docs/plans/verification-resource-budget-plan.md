@@ -1355,7 +1355,9 @@ bound holds.
     - the total number of runs is ≤ 1 per batch window + rechecks.
   - 3.1.2.c **Two plugin instances** (two child processes, simulating two opencode sessions) → the
     slot limits them jointly.
-  - 3.1.2.d **No orphans:** force the gate budget to expire mid-run; 3 s later no descendant is alive.
+  - 3.1.2.d **No orphans:** force the gate budget to expire mid-run; 3 s later no attributable
+    descendant is alive. *Amended during implementation (phase-1.2.md round 2):* "no descendant"
+    became "no attributable descendant" (see G4 and its known limits).
   - 3.1.2.e **Cleanup:** after the suite, no `omr-ref-*` worktrees remain, and the fixture's real
     `node_modules` sentinel file still exists.
   - 3.1.2.f **Deferred costs nothing:** 20 parallel deferred implementation delegations on
@@ -1492,9 +1494,36 @@ checkout is at `v1.15.0`; no `omr-*` worktrees or `vrb/*` branches remain.
   processes, all at below-normal priority. Proven by 3.1.2.b and 3.1.2.c on Windows and Linux.
 - **G4 — Nothing outlives its budget.** Every synchronous verification (a required gate in the
   `delegate` and the native `task` paths, and each `router_verify` call) has one deadline
-  (`gateBudgetMs`). No slot wait, run, recheck or batch step outlives it. Its expiry kills the whole
-  process tree; no orphans after 3 s. Proven by 1.2, the 2.1 deadline and native-`task` tests, the
-  2.4 `router_verify` deadline test, and 3.1.2.d.
+  (`gateBudgetMs`). No slot wait, run, recheck or batch step outlives it by more than the 2 s kill
+  grace: the run resolves and releases its slot at most 2 s after the deadline, even when a
+  descendant still holds its output pipes. Its expiry kills every process still attributable to the
+  run, and no attributable process is alive 3 s after the deadline on a machine that is not
+  saturated by normal-priority load. Attributable means:
+  - on POSIX, a member of the run's process group;
+  - on Windows, a descendant reachable from the live direct child or, once the direct child has
+    exited, a child it created during its lifetime and that child's live tree, found by the
+    creation-time sweep.
+
+  `timedOut: true` means the deadline or abort fired while something still held the run, so a kill
+  was attempted; it does not prove that anything was killed. A case that cannot be told apart counts
+  as a kill (fail-closed): on Windows, the grace settling the run while a sweep that pinned trees is
+  still reporting, even if the leftover exited on its own (QA-1.2-28).
+
+  Known limits, each still bounded by the 2 s grace for the run and its slot:
+  - (a) a descendant whose parent died before the kill (Windows; for example an MSYS `sleep.exe`
+    started by a git filter, which escaped `taskkill /T`) or that left the process group with
+    `setsid` (POSIX) is not killed;
+  - (b) the Windows sweep needs Windows PowerShell 5.1 in FullLanguage mode; where PowerShell is
+    blocked or under Constrained Language Mode it kills nothing (reported on stderr);
+  - (c) under normal-priority CPU saturation the Windows sweep can finish after 3 s: it may complete
+    up to 60 s after the kill request (`SWEEP_TIMEOUT_MS`, QA-3.1-19), and host exit's `taskkill`
+    can be cut at its limit;
+  - (d) on Windows, opencode's exit reaches in-flight descendants only through the exit hook; death
+    by an unhandled signal skips that hook on every platform.
+
+  Proven by 1.2, the 2.1 deadline and native-`task` tests, the 2.4 `router_verify` deadline test,
+  and 3.1.2.d. *Amended during implementation (phase-1.2.md round 2, QA-1.2-14, -21, -28;
+  QA-3.1-19):* the original text claimed "kills the whole process tree; no orphans after 3 s".
 - **G5 — Safe cleanup.** No reference worktree survives a run or a crash (GC). No cleanup path
   touches real `node_modules` or user files. Proven by 1.5 and 3.1.2.e.
 - **G6 — Compatibility.** Existing configs load unchanged; the deprecated keys work with a warning;
@@ -1546,6 +1575,7 @@ re-reviewed until clean. The global DoD cannot be ticked before it closes.
 | Cross-process lock left behind by a crash blocks verification | Stale detection by PID, hostname and age; compare-before-delete; the busy result after `slotWaitMs` is `unverifiable`, never a hang. |
 | Runner CLI differences across versions | Spike C pins the behaviour; the reporter-file parsing falls back to text; an unknown shape → `unverifiable`. |
 | Deferred-by-default lets the orchestrator build on broken work (the "instructed models false-finish" risk from the router's own motivation) | The owner's explicit trade-off (§1.1), stated in the ADR and CHANGELOG. Mitigated by the risk level on every deferred result, the pending list in the prompt, `router_verify`, `VERIFY:required` for fundamental work, `defaultVerify: "required"` and `background: true` as opt-ins, and CI as the final gate. |
+| A descendant escapes the deadline kill: its parent died first (Windows), it called `setsid` (POSIX), PowerShell is blocked or under Constrained Language Mode, normal-priority load starves the Windows sweep, or opencode dies by an unhandled signal (the exit hook is skipped) | *Amended during implementation (phase-1.2.md round 2).* The run and its slot are released 2 s after the deadline anyway (force-closed pipes, `timedOut: true` and a stderr note). POSIX process groups and pinned Windows trees are killed, and Node-forked workers die with their parent (libuv job). On Windows, host exit reaches descendants only through the exit hook. Verification descendants run below normal priority, so a survivor cannot starve the machine. Under load the Windows sweep may complete up to 60 s after the kill request (`SWEEP_TIMEOUT_MS`, QA-3.1-19). The sweep's own failure is reported on stderr (QA-1.2-15). 3.1.2.d asserts the 3 s no-orphans rule for an attributable tree. |
 | The executing session's own plugin runs full suites during execution | Phase 0.P syncs to `1.14.0`; §0.5 forbids `check: testsPass` in dispatches until `1.15.0`. |
 
 ## 6. Out of scope
