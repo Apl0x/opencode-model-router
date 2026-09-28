@@ -826,6 +826,29 @@ describe("gate seams", () => {
       expect(await s.findByContent(root, "(^|[^A-Za-z0-9_])app\\.app", ["*.py"], { regex: true })).toEqual([resolve(root, "tests/test_a.py")]);
       expect(state.commands[0]).toBe(`git --no-optional-locks -C ${root} grep -l -z -E --untracked -e (^|[^A-Za-z0-9_])app\\.app -- *.py`);
     });
+    it("QA-G-3: findByName brackets glob metacharacters, so a name is matched literally", async () => {
+      const s = search();
+      reply(0, "");
+      await s.findByName(root, ["test_mod0[1-2]_[1-3].py", "test_*?.py", "a\\b.py"]);
+      expect(state.commands[0]).toBe(
+        `git --no-optional-locks -C ${root} ls-files -z --cached --others --exclude-standard -- :(glob)**/test_mod0[[]1-2[]]_[[]1-3[]].py :(glob)**/test_[*][?].py :(glob)**/a[\\\\]b.py`,
+      );
+    });
+    it("QA-G-3: real git ls-files finds only the literal bracketed name", async () => {
+      const dir = mkdtempSync(join(tmpdir(), "omr-qag3-"));
+      try {
+        execFileSync("git", ["init", "-q"], { cwd: dir });
+        mkdirSync(join(dir, "tests"));
+        for (const n of ["test_mod0[1-2]_[1-3].py", "test_mod01_1.py", "test_mod02_3.py"]) writeFileSync(join(dir, "tests", n), "");
+        const s = search();
+        state.argvImpl = (file, args) => new Promise(done => {
+          execFile(file, [...args], { encoding: "utf8" }, (err, stdout, stderr) => done({ code: err ? Number(err.code ?? 1) : 0, stdout, stderr, timedOut: false }));
+        });
+        expect(await s.findByName(dir, ["test_mod0[1-2]_[1-3].py"])).toEqual([resolve(dir, "tests/test_mod0[1-2]_[1-3].py")]);
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
     it("a deadline bounds each search and a spent or aborted one runs no git", async () => {
       const ctl = new AbortController(); reply(0, "a.test.ts\0");
       expect(await search(fakeDeadline(2_500, ctl)).findByName(root, ["a.test.ts"])).toEqual([resolve(root, "a.test.ts")]);

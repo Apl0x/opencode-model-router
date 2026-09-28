@@ -1108,7 +1108,10 @@ export function createVerificationWiring(deps: {
     };
     return {
       async findByName(gitRoot, names) {
-        const r = await git(gitRoot, ["ls-files", "-z", "--cached", "--others", "--exclude-standard", "--", ...names.map(n => `:(glob)**/${n}`)]);
+        // QA-G-3: a name is literal, so its glob metacharacters are bracketed ([*], [[], [\\]):
+        // git on Windows reads a backslash in a pathspec as a separator, not an escape.
+        const lit = (n: string) => n.replace(/[*?[\]\\]/g, c => (c === "\\" ? "[\\\\]" : `[${c}]`));
+        const r = await git(gitRoot, ["ls-files", "-z", "--cached", "--others", "--exclude-standard", "--", ...names.map(n => `:(glob)**/${lit(n)}`)]);
         return r && r.code === 0 ? splitZ(r.stdout).map(rel => resolve(gitRoot, rel)) : undefined;
       },
       async findByContent(gitRoot, needle, globs, options) {

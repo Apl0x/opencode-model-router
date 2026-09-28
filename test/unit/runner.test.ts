@@ -1133,7 +1133,12 @@ describe("E2E-1: pytest maps a changed module to the tests that import it, and f
     }
   });
 
-
+  it("QA-G-3: a stem with glob metacharacters maps only by literal name and content", async () => {
+    const files = fixture({ "/r/app/mod0[1-2]_[1-3].py": "", "/r/tests/test_mod0[1-2]_[1-3].py": "" });
+    const search = treeSearch(files);
+    expect(spec(await plan(files, ["app/mod0[1-2]_[1-3].py"], { search })).inputs).toEqual(["/r/tests/test_mod0[1-2]_[1-3].py"]);
+    expect(search.findByName).toHaveBeenCalledWith("/r", ["test_mod0[1-2]_[1-3].py", "mod0[1-2]_[1-3]_test.py"]);
+  });
 });
 
 describe("G.8b: testpaths decide which test inputs the user's run collects", () => {
