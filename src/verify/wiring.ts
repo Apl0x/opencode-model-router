@@ -387,8 +387,9 @@ export type DeferredFinish =
       readonly deferred: false;
       /**
        * "unregistered": the registry refused the entry (registry-full, handle-collision,
-       * invalid-input); "no-change": an attributed empty change set, which the required gate passes
-       * with no process (section 1.5-6); "error": the finish itself failed.
+       * invalid-input); "no-change": an attributed empty change set of a testsPass-only DoD, which
+       * the required gate passes with no process (section 1.5-6; QA-G-1: any other DoD is deferred
+       * with the empty set instead, noChangeGateSpawnsNothing); "error": the finish itself failed.
        */
       readonly reason: "unregistered" | "no-change" | "error";
       readonly detail: string;
@@ -423,6 +424,17 @@ export function dispatchDirectiveText(prompt: string | undefined, description: s
 /** A DoD whose deferral section 1.5-14/16 governs: it carries a testsPass check. */
 export function hasTestsPass(dod: DoD): boolean {
   return dod.checks.some(c => c.kind === "testsPass");
+}
+
+/**
+ * QA-G-1: whether the required gate passes an attributed empty change set of this DoD with no
+ * process and no grader: every check is testsPass (its "no changed files" pass, section 1.5-6) and
+ * there is no criterion. Only such a delegation takes finishDeferred's "no-change" answer
+ * (QA-2.4-10); any other deferred DoD is registered with the empty change set instead, so its
+ * build, lint, run, file and criteria checks run on router_verify, never synchronously.
+ */
+export function noChangeGateSpawnsNothing(dod: DoD): boolean {
+  return dod.checks.length > 0 && dod.checks.every(c => c.kind === "testsPass") && dod.criteria.length === 0;
 }
 
 /**
@@ -772,8 +784,9 @@ export interface VerificationWiring {
    * QA-2.4-10: only what the required gate would actually judge defers. `trivial` is the gate's own
    * input (the native path's dispatch-time classification; delegate passes none): the gate skips a
    * trivial dispatch whose DoD was inferred (gate.ts), so that one is not deferred and takes the
-   * required path, with the same outcome. (An attributed empty change set is the other case;
-   * finishDeferred answers "no-change" for it.)
+   * required path, with the same outcome. (An attributed empty change set of a testsPass-only DoD
+   * is the other case; finishDeferred answers "no-change" for it. QA-G-1: a DoD with any other
+   * check or a criterion stays deferred with that empty set.)
    */
   isDeferred(dod: DoD, directives: VerifyDirectives, trivial?: boolean): boolean;
   /**
@@ -1498,7 +1511,13 @@ export function createVerificationWiring(deps: {
       const change = await observeChange(store, input.dispatchID, input.producerSessionID, input.cwd, deadline);
       // QA-2.4-10: an attributed empty change set is passed by the required gate with no process
       // (section 1.5-6): nothing to defer. The caller runs that gate, with the same outcome.
-      if (change.changeBaseline === "available" && change.changedFiles.length === 0 && !deadline.signal.aborted) {
+      // QA-G-1: only for a testsPass-only DoD. Any other check (build, lint, run, fileExists,
+      // schemaMatch) or a criterion would be run or graded by that gate synchronously, so such a
+      // DoD stays deferred as a whole, with the attributed empty change set (risk low).
+      if (
+        change.changeBaseline === "available" && change.changedFiles.length === 0 && !deadline.signal.aborted &&
+        noChangeGateSpawnsNothing(input.dod)
+      ) {
         return { deferred: false, reason: "no-change", detail: "the producer changed no file" };
       }
       let changedFiles: ChangedPath[] | "unavailable" = "unavailable";

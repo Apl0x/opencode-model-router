@@ -525,6 +525,32 @@ describe("wiring (2.4.2a)", () => {
       expect(await wiring.finishDeferred(store, input({ dispatchID: "task:orch:2" }))).toMatchObject({ deferred: true });
     });
 
+    it("QA-G-1: an attributed empty change set of a DoD with another check or a criterion is deferred with [] (risk low)", async () => {
+      const dods: DoD[] = [
+        { ...TESTS_DOD, checks: [...TESTS_DOD.checks, { kind: "buildPasses", command: "npm run build" }] },
+        { ...TESTS_DOD, checks: [...TESTS_DOD.checks, { kind: "run", command: "npm test" }] },
+        { ...TESTS_DOD, checks: [...TESTS_DOD.checks, { kind: "lintClean", command: "npm run lint" }] },
+        { ...TESTS_DOD, checks: [...TESTS_DOD.checks, { kind: "fileExists", path: "x.txt" }] },
+        { ...TESTS_DOD, criteria: ["the parser rejects empty input"] },
+      ];
+      for (const [i, dod] of dods.entries()) {
+        const { wiring, store } = makeWiring();
+        const id = `task:orch:${i}`;
+        await wiring.startDispatch(store, id, root, dod, "", false);
+        const finish = deferredOf(await wiring.finishDeferred(store, input({ dispatchID: id, dod })));
+        expect(finish.risk).toEqual({ level: "low", reasons: [REASONS.empty] });
+        expect(finish.footer).not.toMatch(/\baccepted\b|\[router\] verified/i);
+        const listed = wiring.pending.listUnverified("orch");
+        expect(listed.map(e => e.handle)).toEqual([finish.handle]);
+        expect(listed[0].changedFiles).toEqual([]);
+      }
+      // Nothing ran: no command, no slot, no scoped run.
+      expect(state.commands).toEqual([]);
+      expect(state.scopeOpeners).toBe(0);
+      expect(state.testsPassHooks).toBe(0);
+      expect(state.slotAcquires).toBe(0);
+    });
+
     it("QA-2.4-4: a finish that throws is not deferred either", async () => {
       const { wiring, store } = makeWiring();
       await wiring.startDispatch(store, "task:orch:1", root, TESTS_DOD, "", false);
@@ -715,7 +741,7 @@ describe("the plugin routes by mode on both dispatch paths", () => {
   /**
    * The producer changes src/a.ts: every snapshot lists it dirty under a new fingerprint and without
    * digests, so delta attributes it (QA-2.1-14) however dispatches interleave. Without a change, a
-   * dispatch is not deferred at all (QA-2.4-10).
+   * testsPass-only dispatch is not deferred at all (QA-2.4-10; QA-G-1: any other DoD still is).
    */
   const producerChanges = (): void => {
     let n = 0;
@@ -816,8 +842,36 @@ describe("the plugin routes by mode on both dispatch paths", () => {
       expect(deferredDefault).not.toMatch(/NOT ACCEPTED|\[router status: unmet\]/);
       // Section 1.5-6: an attributed empty change set passes with no test process.
       expect(state.commands.some(c => /npm|vitest|jest/.test(c))).toBe(false);
+      expect(state.commands.filter(c => !c.startsWith("git "))).toEqual([]);
       expect(pendingOf("orch")).toEqual([]);
       if (p === "delegate") expect(h.producerPrompts).toBe(2);
+    });
+
+    it.each([
+      ["buildPasses", `check: buildPasses command="npm run build"`, "npm run build"],
+      ["run", `check: run command="npm test"`, "npm test"],
+    ])("QA-G-1: testsPass + %s, producer changed nothing: deferred with the footer, nothing spawned, not accepted; router_verify runs it", async (_kind, check, command) => {
+      const h = await makePlugin(home);
+      const out = await h.run(p, `Implement it.\n[acceptance]\ncheck: testsPass command="npm test"\n${check}\n[/acceptance]`);
+      expect(out).toMatch(FOOTER_LINE);
+      expect(out).not.toMatch(/NOT ACCEPTED|\[router status: unmet\]|\[router\] (accepted|verified)|\[router \u2713|accepted:/i);
+      // Git only: no build, no run, no test command, no slot.
+      expect(state.commands.filter(c => !c.startsWith("git "))).toEqual([]);
+      expect(state.scopeOpeners).toBe(0);
+      expect(state.testsPassHooks).toBe(0);
+      expect(state.slotAcquires).toBe(0);
+      const entries = pendingOf("orch");
+      expect(entries).toHaveLength(1);
+      expect(entries[0].changedFiles).toEqual([]);
+      expect(entries[0].risk.level).toBe("low");
+      expect(out).toContain(entries[0].handle);
+      // Deferred, so no escalation ladder either.
+      if (p === "delegate") expect(h.producerPrompts).toBe(1);
+      // On demand, router_verify runs the rest of the DoD.
+      const verified: string = await h.hooks.tool.router_verify.execute({ handles: [entries[0].handle] }, { sessionID: "orch" });
+      expect(verified).toMatch(new RegExp(`^- ${entries[0].handle} \u00b7 .* \u00b7 pass$`, "m"));
+      expect(state.commands.filter(c => !c.startsWith("git "))).toEqual([command]);
+      expect(pendingOf("orch")).toEqual([]);
     });
 
     it("a DoD without testsPass is gated as before, whatever the mode", async () => {
