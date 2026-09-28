@@ -1067,3 +1067,120 @@ Not recorded here: a full unit-suite run (this dispatch was limited to targeted 
   test/integration/verify-resource-budget.deferred.test.ts test/integration/e2e`, twice (before and
   after d00f7e0's final bound): `Test Files  4 passed (4)`, `Tests  66 passed (66)`, `Duration
   223.63s` / `223.72s`, exit 0.
+
+## QA re-review (round 2)
+
+Scope: `git diff 7faf557..HEAD` (HEAD = origin/vrb/p31 = 5dea52e): the product fixes e1b86a9, 02a9a1c and
+533d988, the e2e changes 9cde2d4 and d00f7e0, the CI gate e116182 and the docs. Code cleared in round 1
+was not re-audited. Reviewer: heavy tier. No code, test or workflow was changed. Mutations were applied
+in place to `src/` one at a time and reverted with `git checkout`; `git status` was clean after each.
+
+### Local runs (Windows 11, 16 cores, idle host, node v24, at 5dea52e)
+
+| Command | Result (verbatim) |
+| --- | --- |
+| `$env:RUN_VERIFY_E2E='1'; npx vitest run --maxWorkers=1 test/integration/verify-resource-budget test/integration/e2e` | `Test Files  5 passed (5)`, `Tests  71 passed (71)`, `Duration  292.59s`, exit 0 |
+| `npx vitest run --maxWorkers=2` over dispatch, wiring, tree, baseline, baseline-wiring (unit), deferred-verification and router-verify-tool (integration) | `Test Files  7 passed (7)`, `Tests  324 passed (324)`, exit 0 |
+
+71 = round 1's 65 + the concurrent pair + the `VERIFY_WAIT:0s` child-edit race + 4 matrix cells (jest
+`setup` and vitest `dynamic`, both modes). Measured (`OMR_E2E_REPORT`):
+
+- 3.1.2.b: `peak workers=2 (running 2)`, `exiting-worker exemption=0`, `priority violations=0`,
+  `runner processes sampled at low priority after the grace=6`, `git/cmd descendants seen at normal
+  priority=0`, `required phase scoped=3 (bound 7) rechecks=2 (bound 5); deferred phase=0;
+  router_verify=1; outside the phases=0`, sampler median 296 ms.
+- 3.1.2.b pair: `src/m16.js (broken): NOT ACCEPTED with the concurrent caveat; src/m17.js (neutral):
+  NOT ACCEPTED with the concurrent caveat`.
+- 3.1.2.c: `maxConcurrentVerifications=1 -> bound 2`, `peak runner mains alive at once (both
+  children)=1`, `longest overlap of the two children's gate windows=7516ms`, mains per child 4 and 3.
+- 3.1.2.d: `afterMs(gate)=6017`, `alive >= 3 s after return: descendants=0 machine-wide=0`.
+- 3.1.2.f: `capture wait (beforeMs) p50=964ms p95=966ms max=966ms`, `after-hook p50=1556ms max=1617ms`,
+  `capped footers=0`, `slot dir seen in 0/139 polls`, probe lines 0, sampler median 391 ms.
+- 3.1.2.g race: `beforeMs=11ms`, unverifiable, the report names `tool "edit"`.
+- 3.1.2.h bg-on: `runners seen (repo predicate)=5 machine-wide=5`, `probe lines=2` (`related …src\m19.js`
+  in the repo, then the reference run).
+
+### Mutation checks
+
+| # | Change | Mutation | Result |
+| --- | --- | --- | --- |
+| M-a | 02a9a1c | `createSharedFlight`: a request made while a run is in flight joins that run (`flight = lane.running`) | killed: 4 failed (wiring.test.ts 2, deferred-verification.test.ts 2, e.g. `expected [ [Function] ] to have a length of 2 but got 1`) |
+| M-b | 02a9a1c | a started flight is not aborted when its last sharer leaves | killed: wiring.test.ts, 1 failed |
+| M-c | 533d988 | `execGit` skips `setPriority` on win32 | killed: tree.test.ts "QA-3.1-8: the default git seam lowers the process's priority as exec.ts does" |
+
+### Attacks on the shared flight (02a9a1c)
+
+No false pass was found. The property "a shared snapshot or capture is taken after every sharer's
+dispatch began" holds:
+
+1. **B begins while run R is in flight.** B joins `lane.next`, never R. A lone request starts its run
+   synchronously, so R has exactly one sharer. The next run starts only from R's settle callback, and
+   everyone who shares it asked before it started. M-a proves the tests pin this.
+2. **B's producer edits before B's run starts.** `snapshotPending` and `capturePending` are set in
+   `beginDispatch`, not when the shared run starts. Any tool outside `NON_WRITING_TOOLS`, from any
+   session, therefore discards B's snapshot and capture while B waits in the queue. The result is
+   unverifiable (`dispatch.ts` `observeEdit`). Only a write with no tool event can reach the baseline,
+   which is E2E-3's existing residual. Queuing lengthens that window by up to one generation, but the
+   measured pending time fell from p50 2.9 s to 0.96 s.
+3. **The first sharer aborts or times out.** Its abort stops R. The next run starts once R settled, and
+   all of its sharers asked before that.
+4. **Timeout and priority keying.** The run uses the first requester's closure. That closure depends
+   only on `at`, `lowPriority`, `baselineTimeoutMs` (all in the key) and the wiring-wide argv seam.
+5. **The same directory spelled with different case (win32).** The raw strings are different keys, so
+   the dispatches get separate runs and lose only the sharing. `observeEdit` compares by `pathKey`, so
+   an edit still discards both.
+6. **Shared objects.** Nothing mutates a `TreeSnapshot` after it is built. `rg` finds only
+   `digests.set` inside `tree.ts` while the snapshot is being built. A `DispatchReference` is readonly
+   data around a `git stash create` object, with no per-dispatch dispose.
+7. **The contamination reason and caveat.** `(tool "<name>")` does not match `TRANSIENT_REASON`, so
+   the retry classification is unchanged. Names are reduced to `[A-Za-z0-9_.-]`, so no directive can
+   form.
+
+533d988: a POSIX host without `nice` makes the snapshot's `execFile` fail with ENOENT. The snapshot is
+then undefined and the verdict unverifiable. exec.ts has the same dependency: its runners also run under
+`nice -n 10 --`, with no fallback. `nice` execs git, so git's exit code is preserved. On Windows,
+`setPriority` is guarded by `child?.pid` and a try/catch.
+
+### Round-1 findings: verdicts
+
+| id | verdict |
+| --- | --- |
+| QA-3.1-1 | Resolved (e116182). The workflow passes `--warn-only src/verify/exec.ts` only when `win-unit` is missing, and every other file always blocks. Reviewed in the diff; the merged gate passed in Test run 36373372025. The local merge runs were not repeated. |
+| QA-3.1-2 | Resolved as far as agreed. The caveat reaches rejections, and the concurrent pair e2e passes with it on both outputs. VERIFICATION.md/ADR text and removing the stagger are the owner's 3.2 items. |
+| QA-3.1-3 | Resolved. The ordering holds (see above; M-a and M-b killed), and 3.1.2.f p50 is 964 ms. The ~1.0 s p50 deviation is recorded. New: QA-3.1-24. |
+| QA-3.1-4 | Resolved. bg-on `runners seen (repo predicate)=5 machine-wide=5`, with a positive control and probe lines. |
+| QA-3.1-5 | Resolved with the recorded deviation (500 ms on win32). Medians 391, 258 and 277 ms are asserted. |
+| QA-3.1-6 | Resolved. `scopedRunBound` follows from B5.1/B5.4/B5.6/B7.3b (window cost ≤ n + 1 when n ≥ 2 gives ≤ N + ⌊N/2⌋). router_verify is exactly 1, the deferred phase 0 and outside the phases 0. |
+| QA-3.1-7 | Resolved. One slot, peak mains 1, overlap 7516 ms. Nit: QA-3.1-25. |
+| QA-3.1-8 | Resolved. git/cmd at normal priority 0, a low-priority runner non-vacuity of 6, M-c killed. The win32 spawn-race deviation is recorded. |
+| QA-3.1-9 | Resolved. The probes are asserted in every matrix cell, 3.1.2.f, h and g/required. The vacuous regex is removed. |
+| QA-3.1-10 | Resolved. max 1617 ms ≤ 2150 ms, capped footers 0. Nit: QA-3.1-26. |
+| QA-3.1-11 | Resolved. The slot dir is absent at the start and was seen in 0 of 139 polls. |
+| QA-3.1-12 | Resolved (e75f20e). The implementer's mutation evidence is recorded; not re-run here. |
+| QA-3.1-13 | Resolved (62fa758). The implementer's mutation evidence is recorded; not re-run here. |
+| QA-3.1-14 | Resolved (15e9218). |
+| QA-3.1-15 | Resolved for (b), (c) and (d). (a) is an accepted residual. |
+| QA-3.1-16 | Resolved. The evidence is recorded; the keyed run is cited, not reproduced. |
+| QA-3.1-17 | Resolved. `cappedCensus` excuses at most 1 worker per main per snapshot; 0 were excused in this run. |
+| QA-3.1-18 to -21, -23 | Deferred to 3.2, not re-raised. |
+| QA-3.1-22 | No action. |
+
+### New findings
+
+| id | severity | finding | evidence | fix |
+| --- | --- | --- | --- | --- |
+| QA-3.1-24 | minor | **A shared-flight lane waits for its running run to settle, while each dispatch's timeout counts from its own request.** (a) If a run does not honour its abort, the lane stays held. Every later dispatch with the same key (cwd, priority, timeout) then times out with no baseline until the plugin restarts. (b) If a snapshot or capture takes longer than half of `baselineTimeoutMs` (default 15 s), a dispatch that arrives early in a run times out before its own generation ends. Both fail closed: the change set is unavailable, the reference is none, and the verdict is unverifiable, never a pass. | Scratch run (bun, `createSharedFlight` from `src`). The run ignores its abort, and A is aborted at 50 ms. B then brings a healthy run and a 1 s timeout: `B: undefined after 1003 ms; runs 1`. `wiring.ts` `launch` starts `next` only from `flight.result.then`. `snapshotTree`'s git calls time out at 10 s, but `lstat`, `readlink` and `realpath` take no signal. | 3.2: when a started flight's last sharer leaves, detach it from the lane (clear `running`, launch `next`). The ordering still holds, because the next run starts after its sharers asked. Document the T/2 limit. |
+| QA-3.1-25 | nit | **3.1.2.c infers that one child waited from overlapping gate windows plus at most 1 main alive.** A gate window is the whole after hook: snapshot, planning, slot wait and run. The overlap can come from the phases that run nothing, so a broken cross-process slot would pass whenever the two runs happen not to coincide. The measured 7.5 s overlap makes the check strong in practice. | `bound.test.ts` `gateOverlapMs` and `peakTopMains`. | Optional: require a snapshot in which one child's gate is open with no runner main of its own while the other child's main is alive. |
+| QA-3.1-26 | nit | **3.1.2.f bounds the after hooks at `DEFERRED_FINISH_MS` + 150 ms on the blocking ubuntu leg.** Round 1's resolution recorded one run where every hook reached the cap (`max=2001ms`). 20 hooks cut together on a 4-core runner could run more than 150 ms late (CI1-d measured 104 ms on the before hooks). This is a flake risk, not a false pass. | This run `max=1617ms`. The CI e2e ubuntu legs at d00f7e0 and 5dea52e passed. | Watch it. If it flakes, widen the slack with the CI1-d rationale. |
+| QA-3.1-27 | nit | **`toolLabel` can return 65 characters.** It keeps 64 characters and appends `…`, while the code comment, the commit and the resolution all say "at most 64". | `dispatch.ts` `toolLabel`. | Fix the wording. |
+| QA-3.1-28 | info | **A blocking CI job is red at HEAD, from a flake that predates this diff.** In Test run 36374359146 (5dea52e), `test (node 20, windows-latest)` failed in `test/unit/exec.test.ts > runShell > kills the whole process tree on abort` with `Error: EBUSY: resource busy or locked, rmdir 'C:\Users\RUNNER~1\AppData\Local\Temp\omr-exec-idjGRH'`. `exec.ts` and `exec.test.ts` are unchanged in 7faf557..HEAD, so this is an existing Windows temp-cleanup flake. At 03:42Z, the Windows e2e leg of that run was still running. | `gh api repos/marco-jardim/opencode-model-router/actions/jobs/108777031049/logs`. | Re-run the job before merging. File the cleanup flake with the 3.2 Windows follow-ups. |
+
+### Verdict
+
+**Clean:** no critical, major or blocking finding was introduced by 7faf557..HEAD. Every round-1
+finding is resolved, accepted as a recorded deviation or residual, or deferred to 3.2. No false pass was
+found through the shared flight. Its ordering guard and its abort handling are covered by tests that
+kill both mutations. New: 1 minor finding (QA-3.1-24, fails closed) and 4 nit or info items, all for
+3.2 under the owner's rule. Before merging, re-run the blocking `test (node 20, windows-latest)` job
+(QA-3.1-28).
+
