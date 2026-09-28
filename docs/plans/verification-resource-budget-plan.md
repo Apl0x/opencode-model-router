@@ -614,6 +614,10 @@ string.
   (which only runs git with a timeout and is out of scope). New modules (`reference.ts`,
   `runner.ts`, `batch.ts`, `slot.ts`) must receive `ArgvSeam` by injection and never import
   `child_process`. Phase 3.2 re-checks this across the final tree.
+  *Amended during implementation (QA-1.2-12, phase 3.2):* the unused `exec as nodeExec` import in
+  `src/index.ts` predated this plan and is deleted. `rg "import .*child_process" src` now lists only
+  `exec.ts` and `tree.ts`; the other `child_process` hits (`reference.ts`, `runner.ts`, `wiring.ts`)
+  are comments stating the module does not import it.
 - A killed run reports `timedOut: true` and a non-zero code on both platforms.
 
 **Definition of Done** — as in 1.1; QA report `D:\git\opencode-model-router\docs\qa\verification-resource-budget\phase-1.2.md`.
