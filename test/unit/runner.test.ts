@@ -118,10 +118,15 @@ function pyRepo(extra: Record<string, string> = {}): Record<string, string> {
   return { "/r/.git": "", "/usr/bin/pytest": "", "/usr/bin/uv": "", ...extra };
 }
 
-function stubSearch(content: Record<string, readonly string[] | undefined> = {}, names: Record<string, readonly string[] | undefined> = {}): TestSearchSeam {
+function stubSearch(
+  content: Record<string, readonly string[] | undefined> = {},
+  names: Record<string, readonly string[] | undefined> = {},
+  dirs: Record<string, readonly string[] | undefined> = {},
+): TestSearchSeam {
   return {
     findByContent: vi.fn(async (_root: string, needle: string) => (needle in content ? content[needle] : [])),
     findByName: vi.fn(async (_root: string, n: readonly string[]) => (n[0] in names ? names[n[0]] : [])),
+    listFiles: vi.fn(async (_root: string, dir: string) => (dir in dirs ? dirs[dir] : [])),
   };
 }
 
@@ -942,7 +947,7 @@ describe("planScopedRun: pytest", () => {
     expectS6(await planScopedRun(input({ command: "pytest", files, changedFiles: changed("src/mod.py"), search: stubSearch({ mod: many }) })), "stem-too-common");
     const s = stubSearch({ mod: ["/r/tests/test_use.py"] });
     await planScopedRun(input({ command: "pytest", files, changedFiles: changed("src/mod.py"), search: s }));
-    expect(s.findByContent).toHaveBeenCalledWith("/r", "mod", PY_TEST_GLOBS);
+    expect(s.findByContent).toHaveBeenCalledWith("/r", "mod", [...PY_TEST_GLOBS, ":(glob)**/conftest.py"]);
   });
 
   it("deleted test file -> note", async () => {
@@ -972,6 +977,10 @@ function treeSearch(files: Record<string, string>, root = "/r"): TestSearchSeam 
       // git grep matches one line at a time.
       return under.filter((p) => match.some((m) => m(p)) && files[p].split("\n").some((line) => re.test(line)));
     }),
+    // git ls-files -- :(literal)<dir>: the files under dir ("." is the root). A key another key lies under is a directory.
+    listFiles: vi.fn(async (_r: string, dir: string) =>
+      under.filter((p) => (dir === "." || p.startsWith(`${root}/${dir}/`)) && !under.some((q) => q.startsWith(`${p}/`))),
+    ),
   };
 }
 
@@ -1005,6 +1014,7 @@ async function withGitTree(files: Record<string, string>, fn: (search: TestSearc
       findByContent: vi.fn(async (_r: string, needle: string, globs: readonly string[], options?: { readonly word?: boolean; readonly regex?: boolean }) =>
         under(git(["grep", "-l", "-z", options?.regex === true ? "-E" : "-F", ...(options?.word === true ? ["-w"] : []), "--untracked", "-e", needle, "--", ...globs])),
       ),
+      listFiles: vi.fn(async (_r: string, d: string) => under(git(["ls-files", "-z", "--cached", "--others", "--exclude-standard", "--", `:(literal)${d}`]))),
     });
   } finally {
     rmSync(dir, { recursive: true, force: true });
@@ -1077,7 +1087,7 @@ describe("E2E-1: pytest maps a changed module to the tests that import it, and f
       "unmapped-module",
       "changed module app/mod02.py is referenced by tests/conftest.py: the tests its fixtures reach cannot be mapped",
     );
-    const failing: TestSearchSeam = { findByName: vi.fn(async () => []), findByContent: vi.fn(async () => undefined) };
+    const failing: TestSearchSeam = { findByName: vi.fn(async () => []), findByContent: vi.fn(async () => undefined), listFiles: vi.fn(async () => []) };
     expectS6(await plan(fixture(), ["app/mod02.py"], { search: failing }), "search-failed", "test search failed for app/mod02.py");
     // One unmapped module in a change makes the whole change S6, even when another one maps.
     expectUnmapped(await plan(fixture({ "/r/app/orphan.py": "" }), ["app/mod02.py", "app/orphan.py"]), "app/orphan.py");
@@ -1256,7 +1266,7 @@ describe("E2E-1: pytest maps a changed module to the tests that import it, and f
     });
     const search = treeSearch(files);
     expect(spec(await plan(files, ["app/index.py"], { search })).inputs).toEqual(["/r/tests/test_i1.py", "/r/tests/test_i2.py"]);
-    expect(search.findByContent).toHaveBeenCalledWith("/r", "index", PY_TEST_GLOBS);
+    expect(search.findByContent).toHaveBeenCalledWith("/r", "index", [...PY_TEST_GLOBS, ":(glob)**/conftest.py"]);
     expect(search.findByName).toHaveBeenCalledWith("/r", ["test_app.py", "app_test.py"]);
     // Inside a test package: tests/pkg/index.py deleted, its sibling imports it relatively.
     const pkg = fixture({ "/r/tests/pkg/__init__.py": "", "/r/tests/pkg/test_rel.py": "from .index import helper\n" });
@@ -1276,12 +1286,179 @@ describe("E2E-1: pytest maps a changed module to the tests that import it, and f
     const files = Object.fromEntries(Object.entries(fixture()).filter(([p]) => p !== "/r/app/mod02.py"));
     const search = treeSearch(files);
     expect(spec(await plan(files, ["app/mod02.py"], { search })).inputs).toEqual(["/r/tests/test_mod02_1.py"]);
-    expect(search.findByContent).toHaveBeenCalledWith("/r", "mod02", PY_TEST_GLOBS);
+    expect(search.findByContent).toHaveBeenCalledWith("/r", "mod02", [...PY_TEST_GLOBS, ":(glob)**/conftest.py"]);
     // tests/pkg/__init__.py deleted: the package name, "pkg".
     const init = fixture({ "/r/tests/pkg/test_p.py": "from tests.pkg import helper\n" });
     const initSearch = treeSearch(init);
     expect(spec(await plan(init, ["tests/pkg/__init__.py"], { search: initSearch })).inputs).toEqual(["/r/tests/pkg/test_p.py"]);
-    expect(initSearch.findByContent).toHaveBeenCalledWith("/r", "pkg", PY_TEST_GLOBS);
+    expect(initSearch.findByContent).toHaveBeenCalledWith("/r", "pkg", [...PY_TEST_GLOBS, ":(glob)**/conftest.py"]);
+  });
+
+  describe("QA-G-18..21: a deleted pytest file's conftest, test and package importers run, or the plan is S6", () => {
+    const GLOBS = [...PY_TEST_GLOBS, ":(glob)**/conftest.py"];
+    const UNMAPPABLE = ": the tests its fixtures reach cannot be mapped";
+    /** The fixture tests that import the app package (`from app.modNN import ...`); extra/ is outside testpaths. */
+    const APP = ["/r/tests/test_mod01_1.py", "/r/tests/test_mod01_2.py", "/r/tests/test_mod01_3.py", "/r/tests/test_mod02_1.py", "/r/tests/test_mod03_1.py"];
+    const without = (files: Record<string, string>, gone: string) => Object.fromEntries(Object.entries(files).filter(([p]) => p !== gone));
+    // X2: a fixture of tests/api/conftest.py imports the deleted app.helpers; test_unit.py only says "helpers" in a comment.
+    const X2 = fixture({
+      "/r/tests/api/conftest.py": "import pytest\nfrom app.helpers import make\n\n@pytest.fixture\ndef made():\n    return make()\n",
+      "/r/tests/api/test_api.py": "def test_api(made):\n    assert made\n",
+      "/r/tests/unit/test_unit.py": "# string helpers\ndef test_unit():\n    assert 'a'.upper() == 'A'\n",
+    });
+    // X3: tests/test_base.py renamed to tests/base.py; test_a follows it, test_b still imports test_base.
+    const X3 = pyRepo({
+      "/r/tests": "",
+      "/r/tests/base.py": "class Base:\n    pass\n",
+      "/r/tests/test_a.py": "from base import Base\n",
+      "/r/tests/test_b.py": "from test_base import Base\n",
+      "/r/tests/test_c.py": "def test_base_case():\n    pass\n",
+    });
+    const RENAMED: ChangedPath[] = [{ path: "tests/base.py", previousPath: "tests/test_base.py" }];
+    // X4: tests/pkg/__init__.py deleted; test_rel.py imports relatively; test_other.py matches "pkg" only inside "pkgutil".
+    const X4 = fixture({
+      "/r/tests/pkg/helper.py": "X = 1\n",
+      "/r/tests/pkg/test_rel.py": "from . import helper\n\ndef test_rel():\n    assert helper.X == 1\n",
+      "/r/tests/test_other.py": "import pkgutil\n",
+    });
+    // X1: app/__init__.py re-exports from the deleted app/index.py; test_util.py only calls list.index.
+    const X1 = fixture({ "/r/app/__init__.py": "from .index import VERSION\n", "/r/tests/test_util.py": "def test_util():\n    assert [1, 2].index(2) == 1\n" });
+
+    it("QA-G-19: a deleted module a nested conftest.py imports -> S6 unmapped-module (was a spec without the conftest's tests)", async () => {
+      const search = treeSearch(X2);
+      expectS6(await plan(X2, ["app/helpers.py"], { search }), "unmapped-module", `deleted source app/helpers.py: tests/api/conftest.py references "helpers"${UNMAPPABLE}`);
+      expect(search.findByContent).toHaveBeenCalledWith("/r", "helpers", GLOBS);
+      // X2b: a deleted index.py, with an `.index(` decoy test.
+      const x2b = fixture({
+        "/r/tests/api/conftest.py": "from app.index import make\n",
+        "/r/tests/api/test_api.py": "def test_api():\n    pass\n",
+        "/r/tests/unit/test_unit.py": "def test_unit():\n    assert [1, 2].index(2) == 1\n",
+      });
+      expectS6(await plan(x2b, ["app/index.py"]), "unmapped-module", `deleted source app/index.py: tests/api/conftest.py references "index"${UNMAPPABLE}`);
+      // Control X2c: the same module, modified, is S6 through the existing-module search.
+      expectS6(
+        await plan({ ...X2, "/r/app/helpers.py": "def make():\n    return 1\n" }, ["app/helpers.py"]),
+        "unmapped-module",
+        `changed module app/helpers.py is referenced by tests/api/conftest.py${UNMAPPABLE}`,
+      );
+      // A conftest hit that is not a file in the tree is not one.
+      const ghost = stubSearch({ helpers: ["/r/tests/gone/conftest.py", "/r/tests/unit/test_unit.py"] });
+      expect(spec(await plan(X2, ["app/helpers.py"], { search: ghost })).inputs).toEqual(["/r/tests/unit/test_unit.py"]);
+    });
+
+    it("QA-G-20: a deleted or renamed-away test file other tests import runs them (was a spec or NoAffected without them)", async () => {
+      const search = treeSearch(X3);
+      const s = spec(await plan(X3, [], { changedFiles: RENAMED, search }));
+      expect(s.inputs).toEqual(["/r/tests/test_a.py", "/r/tests/test_b.py"]);
+      expect(s.notes).toContain("deleted test file not run: tests/test_base.py");
+      // Its Python name as a whole word: test_c's test_base_case is not a reference.
+      expect(search.findByContent).toHaveBeenCalledWith("/r", "test_base", GLOBS, { word: true });
+      // X3b: deleted alone (was NoAffected), imported as a module, through its package, or relatively.
+      const x3b = pyRepo({
+        "/r/tests": "",
+        "/r/tests/test_b.py": "import test_base\n",
+        "/r/tests/test_d.py": "from tests.test_base import Base\n",
+        "/r/tests/pkg/__init__.py": "",
+        "/r/tests/pkg/test_e.py": "from .test_base import Base\n",
+        "/r/tests/test_f.py": "import test_base_extra\n",
+      });
+      expect(spec(await plan(x3b, ["tests/test_base.py"])).inputs).toEqual(["/r/tests/pkg/test_e.py", "/r/tests/test_b.py", "/r/tests/test_d.py"]);
+      // A test file nothing names keeps only its note, as before.
+      expect(await plan(pyRepo({ "/r/tests/test_x.py": "" }), ["tests/test_base.py"])).toEqual({ noAffected: true, note: "no affected tests: no changed file is a test input" });
+      // Fail closed: a conftest.py that names it, too many importers, a failed search.
+      const conf = pyRepo({ "/r/tests/sub/conftest.py": "from test_base import helper\n", "/r/tests/sub/test_s.py": "" });
+      expectS6(await plan(conf, ["tests/test_base.py"]), "unmapped-module", `deleted test file tests/test_base.py: tests/sub/conftest.py references "test_base"${UNMAPPABLE}`);
+      const many = pyRepo(Object.fromEntries(Array.from({ length: STEM_MATCH_LIMIT + 1 }, (_, i) => [`/r/tests/test_u${i}.py`, "import test_base\n"])));
+      expectS6(
+        await plan(many, ["tests/test_base.py"]),
+        "stem-too-common",
+        `deleted test file tests/test_base.py: "test_base" appears in ${STEM_MATCH_LIMIT + 1} test files (limit ${STEM_MATCH_LIMIT})`,
+      );
+      expectS6(await plan(pyRepo(), ["tests/test_base.py"], { search: stubSearch({ test_base: undefined }) }), "search-failed", "test search failed for tests/test_base.py");
+    });
+
+    it("QA-G-20: a deleted test file is a pending search, statically and under SEARCH_LIMIT", async () => {
+      const { search: _s, ...rest } = input({ command: "pytest", files: pyRepo(), changedFiles: changed("tests/test_base.py") });
+      expect(await planStaticScoping(rest)).toEqual({ scopable: true, runner: "pytest", pendingSearches: 1, notes: ["deleted test file not run: tests/test_base.py"] });
+      const gone = Array.from({ length: SEARCH_LIMIT + 1 }, (_, i) => `tests/test_g${i}.py`);
+      expectS6(await plan(pyRepo(), gone), "too-many-searches", `too many changed modules to map: ${SEARCH_LIMIT + 1} test searches (limit ${SEARCH_LIMIT})`);
+    });
+
+    it("QA-G-21: a deleted __init__.py runs every in-scope test under its package (was a spec through a pkgutil decoy)", async () => {
+      const search = treeSearch(X4);
+      expect(spec(await plan(X4, ["tests/pkg/__init__.py"], { search })).inputs).toEqual(["/r/tests/pkg/test_rel.py", "/r/tests/test_other.py"]);
+      expect(search.findByContent).toHaveBeenCalledWith("/r", "pkg", GLOBS);
+      expect(search.listFiles).toHaveBeenCalledWith("/r", "tests/pkg");
+      expect(search.findByName).toHaveBeenCalledWith("/r", ["test_rel.py"]);
+      // Without the decoy (was S6 deleted-no-tests).
+      expect(spec(await plan(without(X4, "/r/tests/test_other.py"), ["tests/pkg/__init__.py"])).inputs).toEqual(["/r/tests/pkg/test_rel.py"]);
+      // Subdirectories lose it too; pytest's prepend import mode now imports tests/pkg/test_mod01_1.py as
+      // `test_mod01_1`, which collides with tests/test_mod01_1.py, so that test runs as well.
+      const deep = fixture({ "/r/tests/pkg/sub/test_deep.py": "", "/r/tests/pkg/test_mod01_1.py": "" });
+      expect(spec(await plan(deep, ["tests/pkg/__init__.py"])).inputs).toEqual(["/r/tests/pkg/sub/test_deep.py", "/r/tests/pkg/test_mod01_1.py", "/r/tests/test_mod01_1.py"]);
+      // Only in-scope tests: app/ lies outside testpaths, so app/test_in.py is never collected; the package-name hits stay.
+      const app = without(fixture({ "/r/app/test_in.py": "from . import mod01\n" }), "/r/app/__init__.py");
+      expect(spec(await plan(app, ["app/__init__.py"])).inputs).toEqual(APP);
+      // A deleted __init__.py at the git root lists ".".
+      const root = stubSearch({}, {}, { ".": ["/r/tests/test_mod01_1.py", "/r/app/mod01.py"] });
+      expect(spec(await plan(fixture(), ["__init__.py"], { search: root })).inputs).toEqual(["/r/tests/test_mod01_1.py"]);
+      expect(root.listFiles).toHaveBeenCalledWith("/r", ".");
+      // python_files that match __init__.py do not make it a leaf test file.
+      const star = pyRepo({ "/r/pytest.ini": "[pytest]\npython_files = *.py\n", "/r/tests/pkg/test_rel.py": "from . import helper\n" });
+      expect(spec(await plan(star, ["tests/pkg/__init__.py"])).inputs).toEqual(["/r/tests/pkg/test_rel.py"]);
+    });
+
+    it("QA-G-21: fails closed on a conftest.py under the package, too many tests, and a failed listing or name search", async () => {
+      const conf = fixture({ "/r/tests/pkg/conftest.py": "from . import helper\n", "/r/tests/pkg/sub/test_s.py": "" });
+      expectS6(await plan(conf, ["tests/pkg/__init__.py"]), "unmapped-module", `deleted package tests/pkg/__init__.py: tests/pkg/conftest.py loses its package${UNMAPPABLE}`);
+      const tooMany = (n: number) =>
+        `deleted package tests/pkg/__init__.py: ${n} test files lose its package or share a basename with one that does (limit ${STEM_MATCH_LIMIT})`;
+      const crowd = fixture(Object.fromEntries(Array.from({ length: STEM_MATCH_LIMIT + 1 }, (_, i) => [`/r/tests/pkg/test_p${i}.py`, ""])));
+      expectS6(await plan(crowd, ["tests/pkg/__init__.py"]), "stem-too-common", tooMany(STEM_MATCH_LIMIT + 1));
+      // 11 in the package, 11 namesakes elsewhere: 22.
+      const pairs = fixture(Object.fromEntries(Array.from({ length: 11 }, (_, i) => [`/r/tests/pkg/test_d${i}.py`, `/r/tests/other/test_d${i}.py`]).flat().map((p) => [p, ""])));
+      expectS6(await plan(pairs, ["tests/pkg/__init__.py"]), "stem-too-common", tooMany(22));
+      const failed = "test search failed for tests/pkg/__init__.py";
+      expectS6(await plan(X4, ["tests/pkg/__init__.py"], { search: stubSearch({}, {}, { "tests/pkg": undefined }) }), "search-failed", failed);
+      const names = stubSearch({}, { "test_rel.py": undefined }, { "tests/pkg": ["/r/tests/pkg/test_rel.py"] });
+      expectS6(await plan(X4, ["tests/pkg/__init__.py"], { search: names }), "search-failed", failed);
+    });
+
+    it("QA-G-18: a deleted module its package's __init__.py still imports runs the package's importers (was a spec through an .index( decoy)", async () => {
+      const search = treeSearch(X1);
+      expect(spec(await plan(X1, ["app/index.py"], { search })).inputs).toEqual([...APP, "/r/tests/test_util.py"]);
+      expect(search.findByContent).toHaveBeenCalledWith("/r", "app", GLOBS, { word: true });
+      // X1b: app/helpers.py, the same shape.
+      expect(spec(await plan(fixture({ "/r/app/__init__.py": "from .helpers import make\n" }), ["app/helpers.py"])).inputs).toEqual(APP);
+      // An __init__.py that does not name it adds no package search (the fixture's docstring).
+      const plain = without(X1, "/r/app/__init__.py");
+      const plainFiles = { ...plain, "/r/app/__init__.py": fixture()["/r/app/__init__.py"] };
+      const plainSearch = treeSearch(plainFiles);
+      expect(spec(await plan(plainFiles, ["app/index.py"], { search: plainSearch })).inputs).toEqual(["/r/tests/test_util.py"]);
+      expect(plainSearch.findByContent).not.toHaveBeenCalledWith("/r", "app", GLOBS, { word: true });
+      // One that cannot be read is taken to name it.
+      expect(spec(await plan(plainFiles, ["app/index.py"], { fs: memFs(plainFiles, false, {}, ["/r/app/__init__.py"]) })).inputs).toEqual([...APP, "/r/tests/test_util.py"]);
+      // A conftest.py that imports the package -> S6.
+      const conf = { ...X1, "/r/tests/api/conftest.py": "import app\n" };
+      expectS6(await plan(conf, ["app/index.py"]), "unmapped-module", `deleted source app/index.py: tests/api/conftest.py references "app"${UNMAPPABLE}`);
+    });
+
+    it("QA-G-18..21: the same plans through real git (the wiring's argv)", async () => {
+      await withGitTree(X2, async (search) => {
+        expectS6(await plan(X2, ["app/helpers.py"], { search }), "unmapped-module", `deleted source app/helpers.py: tests/api/conftest.py references "helpers"${UNMAPPABLE}`);
+      });
+      await withGitTree(X3, async (search) => {
+        expect(spec(await plan(X3, [], { changedFiles: RENAMED, search })).inputs).toEqual(["/r/tests/test_a.py", "/r/tests/test_b.py"]);
+      });
+      const x4 = { ...X4, "/r/tests/pkg/sub/test_deep.py": "", "/r/tests/pkgutil/test_near.py": "" };
+      await withGitTree(x4, async (search) => {
+        expect(spec(await plan(x4, ["tests/pkg/__init__.py"], { search })).inputs).toEqual(["/r/tests/pkg/sub/test_deep.py", "/r/tests/pkg/test_rel.py", "/r/tests/test_other.py"]);
+        expect(search.listFiles).toHaveBeenCalledWith("/r", "tests/pkg");
+      });
+      await withGitTree(X1, async (search) => {
+        expect(spec(await plan(X1, ["app/index.py"], { search })).inputs).toEqual([...APP, "/r/tests/test_util.py"]);
+      });
+    });
   });
 
   describe("QA-G-10: app/app.py keeps a hit it cannot prove is not an importer", () => {
@@ -1312,7 +1489,7 @@ describe("E2E-1: pytest maps a changed module to the tests that import it, and f
       await kept({}, big);
     });
     it("a read that finds no occurrence git found", async () => {
-      const search: TestSearchSeam = { findByName: vi.fn(async () => []), findByContent: vi.fn(async () => [X]) };
+      const search: TestSearchSeam = { findByName: vi.fn(async () => []), findByContent: vi.fn(async () => [X]), listFiles: vi.fn(async () => []) };
       await kept({ search }, { ...files, [X]: "import os\n" });
     });
   });
@@ -3332,7 +3509,7 @@ describe("QA-1.3-33: pytest's python_files decides which changed files are tests
     const search = stubSearch({ gone: ["/r/tests/sub/helper.py", "/r/lib/gone_dep.py"] });
     const s = spec(await planPy(files, ["src/gone.py"], { search }));
     expect(s.inputs).toEqual(["/r/tests/sub/helper.py"]);
-    expect(search.findByContent).toHaveBeenCalledWith("/r", "gone", [":(glob)**/*.py", ":(glob)**/check_*.py"]);
+    expect(search.findByContent).toHaveBeenCalledWith("/r", "gone", [":(glob)**/*.py", ":(glob)**/check_*.py", ":(glob)**/conftest.py"]);
     expect(search.findByName).toHaveBeenCalledWith("/r", ["check_gone.py"]);
   });
 
@@ -3343,7 +3520,7 @@ describe("QA-1.3-33: pytest's python_files decides which changed files are tests
     const modules = ["tast_d1.py", "xx_1.py", "foo.py", "spec.py", "bz.py", "rb.py"];
     for (const f of [...tests, ...modules]) files[`/r/p/${f}`] = "";
     // Every module maps to one of the tests (E2E-1: an unmapped module is S6), so the inputs are the tests.
-    const search: TestSearchSeam = { findByContent: vi.fn(async () => ["/r/p/tast_b1.py"]), findByName: vi.fn(async () => []) };
+    const search: TestSearchSeam = { findByContent: vi.fn(async () => ["/r/p/tast_b1.py"]), findByName: vi.fn(async () => []), listFiles: vi.fn(async () => []) };
     const s = spec(await planPy(files, [...tests, ...modules].map((f) => `p/${f}`), { search }));
     expect(search.findByContent).toHaveBeenCalledTimes(modules.length);
     expect(s.inputs.map((p) => path.posix.basename(p)).sort()).toEqual([...tests].sort());

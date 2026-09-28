@@ -541,7 +541,8 @@ export function resolveRepoCommand(
 //        are not comparable, and a rerun with 0 tests is unusable (T4.k, T5).
 //        PlannerFs: fs.promises.realpath, stat(p, { bigint: true }) mapped to FileStat, readdir,
 //        and a fileExists that accepts directories (2.1.3). TestSearchSeam over the ArgvSeam:
-//        `git -C <root> ls-files -z --cached --others --exclude-standard -- :(glob)**/<name>...`
+//        `git -C <root> ls-files -z --cached --others --exclude-standard -- :(glob)**/<name>...`,
+//        the same ls-files with `-- :(literal)<dir>` (listFiles, QA-G-21)
 //        and `git -C <root> grep -l -z -F --untracked -e <needle> -- <globs>`; grep exit 1 -> [],
 //        any other failure or timeout -> undefined (2.1.3). previousPath from the porcelain rename
 //        source (tree.ts, 2.1.3). planRerun(deps.entry) with the live entry (T4.i). node comes

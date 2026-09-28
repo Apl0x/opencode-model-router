@@ -633,7 +633,25 @@
 //          - a gone test file adds a note. A gone module uses the stem search plus findByName,
 //            and gets S6 when both find nothing. QA-G-17: its content search uses the module's
 //            Python name, as for an existing module (a deleted app/index.py searches "index",
-//            not "app"); findByName keeps the stem.
+//            not "app"); findByName keeps the stem. The deleted-file rules below fail closed.
+//            QA-G-19: the content search covers ":(glob)**/conftest.py" too; a conftest hit that
+//            exists -> S6 unmapped-module (unscoped, as for an existing module).
+//            QA-G-20: a gone test file is a module other tests may import (`from test_base import
+//            Base`): search.findByContent(gitRoot, <basename without .py>, [...pytest globs,
+//            conftest glob], {word: true}); in-scope test hits join the inputs, a conftest hit
+//            -> S6 unmapped-module, more than STEM_MATCH_LIMIT -> S6 stem-too-common, no hit ->
+//            the note only. A gone __init__.py is always a gone module, even when python_files
+//            match it.
+//            QA-G-21: a gone __init__.py also takes the package from every file under its
+//            directory (a relative `from . import helper` fails; pytest's prepend import mode
+//            renames tests/pkg/test_x.py to `test_x`, which can collide with a namesake):
+//            search.listFiles(gitRoot, <its directory>); a conftest.py there -> S6
+//            unmapped-module; every in-scope test file there, plus every in-scope test file
+//            findByName finds under the same basenames, joins the inputs; more than
+//            STEM_MATCH_LIMIT -> S6 stem-too-common.
+//            QA-G-18: a gone module whose package's __init__.py still exists and names it as a
+//            whole word (unreadable or over CONFIG_SIZE_LIMIT counts as naming it) adds the
+//            importers of the package name: the QA-G-20 search with that name.
 //        stem = the basename without its last extension. "index" and "__init__" use the parent
 //        directory name instead.
 //   9. Stem search (section 1.5-5): search.findByContent(gitRoot, stem, globs), with JS_TEST_GLOBS
@@ -645,7 +663,8 @@
 //        more than STEM_MATCH_LIMIT files -> S6 stem-too-common.
 //        otherwise               -> the existing, inside-root results join the inputs.
 //   9a. (QA-1.3-26) The searches run one process each, in sequence (a pytest module, gone or
-//      existing, runs a content search and a name search but counts once). More than SEARCH_LIMIT (50)
+//      existing, runs a content search and a name search, and a gone one up to two more, but
+//      counts once; a gone pytest test file counts once). More than SEARCH_LIMIT (50)
 //      pending searches (the count below) -> S6 too-many-searches, decided before the first
 //      search. 5000 changed pytest modules made 5000 git calls (about 26 minutes at 0.3 s each).
 //      Batching (one git grep with several -e, one ls-files) would need a TestSearchSeam change;
@@ -653,8 +672,8 @@
 //   10. Inputs empty after steps 8 and 9 -> NoAffected, with the note from M.2. Every pytest
 //      module has added an input or returned S6 by then (E2E-1), so this only happens when no
 //      changed file is a module or an in-scope test input.
-//   planStaticScoping stops before every search. Each gone non-test source, and each existing
-//   pytest module, counts as a pending search. It applies 9a, and (QA-1.3-27) runs the spec-time
+//   planStaticScoping stops before every search. Each gone non-test source, each pytest module
+//   (existing or gone), and each gone pytest test file (QA-G-20) counts as a pending search. It applies 9a, and (QA-1.3-27) runs the spec-time
 //   pytest config lookup (D.4) over the test inputs it already knows, so an addopts S6 there is
 //   seen by 1.6 too. When nothing is decidable, the result is {scopable: true, runner,
 //   pendingSearches}.
@@ -1288,6 +1307,12 @@ export interface TestSearchSeam {
     globs: readonly string[],
     options?: { readonly word?: boolean },
   ): Promise<readonly string[] | undefined>;
+  /**
+   * QA-G-21: absolute paths of the files under `dir`, a directory relative to gitRoot with "/"
+   * separators ("." is gitRoot itself), at any depth: `git ls-files -z --cached --others
+   * --exclude-standard -- :(literal)<dir>`.
+   */
+  listFiles(gitRoot: string, dir: string): Promise<readonly string[] | undefined>;
 }
 
 export type CommandSource =
@@ -4231,18 +4256,26 @@ function withoutPackageHeads(line: string, name: string): string {
 async function keepImporters(fs: PlannerFs, hits: readonly string[], name: string): Promise<string[]> {
   const out: string[] = [];
   for (const h of hits) {
-    // "" (no occurrence, so kept) stands for a file too large to scan or one that cannot be read.
-    let text = "";
-    try {
-      const st = fs.stat ? await fs.stat(h) : undefined;
-      if (!st || Number(st.size) <= CONFIG_SIZE_LIMIT) text = await fs.readFile(h);
-    } catch {
-      text = "";
-    }
-    if (text.length > CONFIG_SIZE_LIMIT || countWords(text, name) === 0) out.push(h);
+    const text = await readBounded(fs, h);
+    if (text === undefined || countWords(text, name) === 0) out.push(h);
     else if (countWords(text.split(/\r\n|\r|\n/).map((l) => withoutPackageHeads(l, name)).join("\n"), name) > 0) out.push(h);
   }
   return out;
+}
+
+/**
+ * A file's text through the fs seam, or undefined when the stat or the read fails or the file is
+ * over CONFIG_SIZE_LIMIT (by fs.stat, checked before the read, or by the read's length).
+ */
+async function readBounded(fs: PlannerFs, abs: string): Promise<string | undefined> {
+  try {
+    const st = fs.stat ? await fs.stat(abs) : undefined;
+    if (st && Number(st.size) > CONFIG_SIZE_LIMIT) return undefined;
+    const text = await fs.readFile(abs);
+    return text.length > CONFIG_SIZE_LIMIT ? undefined : text;
+  } catch {
+    return undefined;
+  }
 }
 
 /** G.3-G.5 for one path: canonical absolute path inside gitRoot, or undefined. */
@@ -4412,6 +4445,7 @@ async function classify(
   const goneSources: FileRef[] = [];
   const modules: FileRef[] = [];
   const goneModules: FileRef[] = [];
+  const goneTests: FileRef[] = [];
   let skipped = 0;
   // G.8b (E2E-1): without path scopes, pytest's testpaths (when they decide collection) bound the
   // test inputs: a test file the user's run never collects is not one of its tests.
@@ -4431,8 +4465,12 @@ async function classify(
       if (exists && isTest) {
         if (inScope(f.abs)) addInput(f.abs);
       } else if (exists) modules.push(f);
-      else if (isTest) notes.push(`deleted test file not run: ${f.rel}`);
-      else goneModules.push(f);
+      else if (isTest && base !== "__init__.py") {
+        // QA-G-20: other tests may import it; it is searched below. A deleted __init__.py always
+        // takes its package away (QA-G-21), so it is a gone module even when python_files match it.
+        notes.push(`deleted test file not run: ${f.rel}`);
+        goneTests.push(f);
+      } else goneModules.push(f);
     } else {
       const isTest = JS_TEST_RE.test(base) || f.rel.split("/").includes("__tests__");
       if (exists) addInput(f.abs);
@@ -4442,7 +4480,7 @@ async function classify(
   }
   if (skipped > 0) notes.push(`non-input files skipped: ${skipped}`);
 
-  const pending = det.kind === "pytest" ? modules.length + goneModules.length : goneSources.length;
+  const pending = det.kind === "pytest" ? modules.length + goneModules.length + goneTests.length : goneSources.length;
   // G.9a (QA-1.3-26): the searches are sequential processes (a git grep costs ~0.3 s in a large
   // repo), so their number is bounded. Decided before any search, so static scoping agrees.
   if (pending > SEARCH_LIMIT) {
@@ -4529,26 +4567,105 @@ async function classify(
     if (ok.length === 0) return s6("unmapped-module", `no test file maps to the changed module ${f.rel}`);
     for (const h of ok) addInput(h);
   }
+  /**
+   * The test files that name a deleted file's `name` (word: as a whole word), re-checked against
+   * python_files. QA-G-19: conftest.py files are searched with them, and a hit is S6
+   * unmapped-module, as for an existing module: a nested conftest.py's fixtures reach tests that
+   * never name the file. More than STEM_MATCH_LIMIT test files -> S6 stem-too-common.
+   */
+  const goneImporters = async (f: FileRef, what: string, name: string, word: boolean): Promise<readonly string[] | Unverifiable> => {
+    const globs = [...pyGlobs, CONFTEST_GLOB];
+    const hits = await (word ? search.findByContent(gitRoot, name, globs, { word: true }) : search.findByContent(gitRoot, name, globs));
+    if (hits === undefined) return searchFailed(f);
+    // Unscoped: pytest also loads the conftest.py files above the collected tests (up to confcutdir).
+    const conftests = await accept(hits.filter((h) => P.basename(h) === "conftest.py"), false);
+    if (conftests.length > 0) {
+      const rel = toSlash(ctx, P.relative(gitRoot, conftests[0]));
+      return s6("unmapped-module", `${what} ${f.rel}: ${rel} references "${name}": the tests its fixtures reach cannot be mapped`);
+    }
+    const tests = hits.filter((h) => isPyTestFile(ctx, pyFiles, h));
+    if (tests.length > STEM_MATCH_LIMIT) {
+      return s6("stem-too-common", `${what} ${f.rel}: "${name}" appears in ${tests.length} test files (limit ${STEM_MATCH_LIMIT})`);
+    }
+    return tests;
+  };
+  /**
+   * QA-G-21: a deleted __init__.py takes the package away from every file under its directory. A
+   * relative import there (`from . import helper`) never spells the package name and fails, and
+   * pytest's default prepend import mode now imports tests/pkg/test_util.py as `test_util`, which
+   * collides with a test of that basename elsewhere ("import file mismatch"). So every in-scope
+   * test file under the directory is an input, with every in-scope test file that shares a
+   * basename with one. A conftest.py under it is S6 unmapped-module (it can fail to load for a
+   * directory no selected test lies in); more than STEM_MATCH_LIMIT test files -> S6 stem-too-common.
+   */
+  const packageTests = async (f: FileRef): Promise<readonly string[] | Unverifiable> => {
+    const dir = P.dirname(f.abs);
+    const slash = f.rel.lastIndexOf("/");
+    const listed = await search.listFiles(gitRoot, slash === -1 ? "." : f.rel.slice(0, slash));
+    if (listed === undefined) return searchFailed(f);
+    const under = listed.filter((h) => isInside(ctx, dir, h));
+    const conftests = await accept(under.filter((h) => P.basename(h) === "conftest.py"), false);
+    if (conftests.length > 0) {
+      const rel = toSlash(ctx, P.relative(gitRoot, conftests[0]));
+      return s6("unmapped-module", `deleted package ${f.rel}: ${rel} loses its package: the tests its fixtures reach cannot be mapped`);
+    }
+    const tooMany = (n: number) =>
+      s6("stem-too-common", `deleted package ${f.rel}: ${n} test files lose its package or share a basename with one that does (limit ${STEM_MATCH_LIMIT})`);
+    const tests = await accept(under.filter((h) => isPyTestFile(ctx, pyFiles, h)), true);
+    if (tests.length > STEM_MATCH_LIMIT) return tooMany(tests.length);
+    if (tests.length === 0) return [];
+    const same = await search.findByName(gitRoot, [...new Set(tests.map((t) => P.basename(t)))]);
+    if (same === undefined) return searchFailed(f);
+    const all = new Map(tests.map((t) => [ctx.key(t), t]));
+    for (const h of await accept(same.filter((h) => isPyTestFile(ctx, pyFiles, h)), true)) all.set(ctx.key(h), h);
+    return all.size > STEM_MATCH_LIMIT ? tooMany(all.size) : [...all.values()];
+  };
+  /**
+   * QA-G-18: a deleted module that its package's __init__.py still names as a whole word (`from
+   * .index import VERSION`) breaks every import of the package, so the package name's importers
+   * are inputs too (goneImporters, with the package name as a whole word). An __init__.py that
+   * cannot be read, or one over CONFIG_SIZE_LIMIT, is taken to name it.
+   */
+  const reExporters = async (f: FileRef, name: string): Promise<readonly string[] | Unverifiable> => {
+    const dir = P.dirname(f.abs);
+    const init = P.join(dir, "__init__.py");
+    if (!(await existsCached(ctx, fs, init))) return [];
+    const text = await readBounded(fs, init);
+    if (text !== undefined && countWords(text, name) === 0) return [];
+    return goneImporters(f, "deleted source", P.basename(dir), true);
+  };
+
   // QA-G-17: a deleted module is searched by the name its importers spell, as an existing one is:
   // a deleted app/index.py by "index" (`from app.index import x`, `from .index import x`), not by
   // its directory's name; only __init__.py uses the package name. The name search keeps the stem.
+  // QA-G-18/21: plus its package's importers, or (an __init__.py) the tests under its package.
   for (const f of goneModules) {
     const stem = stemOf(ctx, f.abs);
-    const name = P.basename(f.abs) === "__init__.py" ? stem : P.basename(f.abs, ".py");
-    const content = await search.findByContent(gitRoot, name, pyGlobs);
+    const init = P.basename(f.abs) === "__init__.py";
+    const name = init ? stem : P.basename(f.abs, ".py");
+    const tests = await goneImporters(f, "deleted source", name, false);
+    if (isS6(tests)) return tests;
     const named = await byName(stem);
-    if (content === undefined || named === undefined) return searchFailed(f);
-    const tests = content.filter((h) => isPyTestFile(ctx, pyFiles, h));
-    if (tests.length > STEM_MATCH_LIMIT) {
-      return s6("stem-too-common", `deleted source ${f.rel}: "${name}" appears in ${tests.length} test files (limit ${STEM_MATCH_LIMIT})`);
-    }
-    const ok = await accept([...tests, ...named], true);
+    if (named === undefined) return searchFailed(f);
+    const extra = init ? await packageTests(f) : await reExporters(f, name);
+    if (isS6(extra)) return extra;
+    const ok = await accept([...tests, ...named, ...extra], true);
     if (ok.length === 0) return s6("deleted-no-tests", `deleted source ${f.rel}: no test file references "${name}"`);
     for (const h of ok) addInput(h);
   }
+  // QA-G-20: a deleted test file is a module too, and other tests may import it (`from test_base
+  // import Base`, `from .test_base import x`): its Python name is searched as a whole word, and its
+  // importers are inputs. A conftest.py that names it is S6 unmapped-module. A deleted test file
+  // nothing names keeps only its note (a test file is a leaf).
+  for (const f of goneTests) {
+    const tests = await goneImporters(f, "deleted test file", P.basename(f.abs, ".py"), true);
+    if (isS6(tests)) return tests;
+    for (const h of await accept(tests, true)) addInput(h);
+  }
 
   // Every pytest module and gone module above added an input or returned S6, so an empty set here
-  // means no changed file was a test input or a module (docs, dropped paths, deleted tests).
+  // means no changed file was a test input or a module (docs, dropped paths, deleted test files
+  // nothing imports).
   if (inputs.size === 0) return noAffected(NOTE_NO_INPUT);
   const pre = await preflight(ctx, det, fs);
   if (isS6(pre)) return pre;
