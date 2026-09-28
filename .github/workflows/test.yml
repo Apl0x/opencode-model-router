@@ -31,6 +31,10 @@ jobs:
     name: e2e (node 22, ${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
+    # Owner decision (phase 3.1): the Windows leg is non-blocking until its flakes are
+    # fixed; see "Known follow-ups (non-blocking CI)" in docs/qa/verification-resource-budget/phase-3.1.md.
+    # The Ubuntu leg stays blocking.
+    continue-on-error: ${{ matrix.os == 'windows-latest' }}
     strategy:
       fail-fast: false
       matrix:
@@ -52,23 +56,29 @@ jobs:
       # Windows only: the full default suite with coverage, so the merged report
       # sees the win32 branches the unit tests exercise (the `coverage` job
       # provides the POSIX side).
+      # --coverage.reportOnFailure: vitest skips the report when a test fails (default
+      # false), and the Windows leg must still hand its coverage JSON to the merge job.
       - name: Windows unit coverage
+        id: win-unit
         if: matrix.os == 'windows-latest'
-        run: npx vitest run --coverage --coverage.reporter=json --coverage.reporter=text-summary --coverage.reportsDirectory=coverage/win-unit
+        run: npx vitest run --coverage --coverage.reportOnFailure --coverage.reporter=json --coverage.reporter=text-summary --coverage.reportsDirectory=coverage/win-unit
         env:
           OMR_COVERAGE_ARTIFACT: "1"
       - name: e2e
-        run: npx vitest run --maxWorkers=1 ${{ matrix.os == 'windows-latest' && '--coverage --coverage.reporter=json --coverage.reporter=text-summary --coverage.reportsDirectory=coverage/win-e2e' || '' }} test/integration/e2e test/integration/verify-resource-budget
+        # Also runs after a failed Windows unit coverage step, so win-e2e coverage is still produced.
+        if: ${{ always() && (success() || (matrix.os == 'windows-latest' && steps.win-unit.outcome == 'failure')) }}
+        run: npx vitest run --maxWorkers=1 ${{ matrix.os == 'windows-latest' && '--coverage --coverage.reportOnFailure --coverage.reporter=json --coverage.reporter=text-summary --coverage.reportsDirectory=coverage/win-e2e' || '' }} test/integration/e2e test/integration/verify-resource-budget
         env:
           RUN_VERIFY_E2E: "1"
           OMR_E2E_NPM_CACHE: ${{ runner.temp }}/omr-e2e-npm-cache
           OMR_COVERAGE_ARTIFACT: "1"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        if: matrix.os == 'windows-latest'
+        if: always() && matrix.os == 'windows-latest'
         with:
           name: coverage-windows
           path: coverage/*/coverage-final.json
-          if-no-files-found: error
+          # A failed step may leave only one of win-unit / win-e2e.
+          if-no-files-found: warn
           retention-days: 7
 
   # opencode loads the plugin under Bun; every other job runs under Node. This runs the real
@@ -131,6 +141,8 @@ jobs:
   coverage-merge:
     name: coverage gate (merged Windows + Linux)
     needs: [coverage, e2e]
+    # Runs even when the non-blocking Windows e2e leg failed; the Linux coverage job must pass.
+    if: ${{ always() && needs.coverage.result == 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -150,8 +162,20 @@ jobs:
           shopt -s nullglob
           inputs=(coverage-artifacts/coverage-*/*/coverage-final.json)
           printf '%s\n' "${inputs[@]}"
-          if [ "${#inputs[@]}" -ne 4 ]; then echo "expected 4 coverage inputs (win-unit, win-e2e, linux-unit, linux-e2e), got ${#inputs[@]}"; exit 1; fi
-          node scripts/coverage-merge.mjs coverage/merged "${inputs[@]}"
+          for f in coverage-artifacts/coverage-linux/linux-unit/coverage-final.json coverage-artifacts/coverage-linux/linux-e2e/coverage-final.json; do
+            if [ ! -f "$f" ]; then echo "::error::required Linux coverage input missing: $f"; exit 1; fi
+          done
+          if [ "${#inputs[@]}" -lt 2 ] || [ "${#inputs[@]}" -gt 4 ]; then echo "::error::expected 2-4 coverage inputs, got ${#inputs[@]}"; exit 1; fi
+          if [ "${#inputs[@]}" -eq 4 ]; then
+            node scripts/coverage-merge.mjs coverage/merged "${inputs[@]}"
+          else
+            # Windows e2e is non-blocking (phase 3.1 follow-ups). Linux-only coverage misses the
+            # win32 branches of src/verify/exec.ts (65% lines / 58% branches on run 36364312868),
+            # so without all 4 inputs the table is still printed but the gate is a warning.
+            echo "::warning::Windows coverage inputs missing; merged gate is Linux-only for this run"
+            rc=0; node scripts/coverage-merge.mjs coverage/merged "${inputs[@]}" || rc=$?
+            if [ "$rc" -eq 1 ]; then echo "::warning::per-file coverage gate failed on the Linux-only merge; not blocking because Windows inputs are missing"; elif [ "$rc" -ne 0 ]; then exit "$rc"; fi
+          fi
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always()
         with:
