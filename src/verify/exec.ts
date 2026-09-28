@@ -83,8 +83,12 @@ const SWEEP_ARM_MS = 200;
  * It only bounds a hung sweeper: by then the kill grace has already settled the
  * run, so a late kill costs the run nothing, while a short limit turned a slow
  * sweep under normal-priority CPU saturation into no kill at all (QA-1.2-14).
+ * On a saturated 4-core CI runner, the first sweep of the job (a cold
+ * PowerShell start and the first CIM query) killed 28.7 s after the kill was
+ * requested, 1.3 s inside the former 30 s limit (phase 3.1, CI round 3).
+ * Exported for tests.
  */
-const SWEEP_TIMEOUT_MS = 30_000;
+export const SWEEP_TIMEOUT_MS = 60_000;
 /** Windows: the most `taskkill /T` on a live direct child may take. */
 const TASKKILL_TIMEOUT_MS = 5000;
 /**
