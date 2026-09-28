@@ -299,7 +299,7 @@ async function runnerChecks(work: string): Promise<void> {
       changedFiles: [{ path: join("test", testFile) }],
       budget: { maxWorkers: 1 },
       fs,
-      search: { findByName: async () => [], findByContent: async () => [], listFiles: async () => [] },
+      search: { findByName: async () => [], findByContent: async () => [] },
     });
     assert(isScopedSpec(plan), `not a spec: ${JSON.stringify(plan)}`);
     assert(isNode(plan.file), `ScopedSpec.file is ${q(plan.file)}`);

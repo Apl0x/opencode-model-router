@@ -904,7 +904,7 @@ describe("createDirectTestsPassHook (2.1.2.4)", () => {
       fileExists: async p => live.has(p),
       readFile: async (p: string) => { throw new Error(`ENOENT: ${p}`); },
     };
-    const search: TestSearchSeam = { findByName: async () => [], findByContent: async () => [], listFiles: async () => [] };
+    const search: TestSearchSeam = { findByName: async () => [], findByContent: async () => [] };
     const hook = createDirectTestsPassHook({
       openScope, plannerFs, search, plan, currentTree: TREE,
       budget: { maxWorkers: 2, failureRecheck: opts.failureRecheck ?? true },
@@ -1074,7 +1074,7 @@ describe("createDirectTestsPassHook (2.1.2.4)", () => {
       s.close.mockImplementation(() => Promise.reject(new Error("dispose exploded")));
       const hook = createDirectTestsPassHook({
         openScope: s.openScope, plannerFs: { fileExists: async () => true, readFile: async () => "" },
-        search: { findByName: async () => [], findByContent: async () => [], listFiles: async () => [] }, plan: s.plan,
+        search: { findByName: async () => [], findByContent: async () => [] }, plan: s.plan,
         budget: { maxWorkers: 2, failureRecheck: true }, logger: { warn: m => void warnings.push(m) },
       });
       const d = createDeadline(0);
@@ -1247,7 +1247,6 @@ describe("gate pipeline end to end (2.1.6c): real opener, rechecker, hook, plann
     const search: TestSearchSeam = {
       findByName: vi.fn(o.search?.findByName ?? (async () => [])),
       findByContent: vi.fn(o.search?.findByContent ?? (async () => [])),
-      listFiles: vi.fn(o.search?.listFiles ?? (async () => [])),
     };
     const hook = createDirectTestsPassHook({
       openScope, plannerFs, search, budget: { maxWorkers: 2, failureRecheck: true }, host: { platform: process.platform, tmpdir: TMP },

@@ -118,15 +118,10 @@ function pyRepo(extra: Record<string, string> = {}): Record<string, string> {
   return { "/r/.git": "", "/usr/bin/pytest": "", "/usr/bin/uv": "", ...extra };
 }
 
-function stubSearch(
-  content: Record<string, readonly string[] | undefined> = {},
-  names: Record<string, readonly string[] | undefined> = {},
-  dirs: Record<string, readonly string[] | undefined> = {},
-): TestSearchSeam {
+function stubSearch(content: Record<string, readonly string[] | undefined> = {}, names: Record<string, readonly string[] | undefined> = {}): TestSearchSeam {
   return {
     findByContent: vi.fn(async (_root: string, needle: string) => (needle in content ? content[needle] : [])),
     findByName: vi.fn(async (_root: string, n: readonly string[]) => (n[0] in names ? names[n[0]] : [])),
-    listFiles: vi.fn(async (_root: string, dir: string) => (dir in dirs ? dirs[dir] : [])),
   };
 }
 
@@ -977,10 +972,6 @@ function treeSearch(files: Record<string, string>, root = "/r"): TestSearchSeam 
       // git grep matches one line at a time.
       return under.filter((p) => match.some((m) => m(p)) && files[p].split("\n").some((line) => re.test(line)));
     }),
-    // git ls-files -- :(literal)<dir>: the files under dir ("." is the root). A key another key lies under is a directory.
-    listFiles: vi.fn(async (_r: string, dir: string) =>
-      under.filter((p) => (dir === "." || p.startsWith(`${root}/${dir}/`)) && !under.some((q) => q.startsWith(`${p}/`))),
-    ),
   };
 }
 
@@ -1014,7 +1005,6 @@ async function withGitTree(files: Record<string, string>, fn: (search: TestSearc
       findByContent: vi.fn(async (_r: string, needle: string, globs: readonly string[], options?: { readonly word?: boolean; readonly regex?: boolean }) =>
         under(git(["grep", "-l", "-z", options?.regex === true ? "-E" : "-F", ...(options?.word === true ? ["-w"] : []), "--untracked", "-e", needle, "--", ...globs])),
       ),
-      listFiles: vi.fn(async (_r: string, d: string) => under(git(["ls-files", "-z", "--cached", "--others", "--exclude-standard", "--", `:(literal)${d}`]))),
     });
   } finally {
     rmSync(dir, { recursive: true, force: true });
@@ -1087,7 +1077,7 @@ describe("E2E-1: pytest maps a changed module to the tests that import it, and f
       "unmapped-module",
       "changed module app/mod02.py is referenced by tests/conftest.py: the tests its fixtures reach cannot be mapped",
     );
-    const failing: TestSearchSeam = { findByName: vi.fn(async () => []), findByContent: vi.fn(async () => undefined), listFiles: vi.fn(async () => []) };
+    const failing: TestSearchSeam = { findByName: vi.fn(async () => []), findByContent: vi.fn(async () => undefined) };
     expectS6(await plan(fixture(), ["app/mod02.py"], { search: failing }), "search-failed", "test search failed for app/mod02.py");
     // One unmapped module in a change makes the whole change S6, even when another one maps.
     expectUnmapped(await plan(fixture({ "/r/app/orphan.py": "" }), ["app/mod02.py", "app/orphan.py"]), "app/orphan.py");
@@ -1426,7 +1416,6 @@ describe("E2E-1: pytest maps a changed module to the tests that import it, and f
       const search = treeSearch(X4);
       expectS6(await plan(X4, ["tests/pkg/__init__.py"], { search }), "unmapped-module", pkgChanged("tests/pkg/__init__.py"));
       noSearch(search);
-      expect(search.listFiles).not.toHaveBeenCalled();
       // X4 without the decoy: was ["tests/pkg/test_rel.py"].
       expectS6(await plan(without(X4, "/r/tests/test_other.py"), ["tests/pkg/__init__.py"]), "unmapped-module", pkgChanged("tests/pkg/__init__.py"));
       // Subdirectories and a namesake: was ["tests/pkg/sub/test_deep.py", "tests/pkg/test_mod01_1.py", "tests/test_mod01_1.py"].
@@ -1436,7 +1425,7 @@ describe("E2E-1: pytest maps a changed module to the tests that import it, and f
       const app = without(fixture({ "/r/app/test_in.py": "from . import mod01\n" }), "/r/app/__init__.py");
       expectS6(await plan(app, ["app/__init__.py"]), "unmapped-module", pkgChanged("app/__init__.py"));
       // At the git root: was ["tests/test_mod01_1.py"] through the "." listing.
-      const root = stubSearch({}, {}, { ".": ["/r/tests/test_mod01_1.py", "/r/app/mod01.py"] });
+      const root = treeSearch(fixture());
       expectS6(await plan(fixture(), ["__init__.py"], { search: root }), "unmapped-module", pkgChanged("__init__.py"));
       noSearch(root);
       // python_files that match __init__.py do not make it a leaf test file: was ["tests/pkg/test_rel.py"].
@@ -1450,7 +1439,7 @@ describe("E2E-1: pytest maps a changed module to the tests that import it, and f
       expectS6(await plan(crowd, ["tests/pkg/__init__.py"]), "unmapped-module", pkgChanged("tests/pkg/__init__.py"));
       const pairs = fixture(Object.fromEntries(Array.from({ length: 11 }, (_, i) => [`/r/tests/pkg/test_d${i}.py`, `/r/tests/other/test_d${i}.py`]).flat().map((p) => [p, ""])));
       expectS6(await plan(pairs, ["tests/pkg/__init__.py"]), "unmapped-module", pkgChanged("tests/pkg/__init__.py"));
-      const failing = stubSearch({ pkg: undefined }, { "test_rel.py": undefined }, { "tests/pkg": undefined });
+      const failing = stubSearch({ pkg: undefined }, { "test_rel.py": undefined });
       expectS6(await plan(X4, ["tests/pkg/__init__.py"], { search: failing }), "unmapped-module", pkgChanged("tests/pkg/__init__.py"));
       noSearch(failing);
     });
@@ -1554,7 +1543,7 @@ describe("E2E-1: pytest maps a changed module to the tests that import it, and f
       await kept({}, big);
     });
     it("a read that finds no occurrence git found", async () => {
-      const search: TestSearchSeam = { findByName: vi.fn(async () => []), findByContent: vi.fn(async () => [X]), listFiles: vi.fn(async () => []) };
+      const search: TestSearchSeam = { findByName: vi.fn(async () => []), findByContent: vi.fn(async () => [X]) };
       await kept({ search }, { ...files, [X]: "import os\n" });
     });
   });
@@ -3585,7 +3574,7 @@ describe("QA-1.3-33: pytest's python_files decides which changed files are tests
     const modules = ["tast_d1.py", "xx_1.py", "foo.py", "spec.py", "bz.py", "rb.py"];
     for (const f of [...tests, ...modules]) files[`/r/p/${f}`] = "";
     // Every module maps to one of the tests (E2E-1: an unmapped module is S6), so the inputs are the tests.
-    const search: TestSearchSeam = { findByContent: vi.fn(async () => ["/r/p/tast_b1.py"]), findByName: vi.fn(async () => []), listFiles: vi.fn(async () => []) };
+    const search: TestSearchSeam = { findByContent: vi.fn(async () => ["/r/p/tast_b1.py"]), findByName: vi.fn(async () => []) };
     const s = spec(await planPy(files, [...tests, ...modules].map((f) => `p/${f}`), { search }));
     expect(search.findByContent).toHaveBeenCalledTimes(modules.length);
     expect(s.inputs.map((p) => path.posix.basename(p)).sort()).toEqual([...tests].sort());

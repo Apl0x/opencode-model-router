@@ -1315,12 +1315,6 @@ export interface TestSearchSeam {
     globs: readonly string[],
     options?: { readonly word?: boolean },
   ): Promise<readonly string[] | undefined>;
-  /**
-   * QA-G-21: absolute paths of the files under `dir`, a directory relative to gitRoot with "/"
-   * separators ("." is gitRoot itself), at any depth: `git ls-files -z --cached --others
-   * --exclude-standard -- :(literal)<dir>`.
-   */
-  listFiles(gitRoot: string, dir: string): Promise<readonly string[] | undefined>;
 }
 
 export type CommandSource =

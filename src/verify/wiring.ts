@@ -1121,11 +1121,6 @@ export function createVerificationWiring(deps: {
         if (r.code === 1) return [];
         return r.code === 0 ? splitZ(r.stdout).map(rel => resolve(gitRoot, rel)) : undefined;
       },
-      async listFiles(gitRoot, dir) {
-        // QA-G-21: a literal pathspec matches the directory and everything under it, nothing else.
-        const r = await git(gitRoot, ["ls-files", "-z", "--cached", "--others", "--exclude-standard", "--", `:(literal)${dir}`]);
-        return r && r.code === 0 ? splitZ(r.stdout).map(rel => resolve(gitRoot, rel)) : undefined;
-      },
     };
   };
 

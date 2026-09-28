@@ -875,38 +875,19 @@ describe("gate seams", () => {
         rmSync(dir, { recursive: true, force: true });
       }
     });
-    it("QA-G-21: listFiles lists a directory through git ls-files with a literal pathspec", async () => {
-      const s = search();
-      reply(0, "tests/pkg/a.py\0tests/pkg/sub/test_b.py\0");
-      expect(await s.listFiles(root, "tests/pkg")).toEqual([resolve(root, "tests/pkg/a.py"), resolve(root, "tests/pkg/sub/test_b.py")]);
-      expect(state.commands[0]).toBe(`git --no-optional-locks -C ${root} ls-files -z --cached --others --exclude-standard -- :(literal)tests/pkg`);
-      reply(128); expect(await s.listFiles(root, ".")).toBeUndefined();
-      expect(state.commands[1]).toBe(`git --no-optional-locks -C ${root} ls-files -z --cached --others --exclude-standard -- :(literal).`);
-      reply(0, "a.py\0", true); expect(await s.listFiles(root, ".")).toBeUndefined();
-      state.argvImpl = async () => { throw new Error("spawn ENOENT"); };
-      expect(await s.listFiles(root, ".")).toBeUndefined();
-    });
-    it("QA-G-19/21: real git finds a nested conftest.py by content, and lists a package directory at any depth, literally", async () => {
-      const dir = mkdtempSync(join(tmpdir(), "omr-qag21-"));
+    it("QA-G-19: real git finds a nested conftest.py by content", async () => {
+      const dir = mkdtempSync(join(tmpdir(), "omr-qag19-"));
       try {
         execFileSync("git", ["init", "-q"], { cwd: dir });
         const files: Record<string, string> = {
-          ".gitignore": "*.log\n",
           "tests/api/conftest.py": "from app.helpers import make\n",
           "tests/unit/test_unit.py": "# string helpers\n",
           "tests/test_other.py": "import os\n",
-          "tests/pkg/test_rel.py": "from . import helper\n",
-          "tests/pkg/empty_test.py": "",
-          "tests/pkg/sub/test_deep.py": "\n",
-          "tests/pkg/skip.log": "ignored\n",
-          "tests/pkgutil/test_near.py": "x = 1\n",
-          "tests/p[k]g/test_lit.py": "y = 1\n",
         };
         for (const [rel, text] of Object.entries(files)) {
           mkdirSync(dirname(join(dir, rel)), { recursive: true });
           writeFileSync(join(dir, rel), text);
         }
-        execFileSync("git", ["add", "tests/pkg/test_rel.py"], { cwd: dir });
         const s = search();
         state.argvImpl = (file, args) => new Promise(done => {
           execFile(file, [...args], { encoding: "utf8" }, (err, stdout, stderr) => done({ code: err ? Number(err.code ?? 1) : 0, stdout, stderr, timedOut: false }));
@@ -914,14 +895,6 @@ describe("gate seams", () => {
         // The deleted-module search: the needle as a substring, over the test globs and conftest.py.
         const hits = await s.findByContent(dir, "helpers", [":(glob)**/test_*.py", ":(glob)**/*_test.py", ":(glob)**/conftest.py"]);
         expect([...(hits ?? [])].sort()).toEqual([resolve(dir, "tests/api/conftest.py"), resolve(dir, "tests/unit/test_unit.py")]);
-        // Tracked and untracked files, empty ones included, not ignored ones, not tests/pkgutil, not p[k]g.
-        const listed = await s.listFiles(dir, "tests/pkg");
-        expect([...(listed ?? [])].sort()).toEqual(
-          ["tests/pkg/empty_test.py", "tests/pkg/sub/test_deep.py", "tests/pkg/test_rel.py"].map(r => resolve(dir, r)),
-        );
-        expect(await s.listFiles(dir, "tests/p[k]g")).toEqual([resolve(dir, "tests/p[k]g/test_lit.py")]);
-        expect(await s.listFiles(dir, "tests/none")).toEqual([]);
-        expect(await s.listFiles(dir, ".")).toHaveLength(Object.keys(files).length - 1);
       } finally {
         rmSync(dir, { recursive: true, force: true });
       }
