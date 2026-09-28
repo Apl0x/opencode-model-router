@@ -66,7 +66,7 @@ export interface E2EPlugin {
   dispose(): Promise<void>;
 }
 
-const ENV_KEYS = ["HOME", "USERPROFILE", "MODEL_ROUTER_ENFORCE", "MODEL_ROUTER_VERIFIED_DELEGATE"] as const;
+const ENV_KEYS = ["HOME", "USERPROFILE", "APPDATA", "LOCALAPPDATA", "MODEL_ROUTER_ENFORCE", "MODEL_ROUTER_VERIFIED_DELEGATE"] as const;
 
 /**
  * Ids starting with `orch` are proven root orchestrators; every other id is a child of one: of the
@@ -96,6 +96,12 @@ export async function createE2EPlugin(opts: {
   writeFileSync(overrides, JSON.stringify({ enforcement: { ...opts.enforcement, verify: opts.verify ?? {} } }), "utf-8");
   process.env.HOME = opts.home;
   process.env.USERPROFILE = opts.home;
+  // QA-G-9: the profile dirs follow USERPROFILE, so Windows PowerShell (the orphan sweeper) finds its
+  // LocalAppData instead of writing its module analysis cache relative to its cwd.
+  process.env.APPDATA = join(opts.home, "AppData", "Roaming");
+  process.env.LOCALAPPDATA = join(opts.home, "AppData", "Local");
+  mkdirSync(process.env.APPDATA, { recursive: true });
+  mkdirSync(process.env.LOCALAPPDATA, { recursive: true });
   process.env.MODEL_ROUTER_ENFORCE = "1";
   process.env.MODEL_ROUTER_VERIFIED_DELEGATE = "1";
   invalidateConfigCache();

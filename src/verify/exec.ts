@@ -37,7 +37,7 @@
  *   reaches that).
  */
 import { execFile, spawn, spawnSync, type ChildProcess } from "node:child_process";
-import { constants as osConstants, setPriority } from "node:os";
+import { constants as osConstants, setPriority, tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ArgvSeam, ExecOptions, ExecSeam } from "./types";
 
@@ -627,6 +627,9 @@ function armSweeper(pid: number, spawnedAt: number, exitedAt: number): Sweeper {
   let ps: ChildProcess | undefined;
   try {
     ps = spawn(powershell, ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], {
+      // QA-G-9: not the host's cwd (the user's project). PowerShell writes its
+      // module analysis cache relative to its cwd when LocalAppData is missing.
+      cwd: tmpdir(),
       windowsHide: true,
       stdio: ["pipe", "pipe", "ignore"],
     });

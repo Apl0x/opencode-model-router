@@ -19,6 +19,8 @@ const state = vi.hoisted(() => ({
   standIn: { script: "", args: [] as string[] },
   /** PID of the last stand-in started. */
   standInPid: 0,
+  /** The cwd the last stand-in was spawned with (QA-G-9). */
+  standInCwd: undefined as unknown,
   /** The last direct child spawned through exec.ts (not a stand-in). */
   lastChild: undefined as ChildProcess | undefined,
   /** Make the next `taskkill` report a failure without running it. */
@@ -31,6 +33,7 @@ vi.mock("node:child_process", async (importOriginal) => {
     if (file === STAND_IN) {
       const standIn = real.spawn(process.execPath, ["-e", state.standIn.script, ...state.standIn.args], options);
       state.standInPid = standIn.pid ?? 0;
+      state.standInCwd = options.cwd;
       return standIn;
     }
     const child = real.spawn(file, args, options);
@@ -193,6 +196,8 @@ describe.runIf(isWin)("orphan sweep branches (Windows-only: the sweeper runs onl
     try {
       await t.childExited();
       expect(state.standInPid).toBeGreaterThan(0);
+      // QA-G-9: never the host's cwd (the user's project).
+      expect(state.standInCwd).toBe(tmpdir());
       writeFileSync(join(t.dir, "release"), "");
       expect(await pending).toEqual({ code: 0, stdout: "", stderr: "", timedOut: false });
       // dispose() ended the hung stand-in rather than leaving it for 60 s.
