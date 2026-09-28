@@ -13,6 +13,7 @@
  * The pure helpers below (descendantsOf, peak, seen, priorityViolations) work on the snapshots.
  */
 import { spawn, type ChildProcess } from "node:child_process";
+import { realpathSync } from "node:fs";
 import os from "node:os";
 import { join } from "node:path";
 
@@ -40,6 +41,20 @@ const WIN_LOW_PRIORITY_MAX = 6;
 /** POSIX nice at or above this is low priority. */
 const POSIX_LOW_NICE_MIN = 10;
 const STOP_WAIT_MS = 3000;
+
+/**
+ * QA-3.1-5: the median snapshot interval a test may accept. The plan's 100 ms is reachable on
+ * POSIX (`ps`; CI 107-112 ms, the sleep adds to the query) but not on win32: one Get-CimInstance
+ * Win32_Process query costs ~250 ms on an idle 16-core Windows 11 host with ~550 processes (10
+ * queries measured: 250 ms full, 240 ms with a `ProcessId=` WQL filter, 244 ms without
+ * CommandLine), so a WQL filter does not buy rate, and a `Name`/`CreationDate` filter would also
+ * drop parent-chain processes (cmd.exe, uv, python, git, the long-lived test process) and orphans
+ * started before the sampler. Under 20 parallel dispatches the median measured 291-429 ms. This is
+ * the documented deviation: a worker that lives shorter than one interval can be missed, so counts
+ * are lower bounds (lifetimePeak narrows that), and the zero-runner checks also rely on the
+ * runner probes (fixture-repo.ts installRunnerProbe), which do not sample.
+ */
+export const SAMPLER_MEDIAN_INTERVAL_MAX_MS = process.platform === "win32" ? 500 : 250;
 
 /**
  * The real profile and temp dirs, captured when this module loads (before any plugin instance
@@ -423,6 +438,97 @@ export function workerCensus(
     }
     return { snapshot, workers, retiring, running: workers.length - retiring.size, sightings };
   });
+}
+
+/** Case-insensitive on win32 (paths there are), case-sensitive elsewhere. */
+function foldCase(s: string): string {
+  return process.platform === "win32" ? s.toLowerCase() : s;
+}
+
+/**
+ * Every spelling of `dir` a command line may carry: raw and realpath (an 8.3 short os.tmpdir()
+ * vs its long form), each with `\` and with `/` separators, case-folded on win32 (QA-3.1-4).
+ */
+export function pathSpellings(dir: string): string[] {
+  const forms = [dir];
+  try {
+    forms.push(realpathSync.native(dir));
+  } catch (e) {
+    // A dir that does not exist (yet) has only its raw spelling.
+    if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e;
+  }
+  const out = new Set<string>();
+  for (const f of forms) {
+    out.add(foldCase(f.replace(/\//g, "\\")));
+    out.add(foldCase(f.replace(/\\/g, "/")));
+  }
+  return [...out];
+}
+
+/** Whether `text` mentions any of `spellings` (pathSpellings), compared as-is and with separators unified to `/`. */
+export function mentionsAny(text: string, spellings: readonly string[]): boolean {
+  const raw = foldCase(text);
+  const slashed = raw.replace(/\\/g, "/");
+  return spellings.some(s => raw.includes(s) || slashed.includes(s.replace(/\\/g, "/")));
+}
+
+/** Matching processes anywhere on the machine (not only descendants), distinct by workerKey, as first sighted. */
+export function seenAnywhere(snapshots: Snapshot[], exclude: number[], predicate: (p: ProcSample) => boolean): ProcSample[] {
+  const skip = new Set(exclude);
+  const first = new Map<string, ProcSample>();
+  for (const s of snapshots) {
+    for (const p of s.procs) {
+      if (!skip.has(p.pid) && !first.has(workerKey(p)) && predicate(p)) first.set(workerKey(p), p);
+    }
+  }
+  return [...first.values()];
+}
+
+/** The gaps between consecutive snapshots, in ms (QA-3.1-5: the sampler's real rate). */
+export function snapshotIntervals(snapshots: Snapshot[]): number[] {
+  return snapshots.slice(1).map((s, i) => s.t - snapshots[i].t);
+}
+
+/** The median of `values` (NaN when empty). */
+export function median(values: number[]): number {
+  if (values.length === 0) return Number.NaN;
+  const sorted = [...values].sort((a, b) => a - b);
+  const mid = Math.floor(sorted.length / 2);
+  return sorted.length % 2 === 1 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
+}
+
+/**
+ * QA-3.1-5: the largest number of matching descendants alive at once, from each process's
+ * lifetime rather than per-snapshot counts. A lifetime runs from its creation time (win32; POSIX
+ * samples have none, so the first sighting) to its last sighting. Two processes sighted in
+ * different snapshots still overlap when one was created before the other was last seen, which a
+ * per-snapshot count misses when the sampler's interval is longer than a short worker's life. It
+ * is still a lower bound for a process created and gone between two snapshots.
+ */
+export function lifetimePeak(snapshots: Snapshot[], rootPid: number, exclude: number[], predicate: (p: ProcSample) => boolean): number {
+  const lives = new Map<string, { start: number; end: number }>();
+  for (const s of snapshots) {
+    for (const p of descendantsOf(s, rootPid, exclude)) {
+      if (!predicate(p)) continue;
+      const k = workerKey(p);
+      const x = lives.get(k);
+      if (x === undefined) lives.set(k, { start: Math.min(p.createdMs ?? s.t, s.t), end: s.t });
+      else x.end = s.t;
+    }
+  }
+  const events = [...lives.values()].flatMap(l => [
+    { t: l.start, d: 1 },
+    { t: l.end, d: -1 },
+  ]);
+  // Starts before ends at the same instant: both were alive then.
+  events.sort((a, b) => a.t - b.t || b.d - a.d);
+  let alive = 0;
+  let max = 0;
+  for (const e of events) {
+    alive += e.d;
+    max = Math.max(max, alive);
+  }
+  return max;
 }
 
 /** The largest number of running workers (workerCensus) in any snapshot. */

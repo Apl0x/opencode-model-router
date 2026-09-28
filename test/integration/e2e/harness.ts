@@ -5,7 +5,7 @@
  * test/integration/router-verify-tool.test.ts `makePlugin()`.
  */
 import { mkdirSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { dirname, isAbsolute, join } from "node:path";
 import ModelRouterPlugin from "../../../src/index";
 import { invalidateConfigCache } from "../../../src/router/config";
 
@@ -28,6 +28,14 @@ export interface E2ETaskParams {
   subagentType?: string /* default "medium" */;
   produce?: () => Promise<void>;
   output?: string;
+  /**
+   * QA-3.1-15 (d): files the producer edits, reported as the child session's own `edit` tool
+   * calls. The harness fires `tool.execute.before("edit")` for each before `produce` runs and
+   * `tool.execute.after("edit")` after it returns, from the dispatch's child session
+   * (`child-<callID>`, the id the task result's metadata names), as opencode does for a real
+   * subagent. Absolute paths or paths relative to the plugin directory.
+   */
+  childEdits?: string[];
 }
 
 export interface E2ETaskResult {
@@ -35,7 +43,11 @@ export interface E2ETaskResult {
   beforeMs: number;
   afterMs: number;
   produceStartedAt: number;
+  /** Date.now() right before the after hook was called (QA-3.1-9: the gate's window). */
+  afterStartedAt: number;
   returnedAt: number;
+  /** The child session id the task result names (and `childEdits` are fired from). */
+  childSessionID: string;
 }
 
 export interface E2ECalls {
@@ -56,9 +68,12 @@ export interface E2EPlugin {
 
 const ENV_KEYS = ["HOME", "USERPROFILE", "MODEL_ROUTER_ENFORCE", "MODEL_ROUTER_VERIFIED_DELEGATE"] as const;
 
-/** Ids starting with `orch` are proven root orchestrators; every other id is a child of one. */
-function sessionInfo(id: string): { id: string; parentID?: string } {
-  return id.startsWith("orch") ? { id } : { id, parentID: "orch" };
+/**
+ * Ids starting with `orch` are proven root orchestrators; every other id is a child of one: of the
+ * session that dispatched it when the harness created it (a task's `child-<callID>`), else `orch`.
+ */
+function sessionInfo(id: string, parents: ReadonlyMap<string, string>): { id: string; parentID?: string } {
+  return id.startsWith("orch") ? { id } : { id, parentID: parents.get(id) ?? "orch" };
 }
 
 export async function createE2EPlugin(opts: {
@@ -88,6 +103,7 @@ export async function createE2EPlugin(opts: {
   const logs: unknown[] = [];
   const calls: E2ECalls = { create: [], prompt: [], abort: [], delete: [] };
   let created = 0;
+  const parents = new Map<string, string>();
   const ctx = {
     directory: opts.directory,
     worktree: opts.directory,
@@ -102,7 +118,7 @@ export async function createE2EPlugin(opts: {
         },
       },
       session: {
-        get: async (req: { path: { id: string } }) => ({ data: sessionInfo(req.path.id) }),
+        get: async (req: { path: { id: string } }) => ({ data: sessionInfo(req.path.id, parents) }),
         create: async (req: unknown) => {
           calls.create.push(req);
           created++;
@@ -147,13 +163,21 @@ export async function createE2EPlugin(opts: {
       const t0 = performance.now();
       await hooks["tool.execute.before"](input, before);
       const beforeMs = performance.now() - t0;
+      const childSessionID = `child-${p.callID}`;
+      parents.set(childSessionID, p.sessionID);
       const produceStartedAt = Date.now();
+      const edits = (p.childEdits ?? []).map((f, i) => ({
+        input: { tool: "edit", sessionID: childSessionID, callID: `${p.callID}-edit-${i + 1}`, args: { filePath: isAbsolute(f) ? f : join(opts.directory, f) } },
+      }));
+      for (const e of edits) await hooks["tool.execute.before"](e.input, { args: { ...e.input.args } });
       if (p.produce !== undefined) await p.produce();
-      const output = { output: p.output ?? "<task_result>\nDONE\n</task_result>", metadata: { sessionId: `child-${p.callID}` } };
+      for (const e of edits) await hooks["tool.execute.after"](e.input, { output: "Edit applied successfully.", metadata: {} });
+      const output = { output: p.output ?? "<task_result>\nDONE\n</task_result>", metadata: { sessionId: childSessionID } };
+      const afterStartedAt = Date.now();
       const t1 = performance.now();
       await hooks["tool.execute.after"]({ ...input, args: before.args }, output);
       const afterMs = performance.now() - t1;
-      return { output: output.output, beforeMs, afterMs, produceStartedAt, returnedAt: Date.now() };
+      return { output: output.output, beforeMs, afterMs, produceStartedAt, afterStartedAt, returnedAt: Date.now(), childSessionID };
     },
     async routerVerify(args, toolCtx): Promise<string> {
       const t = hooks.tool?.router_verify;
