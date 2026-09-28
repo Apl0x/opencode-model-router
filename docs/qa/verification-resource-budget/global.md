@@ -415,3 +415,142 @@ for acceptance.
 
 - QA-G-10: resolved in 29ca663 (see Resolution lines).
 - QA-G-11, -12, -13, -14 accepted per owner rule (post-round-2: only major/critical are fixed).
+
+---
+
+## QA-G-10 fix verification
+
+**Scope.** Only 29ca663: the G.8 existing-module search in `src/verify/runner.ts` (`git grep -F -w <name>`, plus
+`keepImporters` for a module named like the regular package that holds it) and `wiring.ts` dropping `-E`. Base
+`vrb/p32` at 5bdabce. The goal was to find a **miss**: a test that imports or uses the changed module, is not
+selected, and the result is not S6. Over-inclusion is acceptable.
+
+**Verdict: VERIFIED.** No miss is attributable to 29ca663. Every wrapped, continued, CRLF and CR layout selects
+its test. The `app/app.py` drop step kept every file that reaches `app.app` in every spelling tried below. It dropped only files whose `app` is the package head of a longer path, which are the documented
+indirect residuals. The attack also found three **minor** misses on the general path (QA-G-15 … QA-G-17). All
+three predate 29ca663 and lie outside its diff. Under the owner rule they are recorded, not fixed.
+
+### Method
+
+- Unit tests: `npx vitest run --maxWorkers=2 test/unit/runner.test.ts test/unit/baseline-wiring.test.ts` →
+  `Test Files  2 passed (2)` / `Tests  795 passed (795)`.
+- E2E: `$env:RUN_VERIFY_E2E='1'; npx vitest run --maxWorkers=1 test/integration/verify-resource-budget.test.ts -t pytest`
+  → `Test Files  1 passed (1)` / `Tests  13 passed | 28 skipped (41)`. The QA-G-10 repro printed
+  `[router ⚠ UNVERIFIED: deterministic]` and `observed failures: tests/test_combo.py::test_combo02`. Its argv
+  ended `"--","…\\tests\\test_combo.py","…\\tests\\test_mod02_1.py"`.
+- Scratch harness (in `%TEMP%`, deleted afterwards). It ran this commit's real `planScopedRun` over real git
+  repositories (Git for Windows 2.51.0), using the wiring's exact argv:
+  - `git --no-optional-locks -C <root> grep -l -z -F [-w] --untracked -e <name> -- <globs>`;
+  - `ls-files -z --cached --others --exclude-standard`.
+
+  The fs seam was the real worktree (utf8 `readFile`, bigint `stat`).
+  - Base fixture: `pyproject.toml` with `testpaths = ["tests"]`, `app/__init__.py`, `app/app.py`, `app/mod01.py`,
+    `app/mod02.py`, `tests/test_app.py` (`from app.app import f`) and `tests/test_mod01.py` (`from app.mod01 import X`).
+  - `tests/test_app.py` keeps the plan a spec, so a dropped importer shows as a miss rather than as S6.
+  - Each case adds `tests/test_atk.py` unless stated. 67 cases ran: 64 matched expectations, and the 3 misses
+    became QA-G-15 and QA-G-16.
+  - A second run covered deleted modules. Its `app/index.py` case became QA-G-17.
+- Real Python (uv 0.11.7, `uv run --no-project --with pytest python -m pytest`) checked each spelling that
+  Python accepts.
+- git 2.43.0 (WSL, `LC_ALL=C.UTF-8` and `LC_ALL=C`) checked the `-w` retry cases.
+
+### Attempts: the drop step (`app/app.py` beside `app/__init__.py`)
+
+These files are **kept (selected)**. Each harness line read
+`SPEC inputs=["tests/test_app.py","tests/test_atk.py"]`, or the file's own path for A40–A43.
+
+| Group | Test file content |
+|---|---|
+| Basic forms | `from app.app import f`<br>`import app.app as a`<br>`from app import app`<br>`import app.mod01 as m, app.app as n`<br>`from app.mod01 import X as app` |
+| Strings | `importlib.import_module("app.app")` after `from app.mod01 import X`<br>`__import__("app.app")`<br>`@patch('app.app.f')`<br>a docstring naming the app<br>a comment `# see app.app` |
+| Line ends and whitespace | CRLF: `from app.mod01 import X\r\nfrom app.app import f`<br>CR only: `…\rimport app.app\r`<br>tabs throughout |
+| Semicolons | `from app.mod01 import X; from app.app import f`<br>`import app.mod01; import app.app`<br>`import app.mod01 ;import app.app as a` |
+| Backslash continuations | `import app.mod01, \` / `    app.app`<br>`from app.\` / `app import f` (inside the dotted name)<br>`from \` / `    app.app import f` |
+| Parenthesised imports | `from app.mod01 import (` / `X,` / `)` followed by any of:<br>• `import app.app`<br>• a CRLF `from app.app import (` / `f,` / `)`<br>• `app.app.f()` |
+| Unusual statement forms | `from app . app import f` (Python accepts it)<br>`from app.app import *`<br>`if True: from app.app import f`<br>`exec("""` / `from app.app import f` / `""")` |
+| Oversized files | over 1 MiB (`from app.mod01 import X` + 1 MiB + 10 of `#`), both with and without a later `import app.app` |
+| Over-inclusions | BOM before `from app.mod01 import X`<br>form feed before `from` |
+| Relative imports | `tests/__init__.py` + `from .app import f`<br>`app/tests/test_in.py`: `from ..app import f` and `from .. import app`<br>`app/test_in.py`: `from .app import f` and `from . import app` |
+| Worktree and git state | `core.autocrlf=true` checkout of a parenthesised `from app.app import (`<br>an untracked `from app.app import (` / `f,` / `)` |
+
+These files are **not selected, as expected**:
+
+| Case | Setup | Harness output |
+|---|---|---|
+| A00 (control) | `from app.mod01 import X` | `SPEC inputs=["tests/test_app.py"]` |
+| A21 | `from ..app.mod01 import X` | not selected |
+| A35 | 25 `from app.mod01 import X` decoys | `SPEC inputs=["tests/test_app.py"]`, not `stem-too-common`: the limit is counted after the drop |
+
+A conftest.py naming `app.app` (`from app.app import (\r\n    f,\r\n)`) gives
+`S6 unmapped-module: changed module app/app.py is referenced by tests/conftest.py: the tests its fixtures reach cannot be mapped`.
+
+These **residuals** are documented as indirect imports and are recorded here only. Each harness output was
+`SPEC inputs=["tests/test_app.py"]`, so the test is not selected.
+
+| Case | Setup |
+|---|---|
+| A22 | `app/__init__.py` holds `from .app import f`, and the test holds `from app.mod01 import X` |
+| A23 | `app/mod01.py` holds `from app.app import f`, and the test holds `from app.mod01 import X` |
+| A33 | a conftest.py holding only `from app.mod01 import X` is dropped, with no S6 |
+
+A22 carries little risk:
+
+- An import-time break of `app/app.py` fails every selected direct importer too.
+- `from app import <re-export>` is kept, since its `app` heads no longer path.
+- The only thing lost is behaviour reached through another submodule, which is the general indirect residual.
+
+The line parse drops a file only when an `app` occurrence is followed by `.segment` on a line that starts with
+`from`/`import`. The second segment of `app.app` always survives. No attempted form hides it: `;`, a
+continuation inside the path, spaces around the dot, a string or a comment. A dropped file therefore has no
+spelling of `app.app` except through indirection or a six-style `app/` on `sys.path`, as VERIFICATION.md already
+states.
+
+### Attempts: the general path (`git grep -F -w <name>`)
+
+| Case | Test file content or setup | Result |
+|---|---|---|
+| G02 | `from app import mod02_helpers, mod02` | selected: git's `-w` retries after the failed first occurrence |
+| G01 | `mod02_helpers` only | not selected (a different module) |
+| G03 | `def test_mod02_café(): assert app.mod02.value02() == 2` | selected on git 2.51 (Windows) and git 2.43 (Linux, UTF-8 and C locales). The retry stops mid-UTF-8 sequence and still finds `app.mod02`: `tests/test_crlf.py tests/test_g02.py tests/test_g03.py tests/test_g03b.py exit=0` |
+| G03b | `xmod02é = 1; import app.mod02` | selected, same run as G03 |
+| G04 | `app/módulo.py`, test `from app import módulo` | selected |
+| G11 | keyword stem `app/class.py`, test `import_module("app.class")` | selected |
+| G11b | soft keyword stem `app/match.py` | selected |
+| G05 | `core.autocrlf=true` isort grid | selected |
+| G06 | untracked importer | selected |
+| G08 | `extra/test_x.py` outside `testpaths` | not selected, correct because not collected |
+| G08b | the same without `testpaths` | selected |
+| G09a | exactly 20 importers | spec with 20 inputs |
+| G09b | 21 importers | `S6 stem-too-common: changed module app/mod02.py: 21 test files import it (limit 20)` |
+| G10 | conftest `from app import (mod01,\r\n    mod02)` | `S6 unmapped-module` |
+
+The S6 wording "import it" should now read "name it", as VERIFICATION.md does. This is cosmetic and gets no
+finding.
+
+**index.py.** `app/index.py` is searched as `index`, and each of these is selected:
+
+- `from app import (mod01,\r\n    index)`;
+- `import app.index as ix`;
+- `from .index import x` inside `app/`.
+
+`index/index.py` beside `index/__init__.py` behaves like `app/app.py`: `from index.index import f` is kept, and
+`from index.mod import X` is dropped. The naming change creates no miss for an existing module. The deleted
+path still has the old naming (QA-G-17).
+
+**Unreadable file.** With `icacls /deny <me>:(R)` on a tracked test file, the wiring's grep prints
+`error: failed to stat 'tests/test_locked.py': Permission denied` and exits `exit=0` without the file (see
+QA-G-16). pytest cannot read the file either, so it cannot hide a failure the change causes, unless the lock is
+transient. For `keepImporters`' own read failure, a file git read but the planner cannot is kept. The unit
+tests cover this (`a read that fails`, `a stat that fails`).
+
+### Round 3 findings
+
+| ID | Severity | Evidence | Fix |
+|---|---|---|---|
+| QA-G-15 | minor | **The content search misses a module name that is not spelled in its UTF-8 NFC bytes.** This predates the diff: every `git grep -F` version has it. Python normalises identifiers with NFKC and decodes a PEP 263 source encoding, so all three spellings below import the module, and a byte search sees none of them.<br>**Spellings** (each checked in `uv run … pytest` before the change):<br>• fullwidth `from ａｐｐ.ａｐｐ import f`;<br>• NFD `from app import módulo`, written as `mo` + U+0301;<br>• `# -*- coding: latin-1 -*-` + `from app import m\xf3dulo`.<br>**After breaking the modules**: pytest gave `FAILED tests/test_nfkc.py::test_nfkc - assert 2 == 1`, `FAILED tests/test_nfd.py::test_nfd - assert 8 == 7` and `FAILED tests/test_latin1.py::test_latin1 - assert 8 == 7`, while `git grep -F -w -e módulo` gave `exit=1`.<br>**Planner results**: A31 gave `SPEC inputs=["tests/test_app.py"]`, and G04b gave `SPEC inputs=["tests/test_módulo.py"]`. Both are false passes.<br>No editor or formatter produces these spellings. | Document it in VERIFICATION.md's residual limits: "a name spelled in a compatibility or decomposed Unicode form, or in a non-UTF-8 source encoding, is not seen". |
+| QA-G-16 | minor | **The content search skips test files git does not read, while pytest collects them.** This predates the diff: the argv is unchanged apart from `-E`.<br>**G07**: `.gitignore` holds `tests/test_local_*.py`, and `tests/test_local_x.py` imports `app.mod02` and fails. The plan was `SPEC inputs=["tests/test_ctrl.py"]`, while `uv run … pytest` collects the ignored file: `FAILED tests/test_local_x.py::test_local - assert 2 == 1`. The cause is that `--untracked` honours `.gitignore` and the other standard excludes.<br>**Unreadable file**: git reports `error: failed to stat …: Permission denied` and still exits 0, and the wiring reads only the exit code. This matters only for a transiently locked file.<br>These are local-only files that CI never runs. | Document the ignored-file residual. Optionally, treat an `error:` line on grep's stderr as S6 `search-failed`. |
+| QA-G-17 | minor | **A deleted `index.py` is still searched by its directory's name.** This predates 29ca663 and lies outside it: 29ca663 moved only the existing-module search to the module's own name.<br>**Repro** (no `testpaths`): `app/index.py` is deleted, and `app/test_in.py` holds `from .index import x`. The content search ran `grep -F "app"` and returned `SPEC inputs=["tests/test_mod01.py"]`, so the importer, which fails with ImportError, is not run.<br>**Control**: deleted `app/mod02.py` with `from .mod02 import y` gives `grep -F "mod02"` → `SPEC inputs=["app/test_in2.py"]`.<br>The miss needs importers that never contain the package name, such as relative imports inside the package. | Use the same `name` (`index`) in the deleted-module content search. |
+
+**Status after round 3:** QA-G-10 is **verified resolved**. G2 is **MET**, subject to the documented residuals and the
+three minor findings above. QA-G-15 … QA-G-17 are minor and predate 29ca663. Under the owner rule they are
+recorded for acceptance.
