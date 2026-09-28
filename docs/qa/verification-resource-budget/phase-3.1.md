@@ -913,4 +913,58 @@ Not recorded here: a full unit-suite run (this dispatch was limited to targeted 
   local-only providerID failure, Bun smoke 12/12, CI run 36366712022 12/12 jobs green with the merged
   table, local e2e 65/65, the keyed smokes' soft-pass caveat and the one hard-path keyed run). The
   keyed run's evidence file is cited as reported, not reproduced; no full unit-suite run is recorded.
+- **QA-3.1-12** (e75f20e): unit test in `tests-pass-pipeline.test.ts`. The deadline leaves 2 500 ms
+  (< `slotWaitMs`), and the busy answer arrives after 2 497 ms with `remaining()` still at 3, so
+  `deadlineCut: true` is expected. A control bounded by `slotWaitMs` expects `false`. With 9053dd8
+  reverted in `src` only: `- "deadlineCut": true, + "deadlineCut": false`, `1 failed | 118 skipped`.
+- **QA-3.1-13** (62fa758): `runner.test.ts` covers mixed testpaths `["tests", "pkg*/tests"]`, the
+  `?` and `[]` forms and the ini form. Each must keep `pkgA/tests`' importer and give no collect
+  scopes; the literal-only control keeps the bound. Mutant M7f (guard removed): `expected [
+  '/r/tests/test_m.py' ] to deeply equal [ …(3) ]`, `Tests  1 failed | 725 passed (726)`.
+- **QA-3.1-8** (533d988): `snapshotTree` spawns through a `SnapshotGit` seam. The default applies
+  exec.ts's rule when `lowPriority` is set (`nice -n 10 --` on POSIX, `PRIORITY_BELOW_NORMAL` right
+  after the spawn on Windows). The wiring passes `VerifyBudget.lowPriority` to the dispatch snapshot,
+  the gate and deferred-finish snapshot, and router_verify's snapshot. A background run is always low,
+  and an unreadable config falls back to the default (low). The capture's git already ran low
+  (QA-1.2-13). Unit tests check the seam gets `lowPriority: true` on all 7 git calls and the wiring
+  passes it; with `src` stashed: 4 failed. Local e2e after the fix: 3.1.2.b `git/cmd descendants
+  seen at normal priority=2` (was 4): `git --no-pager ls-files --stage` (snapshot) and `git
+  --no-optional-locks ls-files --stage` (capture, low since QA-1.2-13). Inferred, not proven: both
+  are the Windows window between CreateProcess and `setPriority`. **Deviation:** on Windows a
+  sampler can still see a direct git child at normal priority. The e2e assertion over every
+  descendant is not added (e2e owner).
+- **QA-3.1-2** (e1b86a9): the tree is not partitioned. The store records each dispatch's window
+  (begin to record drop) and links it with every live window, so a sibling that has ended still
+  counts. `concurrentDispatches(id, root)` counts overlapping dispatches in the same git root. A fail
+  that lists introduced failures gains `other delegations ran in this working tree concurrently (N);
+  introduced failures may come from their edits` (through `neutralizeDirectives`); the outcome stays
+  fail. This reaches the native forcing note, the delegate ladder's retry and give-up notes, and
+  router_verify, where the count is fixed at the deferred return. Tests: dispatch/wiring unit tests, a
+  plugin-level native `VERIFY:required` pair plus a lone control, and a deferred router_verify case.
+  With `src` stashed: `Tests  7 failed | 98 skipped (105)`. Local e2e 3.1.2.b printed the caveat
+  `(1)` on two rejections. Not done here: VERIFICATION.md/ADR text and the e2e stagger (owner, 3.2).
+- **QA-3.1-3** (02a9a1c). **Profile** (bun, vitest-app copy, Windows 11, 16 cores): one dispatch's
+  snapshot takes 392–420 ms (7 git processes) and its capture 464 ms (8). With 20 in parallel there
+  are 300 git processes of 130–695 ms each; per-dispatch completion is `p50=2861–2902ms` (snapshot
+  only 1194–1264, capture only 1370–1519). The cause is the number of process spawns under
+  contention, in two serial chains per dispatch. **Fix:** the snapshot and the capture run through
+  `createSharedFlight` (key: priority, `baselineTimeoutMs`, cwd). A dispatch that arrives while a run
+  is in flight waits for the next run, so a shared result is always taken after each sharer began. A
+  lone request starts synchronously (ab81633 holds). An abort ends only its own wait; a started run
+  stops once every sharer left; a queued run nobody waits for never starts. Profiled: 30 git
+  processes, `p50=997–1031ms`. Local e2e 3.1.2.f: `capture wait (beforeMs) p50=975ms p95=976ms
+  max=977ms` (was 2891/3155/3296). **Deviation:** p50 is about 1.0 s, not < 1 s. It is two
+  generations of ~0.5 s, the cost of the start-after-begin rule; recorded, not asserted (the 3.1.2.f
+  assertion is the e2e owner's). The contaminating tool is now named: a discarded capture's reason
+  reads `… before the capture resolved (tool "<name>")`, and a discarded snapshot adds `the
+  dispatch-time change baseline was discarded: tool "<name>" ran in an overlapping directory before
+  it resolved` to an unverifiable verdict (native, delegate, router_verify). Names are reduced to
+  `[A-Za-z0-9_.-]`, at most 64 characters. With `src` stashed: `Tests  19 failed | 296 passed (315)`.
+  No e2e file matched the old reason text.
+- Runs after 02a9a1c: `npm run typecheck` clean. Scoped (dispatch, wiring, tree, baseline,
+  baseline-wiring, pending, runner, tests-pass-pipeline, router-verify-tool, deferred-verification,
+  batch-, layer2-, ladder-wiring): `Test Files  13 passed (13)`, `Tests  1282 passed (1282)`.
+  `$env:RUN_VERIFY_E2E='1'; npx vitest run --maxWorkers=1 test/integration/verify-resource-budget
+  test/integration/e2e`: `Test Files  5 passed (5)`, `Tests  65 passed (65)`, `Duration  262.23s`,
+  exit 0.
 
