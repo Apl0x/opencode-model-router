@@ -967,4 +967,44 @@ Not recorded here: a full unit-suite run (this dispatch was limited to targeted 
   `$env:RUN_VERIFY_E2E='1'; npx vitest run --maxWorkers=1 test/integration/verify-resource-budget
   test/integration/e2e`: `Test Files  5 passed (5)`, `Tests  65 passed (65)`, `Duration  262.23s`,
   exit 0.
+- **QA-3.1-2, e2e part** (9cde2d4): 3.1.2.b keeps its stagger. A new test, "3.1.2.b (concurrent
+  pair)", dispatches a broken leaf (m16) and a neutral leaf (m17) at the same moment in required
+  mode, on a fresh repo. It asserts that the broken one is NOT ACCEPTED, and that the neutral one is
+  accepted or NOT ACCEPTED with `other delegations ran in this working tree concurrently`. A
+  rejection without that caveat fails the test. Local, three runs: both outputs `NOT ACCEPTED with the
+  concurrent caveat`.
+- **QA-3.1-6** (9cde2d4): `scopedRunBound` replaces the `≤ 14` check. Its comment derives the bound
+  from batch.ts. A window of n gates runs 1 scoped command when n = 1 (B5.1). When n ≥ 2 it runs at
+  most n + 1: the union (B5.4) plus one mode-B own run per member when the union fails (B7.3b), or n
+  own runs when the window splits (B5.6). Rechecks are at most one per member (B5.8, shared by B8.6).
+  The windows are not visible, and the worst split pools the gates in pairs, so scoped ≤ N + ⌊N/2⌋
+  (7 for 5 gates) and rechecks ≤ N. Runner mains are assigned to phases by creation time (first
+  sighting on POSIX), with ±250 ms at the edges. Asserted: required scoped 1..7, rechecks 1..5, 0
+  runs at the deferred gates, exactly 1 scoped run and no recheck in the `router_verify({pending:
+  true})` window, and 0 runs outside the phases. Local, three runs: `required phase scoped=3 (bound
+  7) rechecks=2 (bound 5); deferred phase=0; router_verify=1; outside the phases=0`.
+- **QA-3.1-7** (9cde2d4): `ChildConfig.verify` passes overrides to the child's plugin. 3.1.2.c gives
+  both children `maxConcurrentVerifications: 1`, so the worker bound is 2. It asserts that each child
+  ran ≥ 1 runner main, that the two children's gate windows overlapped (> 0 ms), and that at most 1
+  runner main was alive at any snapshot across both children, so one child waited. Local runs:
+  `peak runner mains alive at once (both children)=1; longest overlap of the two children's gate
+  windows=7326ms` / `9590ms` / `7566ms`, `peak workers (both children)=2 (running 2)`.
+- **QA-3.1-8, non-vacuity** (9cde2d4): the test requires ≥ 1 runner-tree process sampled with
+  `lowPriority === true` more than 250 ms after its first sighting. Local: 6, 6 and 7. git/cmd
+  descendants seen at normal priority are still reported. The test now fails on any that was more than
+  500 ms past its creation (creation time on win32, first sighting on POSIX). The test's own
+  synchronous `git reset`/`clean` between the phases is excluded (run 2 saw it at normal priority).
+  Local run 3: `seen at normal priority=2` (`git --no-pager rev-parse --show-toplevel`, `git
+  --no-pager ls-files --stage`), `more than 500ms after creation=0`.
+- **QA-3.1-17** (9cde2d4): `cappedCensus` applies `workerCensus`'s exiting-fork exemption to at most
+  1 worker per runner main per snapshot. A retiring worker beyond the cap counts as running. b and c
+  report `snapshots using the exiting-worker exemption=N (workers excused=M)`. Local, three runs: 0
+  in b and c. There is no share threshold; the cap alone limits what the exemption can hide.
+  sampler.ts is unchanged.
+- Runs after 9cde2d4: `npm run typecheck` clean. `$env:RUN_VERIFY_E2E='1'; npx vitest run
+  --maxWorkers=1 test/integration/verify-resource-budget.bound.test.ts` three times: `Test Files  1
+  passed (1)`, `Tests  5 passed (5)`, `Duration  67.92s` / `70.91s` / `69.54s`. The third run
+  includes the own-git exclusion. The worktree also held another agent's uncommitted e2e edits
+  (sampler, harness, fixture-repo, deferred test) during these runs. Sampler interval median was
+  282–306 ms.
 
