@@ -474,3 +474,84 @@ pid reuse.
   failures: test/m12-1.test.js ..."). The captures were slow enough under that load for a sibling's
   edit to land first. The worker bound, priority and scoping assertions held. Not investigated
   further. The heuristic's slack assumes an unloaded host.
+
+## CI round 2 (heads 7d59d46 and b4d001d)
+
+### Run 36359394958 (head 7d59d46)
+
+Two failures:
+
+| # | Failure | Verdict | Fix |
+|---|---------|---------|-----|
+| CI2-a | `exec.test.ts`, the deadline-after-exit test (QA-1.2-1): the holder not dead 3 s after the deadline on a loaded runner | test (G4's documented load limit) | a325320 |
+| CI2-b | coverage gate: branches below 90% for `exec.ts` (82.54%), `slot.ts` (78.01%) and `reference.ts` (79.42%) | test coverage, with one product bug found on the way | e8ee28f, bcd6639, b4d001d |
+
+- **CI2-a.** a325320 tolerates only G4's documented sweep load limit (QA-1.2-14), and only with its
+  signature: when the holder is not dead 3 s after the deadline, the test still requires it killed
+  within 18 s of its start and logs `[G4 load limit, QA-1.2-14]` with the measured delay and stderr.
+  Any other shape still fails.
+- **CI2-b, product bug (e8ee28f).** An abort in the tick between a failed spawn and its error event
+  reached `killTree` with no PID. There, `child.kill` threw `kill EINVAL` (Windows) out of the abort
+  listener. The kill is now wrapped. The same commit runs the orphan sweeper's stand-ins in-process so
+  `exec.ts`'s sweep and kill branches count toward coverage.
+- **CI2-b, coverage.** bcd6639 covers `slot.ts`'s error and edge branches through its seams (merged
+  branches 401/514 -> 505/514). b4d001d covers `reference.ts`'s error, abort and cleanup branches
+  through fake git and fs seams.
+
+### Run 36360864743 (head b4d001d)
+
+Every job passed except `test (node 20, windows-latest)`, where one test failed:
+
+```
+test/unit/slot.test.ts > slot: waiting > backoff jitter never goes below the floor nor above the cap (QA-1.4-16)
+AssertionError: expected 1 to be greater than or equal to 2
+```
+
+at `slot.test.ts:1115`, the `stamps.length` after
+`acquireSlot({ max: 1, waitMs: 300, meta }, { dir, backoffMinMs: 100, backoffMaxMs: 800, ... })`.
+With a 300 ms wait and a 100 ms floor, a loaded runner got only one attempt in.
+
+**Verdict: test defect.** The wait is now 20 s, ended by an abort signal once 3 attempts are stamped,
+so the test no longer depends on how many attempts fit in a time window. It still asserts that each
+wall-clock gap is at least its backoff step (100 ms, then 200 ms, 5 ms timer slack; load only
+lengthens a gap). It now also asserts the sleeps the loop asks for between the first and the third
+attempt, via a pass-through `setTimeout` spy: exactly `[100, 200]`, each within [floor, cap]. Locally:
+5 runs pass, 3 more pass with 14 normal-priority `node -e "for(;;){}"` processes running, and the
+whole `slot.test.ts` passes 62/62.
+
+The coverage gate on this run:
+
+```
+per-file gate: lines >= 90%, branches >= 90%
+src/verify/exec.ts           lines  96.12% (248/258)  branches  96.22% (204/212)  ok
+src/verify/runner.ts         lines  99.88% (1778/1780)  branches  97.94% (2003/2045)  ok
+src/verify/slot.ts           lines  98.46% (640/650)  branches  98.24% (505/514)  ok
+src/verify/reference.ts      lines  98.11% (624/636)  branches   98.8% (581/588)  ok
+src/verify/batch.ts          lines   98.4% (557/566)  branches  92.34% (362/392)  ok
+src/verify/directives.ts     lines    100% (59/59)  branches  91.04% (61/67)  ok
+src/verify/risk.ts           lines    100% (75/75)  branches  98.36% (120/122)  ok
+src/verify/pending.ts        lines  99.62% (532/534)  branches  93.94% (388/413)  ok
+coverage gate passed
+```
+
+### Bun smoke
+
+b246ab2 adds `test/smoke/bun-runtime.smoke.ts`, a plain Bun script that runs the real `src/verify`
+modules under Bun (opencode loads the plugin in Bun; every other test runs under Node). f5ff0c8 runs
+it in CI as the `bun-smoke` job on ubuntu and windows, with `oven-sh/setup-bun@0c5077e` (v2.2.0),
+Bun 1.3.14.
+
+Local runs:
+
+- **Windows: 12/12 pass.** The deadline kill left the tree dead 366 ms after the deadline;
+  lowPriority gave priority 6; a `.cmd` was refused and its marker file is absent; JS runners run
+  under node, not bun; the slot had one holder across 2 Bun processes; disposing a reference with a
+  junctioned `node_modules` was safe; the exit hook left the tree dead in 1 ms.
+- **WSL Linux: 11 pass, 1 skipped (Windows only).** lowPriority gave niceness 10; disposing a
+  reference with a symlinked `node_modules` was safe.
+
+### Code scanning AI findings
+
+The "Code scanning AI findings" check fails on every sha with a GitHub infrastructure error,
+`CAPIError: 400 The requested model is not supported`. It is not caused by the code: the repository
+has no `codeql.yml`, and the check is not part of the Test workflow.
