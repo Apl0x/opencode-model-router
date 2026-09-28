@@ -158,9 +158,10 @@ Each dispatch carries `VERIFY:required` or `VERIFY:deferred` (default: `defaultV
   - The orphan sweeper needs PowerShell in FullLanguage mode; under Constrained Language Mode
     (AppLocker/WDAC) it exits at once and kills nothing.
   - `taskkill` slowed by CPU saturation can leave part of a tree running.
-  - Death of opencode by an unhandled signal skips the exit hook, so in-flight runs are not killed.
   - `lowPriority` is applied just after spawn; a descendant spawned before that call (a narrow
     race) runs at normal priority.
+- **Unhandled signals (all platforms).** Death of opencode by an unhandled signal skips the exit
+  hook, so in-flight runs are not killed, on POSIX as on Windows.
 - **Deprecations.** `enforcement.verify.testBaseline` logs a once-per-process warning and maps onto
   `failureRecheck`.
 - **Bundled defaults.** The bundled `tiers.json` no longer sets `gateBudgetMs`. The key is still

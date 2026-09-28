@@ -332,14 +332,20 @@ All of these must hold:
   is not `"never"` **and** (the start-time enforcement mode is not `off` **or** the
   `delegate` tool is enabled);
 - the caller is a proven root orchestrator (a subagent cannot defer its own work);
+- on the native `task` path, the enforcement mode at dispatch time is not `off` (for
+  example after `/router enforce off`);
 - the DoD carries a `testsPass` check, and the dispatch is not a trivial dispatch with
   an inferred DoD;
 - on the `delegate` path, the producer did not error;
 - the producer changed files. Only an attributed, empty change set falls back; a change
   set that cannot be attributed still defers, with risk `high`.
 
+A DoD with a `testsPass` check defers **as a whole**: its build, lint, `run` and
+criteria checks are deferred too, and run only when the handle is verified.
+
 Otherwise the dispatch is handled as before deferred verification: the required
-(synchronous) gate, or no gate when `require` is `"never"`.
+(synchronous) gate, or no gate when `require` is `"never"` or, on the native `task`
+path, when the enforcement mode at dispatch time is `off`.
 
 When registration fails (for example a handle collision), the delegation falls
 back to the required gate. It is never marked accepted or verified by that failure.

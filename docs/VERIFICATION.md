@@ -187,7 +187,7 @@ The mode is chosen by directives in the orchestrator's dispatch prompt. A subage
 - `VERIFY:required`, or `VERIFY:deferred` (the default).
 - `VERIFY_WAIT:<n>s` or `VERIFY_WAIT:<n>ms`: `0` is allowed, and the value is capped at `baselineTimeoutMs`. A malformed value falls back to `captureWaitMs` and is logged.
 
-Deferral applies to delegations whose DoD has a `testsPass` check.
+Deferral applies to delegations whose DoD has a `testsPass` check. Such a DoD defers **as a whole**: its build, lint, `run` and criteria checks are deferred too. On the native `task` path, a dispatch made while the enforcement mode is `off` gets no gate at all. The full list of conditions is in `docs/CONFIG_REFERENCE.md` → "Which delegations defer".
 
 1. **Dispatch.** When the DoD has `testsPass` and `failureRecheck` is on, the router starts a **git-only** reference capture of the working tree. It never runs the test command at dispatch time. The dispatch waits for the capture for at most `VERIFY_WAIT` (default `captureWaitMs`), then starts the producer anyway. The capture keeps running for up to `baselineTimeoutMs`. A capture that fails or times out means "no reference". It never blocks or fails the dispatch.
 2. **Producer returns.** The deferred finish takes a git-only tree snapshot, bounded at 2 s (`DEFERRED_FINISH_MS`). From that snapshot it computes:
@@ -251,6 +251,10 @@ While a dispatch's tree snapshot or reference capture is still in flight (a `VER
 
 Residual limits: a write with no tool event (an external editor, an MCP server that writes after its call returned, the user's own `!` shell) cannot be seen by any hook. A tool that writes under a non-writing name (for example a custom tool called `lsp`) is not caught.
 
+### Process limits (all platforms)
+
+- **Unhandled signals.** Runs still in flight when opencode exits are killed from a `process.once("exit")` hook. Death by an unhandled signal (SIGTERM, SIGHUP, Ctrl-C, per the host's policy) skips that hook on every platform, POSIX process groups included, so those runs are not killed by the router.
+
 ### Windows limits
 
 - **Junction-based `node_modules` at the reference.** The reference worktree links the live tree's `node_modules` with directory junctions. A reference rerun therefore uses today's installed dependencies, not the dependencies from dispatch time. Cleanup takes care not to follow those junctions into the live tree.
@@ -258,7 +262,6 @@ Residual limits: a write with no tool event (an external editor, an MCP server t
 - **Orphan processes.** Abort kills the process tree of the run. A descendant whose parent died before it was pinned, such as a detached grandchild of a short-lived middle process, cannot be attributed safely and is **not** killed. The run still resolves within the 2 s kill grace (`KILL_GRACE_MS`), and the report notes any force-closed output streams.
 - **Orphan sweep needs FullLanguage PowerShell.** The sweeper runs Windows PowerShell 5.1 and needs FullLanguage mode. Under Constrained Language Mode (AppLocker/WDAC) it exits at once and kills nothing; the run appends `[orphan sweep unavailable: <reason>]` to stderr if it has not settled yet.
 - **`taskkill` under CPU saturation.** A load that slows `taskkill /T` past its time limit can leave part of a tree running.
-- **Unhandled signals.** Runs still in flight when opencode exits are killed from a `process.once("exit")` hook. Death by an unhandled signal (SIGTERM, SIGHUP, Ctrl-C, per the host's policy) skips that hook, so those runs are not killed by the router.
 - **Low priority is applied after spawn.** On Windows, `lowPriority` lowers the direct child right after it is spawned; descendants inherit the class when created. Anything the child spawns before that call runs at normal priority. The window is tiny, but it is not a guarantee.
 
 ## Checker (Independent Grader) Verifier
