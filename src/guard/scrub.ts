@@ -10,7 +10,6 @@ const TOKEN_PATTERNS: RegExp[] = [
   /\bxox[baprs]-[A-Za-z0-9\-]{10,}/g,     // Slack
   /\beyJ[A-Za-z0-9._\-]{20,}/g,           // JWT (header starts eyJ)
   /\bBearer\s+[A-Za-z0-9._\-]+/gi,        // bearer tokens
-  /\bBasic[ \t]+[A-Za-z0-9+/]+={0,2}(?![A-Za-z0-9+/=])/gi, // Basic credentials
 ];
 
 /**

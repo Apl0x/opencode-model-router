@@ -46,6 +46,13 @@ function fakeClient(over: Record<string, any> = {}) {
   };
 }
 
+function respondToPrompt(client: ReturnType<typeof fakeClient>, response: any): void {
+  client.session.prompt = async (args: any) => {
+    client.calls.push(["prompt", args]);
+    return response;
+  };
+}
+
 describe("extractAssistantText", () => {
   it("joins the text parts", () => {
     expect(
@@ -94,30 +101,27 @@ describe("dispatchGrader", () => {
 
   // The dispose lives in a finally; a failing prompt must not leak the session.
   it("still disposes when the prompt throws", async () => {
-    const client = fakeClient({
-      prompt: async () => {
-        throw new Error("boom");
-      },
-    });
+    const client = fakeClient();
+    client.session.prompt = async (args: any) => {
+      client.calls.push(["prompt", args]);
+      throw new Error("boom");
+    };
     const w = createVerificationWiring({ client, directory: "/d", getConfig: () => cfg() });
     await expect(
       w.dispatchGrader({ tier: "fast", system: "s", prompt: "p" }),
     ).rejects.toThrow("boom");
-    expect(client.calls.map((c) => c[0])).toContain("delete");
+    expect(client.calls.map((c) => c[0])).toEqual(["create", "prompt", "abort", "delete"]);
   });
 
   it("reports a nested grader response error and disposes the session", async () => {
     const client = fakeClient();
-    client.session.prompt = async (args: any) => {
-      client.calls.push(["prompt", args]);
-      return {
-        data: {
-          info: { error: { name: "APIError", data: { message: "request failed api_key=supersecret", statusCode: 400 } } },
-          parts: [],
-        },
-        response: { status: 200 },
-      };
-    };
+    respondToPrompt(client, {
+      data: {
+        info: { error: { name: "APIError", data: { message: "api_key=supersecret Authorization: Basic dXNlcjpwYXNz password=anothersecret", statusCode: 400 } } },
+        parts: [],
+      },
+      response: { status: 200 },
+    });
     const w = createVerificationWiring({ client, directory: "/d", getConfig: () => cfg() });
 
     let message = "";
@@ -126,46 +130,60 @@ describe("dispatchGrader", () => {
     } catch (error) {
       message = (error as Error).message;
     }
-    expect(message).toBe("grader prompt failed (400): request failed api_key=[REDACTED]");
-    expect(message).not.toContain("supersecret");
+    expect(message).toBe("grader prompt failed (400): APIError");
+    for (const credential of ["supersecret", "dXNlcjpwYXNz", "anothersecret"]) {
+      expect(message).not.toContain(credential);
+    }
     expect(client.calls.map((c) => c[0])).toEqual(["create", "prompt", "abort", "delete"]);
   });
 
   it("reports a top-level grader response error with a failing HTTP status", async () => {
-    const client = fakeClient({
-      prompt: async () => ({ error: { message: "request failed" }, response: { status: 503 } }),
-    });
+    const client = fakeClient();
+    respondToPrompt(client, { error: { name: "UnknownError", message: "untrusted free-form text" }, response: { status: 500 } });
     const w = createVerificationWiring({ client, directory: "/d", getConfig: () => cfg() });
 
     await expect(w.dispatchGrader({ tier: "fast", system: "s", prompt: "p" }))
-      .rejects.toThrow("grader prompt failed (503): request failed");
+      .rejects.toThrow("grader prompt failed (500): UnknownError");
+    expect(client.calls.map((c) => c[0])).toEqual(["create", "prompt", "abort", "delete"]);
   });
 
   it("rejects a failing HTTP response even when its text looks like a passing verdict", async () => {
-    const client = fakeClient({
-      prompt: async () => ({
-        data: { parts: [{ type: "text", text: '{"pass":true,"reasons":[]}' }] },
-        response: { status: 500 },
-      }),
+    const client = fakeClient();
+    respondToPrompt(client, {
+      data: { parts: [{ type: "text", text: '{"pass":true,"reasons":[]}' }] },
+      response: { status: 500 },
     });
     const w = createVerificationWiring({ client, directory: "/d", getConfig: () => cfg() });
 
     await expect(w.dispatchGrader({ tier: "fast", system: "s", prompt: "p" }))
-      .rejects.toThrow("grader prompt failed (500): unknown SDK error");
-    expect(client.calls.map((c) => c[0])).toEqual(["create", "abort", "delete"]);
+      .rejects.toThrow("grader prompt failed (500): SDK error");
+    expect(client.calls.map((c) => c[0])).toEqual(["create", "prompt", "abort", "delete"]);
   });
 
   it("prefers a failing HTTP status over a conflicting nested error status", async () => {
-    const client = fakeClient({
-      prompt: async () => ({
-        data: { info: { error: { data: { statusCode: 400, message: "request failed" } } }, parts: [] },
-        response: { status: 503 },
-      }),
+    const client = fakeClient();
+    respondToPrompt(client, {
+      data: { info: { error: { name: "APIError", data: { statusCode: 400, message: "request failed" } } }, parts: [] },
+      response: { status: 503 },
     });
     const w = createVerificationWiring({ client, directory: "/d", getConfig: () => cfg() });
 
     await expect(w.dispatchGrader({ tier: "fast", system: "s", prompt: "p" }))
-      .rejects.toThrow("grader prompt failed (503): request failed");
+      .rejects.toThrow("grader prompt failed (503): APIError");
+    expect(client.calls.map((c) => c[0])).toEqual(["create", "prompt", "abort", "delete"]);
+  });
+
+  it("uses a safe fallback for an invalid error name", async () => {
+    const client = fakeClient();
+    respondToPrompt(client, {
+      error: { name: "Bad Error\napi_key=supersecret", message: "Authorization: Basic dXNlcjpwYXNz" },
+      response: { status: 400 },
+    });
+    const w = createVerificationWiring({ client, directory: "/d", getConfig: () => cfg() });
+
+    await expect(w.dispatchGrader({ tier: "fast", system: "s", prompt: "p" }))
+      .rejects.toThrow(new Error("grader prompt failed (400): SDK error"));
+    expect(client.calls.map((c) => c[0])).toEqual(["create", "prompt", "abort", "delete"]);
   });
 
   it("tracks the session as a grader only while it runs", async () => {
