@@ -106,6 +106,41 @@ describe("dispatchGrader", () => {
     expect(client.calls.map((c) => c[0])).toContain("delete");
   });
 
+  it("reports a nested grader response error and disposes the session", async () => {
+    const client = fakeClient();
+    client.session.prompt = async (args: any) => {
+      client.calls.push(["prompt", args]);
+      return {
+        data: {
+          info: { error: { name: "APIError", data: { message: "request failed api_key=supersecret", statusCode: 400 } } },
+          parts: [],
+        },
+        response: { status: 200 },
+      };
+    };
+    const w = createVerificationWiring({ client, directory: "/d", getConfig: () => cfg() });
+
+    let message = "";
+    try {
+      await w.dispatchGrader({ tier: "fast", system: "s", prompt: "p" });
+    } catch (error) {
+      message = (error as Error).message;
+    }
+    expect(message).toBe("grader prompt failed (400): request failed api_key=[REDACTED]");
+    expect(message).not.toContain("supersecret");
+    expect(client.calls.map((c) => c[0])).toEqual(["create", "prompt", "abort", "delete"]);
+  });
+
+  it("reports a top-level grader response error with a failing HTTP status", async () => {
+    const client = fakeClient({
+      prompt: async () => ({ error: { message: "request failed" }, response: { status: 503 } }),
+    });
+    const w = createVerificationWiring({ client, directory: "/d", getConfig: () => cfg() });
+
+    await expect(w.dispatchGrader({ tier: "fast", system: "s", prompt: "p" }))
+      .rejects.toThrow("grader prompt failed (503): request failed");
+  });
+
   it("tracks the session as a grader only while it runs", async () => {
     // Hold the prompt open so the in-flight window is observable; the session is
     // not registered until session.create has resolved.

@@ -123,6 +123,29 @@ export function extractAssistantText(res: any): string {
     .join("\n");
 }
 
+function graderPromptResponseError(res: unknown): Error | undefined {
+  if (typeof res !== "object" || res === null) return undefined;
+  const envelope = res as {
+    error?: unknown;
+    data?: { info?: { error?: unknown } };
+    response?: { status?: unknown };
+  };
+  const error = envelope.data?.info?.error ?? envelope.error;
+  if (error == null) return undefined;
+  const detail = typeof error === "object" ? error as {
+    data?: { statusCode?: unknown; message?: unknown };
+    message?: unknown;
+  } : undefined;
+  const status = typeof detail?.data?.statusCode === "number"
+    ? detail.data.statusCode
+    : typeof envelope.response?.status === "number" && envelope.response.status >= 400
+      ? envelope.response.status
+      : undefined;
+  const message = typeof detail?.data?.message === "string" ? detail.data.message
+    : typeof detail?.message === "string" ? detail.message : "unknown SDK error";
+  return new Error(scrubText(`grader prompt failed${status === undefined ? "" : ` (${status})`}: ${message}`));
+}
+
 /** P0 (deterministic.ts header, T2): what a gate needs from its dispatch. */
 export interface PreparedVerification {
   /**
@@ -1208,6 +1231,8 @@ export function createVerificationWiring(deps: {
         graderTimeoutMs(req.tier, cfg.enforcement?.verify?.graderTimeoutMs),
         "grader prompt",
       );
+      const responseError = graderPromptResponseError(res);
+      if (responseError) throw responseError;
       return { sessionID: sid, text: extractAssistantText(res) };
     } finally {
       graderSessions.delete(sid);
