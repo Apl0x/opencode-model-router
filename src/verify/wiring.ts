@@ -137,7 +137,7 @@ function graderPromptResponseError(res: unknown): Error | undefined {
   const detail = typeof error === "object" && error !== null ? error as {
     data?: { statusCode?: unknown };
   } : undefined;
-  const status = httpStatus ?? (typeof detail?.data?.statusCode === "number"
+  const status = httpStatus ?? (typeof detail?.data?.statusCode === "number" && Number.isFinite(detail.data.statusCode)
     ? detail.data.statusCode : undefined);
   return new Error(`grader prompt failed${status === undefined ? "" : ` (${status})`}: SDK error`);
 }
