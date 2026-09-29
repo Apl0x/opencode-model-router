@@ -131,10 +131,12 @@ function graderPromptResponseError(res: unknown): Error | undefined {
     response?: { status?: unknown };
   };
   const error = envelope.data?.info?.error ?? envelope.error;
-  const httpStatus = typeof envelope.response?.status === "number"
-    && Number.isFinite(envelope.response.status) && envelope.response.status >= 400
-    ? envelope.response.status : undefined;
-  if (error == null && httpStatus === undefined) return undefined;
+  const responseStatus = envelope.response?.status;
+  const malformedStatus = typeof responseStatus === "number" && !Number.isFinite(responseStatus);
+  const httpStatus = typeof responseStatus === "number"
+    && Number.isFinite(responseStatus) && responseStatus >= 400
+    ? responseStatus : undefined;
+  if (error == null && httpStatus === undefined && !malformedStatus) return undefined;
   const detail = typeof error === "object" && error !== null ? error as {
     data?: { statusCode?: unknown };
   } : undefined;

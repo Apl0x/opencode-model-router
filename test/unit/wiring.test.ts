@@ -230,6 +230,22 @@ describe("dispatchGrader", () => {
     },
   );
 
+  it.each([Number.NaN, Number.POSITIVE_INFINITY])(
+    "rejects a status-only malformed HTTP response %s before accepting its text",
+    async (status) => {
+      const client = fakeClient();
+      respondToPrompt(client, {
+        data: { parts: [{ type: "text", text: '{"pass":true,"reasons":[]}' }] },
+        response: { status },
+      });
+      const w = createVerificationWiring({ client, directory: "/d", getConfig: () => cfg() });
+
+      await expect(w.dispatchGrader({ tier: "fast", system: "s", prompt: "p" }))
+        .rejects.toThrow(new Error("grader prompt failed: SDK error"));
+      expect(client.calls.map((c) => c[0])).toEqual(["create", "prompt", "abort", "delete"]);
+    },
+  );
+
   it("tracks the session as a grader only while it runs", async () => {
     // Hold the prompt open so the in-flight window is observable; the session is
     // not registered until session.create has resolved.
