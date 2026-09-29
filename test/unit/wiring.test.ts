@@ -214,6 +214,22 @@ describe("dispatchGrader", () => {
     },
   );
 
+  it.each([-1, 99, 200.5, 600])(
+    "omits out-of-domain nested error status %s",
+    async (statusCode) => {
+      const client = fakeClient();
+      respondToPrompt(client, {
+        data: { info: { error: { data: { statusCode } } }, parts: [] },
+        response: { status: 200 },
+      });
+      const w = createVerificationWiring({ client, directory: "/d", getConfig: () => cfg() });
+
+      await expect(w.dispatchGrader({ tier: "fast", system: "s", prompt: "p" }))
+        .rejects.toThrow(new Error("grader prompt failed: SDK error"));
+      expect(client.calls.map((c) => c[0])).toEqual(["create", "prompt", "abort", "delete"]);
+    },
+  );
+
   it.each([Number.NaN, Number.POSITIVE_INFINITY])(
     "omits non-finite HTTP response status %s",
     async (status) => {
