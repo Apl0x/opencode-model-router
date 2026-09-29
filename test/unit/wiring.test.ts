@@ -141,6 +141,33 @@ describe("dispatchGrader", () => {
       .rejects.toThrow("grader prompt failed (503): request failed");
   });
 
+  it("rejects a failing HTTP response even when its text looks like a passing verdict", async () => {
+    const client = fakeClient({
+      prompt: async () => ({
+        data: { parts: [{ type: "text", text: '{"pass":true,"reasons":[]}' }] },
+        response: { status: 500 },
+      }),
+    });
+    const w = createVerificationWiring({ client, directory: "/d", getConfig: () => cfg() });
+
+    await expect(w.dispatchGrader({ tier: "fast", system: "s", prompt: "p" }))
+      .rejects.toThrow("grader prompt failed (500): unknown SDK error");
+    expect(client.calls.map((c) => c[0])).toEqual(["create", "abort", "delete"]);
+  });
+
+  it("prefers a failing HTTP status over a conflicting nested error status", async () => {
+    const client = fakeClient({
+      prompt: async () => ({
+        data: { info: { error: { data: { statusCode: 400, message: "request failed" } } }, parts: [] },
+        response: { status: 503 },
+      }),
+    });
+    const w = createVerificationWiring({ client, directory: "/d", getConfig: () => cfg() });
+
+    await expect(w.dispatchGrader({ tier: "fast", system: "s", prompt: "p" }))
+      .rejects.toThrow("grader prompt failed (503): request failed");
+  });
+
   it("tracks the session as a grader only while it runs", async () => {
     // Hold the prompt open so the in-flight window is observable; the session is
     // not registered until session.create has resolved.

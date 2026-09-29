@@ -131,16 +131,15 @@ function graderPromptResponseError(res: unknown): Error | undefined {
     response?: { status?: unknown };
   };
   const error = envelope.data?.info?.error ?? envelope.error;
-  if (error == null) return undefined;
+  const httpStatus = typeof envelope.response?.status === "number" && envelope.response.status >= 400
+    ? envelope.response.status : undefined;
+  if (error == null && httpStatus === undefined) return undefined;
   const detail = typeof error === "object" ? error as {
     data?: { statusCode?: unknown; message?: unknown };
     message?: unknown;
   } : undefined;
-  const status = typeof detail?.data?.statusCode === "number"
-    ? detail.data.statusCode
-    : typeof envelope.response?.status === "number" && envelope.response.status >= 400
-      ? envelope.response.status
-      : undefined;
+  const status = httpStatus ?? (typeof detail?.data?.statusCode === "number"
+    ? detail.data.statusCode : undefined);
   const message = typeof detail?.data?.message === "string" ? detail.data.message
     : typeof detail?.message === "string" ? detail.message : "unknown SDK error";
   return new Error(scrubText(`grader prompt failed${status === undefined ? "" : ` (${status})`}: ${message}`));

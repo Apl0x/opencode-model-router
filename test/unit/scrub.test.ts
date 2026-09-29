@@ -63,6 +63,12 @@ describe("scrubText", () => {
     expect(result).not.toContain("mytoken12345");
   });
 
+  it("redacts Basic authorization credentials", () => {
+    const result = scrubText("Authorization: Basic dXNlcjpwYXNz");
+    expect(result).toBe("Authorization: [REDACTED]");
+    expect(result).not.toContain("dXNlcjpwYXNz");
+  });
+
   // -------------------------------------------------------------------------
   // Key=value secrets
   // -------------------------------------------------------------------------
