@@ -131,7 +131,8 @@ function graderPromptResponseError(res: unknown): Error | undefined {
     response?: { status?: unknown };
   };
   const error = envelope.data?.info?.error ?? envelope.error;
-  const httpStatus = typeof envelope.response?.status === "number" && envelope.response.status >= 400
+  const httpStatus = typeof envelope.response?.status === "number"
+    && Number.isFinite(envelope.response.status) && envelope.response.status >= 400
     ? envelope.response.status : undefined;
   if (error == null && httpStatus === undefined) return undefined;
   const detail = typeof error === "object" && error !== null ? error as {
