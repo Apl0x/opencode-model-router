@@ -262,6 +262,48 @@ describe("dispatchGrader", () => {
     },
   );
 
+  it.each([0, -1, 99, 200.5, 600])(
+    "rejects out-of-domain HTTP status %s before accepting its text",
+    async (status) => {
+      const client = fakeClient();
+      respondToPrompt(client, {
+        data: { parts: [{ type: "text", text: '{"pass":true,"reasons":[]}' }] },
+        response: { status },
+      });
+      const w = createVerificationWiring({ client, directory: "/d", getConfig: () => cfg() });
+
+      await expect(w.dispatchGrader({ tier: "fast", system: "s", prompt: "p" }))
+        .rejects.toThrow(new Error("grader prompt failed: SDK error"));
+      expect(client.calls.map((c) => c[0])).toEqual(["create", "prompt", "abort", "delete"]);
+    },
+  );
+
+  it.each([200, 399])("accepts a valid non-failing HTTP status %s", async (status) => {
+    const client = fakeClient();
+    respondToPrompt(client, {
+      data: { parts: [{ type: "text", text: '{"pass":true,"reasons":[]}' }] },
+      response: { status },
+    });
+    const w = createVerificationWiring({ client, directory: "/d", getConfig: () => cfg() });
+
+    await expect(w.dispatchGrader({ tier: "fast", system: "s", prompt: "p" }))
+      .resolves.toEqual({ sessionID: "SID1", text: '{"pass":true,"reasons":[]}' });
+    expect(client.calls.map((c) => c[0])).toEqual(["create", "prompt", "abort", "delete"]);
+  });
+
+  it.each([400, 500])("reports a valid failing HTTP status %s", async (status) => {
+    const client = fakeClient();
+    respondToPrompt(client, {
+      data: { parts: [{ type: "text", text: '{"pass":true,"reasons":[]}' }] },
+      response: { status },
+    });
+    const w = createVerificationWiring({ client, directory: "/d", getConfig: () => cfg() });
+
+    await expect(w.dispatchGrader({ tier: "fast", system: "s", prompt: "p" }))
+      .rejects.toThrow(new Error(`grader prompt failed (${status}): SDK error`));
+    expect(client.calls.map((c) => c[0])).toEqual(["create", "prompt", "abort", "delete"]);
+  });
+
   it("tracks the session as a grader only while it runs", async () => {
     // Hold the prompt open so the in-flight window is observable; the session is
     // not registered until session.create has resolved.

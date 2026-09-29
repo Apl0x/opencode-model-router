@@ -123,6 +123,10 @@ export function extractAssistantText(res: any): string {
     .join("\n");
 }
 
+function isValidHttpStatus(status: unknown): status is number {
+  return typeof status === "number" && Number.isInteger(status) && status >= 100 && status <= 599;
+}
+
 function graderPromptResponseError(res: unknown): Error | undefined {
   if (typeof res !== "object" || res === null) return undefined;
   const envelope = res as {
@@ -132,10 +136,9 @@ function graderPromptResponseError(res: unknown): Error | undefined {
   };
   const error = envelope.data?.info?.error ?? envelope.error;
   const responseStatus = envelope.response?.status;
-  const malformedStatus = responseStatus !== undefined
-    && (typeof responseStatus !== "number" || !Number.isFinite(responseStatus));
-  const httpStatus = typeof responseStatus === "number"
-    && Number.isFinite(responseStatus) && responseStatus >= 400
+  const validStatus = isValidHttpStatus(responseStatus);
+  const malformedStatus = responseStatus !== undefined && !validStatus;
+  const httpStatus = validStatus && responseStatus >= 400
     ? responseStatus : undefined;
   if (error == null && httpStatus === undefined && !malformedStatus) return undefined;
   const detail = typeof error === "object" && error !== null ? error as {
