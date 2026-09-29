@@ -136,13 +136,10 @@ function graderPromptResponseError(res: unknown): Error | undefined {
   if (error == null && httpStatus === undefined) return undefined;
   const detail = typeof error === "object" && error !== null ? error as {
     data?: { statusCode?: unknown };
-    name?: unknown;
   } : undefined;
   const status = httpStatus ?? (typeof detail?.data?.statusCode === "number"
     ? detail.data.statusCode : undefined);
-  const label = typeof detail?.name === "string" && /^[A-Za-z][A-Za-z0-9_-]{0,63}$/.test(detail.name)
-    ? detail.name : "SDK error";
-  return new Error(`grader prompt failed${status === undefined ? "" : ` (${status})`}: ${label}`);
+  return new Error(`grader prompt failed${status === undefined ? "" : ` (${status})`}: SDK error`);
 }
 
 /** P0 (deterministic.ts header, T2): what a gate needs from its dispatch. */

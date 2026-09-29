@@ -130,7 +130,7 @@ describe("dispatchGrader", () => {
     } catch (error) {
       message = (error as Error).message;
     }
-    expect(message).toBe("grader prompt failed (400): APIError");
+    expect(message).toBe("grader prompt failed (400): SDK error");
     for (const credential of ["supersecret", "dXNlcjpwYXNz", "anothersecret"]) {
       expect(message).not.toContain(credential);
     }
@@ -143,7 +143,7 @@ describe("dispatchGrader", () => {
     const w = createVerificationWiring({ client, directory: "/d", getConfig: () => cfg() });
 
     await expect(w.dispatchGrader({ tier: "fast", system: "s", prompt: "p" }))
-      .rejects.toThrow("grader prompt failed (500): UnknownError");
+      .rejects.toThrow("grader prompt failed (500): SDK error");
     expect(client.calls.map((c) => c[0])).toEqual(["create", "prompt", "abort", "delete"]);
   });
 
@@ -169,7 +169,7 @@ describe("dispatchGrader", () => {
     const w = createVerificationWiring({ client, directory: "/d", getConfig: () => cfg() });
 
     await expect(w.dispatchGrader({ tier: "fast", system: "s", prompt: "p" }))
-      .rejects.toThrow("grader prompt failed (503): APIError");
+      .rejects.toThrow("grader prompt failed (503): SDK error");
     expect(client.calls.map((c) => c[0])).toEqual(["create", "prompt", "abort", "delete"]);
   });
 
@@ -184,6 +184,18 @@ describe("dispatchGrader", () => {
     await expect(w.dispatchGrader({ tier: "fast", system: "s", prompt: "p" }))
       .rejects.toThrow(new Error("grader prompt failed (400): SDK error"));
     expect(client.calls.map((c) => c[0])).toEqual(["create", "prompt", "abort", "delete"]);
+  });
+
+  it("never surfaces token-shaped error names", async () => {
+    for (const name of ["sk-ABCDEFGHIJKLMNOPQRSTU1234567890", "api_key=supersecret"]) {
+      const client = fakeClient();
+      respondToPrompt(client, { error: { name }, response: { status: 400 } });
+      const w = createVerificationWiring({ client, directory: "/d", getConfig: () => cfg() });
+
+      await expect(w.dispatchGrader({ tier: "fast", system: "s", prompt: "p" }))
+        .rejects.toThrow(new Error("grader prompt failed (400): SDK error"));
+      expect(client.calls.map((c) => c[0])).toEqual(["create", "prompt", "abort", "delete"]);
+    }
   });
 
   it("tracks the session as a grader only while it runs", async () => {
