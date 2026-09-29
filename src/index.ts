@@ -960,7 +960,7 @@ const ModelRouterPlugin: Plugin = async (ctx: PluginInput) => {
       try {
         if (input?.sessionID && graderSessions.has(input.sessionID)) {
           const graderTemperature = cfg.enforcement?.verify?.graderTemperature;
-          if (graderTemperature !== undefined) {
+          if (graderTemperature !== undefined && graderTemperature !== null) {
             output.temperature = graderTemperature;
           }
         }

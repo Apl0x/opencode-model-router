@@ -59,6 +59,15 @@ describe("grader temperature hook", () => {
     await expect(captureGraderParams()).resolves.not.toHaveProperty("temperature");
   });
 
+  it("omits temperature when graderTemperature is null", async () => {
+    const cfg = loadConfig();
+    cfg.enforcement ??= {};
+    cfg.enforcement.verify ??= {};
+    cfg.enforcement.verify.graderTemperature = null;
+
+    await expect(captureGraderParams()).resolves.not.toHaveProperty("temperature");
+  });
+
   it("keeps an explicitly configured zero grader temperature", async () => {
     const cfg = loadConfig();
     cfg.enforcement ??= {};
