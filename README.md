@@ -449,7 +449,7 @@ The plugin ships with seven presets (switch with `/preset <name>`):
 |------|-------|-----------|
 | @fast | `openai/gpt-6-luna-fast` (medium) | 1x |
 | @medium | `openai/gpt-6-astra-fast` (high) | 5x |
-| @heavy | `anthropic/claude-opus-5-5` (xhigh) | 20x |
+| @heavy | `anthropic/claude-opus-5-5` (variant/effort: xhigh) | 20x |
 
 **fable-effort** — one model, three reasoning depths (see [per-tier `effort`](#per-tier-effort)):
 | Tier | Model | Effort | Cost ratio |

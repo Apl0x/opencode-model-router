@@ -32,6 +32,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `hybrid` fast → Luna medium, medium → Astra high, heavy → Opus 5.5 xhigh
   (was Fable 5.1 max). The orchestrator prompt grows by 11 characters:
   3,249 / 4,021 / 6,221 for base / Claude / Claude with enforcement.
+- `hybrid` heavy now also sets `effort: "xhigh"`, like the `anthropic` preset's
+  heavy tier, so Opus 5.5 receives the effort and not only the variant. The
+  `github-copilot` heavy description names Fable 5.1, the model it runs.
 - V1 graders no longer send `graderTemperature` to models whose capabilities
   report `temperature: false`.
 

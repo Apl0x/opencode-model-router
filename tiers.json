@@ -156,7 +156,7 @@
       "heavy": {
         "model": "github-copilot/claude-fable-5-1",
         "costRatio": 20,
-        "description": "Claude Fable 5 via GitHub Copilot for architecture, complex debugging, and security",
+        "description": "Claude Fable 5.1 via GitHub Copilot for architecture, complex debugging, and security",
         "steps": 120,
         "whenToUse": [
           "Architecture decisions",
@@ -276,6 +276,7 @@
       "heavy": {
         "model": "anthropic/claude-opus-5-5",
         "variant": "xhigh",
+        "effort": "xhigh",
         "costRatio": 20,
         "description": "Claude Opus 5.5 xhigh for architecture, complex debugging, and security",
         "steps": 120,
