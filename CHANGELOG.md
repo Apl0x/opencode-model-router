@@ -38,6 +38,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   snapshots and 19 hit the 2 s finish bound, leaving their changes unattributed
   (risk high). Measured with that affinity: finish p50 2.11 s → 0.96 s, 19 → 0 capped.
 
+### Documentation
+
+- README updated for OpenCode v2 support, presets and requirements.
+
 ## [1.15.0] - 2026-09-28
 
 The acceptance gate no longer runs a test suite per delegation. `testsPass` now runs only
