@@ -33,6 +33,8 @@ export interface Snapshot {
 
 export interface Sampler {
   stop(): Promise<Snapshot[]>;
+  /** Snapshots collected so far. */
+  count(): number;
   pid: number /* sampler process pid */;
 }
 
@@ -259,7 +261,7 @@ export function startSampler(opts?: {
     return stopping;
   };
 
-  return { stop, pid: child.pid ?? -1 };
+  return { stop, count: () => snapshots.length, pid: child.pid ?? -1 };
 }
 
 // ---------------------------------------------------------------------------------------------
