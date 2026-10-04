@@ -38,12 +38,17 @@ const AGENT = "SmokeScout";
 // Repaired three times now, which is the cost of pinning: first from
 // `claude-haiku-4-5` / `claude-opus-4-8`, then from `claude-fable-5` when the
 // heavy tier moved to `claude-fable-5-1`, then from `claude-fable-5-1` "max"
-// when it moved to `claude-opus-5-5` "xhigh". Re-derive from tiers.json only if
-// this keeps gating CI on a preset bump. Current `anthropic` preset: fast is
-// claude-sonnet-5 with no variant, heavy is claude-opus-5-5 with variant "xhigh".
-const FAST_MODEL = { providerID: "anthropic", modelID: "claude-sonnet-5" };
+// when it moved to `claude-opus-5-5` "xhigh", then when fast moved to
+// `claude-sonnet-5-5` "low". Re-derive from tiers.json only if this keeps gating
+// CI on a preset bump. Current `anthropic` preset: fast is claude-sonnet-5-5 with
+// variant "low", heavy is claude-opus-5-5 with variant "xhigh".
+const FAST_MODEL = { providerID: "anthropic", modelID: "claude-sonnet-5-5" };
 const HEAVY_MODEL = { providerID: "anthropic", modelID: "claude-opus-5-5" };
 const HEAVY_VARIANT = "xhigh";
+// Every `anthropic` tier now sets a variant, so the variant-clearing case uses
+// the `openai` preset: heavy is gpt-6-astra-fast "max", fast gpt-6-luna-fast has none.
+const OPENAI_FAST_MODEL = { providerID: "openai", modelID: "gpt-6-luna-fast" };
+const OPENAI_HEAVY_VARIANT = "max";
 
 // Each case shells out to a real opencode. The first one also pays process
 // cold-start, which exceeds vitest's 5s default on slower hosts (Windows CI
@@ -137,12 +142,12 @@ d("subagentTiers smoke", () => {
   }, SMOKE_TIMEOUT_MS);
 
   it("clears a variant when moving to a tier that has none", () => {
-    writeOverrides({ subagentTiers: { [AGENT]: "heavy" } });
-    expect(debugAgent(AGENT).variant).toBe(HEAVY_VARIANT);
+    writeOverrides({ activePreset: "openai", subagentTiers: { [AGENT]: "heavy" } });
+    expect(debugAgent(AGENT).variant).toBe(OPENAI_HEAVY_VARIANT);
 
-    writeOverrides({ subagentTiers: { [AGENT]: "fast" } });
+    writeOverrides({ activePreset: "openai", subagentTiers: { [AGENT]: "fast" } });
     const agent = debugAgent(AGENT);
-    expect(agent.model).toEqual(FAST_MODEL);
+    expect(agent.model).toEqual(OPENAI_FAST_MODEL);
     expect(agent.variant ?? null).toBeNull();
   }, SMOKE_TIMEOUT_MS);
 
