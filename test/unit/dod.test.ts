@@ -9,6 +9,29 @@ import {
   isCheckable,
   type DoD,
 } from "../../src/verify/dod";
+import { buildDelegationDoD } from "../../src/verify/dispatch";
+
+describe("acceptance cwd", () => {
+  it.each(["cwd: /work/tree", 'cwd: "/work/tree"', "cwd: '/work/tree'", "CWD: /work/tree"])("parses %s and preserves it through dispatch and annotation", (line) => {
+    const block = `[acceptance]\n${line}\ncheck: testsPass\n[/acceptance]`;
+    expect(parseAcceptanceBlock(block)?.cwd).toBe("/work/tree");
+    expect(buildDelegationDoD({ prompt: block }).cwd).toBe("/work/tree");
+    expect(buildDelegationDoD({ acceptance: block }).cwd).toBe("/work/tree");
+    expect(parseDoDFromAnnotation(block)?.cwd).toBe("/work/tree");
+  });
+
+  it.each(["", "cwd:", 'cwd: ""', "cwd: ''", "cwd:   "])("omits an absent or empty cwd (%s)", (line) => {
+    expect(parseAcceptanceBlock(`[acceptance]\n${line}\n[/acceptance]`)).not.toHaveProperty("cwd");
+  });
+
+  it("normalizes only non-empty string cwd values and never infers cwd", () => {
+    const dod = inferDoD("Working directory: /work/tree. Implement feature", "medium", {});
+    expect(dod).not.toHaveProperty("cwd");
+    expect(normalizeDoD({ ...dod, cwd: " /work/tree " }).cwd).toBe("/work/tree");
+    for (const cwd of [undefined, "", "  "]) expect(normalizeDoD({ ...dod, cwd })).not.toHaveProperty("cwd");
+    expect(normalizeDoD({ ...dod, ...JSON.parse('{"cwd":42}') })).not.toHaveProperty("cwd");
+  });
+});
 
 // ---------------------------------------------------------------------------
 // summarizeDispatch

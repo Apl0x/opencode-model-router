@@ -7,7 +7,13 @@
 // suite is green on both ubuntu and windows. Separator-sensitive cases
 // (drive letters, UNC) branch on process.platform instead of hardcoding "/".
 
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import type { PluginInput } from "@opencode-ai/plugin";
+import { mkdtempSync, rmSync } from "node:fs";
+import ModelRouterPlugin from "../../src/index";
+import { invalidateConfigCache, loadConfig } from "../../src/router/config";
+import { snapshotTree } from "../../src/verify/tree";
+import { runShell } from "../../src/verify/exec";
 import { isAbsolute, join } from "node:path";
 import { tmpdir } from "node:os";
 import { resolveBaseDir, resolveAgainst } from "../../src/verify/paths";
@@ -25,6 +31,62 @@ import type { DeterministicDeps } from "../../src/verify/types";
 import type { DoD } from "../../src/verify/dod";
 
 const isWin = process.platform === "win32";
+
+// Exercise the real hooks and gate without spawning git or a check process.
+vi.mock("../../src/verify/tree", () => ({ snapshotTree: vi.fn(async () => undefined) }));
+vi.mock("../../src/verify/exec", async (importOriginal) => ({
+  ...await importOriginal<typeof import("../../src/verify/exec")>(),
+  runShell: vi.fn(async () => ({ code: 0, stdout: "OK", stderr: "", timedOut: false })),
+}));
+
+describe("native task — acceptance cwd wiring", () => {
+  let root: string;
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), "router-task-cwd-"));
+    vi.stubEnv("HOME", root);
+    vi.stubEnv("USERPROFILE", root);
+    invalidateConfigCache();
+    const cfg = loadConfig();
+    cfg.enforcement = { ...cfg.enforcement, mode: "advisory" };
+    vi.mocked(runShell).mockClear();
+    vi.mocked(snapshotTree).mockClear();
+  });
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    invalidateConfigCache();
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  it.each([undefined, "", "   ", "override"])("uses acceptance cwd unless args.cwd is non-empty (%j)", async (argCwd) => {
+    const producerDir = mkdtempSync(join(root, "producer-"));
+    const overrideDir = mkdtempSync(join(root, "override-"));
+    const cwd = argCwd === "override" ? overrideDir : argCwd;
+    const expected = argCwd === "override" ? overrideDir : producerDir;
+    const hooks = await ModelRouterPlugin({
+      directory: root,
+      worktree: root,
+      client: { session: { get: async () => ({ data: {} }) } },
+    } as unknown as PluginInput);
+    try {
+      const call = { tool: "task", sessionID: "orch", callID: "cwd-dispatch" };
+      const before = { args: {
+        subagent_type: "fast",
+        prompt: `VERIFY:required\n[acceptance]\ncwd: "${producerDir}"\ncheck: run command="node verify.js" expect=OK\n[/acceptance]`,
+        ...(cwd === undefined ? {} : { cwd }),
+      } };
+      await hooks["tool.execute.before"]!(call, before);
+      expect(vi.mocked(snapshotTree).mock.calls.some(([dir]) => dir === expected)).toBe(true);
+      vi.mocked(snapshotTree).mockClear();
+      const result = { title: "task", output: "<task_result>done</task_result>", metadata: { sessionId: "producer" } };
+      await hooks["tool.execute.after"]!({ ...call, args: before.args }, result);
+      expect(vi.mocked(snapshotTree).mock.calls.some(([dir]) => dir === expected)).toBe(true);
+      expect(runShell).toHaveBeenCalledWith("node verify.js", expect.objectContaining({ cwd: expected }));
+      expect(result.output).toContain("verified: deterministic");
+    } finally {
+      await hooks.dispose?.();
+    }
+  });
+});
 
 // ---------------------------------------------------------------------------
 // resolveBaseDir — the three branches

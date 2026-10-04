@@ -1,4 +1,6 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
 import { accept } from "../../src/verify/gate";
 import type { Artefact, Delegation, GateDeps } from "../../src/verify/gate";
 import type { DeterministicDeps } from "../../src/verify/types";
@@ -98,6 +100,62 @@ function deps(over: Partial<GateDeps> = {}): GateDeps {
 }
 
 // --- tests -----------------------------------------------------------------
+
+describe("accept() — outside-directory safety net", () => {
+  const base = join(tmpdir(), "gate-repo");
+  const outside = join(tmpdir(), "producer-worktree");
+  const changed = (paths: string[]) => artefact({ changedFiles: paths.map(path => ({ path, status: "M" })) });
+  function setup() {
+    const exec = vi.fn<DeterministicDeps["exec"]>().mockResolvedValue({ code: 0, stdout: "OK", stderr: "" });
+    const d = deps({ deterministic: { ...fakeDeterministicDeps(), cwd: base, exec } });
+    const dod = normalizeDoD({ ...detDoD(), checks: [{ kind: "run", command: "node verify.js", expect: "OK" }] });
+    return { exec, d, dod };
+  }
+
+  it.each([false, true])("does not run checks when every change is absolute and outside (strict=%s)", async (strictUnverifiable) => {
+    const { exec, d, dod } = setup();
+    const firstPath = join(outside, "file.ts");
+    const r = await accept({ dod }, changed([firstPath, join(outside, "other.ts")]), { ...d, strictUnverifiable });
+    const reason = `the producer changed files only outside ${base} (e.g. ${firstPath}); checks run there cannot see them. Add "cwd: <dir>" to the [acceptance] block to verify where the work landed.`;
+    expect(r.verdict).toEqual({ pass: false, outcome: "unverifiable", method: "none", reasons: [reason], caveats: [reason] });
+    expect(r.accepted).toBe(!strictUnverifiable);
+    expect(exec).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    [join(base, "inside.ts"), join(outside, "outside.ts")],
+    ["relative.ts"],
+    ["relative.ts", join(outside, "outside.ts")],
+    [],
+  ])("runs checks unless all changes are absolute and outside: %j", async (...paths) => {
+    const { exec, d, dod } = setup();
+    const r = await accept({ dod }, changed(paths), d);
+    expect(r.verdict.outcome).toBe("pass");
+    expect(exec).toHaveBeenCalled();
+  });
+
+  it("treats a sibling-prefix directory as outside", async () => {
+    const { exec, d, dod } = setup();
+    const r = await accept({ dod }, changed([join(`${base}-v2`, "file.ts")]), d);
+    expect(r.verdict.outcome).toBe("unverifiable");
+    expect(exec).not.toHaveBeenCalled();
+  });
+
+  it("runs checks in delegation.cwd when it contains the changes", async () => {
+    const { exec, d, dod } = setup();
+    const r = await accept({ dod, cwd: outside }, changed([join(outside, "file.ts")]), d);
+    expect(r.verdict.outcome).toBe("pass");
+    expect(exec).toHaveBeenCalledWith("node verify.js", expect.objectContaining({ cwd: outside }));
+  });
+
+  it("does not apply the safety net to a checker DoD", async () => {
+    const { d } = setup();
+    const dispatchGrader = vi.fn<CheckerDeps["dispatchGrader"]>().mockResolvedValue({ sessionID: "grader", text: '{"pass":true,"reasons":[]}' });
+    const r = await accept({ dod: checkerDoD() }, changed([join(outside, "file.ts")]), { ...d, checker: { ...d.checker, dispatchGrader } });
+    expect(r.verdict.outcome).toBe("pass");
+    expect(dispatchGrader).toHaveBeenCalled();
+  });
+});
 
 describe("accept() — gate policy", () => {
   it("1. require:'never' disables the gate (accepts without verifying)", async () => {

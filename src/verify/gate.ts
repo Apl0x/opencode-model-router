@@ -24,7 +24,8 @@ import { isCheckable } from "./dod";
 import { runDeterministic } from "./deterministic";
 import { runChecker } from "./checker";
 import type { ArtefactView, CheckerDeps } from "./checker";
-import { resolveBaseDir } from "./paths";
+import { isAbsolute } from "node:path";
+import { isWithinDir, resolveBaseDir } from "./paths";
 
 /** The concrete, inspectable result of a delegation (artefact contract §3.3). */
 export interface Artefact {
@@ -187,6 +188,12 @@ export async function accept(
 
   let verdict: Verdict;
   if (dod.kind === "deterministic") {
+    if (artefact.changedFiles.length > 0 && artefact.changedFiles.every(
+      ({ path }) => isAbsolute(path) && !isWithinDir(path, effectiveBaseDir),
+    )) {
+      const reason = `the producer changed files only outside ${effectiveBaseDir} (e.g. ${artefact.changedFiles[0].path}); checks run there cannot see them. Add "cwd: <dir>" to the [acceptance] block to verify where the work landed.`;
+      return gateResult({ pass: false, outcome: "unverifiable", method: "none", reasons: [reason], caveats: [reason] }, dodSource, deps.strictUnverifiable);
+    }
     verdict = await runDeterministic(dod, {
       ...deps.deterministic,
       cwd: effectiveBaseDir,
