@@ -250,6 +250,37 @@ Then install and configure model-router to handle the rest.
 
 ## Installation
 
+### OpenCode v2
+
+The v2 adapter is tested with OpenCode **2.0.20**. Use the v2 `plugins` key:
+
+```json
+{
+  "plugins": ["opencode-model-router"]
+}
+```
+
+For a local checkout, replace the package name with its absolute directory path.
+V2 loads the package's `server.ts` definition; v1 continues to load the original
+function from `src/index.ts`. Existing v1 configuration does not need to change.
+
+Routing, tool guards and verification use the same engine on both versions. V2
+uses its native `subagent` tool to create real child sessions, preserving the
+host's permissions and cancellation. There are a few host differences:
+
+- Delegations the router verifies run in the foreground so verification receives
+  a completed result; other `background` requests are kept. The router's own
+  deferred/background verification remains a separate setting.
+- Temporary child sessions are removed after use on v2 ≥2.0.21; 2.0.20 can only
+  interrupt them, so their history is retained.
+- Graders send no temperature unless the exact `provider/model` is listed in
+  `enforcement.verify.graderTemperatureModels`
+  ([details](docs/OPENCODE_V2.md#grader-temperature-on-v2)).
+- Anti-narration warnings appear as separate synthetic transcript entries, because
+  completed v2 text events cannot be rewritten.
+
+See [the v2 compatibility notes](docs/OPENCODE_V2.md) for the API mapping and validation.
+
 ### From npm (recommended)
 ```bash
 # In your opencode project or globally

@@ -14,6 +14,7 @@
  * silently stop applying to graded work.
  */
 import { createHash } from "node:crypto";
+import type { ChildSessionRunner } from "../compat/child-session";
 import { access, readdir, readFile as fsReadFile, realpath, stat, unlink } from "node:fs/promises";
 import { isAbsolute, join, relative, resolve } from "node:path";
 import { createBatchCoordinator, type BatchCoordinatorOptions, type BatchPlanner } from "./batch";
@@ -865,7 +866,7 @@ export interface VerificationWiring {
   ): Promise<PreparedVerification>;
   /** Session ids currently running a grader prompt, so hooks can skip them. */
   graderSessions: Set<string>;
-  /** Abort then delete a plugin-created child session. Never throws. */
+  /** Stop a plugin-created child; v1 deletes it, a host runner owns v2 cleanup. Never throws. */
   disposeChildSession(sid: string): Promise<void>;
   /** Run one grader turn, parented to the caller's session when given. */
   dispatchGrader(
@@ -935,6 +936,7 @@ function errorText(err: unknown): string {
 
 export function createVerificationWiring(deps: {
   client: any;
+  childRunner?: ChildSessionRunner;
   /** Project root; relative paths in checks resolve against it. */
   directory: string;
   getConfig: () => RouterConfig;
@@ -1006,6 +1008,8 @@ export function createVerificationWiring(deps: {
   /** QA-3.1-3: dispatches starting together share their snapshot and capture (createSharedFlight). */
   const sharedSnapshots = createSharedFlight<TreeSnapshot>();
   const sharedCaptures = createSharedFlight<DispatchReference>();
+  /** The gate-time snapshot of observeChange, shared the same way (keyed by priority, cwd and digest paths). */
+  const sharedGateSnapshots = createSharedFlight<TreeSnapshot>();
 
   const abs = (p: string): string => (isAbsolute(p) ? p : join(directory, p));
 
@@ -1150,6 +1154,10 @@ export function createVerificationWiring(deps: {
       }
     }
     disposed.add(sid);
+    if (deps.childRunner) {
+      try { await deps.childRunner.dispose(sid); } catch { /* best-effort cleanup */ }
+      return;
+    }
     try {
       await client.session.abort({ path: { id: sid } });
     } catch {
@@ -1167,6 +1175,33 @@ export function createVerificationWiring(deps: {
     parentSessionID?: string,
     inFlight?: Set<string>,
   ): Promise<{ sessionID: string; text: string }> => {
+    if (deps.childRunner) {
+      const cfg = getConfig();
+      const controller = new AbortController();
+      let sid: string | undefined;
+      try {
+        return await withTimeout(deps.childRunner.run({
+          parentSessionID,
+          cwd: req.cwd,
+          model: tierModel(cfg, req.tier) ?? undefined,
+          system: req.system,
+          prompt: req.prompt,
+          signal: controller.signal,
+          async onCreated(sessionID) {
+            sid = sessionID;
+            graderSessions.add(sessionID);
+            inFlight?.add(sessionID);
+          },
+        }), graderTimeoutMs(req.tier, cfg.enforcement?.verify?.graderTimeoutMs), "grader prompt");
+      } finally {
+        controller.abort();
+        if (sid) {
+          graderSessions.delete(sid);
+          inFlight?.delete(sid);
+          await disposeChildSession(sid);
+        }
+      }
+    }
     // Scope the grader session to the producer's working directory when one was
     // declared. Naming the directory in the prompt is not enough: the grader
     // has real tools, and an unscoped session resolves every read and command
@@ -1385,8 +1420,20 @@ export function createVerificationWiring(deps: {
       const options = digests === undefined
         ? { lowPriority }
         : { lowPriority, digestPaths: digests === "unavailable" ? [] : [...digests.keys()] };
+      // QA-3.1-3 at the finish: parallel finishes share one gate-time snapshot per key, and a run
+      // only serves finishes that asked before it started (createSharedFlight), so each still sees
+      // the tree as it was after its own producer returned. Unshared, 20 parallel deferred finishes
+      // spawned 140 git processes and hit DEFERRED_FINISH_MS on a 4-core Windows runner.
+      const digestKey = options.digestPaths === undefined
+        ? "all"
+        : createHash("sha256").update([...options.digestPaths].sort().join("\0")).digest("hex");
+      const key = `${lowPriority ? "low" : "normal"}\0${base}\0${digestKey}`;
       snapshot = bound > 0 && !controller.signal.aborted
-        ? await withTimeout(snapshotTree(base, controller.signal, options), bound, "grade fingerprint")
+        ? await withTimeout(
+          sharedGateSnapshots(key, shared => snapshotTree(base, shared, options), controller.signal),
+          bound,
+          "grade fingerprint",
+        )
         : undefined;
     } catch {
       snapshot = undefined; // Explicit unavailable disclaimer, never a raw tree.

@@ -4,7 +4,7 @@ import { invalidateConfigCache, loadConfig } from "../../src/router/config";
 // Keep this hook test independent of Git processes and background suite runs.
 vi.mock("../../src/verify/tree", () => ({ snapshotTree: async () => undefined }));
 
-async function captureGraderParams(): Promise<Record<string, unknown>> {
+async function captureGraderParams(temperatureCapability?: boolean): Promise<Record<string, unknown>> {
   let hooks: any;
   const params: Record<string, unknown> = {};
   const graderSessionID = "grader-session";
@@ -20,7 +20,7 @@ async function captureGraderParams(): Promise<Record<string, unknown>> {
         create: async () => ({ data: { id: graderSessionID } }),
         prompt: async (request: any) => {
           if (request.body.system !== undefined) {
-            await hooks["chat.params"]({ sessionID: graderSessionID }, params);
+            await hooks["chat.params"]({ sessionID: graderSessionID, model: { capabilities: { temperature: temperatureCapability } } }, params);
             return {
               data: { parts: [{ type: "text", text: '{"pass":true,"reasons":[]}' }] },
             };
@@ -66,5 +66,16 @@ describe("grader temperature hook", () => {
     cfg.enforcement.verify.graderTemperature = 0;
 
     await expect(captureGraderParams()).resolves.toHaveProperty("temperature", 0);
+  });
+
+  it.each([false, true, undefined])("respects the host temperature capability %s", async (capability) => {
+    const cfg = loadConfig();
+    cfg.enforcement ??= {};
+    cfg.enforcement.verify ??= {};
+    cfg.enforcement.verify.graderTemperature = 0.65;
+
+    const params = await captureGraderParams(capability);
+    if (capability === false) expect(params).not.toHaveProperty("temperature");
+    else expect(params).toHaveProperty("temperature", 0.65);
   });
 });

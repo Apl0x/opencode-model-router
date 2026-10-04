@@ -5,6 +5,39 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- OpenCode v2 compatibility through a separate server entrypoint, fixing the
+  `Expected object at ["default"]` plugin validation error while preserving the
+  callable v1 entrypoint. The adapter translates agent registration, commands,
+  prompts, tool guards and verification to v2's domain APIs, and uses native
+  subagents for producer/grader sessions. A subagent's `background` request is
+  kept unless the router verifies that dispatch. Only router-added instructions
+  are translated to v2 tool names. V2 tier options reach requests through the
+  context hook, not unused agent settings. V2 ≥2.0.21 removes temporary children
+  after use; 2.0.20 retains their history. Anti-narration warnings appear as
+  synthetic transcript entries. Includes an opt-in provider-backed v2 e2e smoke
+  adapted from @ChronosWS (Cliff Hudson). See
+  [the compatibility notes](docs/OPENCODE_V2.md).
+- **Behavior note:** on v2, graders send no temperature (the provider default
+  applies, not `graderTemperature`) unless the exact `provider/model` is listed in
+  `enforcement.verify.graderTemperatureModels` (reported by @ChronosWS).
+
+### Changed
+
+- V1 graders no longer send `graderTemperature` to models whose capabilities
+  report `temperature: false`.
+
+### Fixed
+
+- Parallel deferred finishes now share their gate-time tree snapshot, as dispatch
+  starts already did. A run only serves finishes that asked before it started.
+  Unshared, 20 parallel deferred delegations on a 4-core Windows host ran 20
+  snapshots and 19 hit the 2 s finish bound, leaving their changes unattributed
+  (risk high). Measured with that affinity: finish p50 2.11 s → 0.96 s, 19 → 0 capped.
+
 ## [1.15.0] - 2026-09-28
 
 The acceptance gate no longer runs a test suite per delegation. `testsPass` now runs only
