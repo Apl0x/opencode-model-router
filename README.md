@@ -252,7 +252,8 @@ Then install and configure model-router to handle the rest.
 
 ### OpenCode v2
 
-The v2 adapter is tested with OpenCode **2.0.20**. Use the v2 `plugins` key:
+The v2 adapter supports OpenCode hosts **2.0.20 or later** and typechecks against
+`@opencode/plugin` **2.0.22**. Use the v2 `plugins` key:
 
 ```json
 {
@@ -278,6 +279,15 @@ host's permissions and cancellation. There are a few host differences:
   ([details](docs/OPENCODE_V2.md#grader-temperature-on-v2)).
 - Anti-narration warnings appear as separate synthetic transcript entries, because
   completed v2 text events cannot be rewritten.
+- Tier options (`effort`/`variant`/`reasoning_effort`, `budget_tokens`, etc.) are
+  applied per turn through the v2 `session` context hook, filling only keys not
+  already present, because v2 does not read `Agent.Info.request.settings`.
+
+**Smoke tests:** Set `OPENCODE_V2_BIN` to the absolute path of an OpenCode v2
+executable. `npm run smoke:v2` checks loading and registration without provider
+credentials. `npm run smoke:v2:e2e` opts in to the end-to-end smoke (the script sets
+`RUN_OC_SMOKE_V2_E2E=1`), driving `opencode run --standalone` against a local
+deterministic OpenAI-compatible provider, also without provider credentials.
 
 See [the v2 compatibility notes](docs/OPENCODE_V2.md) for the API mapping and validation.
 
@@ -410,22 +420,22 @@ The plugin ships with seven presets (switch with `/preset <name>`):
 | Tier | Model | Cost ratio |
 |------|-------|-----------|
 | @fast | `anthropic/claude-sonnet-5` | 1x |
-| @medium | `anthropic/claude-opus-5` (high) | 5x |
-| @heavy | `anthropic/claude-fable-5` (max) | 20x |
+| @medium | `anthropic/claude-opus-5-5` (variant/effort: low) | 5x |
+| @heavy | `anthropic/claude-opus-5-5` (variant/effort: xhigh) | 20x |
 
 **openai**:
 | Tier | Model | Cost ratio |
 |------|-------|-----------|
-| @fast | `openai/gpt-5.6-luna-fast` | 1x |
-| @medium | `openai/gpt-5.6-terra-fast` (high) | 5x |
-| @heavy | `openai/gpt-5.6-sol-fast` (xhigh) | 20x |
+| @fast | `openai/gpt-6-luna-fast` | 1x |
+| @medium | `openai/gpt-6-astra-fast` (high) | 5x |
+| @heavy | `openai/gpt-6-astra-fast` (max) | 20x |
 
 **github-copilot**:
 | Tier | Model | Cost ratio |
 |------|-------|-----------|
 | @fast | `github-copilot/claude-haiku-4.5` | 1x |
 | @medium | `github-copilot/claude-sonnet-5` | 5x |
-| @heavy | `github-copilot/claude-fable-5` | 20x |
+| @heavy | `github-copilot/claude-fable-5-1` | 20x |
 
 **google**:
 | Tier | Model | Cost ratio |
@@ -434,19 +444,19 @@ The plugin ships with seven presets (switch with `/preset <name>`):
 | @medium | `google/gemini-3.7-flash` | 5x |
 | @heavy | `google/gemini-3.1-pro-preview` | 20x |
 
-**hybrid** — Anthropic for exploration and heavy analysis, OpenAI for implementation:
+**hybrid** — OpenAI for exploration and implementation, Anthropic for heavy analysis:
 | Tier | Model | Cost ratio |
 |------|-------|-----------|
-| @fast | `anthropic/claude-haiku-4-5` | 1x |
-| @medium | `openai/gpt-5.6-terra-fast` (high) | 5x |
-| @heavy | `anthropic/claude-opus-5` (max) | 20x |
+| @fast | `openai/gpt-6-luna-fast` (low) | 1x |
+| @medium | `openai/gpt-6-astra-fast` (low) | 5x |
+| @heavy | `anthropic/claude-fable-5-1` (max) | 20x |
 
 **fable-effort** — one model, three reasoning depths (see [per-tier `effort`](#per-tier-effort)):
 | Tier | Model | Effort | Cost ratio |
 |------|-------|--------|-----------|
-| @fast | `anthropic/claude-fable-5` | `low` | 1x |
-| @medium | `anthropic/claude-fable-5` | `high` | 3x |
-| @heavy | `anthropic/claude-fable-5` | `xhigh` | 6x |
+| @fast | `anthropic/claude-fable-5-1` | `low` | 1x |
+| @medium | `anthropic/claude-fable-5-1` | `high` | 3x |
+| @heavy | `anthropic/claude-fable-5-1` | `xhigh` | 6x |
 
 Because the model string is identical across tiers, escalating a task keeps the prompt
 cache warm. The cost ratios are estimated token-spend multipliers, not price differences.
@@ -471,6 +481,9 @@ highest first:
 2. `effort`.
 
 **Unset means unset**: no `effort` (and no `reasoning_effort`) key is registered at all.
+
+Explicit fields are gated by model family: Claude drops `reasoning.effort`/`reasoning.summary`; adaptive-only Claude also ignores `thinking.budgetTokens`, leaving `effort` applicable.
+Each drop warns once per tier; non-Claude explicit fields are unchanged. See the [provider gate](docs/CONFIG_REFERENCE.md#provider-gate-for-explicit-thinking-and-reasoning-fields).
 
 | Model family | Registered as | Caveats |
 |---|---|---|
@@ -906,6 +919,8 @@ Defines provider fallback order when a delegated task fails:
 
 The read-only cap banners described above are advisory: a well-behaved subagent will respect them, but nothing prevents a model from making one more read after the `[⚠ CAP REACHED]` banner. The **enforcement layer** turns delegation into a produce → verify → accept/escalate loop with independent acceptance and quality escalation. As of v1.3.0 it runs in **`advisory` mode by default**: non-trivial delegations are verified and any genuine failure surfaces a forcing-note, except that a DoD with `testsPass` is deferred by default and returns unverified with a `vrf_` handle until you call `router_verify`, use `VERIFY:required` or enable background verification; nothing is ever hard-blocked (the DoD/acceptance section adds 2,200 characters to the orchestrator system prompt, roughly 550–612 tokens at 3.6–4.0 characters per token, and subagents may receive non-blocking guard banners). Unavailable verification is accepted with explicit caveats by default; `enforcement.verify.strictUnverifiable: true` restores rejection without producer escalation. Set `"mode": "off"` — or run `/router enforce off` — to restore byte-for-byte-unchanged routing with zero added prompt tokens and zero new latency. Hard-blocks only activate in `"mode": "enforced"`.
 
+That deferral is the v1.15.0 default (`enforcement.verify.defaultVerify: "deferred"`, `enforcement.verify.background: false`). It applies only to root-orchestrator dispatches whose DoD carries `testsPass`; see [deferred verification](docs/CONFIG_REFERENCE.md#deferred-verification) for the full conditions.
+
 ### The three enforcement layers
 
 - **Layer 1 — hard-block guard.** A `tool.execute.before` hook throws before a disallowed tool call executes, stopping budget overruns, redundant reads, and throwaway-script sidesteps in subagent sessions.
@@ -914,7 +929,7 @@ The read-only cap banners described above are advisory: a well-behaved subagent 
 
 ### Two operating modes
 
-- **Mode A — on-the-fly.** The orchestrator delegates through the native `Task()` tool — observed and verified automatically by the enforcement pipeline, and rendered inline in the TUI. (An optional, independently-verified `delegate` tool can be enabled via `experimental.verifiedDelegateTool` in `tiers.json` or `MODEL_ROUTER_VERIFIED_DELEGATE=1`; it is hidden by default so delegation stays visible.)
+- **Mode A — on-the-fly.** The orchestrator delegates through the native `Task()` tool — observed by the enforcement pipeline, verified according to the settings above, and rendered inline in the TUI. (An optional, independently-verified `delegate` tool can be enabled via `experimental.verifiedDelegateTool` in `tiers.json` or `MODEL_ROUTER_VERIFIED_DELEGATE=1`; it is hidden by default so delegation stays visible.)
 - **Mode B — plan-annotated.** `/annotate-plan` emits `[tier:X]` plus an `[acceptance]` block per task; the enforcement loop is wired up at execution time based on those annotations.
 
 ### Tuning enforcement
@@ -924,6 +939,9 @@ Advisory is the default. To change the level:
 1. Add or edit the `enforcement` block in `tiers.json` — `"mode": "off"`, `"advisory"`, or `"enforced"` (see `docs/CONFIG_REFERENCE.md`).
 2. Set `MODEL_ROUTER_ENFORCE=1` to force `enforced` for a session, or `MODEL_ROUTER_ENFORCE=0` to force `off`.
 3. Run `/router enforce <off|advisory|enforced>` from the chat to toggle at runtime.
+
+`taskPromptRepair` (top-level, default `true`) fills an absent, null or blank `task` prompt from a non-empty trimmed description, or refuses the call readably if none is usable.
+Set `taskPromptRepair: false` to restore the previous behaviour; see [configuration details](docs/CONFIG_REFERENCE.md#taskpromptrepair).
 
 **Modes:** `off` — no-op, byte-for-byte-unchanged routing (must now be set explicitly, since `advisory` is the default); `advisory` (default) — evaluates and surfaces guidance, never blocks; `enforced` — hard-blocks active, full produce → verify → accept/escalate pipeline.
 
@@ -1038,7 +1056,7 @@ These are character counts of the prompts the shipped config actually produces, 
 
 ## Requirements
 
-- [OpenCode](https://opencode.ai) v1.0 or later
+- [OpenCode](https://opencode.ai) v1 (`>=1.0.0 <2.0.0`) or v2 **2.0.20+**
 - Node.js 20+
 - Provider API keys configured in OpenCode
 
