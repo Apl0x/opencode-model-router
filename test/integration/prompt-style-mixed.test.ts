@@ -82,7 +82,7 @@ test("shipped hybrid preset mixes styles by model under auto", async () => {
     // No shipped preset sets promptStyle, so every tier resolves through auto.
     expect(agent.fast?.model).toBe("openai/gpt-6-luna-fast");
     expect(agent.medium?.model).toBe("openai/gpt-6-astra-fast");
-    expect(agent.heavy?.model).toBe("anthropic/claude-fable-5-1");
+    expect(agent.heavy?.model).toBe("anthropic/claude-opus-5-5");
 
     // Weak models keep the enumerated prompts.
     expect(agent.fast?.prompt).toContain(PRESCRIPTIVE_MARKER);
@@ -90,7 +90,7 @@ test("shipped hybrid preset mixes styles by model under auto", async () => {
     expect(agent.medium?.prompt).toContain(PRESCRIPTIVE_MARKER);
     expect(agent.medium?.prompt).not.toContain(GOAL_MARKER);
 
-    // claude-fable-5-1 matches the claude-fable-5 strong pattern: goal-oriented.
+    // claude-opus-5-5 matches a strong pattern: goal-oriented.
     expect(agent.heavy?.prompt).toContain(GOAL_MARKER);
     expect(agent.heavy?.prompt).not.toContain(PRESCRIPTIVE_MARKER);
     expect(agent.heavy?.prompt).toContain("SCOPE GROWTH:");

@@ -4,7 +4,7 @@
 
 > **Use the cheapest model that can do the job. Automatically.**
 
-An [OpenCode](https://opencode.ai) plugin that routes every coding task to the right-priced AI tier — automatically, on every message, with 3,238–5,229 characters of system-prompt overhead depending on the orchestrator and enforcement mode.
+An [OpenCode](https://opencode.ai) plugin that routes every coding task to the right-priced AI tier — automatically, on every message, with 3,249–6,221 characters of system-prompt overhead depending on the orchestrator and enforcement mode.
 
 ## Why it's different
 
@@ -14,7 +14,7 @@ Most AI coding tools give you one model for everything. You pay Opus prices to r
 The orchestrator runs on *every* message. Put Sonnet there, not Opus. Sonnet reads a routing protocol and delegates just as well as Opus — at 4x lower cost. Reserve Opus for when it genuinely matters.
 
 **Inject a compressed, LLM-optimized routing protocol.**
-Instead of duplicated prose, the plugin injects a dense, machine-readable routing protocol. The protocol itself is 3,238 characters; a Claude orchestrator receives 4,010 characters after its authority prefix (roughly 1,000–1,115 tokens at 3.6–4.0 characters per token). Every message, every session.
+Instead of duplicated prose, the plugin injects a dense, machine-readable routing protocol. The protocol itself is 3,249 characters; a Claude orchestrator receives 4,021 characters after its authority prefix (roughly 1,005–1,117 tokens at 3.6–4.0 characters per token). Every message, every session.
 
 **Match task to tier using a configurable taxonomy.**
 A keyword routing guide (`@fast→search/grep/read`, `@medium→impl/refactor/test`, `@heavy→arch/debug/security`) tells the orchestrator exactly which tier fits each task type. Fully customizable. No ambiguity.
@@ -67,7 +67,7 @@ opencode-model-router injects a **delegation protocol** into the system prompt t
 4. **Never over-qualify** — use the cheapest tier that can reliably handle the task
 5. **Fallback** across providers when one fails
 
-All of this adds 3,238 characters for a non-Claude orchestrator or 4,010 characters for a Claude orchestrator (roughly 810–1,115 tokens at 3.6–4.0 characters per token).
+All of this adds 3,249 characters for a non-Claude orchestrator or 4,021 characters for a Claude orchestrator (roughly 812–1,117 tokens at 3.6–4.0 characters per token).
 
 ## Understanding how it works
 
@@ -168,13 +168,13 @@ Task distribution: 18 exploration (60%), 10 implementation (33%), 2 architecture
 
 ## How it works
 
-On every message, the plugin injects a 3,238-character routing protocol. A Claude orchestrator receives 4,010 characters after its authority prefix (roughly 1,000–1,115 tokens at 3.6–4.0 characters per token). The notation is intentionally dense and compressed — it's **optimized for LLM comprehension, not human readability**. An agent reads it as a precise routing grammar; a human might squint at it.
+On every message, the plugin injects a 3,249-character routing protocol. A Claude orchestrator receives 4,021 characters after its authority prefix (roughly 1,005–1,117 tokens at 3.6–4.0 characters per token). The notation is intentionally dense and compressed — it's **optimized for LLM comprehension, not human readability**. An agent reads it as a precise routing grammar; a human might squint at it.
 
 What the orchestrator sees (Anthropic preset, normal mode):
 
 ```
 ## Model Delegation Protocol
-Preset: anthropic. Tiers: @fast=claude-sonnet-5(1x) @medium=claude-opus-5/high(5x) @heavy=claude-fable-5/max(20x). mode:normal
+Preset: anthropic. Tiers: @fast=claude-sonnet-5-5/low(1x) @medium=claude-sonnet-5-5/medium(5x) @heavy=claude-opus-5-5/xhigh(20x). mode:normal
 R: @fast→search/grep/read/git-info/ls/lookup-docs/types/count/exists-check/rename @medium→impl-feature/refactor/write-tests/bugfix(≤2)/edit-logic/code-review/build-fix/create-file/db-migrate/api-endpoint/config-update @heavy→arch-design/debug(≥3fail)/sec-audit/perf-opt/migrate-strategy/multi-system-integration/tradeoff-analysis/rca
 Multi-phase: prefer explore(@fast)→execute(@medium) when phases are separable. Cheapest-first when practical.
 1.[tier:X] tag in plan → delegate to X 2.plan:fast/cheap→@fast | plan:medium→@medium | plan:heavy→@heavy 3.default preference: read-only work → @fast; implementation → @medium 4.orchestrate=self, execute=subagent (info-gathering IS execution, not orchestration) 5.trivial (≤1 tool call, no expected follow-up) → direct, spent from the orchestrator read-only allowance 6.orchestrator read-only allowance (TARGET): dispatch is default; ≤2 direct read-only calls per turn; 3rd need → dispatch @fast (exceed only with 1-line reason) 7.dispatch caps baseline: @fast=CAP:8, @medium=CAP:5, @heavy=CAP:3 (omit directive = baseline; include CAP:N to override; CAP:none disables the cap only when the dispatch also carries a `reason:` line) 8.before dispatching @heavy: gather context first (usually via @fast); if context is already sufficient, dispatch directly 9.if self is opus: skip-@heavy (do locally); still prefer routing broader read-only exploration to @fast 10.min(cost, adequate-tier)
@@ -220,7 +220,7 @@ With router → split:
 | Cross-provider fallback | ✅ | ❌ | ❌ | ❌ | ❌ |
 | Cost ratio awareness | ✅ | ❌ | ❌ | ❌ | ❌ |
 | Plan annotation with tiers | ✅ | ❌ | ❌ | ❌ | ❌ |
-| Measured prompt overhead: 3,238–5,229 chars | ✅ | — | ❌ | ❌ | ❌ |
+| Measured prompt overhead: 3,249–6,221 chars | ✅ | — | ❌ | ❌ | ❌ |
 
 **Claude native**: single model for everything, no cost routing. If you're using claude.ai or OpenCode without plugins, you're paying the same price for `grep` as for architecture design.
 
@@ -419,15 +419,15 @@ The plugin ships with seven presets (switch with `/preset <name>`):
 **anthropic** (default):
 | Tier | Model | Cost ratio |
 |------|-------|-----------|
-| @fast | `anthropic/claude-sonnet-5` | 1x |
-| @medium | `anthropic/claude-opus-5-5` (variant/effort: low) | 5x |
+| @fast | `anthropic/claude-sonnet-5-5` (variant/effort: low) | 1x |
+| @medium | `anthropic/claude-sonnet-5-5` (variant/effort: medium) | 5x |
 | @heavy | `anthropic/claude-opus-5-5` (variant/effort: xhigh) | 20x |
 
 **openai**:
 | Tier | Model | Cost ratio |
 |------|-------|-----------|
 | @fast | `openai/gpt-6-luna-fast` | 1x |
-| @medium | `openai/gpt-6-astra-fast` (high) | 5x |
+| @medium | `openai/gpt-6.1-sol-fast` (xhigh) | 5x |
 | @heavy | `openai/gpt-6-astra-fast` (max) | 20x |
 
 **github-copilot**:
@@ -447,9 +447,9 @@ The plugin ships with seven presets (switch with `/preset <name>`):
 **hybrid** — OpenAI for exploration and implementation, Anthropic for heavy analysis:
 | Tier | Model | Cost ratio |
 |------|-------|-----------|
-| @fast | `openai/gpt-6-luna-fast` (low) | 1x |
-| @medium | `openai/gpt-6-astra-fast` (low) | 5x |
-| @heavy | `anthropic/claude-fable-5-1` (max) | 20x |
+| @fast | `openai/gpt-6-luna-fast` (medium) | 1x |
+| @medium | `openai/gpt-6-astra-fast` (high) | 5x |
+| @heavy | `anthropic/claude-opus-5-5` (xhigh) | 20x |
 
 **fable-effort** — one model, three reasoning depths (see [per-tier `effort`](#per-tier-effort)):
 | Tier | Model | Effort | Cost ratio |
@@ -709,9 +709,9 @@ Each tier (`@fast`, `@medium`, `@heavy`) has a system prompt that describes its 
   },
   "presets": {
     "anthropic": {
-      "fast":   { "model": "anthropic/claude-sonnet-5", ... },
-      "medium": { "model": "anthropic/claude-opus-5", ... },
-      "heavy":  { "model": "anthropic/claude-fable-5", ... }
+      "fast":   { "model": "anthropic/claude-sonnet-5-5", ... },
+      "medium": { "model": "anthropic/claude-sonnet-5-5", ... },
+      "heavy":  { "model": "anthropic/claude-opus-5-5", ... }
     }
   }
 }
@@ -1044,7 +1044,7 @@ After `/annotate-plan`:
 
 ## Token overhead
 
-Measured with the bundled Anthropic preset in normal mode (the shipped `activePreset`/`activeMode` defaults), the routing protocol is 3,238 characters for a non-Claude orchestrator. A Claude orchestrator receives 4,010 characters after its authority prefix, or 6,210 characters when the 2,200-character DoD/enforcement section is enabled. That is roughly 810–1,725 tokens across the three paths at 3.6–4.0 characters per token. The optional anti-narration clause adds another 650 characters to the Claude path.
+Measured with the bundled Anthropic preset in normal mode (the shipped `activePreset`/`activeMode` defaults), the routing protocol is 3,249 characters for a non-Claude orchestrator. A Claude orchestrator receives 4,021 characters after its authority prefix, or 6,221 characters when the 2,200-character DoD/enforcement section is enabled. That is roughly 812–1,728 tokens across the three paths at 3.6–4.0 characters per token. The optional anti-narration clause adds another 650 characters to the Claude path.
 
 These are character counts of the prompts the shipped config actually produces, so they move whenever the protocol text does. `test/unit/docs-drift.test.ts` recomputes all three from `tiers.json` on every run and fails unless this section still quotes them, so a change that grows the protocol cannot land without updating these numbers.
 
