@@ -130,8 +130,9 @@ export function createV2Runtime(ctx: Plugin.Context) {
     async dispose(sessionID) {
       childSystems.delete(sessionID);
       await interrupt(sessionID);
-      // The public v2 plugin context cannot remove sessions. Keep the native
-      // child history for inspection; never turn it into an unparented session.
+      // Removal was added in 2.0.21; older hosts retain child history.
+      // disposeChildSession catches cleanup failures without masking the result.
+      if (typeof ctx.session.remove === "function") await ctx.session.remove({ sessionID });
     },
   };
 

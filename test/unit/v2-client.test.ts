@@ -19,6 +19,7 @@ function fixture() {
     session: {
       get: vi.fn(async () => ({ id: "child", parentID: "parent", agent: "fast" })),
       interrupt: vi.fn(async () => ({ interrupted: true })),
+      remove: vi.fn(async () => {}),
       move: vi.fn(async () => {}),
     },
     tool: { list: vi.fn(async () => [{ id: "subagent", execute }]) },
@@ -80,6 +81,33 @@ describe("v2 client compatibility", () => {
 });
 
 describe("native v2 child runner", () => {
+  it("interrupts before removing a child on newer hosts", async () => {
+    const { runtime, context } = fixture();
+    await runtime.childRunner.dispose("child");
+    expect(context.session.interrupt).toHaveBeenCalledWith({ sessionID: "child" }, undefined);
+    expect(context.session.remove).toHaveBeenCalledWith({ sessionID: "child" });
+    expect(context.session.interrupt.mock.invocationCallOrder[0]).toBeLessThan(context.session.remove.mock.invocationCallOrder[0]!);
+  });
+
+  it("still interrupts without throwing on hosts without session removal", async () => {
+    const { context } = fixture();
+    const { remove, ...session } = context.session;
+    const runtime = createV2Runtime({ ...context, session } as unknown as Plugin.Context);
+    await expect(runtime.childRunner.dispose("child")).resolves.toBeUndefined();
+    expect(session.interrupt).toHaveBeenCalledWith({ sessionID: "child" }, undefined);
+    expect(remove).not.toHaveBeenCalled();
+  });
+
+  it("catches removal failures at the shared disposal boundary", async () => {
+    const { runtime, context } = fixture();
+    context.session.remove.mockRejectedValueOnce(new Error("session already removed"));
+    const wiring = createVerificationWiring({ client: runtime.client, childRunner: runtime.childRunner, directory: "/project", getConfig: routerConfig.loadConfig });
+    try {
+      await expect(wiring.disposeChildSession("child")).resolves.toBeUndefined();
+      expect(context.session.remove).toHaveBeenCalledWith({ sessionID: "child" });
+    } finally { await wiring.disposeVerification(); }
+  });
+
   it("runs a real child with its parent, model variant, and guards registered before execution", async () => {
     const { runtime, toolContext, execute, context } = fixture();
     const onCreated = vi.fn(async (sessionID: string) => {
@@ -300,6 +328,8 @@ describe("native v2 child runner", () => {
       expect(sequence).toBe(2);
       expect(context.session.interrupt).toHaveBeenCalledWith({ sessionID: "child-1" }, undefined);
       expect(context.session.interrupt).toHaveBeenCalledWith({ sessionID: "child-2" }, undefined);
+      expect(context.session.remove).toHaveBeenCalledWith({ sessionID: "child-1" });
+      expect(context.session.remove).toHaveBeenCalledWith({ sessionID: "child-2" });
     } finally {
       await hooks.dispose?.();
       await runtime.dispose();

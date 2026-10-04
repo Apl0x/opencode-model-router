@@ -120,13 +120,23 @@ export async function registerV2Hooks(
     };
     const originals = new Map(Object.entries(config.agent).map(([id, agent]) => [id, JSON.stringify(agent)]));
     await hooks.config?.(config);
+    const agentOptions = new Map<string, Record<string, unknown>>();
+    for (const [name, definition] of Object.entries(config.agent)) {
+      if (originals.get(name) === JSON.stringify(definition) || !definition.options) continue;
+      const { reasoning_effort, reasoning_summary, budget_tokens, ...options } = definition.options;
+      agentOptions.set(name, {
+        ...options,
+        ...(reasoning_effort === undefined ? {} : { reasoningEffort: reasoning_effort }),
+        ...(reasoning_summary === undefined ? {} : { reasoningSummary: reasoning_summary }),
+        ...(budget_tokens === undefined ? {} : { thinking: { type: "enabled", budgetTokens: budget_tokens } }),
+      });
+    }
     registrations.push(await ctx.agent.transform((editor) => {
       if (runtime) editor.update(V2_GRADER_AGENT, (agent) => {
         agent.mode = "subagent";
         agent.hidden = true;
         agent.description = "Model router verification grader";
         agent.system = GRADER_SYSTEM;
-        agent.request.settings.temperature = loadConfig().enforcement?.verify?.graderTemperature ?? 0;
       });
       for (const [name, definition] of Object.entries(config.agent)) {
         if (originals.get(name) === JSON.stringify(definition)) continue;
@@ -137,13 +147,6 @@ export async function registerV2Hooks(
           if (definition.prompt !== undefined) agent.system = v2Instructions(definition.prompt);
           if (definition.color !== undefined) agent.color = definition.color;
           if (definition.steps !== undefined) agent.steps = definition.steps;
-          if (definition.options) {
-            const { reasoning_effort, reasoning_summary, budget_tokens, ...options } = definition.options;
-            Object.assign(agent.request.settings, options,
-              reasoning_effort === undefined ? {} : { reasoningEffort: reasoning_effort },
-              budget_tokens === undefined ? {} : { thinking: { type: "enabled", budgetTokens: budget_tokens } });
-            if (reasoning_summary !== undefined) agent.request.settings.reasoningSummary = reasoning_summary;
-          }
         });
       }
     }));
@@ -205,7 +208,15 @@ export async function registerV2Hooks(
     }));
     registrations.push(await ctx.session.hook("context", async (event) => {
       const input = { sessionID: event.sessionID, agent: event.agent, model: { ...event.model, modelID: event.model.id } };
+      // V2 consumes per-turn options, not Agent.Info.request.settings.
+      for (const [key, value] of Object.entries(agentOptions.get(event.agent) ?? {})) {
+        if (!(key in event.options)) event.options[key] = value;
+      }
       await legacy["chat.params"]?.(input, event.options);
+      if (event.agent === V2_GRADER_AGENT
+        && !(loadConfig().enforcement?.verify?.graderTemperatureModels ?? []).includes(`${event.model.providerID}/${event.model.id}`)) {
+        delete event.options.temperature;
+      }
       const original = new Map<string, SystemPart[]>();
       for (const part of event.system) {
         const copies = original.get(part.text) ?? [];

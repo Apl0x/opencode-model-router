@@ -174,6 +174,18 @@ describe("validateConfig — enforcement block", () => {
     expect(() => validateConfig(withEnf({ verify: { graderPolicy: "cheapest" } }))).toThrow(/graderPolicy/);
     expect(validateConfig(withEnf({ verify: { graderPolicy: "atLeastProducerTier" } })).enforcement).toBeDefined();
   });
+  it.each([null, {}, "x", [1], [""], ["noslash"], ["/m"], ["p/"]].map(value => ({ value })))(
+    "rejects invalid graderTemperatureModels: $value", ({ value }) => {
+      expect(() => validateConfig(withEnf({ verify: { graderTemperatureModels: value } })))
+        .toThrow("tiers.json: enforcement.verify.graderTemperatureModels");
+    },
+  );
+  it.each([[], ["openai/gpt-x"], ["openai/org/model"]].map(value => ({ value })))(
+    "accepts graderTemperatureModels: $value", ({ value }) => {
+      expect(validateConfig(withEnf({ verify: { graderTemperatureModels: value } })).enforcement?.verify?.graderTemperatureModels)
+        .toEqual(value);
+    },
+  );
   it("rejects costCeiling.multiple <= 0; accepts > 0", () => {
     expect(() => validateConfig(withEnf({ escalate: { costCeiling: { multiple: 0 } } }))).toThrow(/multiple must be a number/);
     expect(() => validateConfig(withEnf({ escalate: { costCeiling: { multiple: -1 } } }))).toThrow(/multiple must be a number/);

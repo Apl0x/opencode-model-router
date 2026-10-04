@@ -13,8 +13,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Expected object at ["default"]` plugin validation error while preserving the
   callable v1 entrypoint. The adapter translates agent registration, commands,
   prompts, tool guards and verification to v2's domain APIs, and uses native
-  subagents for producer/grader sessions. V2 retains child history and displays
-  anti-narration warnings as synthetic transcript entries. See
+  subagents for producer/grader sessions. Grader temperature respects the v1 host
+  capability flag and is omitted on v2 unless the exact model is listed in
+  `enforcement.verify.graderTemperatureModels` (reported by @ChronosWS). V2 tier
+  options reach requests through the context hook, not unused agent settings.
+  V2 ≥2.0.21 removes temporary children after use; 2.0.20 retains their history.
+  Anti-narration warnings appear as synthetic transcript entries. Includes an
+  opt-in provider-backed v2 e2e smoke adapted from @ChronosWS (Cliff Hudson). See
   [the compatibility notes](docs/OPENCODE_V2.md).
 
 ## [1.15.0] - 2026-09-28

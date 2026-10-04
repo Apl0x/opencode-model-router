@@ -81,8 +81,19 @@ describe("OpenCode 2 hook adapter", () => {
       config.agent.explore.model = "anthropic/claude";
       config.agent.explore.options = { budget_tokens: 2000 };
     } });
-    expect(f.agents.fast).toMatchObject({ mode: "subagent", steps: 12, system: 'subagent(agent="fast")', model: { providerID: "openai", id: "org/model", variant: "high" }, request: { settings: { reasoningEffort: "high", reasoningSummary: "auto" } } });
-    expect(f.agents.explore).toMatchObject({ permissions: [{ action: "write", effect: "deny" }], request: { settings: { thinking: { type: "enabled", budgetTokens: 2000 } } } });
+    expect(f.agents.fast).toMatchObject({ mode: "subagent", steps: 12, system: 'subagent(agent="fast")', model: { providerID: "openai", id: "org/model", variant: "high" } });
+    expect(f.agents.explore).toMatchObject({ permissions: [{ action: "write", effect: "deny" }] });
+    expect(f.agents.fast.request.settings).toEqual({});
+    expect(f.agents.explore.request.settings).toEqual({});
+    for (const [agent, expected] of Object.entries({
+      fast: { reasoningEffort: "high", reasoningSummary: "auto" },
+      explore: { thinking: { type: "enabled", budgetTokens: 2000 } },
+      build: {},
+    })) {
+      const event = { ...call, agent, model: { providerID: "openai", id: "org/model" }, options: {}, system: [] };
+      await f.sessionHooks.context(event);
+      expect(event.options).toEqual(expected);
+    }
     f.transforms.agent(f.editors.agent);
     expect(f.agents.explore.permissions).toHaveLength(1);
     expect(f.agents.build).not.toHaveProperty("model");
@@ -312,10 +323,55 @@ describe("OpenCode 2 hook adapter", () => {
     await expect(f.toolHooks["execute.before"]({ ...read, id: "next", input: { path: "another.ts" } })).rejects.toThrow();
   });
 
-  it("defines grader instructions and temperature independently of source-instance session state", async () => {
+  it("defines grader instructions without a static temperature setting", async () => {
     const f = fixture();
     await f.start({}, { withToolContext: (_: any, run: any) => run(), applyChildSystem: vi.fn() });
-    expect(f.agents[V2_GRADER_AGENT]).toMatchObject({ mode: "subagent", hidden: true, system: GRADER_SYSTEM, request: { settings: { temperature: 0 } } });
+    expect(f.agents[V2_GRADER_AGENT]).toMatchObject({ mode: "subagent", hidden: true, system: GRADER_SYSTEM });
+    expect(f.agents[V2_GRADER_AGENT].request.settings).not.toHaveProperty("temperature");
+  });
+
+  it("fills only missing tier options before calling chat.params", async () => {
+    const f = fixture();
+    await f.start({
+      config: async (config: { agent: Record<string, unknown> }) => {
+        config.agent.fast = { options: { maxTokens: 100, topP: 0.8, reasoning_effort: "high" } };
+      },
+      "chat.params": async (_: unknown, options: Record<string, unknown>) => {
+        expect(options).toEqual({ maxTokens: 200, topP: 0.8, reasoningEffort: undefined });
+        options.topP = 0.9;
+      },
+    });
+    const event = { ...call, model: { providerID: "p", id: "m" }, options: { maxTokens: 200, reasoningEffort: undefined }, system: [] };
+    await f.sessionHooks.context(event);
+    expect(event.options).toEqual({ maxTokens: 200, topP: 0.9, reasoningEffort: undefined });
+  });
+
+  it.each([
+    { models: undefined, id: "model", temperature: 0, retained: false },
+    { models: ["openai/model"], id: "model", temperature: 0, retained: true },
+    { models: ["openai/model"], id: "model", temperature: 0.65, retained: true },
+    { models: ["openai/model"], id: "model-extra", temperature: 0.65, retained: false },
+    { models: ["openai/model-extra"], id: "model", temperature: 0.65, retained: false },
+    { models: ["other/model"], id: "model", temperature: 0.65, retained: false },
+    { models: ["openai/org/model"], id: "org/model", temperature: 0.65, retained: true },
+  ])("filters grader temperature for $id with allowlist $models", async ({ models, id, temperature, retained }) => {
+    const cfg = loadConfig();
+    cfg.enforcement ??= {};
+    cfg.enforcement.verify ??= {};
+    cfg.enforcement.verify.graderTemperatureModels = models;
+    const f = fixture();
+    await f.start({ "chat.params": async (_: unknown, options: Record<string, unknown>) => { options.temperature = temperature; } });
+    const event = { ...call, agent: V2_GRADER_AGENT, model: { providerID: "openai", id }, options: { maxOutputTokens: 123 }, system: [] };
+    await f.sessionHooks.context(event);
+    expect(event.options).toEqual({ maxOutputTokens: 123, ...(retained ? { temperature } : {}) });
+  });
+
+  it("leaves non-grader temperature and other options untouched", async () => {
+    const f = fixture();
+    await f.start();
+    const event = { ...call, model: { providerID: "p", id: "m" }, options: { temperature: 0.65, maxOutputTokens: 123 }, system: [] };
+    await f.sessionHooks.context(event);
+    expect(event.options).toEqual({ temperature: 0.65, maxOutputTokens: 123 });
   });
 
   it("strips attributed nested instructions on children while preserving identical explicit user text and attachments", async () => {
