@@ -22,6 +22,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   opt-in provider-backed v2 e2e smoke adapted from @ChronosWS (Cliff Hudson). See
   [the compatibility notes](docs/OPENCODE_V2.md).
 
+### Fixed
+
+- Parallel deferred finishes now share their gate-time tree snapshot, as dispatch
+  starts already did. A run only serves finishes that asked before it started.
+  Unshared, 20 parallel deferred delegations on a 4-core Windows host ran 20
+  snapshots and 19 hit the 2 s finish bound, leaving their changes unattributed
+  (risk high). Measured with that affinity: finish p50 2.11 s → 0.96 s, 19 → 0 capped.
+
 ## [1.15.0] - 2026-09-28
 
 The acceptance gate no longer runs a test suite per delegation. `testsPass` now runs only

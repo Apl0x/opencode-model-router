@@ -1008,6 +1008,8 @@ export function createVerificationWiring(deps: {
   /** QA-3.1-3: dispatches starting together share their snapshot and capture (createSharedFlight). */
   const sharedSnapshots = createSharedFlight<TreeSnapshot>();
   const sharedCaptures = createSharedFlight<DispatchReference>();
+  /** The gate-time snapshot of observeChange, shared the same way (keyed by priority, cwd and digest paths). */
+  const sharedGateSnapshots = createSharedFlight<TreeSnapshot>();
 
   const abs = (p: string): string => (isAbsolute(p) ? p : join(directory, p));
 
@@ -1418,8 +1420,20 @@ export function createVerificationWiring(deps: {
       const options = digests === undefined
         ? { lowPriority }
         : { lowPriority, digestPaths: digests === "unavailable" ? [] : [...digests.keys()] };
+      // QA-3.1-3 at the finish: parallel finishes share one gate-time snapshot per key, and a run
+      // only serves finishes that asked before it started (createSharedFlight), so each still sees
+      // the tree as it was after its own producer returned. Unshared, 20 parallel deferred finishes
+      // spawned 140 git processes and hit DEFERRED_FINISH_MS on a 4-core Windows runner.
+      const digestKey = options.digestPaths === undefined
+        ? "all"
+        : createHash("sha256").update([...options.digestPaths].sort().join("\0")).digest("hex");
+      const key = `${lowPriority ? "low" : "normal"}\0${base}\0${digestKey}`;
       snapshot = bound > 0 && !controller.signal.aborted
-        ? await withTimeout(snapshotTree(base, controller.signal, options), bound, "grade fingerprint")
+        ? await withTimeout(
+          sharedGateSnapshots(key, shared => snapshotTree(base, shared, options), controller.signal),
+          bound,
+          "grade fingerprint",
+        )
         : undefined;
     } catch {
       snapshot = undefined; // Explicit unavailable disclaimer, never a raw tree.

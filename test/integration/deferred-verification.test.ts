@@ -362,6 +362,42 @@ describe("wiring (2.4.2a)", () => {
       expect(state.commands).toEqual([]);
     });
 
+    it("20 parallel deferred finishes share their gate-time snapshot; none uses a run started before it asked", async () => {
+      const { wiring, store } = makeWiring();
+      const ids = Array.from({ length: 20 }, (_, i) => `task:orch:${i}`);
+      for (const id of [...ids, "task:orch:late"]) await wiring.startDispatch(store, id, root, TESTS_DOD, "", false);
+      const input = (dispatchID: string) => ({
+        dispatchID, orchestratorSessionID: "orch", producerSessionID: "child", producerTier: "fast",
+        description: "tidy", cwd: root, dod: TESTS_DOD, dispatchedAt: 0,
+      });
+      const held = holdSnapshots();
+      const a = resolve(root, "src", "a.ts");
+      const b = resolve(root, "src", "b.ts");
+      const finishing = ids.map(id => wiring.finishDeferred(store, input(id)));
+      // The first finish started run 1 at once; the other 19 asked while it ran, so they wait for run 2.
+      await vi.waitFor(() => expect(held).toHaveLength(1));
+      held[0](snap([{ path: a, status: " M" }], "first"));
+      await vi.waitFor(() => expect(held).toHaveLength(2));
+      // A finish that asks while run 2 is in flight waits for run 3.
+      const late = wiring.finishDeferred(store, input("task:orch:late"));
+      held[1](snap([{ path: a, status: " M" }, { path: b, status: " M" }], "second"));
+      await vi.waitFor(() => expect(held).toHaveLength(3));
+      held[2](snap([{ path: b, status: " M" }], "third"));
+      const finishes = (await Promise.all(finishing)).map(deferredOf);
+      const lateFinish = deferredOf(await late);
+      expect(held).toHaveLength(3);
+      const changed = (handle: string) => {
+        const found = wiring.pending.get("orch", handle);
+        if (found.kind !== "found") throw new Error(`handle ${handle} not found`);
+        const files = found.entry.changedFiles;
+        return files === "unavailable" ? files : files.map(f => f.path);
+      };
+      expect(changed(finishes[0].handle)).toEqual([a]);
+      for (const finish of finishes.slice(1)) expect(changed(finish.handle)).toEqual([a, b]);
+      expect(changed(lateFinish.handle)).toEqual([b]);
+      expect(state.commands).toEqual([]);
+    });
+
     it("a tool outside NON_WRITING_TOOLS during a shared snapshot discards it for every sharer, and the deferred entry names the tool", async () => {
       const held = holdSnapshots();
       const { wiring, store } = makeWiring();
