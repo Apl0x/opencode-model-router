@@ -268,10 +268,14 @@ Routing, tool guards and verification use the same engine on both versions. V2
 uses its native `subagent` tool to create real child sessions, preserving the
 host's permissions and cancellation. There are a few host differences:
 
-- Delegations run in the foreground so verification receives a completed result.
-  The router's own deferred/background verification remains a separate setting.
-- V2 child sessions are interrupted during cleanup, but their history is retained:
-  its public plugin API does not expose session deletion.
+- Delegations the router verifies run in the foreground so verification receives
+  a completed result; other `background` requests are kept. The router's own
+  deferred/background verification remains a separate setting.
+- Temporary child sessions are removed after use on v2 ≥2.0.21; 2.0.20 can only
+  interrupt them, so their history is retained.
+- Graders send no temperature unless the exact `provider/model` is listed in
+  `enforcement.verify.graderTemperatureModels`
+  ([details](docs/OPENCODE_V2.md#grader-temperature-on-v2)).
 - Anti-narration warnings appear as separate synthetic transcript entries, because
   completed v2 text events cannot be rewritten.
 

@@ -13,14 +13,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Expected object at ["default"]` plugin validation error while preserving the
   callable v1 entrypoint. The adapter translates agent registration, commands,
   prompts, tool guards and verification to v2's domain APIs, and uses native
-  subagents for producer/grader sessions. Grader temperature respects the v1 host
-  capability flag and is omitted on v2 unless the exact model is listed in
-  `enforcement.verify.graderTemperatureModels` (reported by @ChronosWS). V2 tier
-  options reach requests through the context hook, not unused agent settings.
-  V2 ≥2.0.21 removes temporary children after use; 2.0.20 retains their history.
-  Anti-narration warnings appear as synthetic transcript entries. Includes an
-  opt-in provider-backed v2 e2e smoke adapted from @ChronosWS (Cliff Hudson). See
+  subagents for producer/grader sessions. A subagent's `background` request is
+  kept unless the router verifies that dispatch. Only router-added instructions
+  are translated to v2 tool names. V2 tier options reach requests through the
+  context hook, not unused agent settings. V2 ≥2.0.21 removes temporary children
+  after use; 2.0.20 retains their history. Anti-narration warnings appear as
+  synthetic transcript entries. Includes an opt-in provider-backed v2 e2e smoke
+  adapted from @ChronosWS (Cliff Hudson). See
   [the compatibility notes](docs/OPENCODE_V2.md).
+- **Behavior note:** on v2, graders send no temperature (the provider default
+  applies, not `graderTemperature`) unless the exact `provider/model` is listed in
+  `enforcement.verify.graderTemperatureModels` (reported by @ChronosWS).
+
+### Changed
+
+- V1 graders no longer send `graderTemperature` to models whose capabilities
+  report `temperature: false`.
 
 ### Fixed
 

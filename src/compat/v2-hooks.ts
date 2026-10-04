@@ -5,6 +5,7 @@ import type { ToolContext } from "@opencode/plugin/promise/tool";
 import type { SystemPart } from "@opencode/ai";
 import type { V2Runtime } from "./v2-client";
 import { V2_GRADER_AGENT } from "./v2-client";
+import { TASK_VERIFICATION } from "./child-session";
 import { isAbsolute, resolve } from "node:path";
 import { loadConfig } from "../router/config";
 import { getActiveTiers } from "../router/protocol";
@@ -42,11 +43,11 @@ function taskArgs(toolName: string, input: unknown): any {
   return input;
 }
 
-function nativeArgs(toolName: string, args: any, original: any): any {
+function nativeArgs(toolName: string, args: any, original: any, verifying: boolean): any {
   if (!args || typeof args !== "object") return args;
   if (toolName === "subagent") {
     const { subagent_type, task_id, ...rest } = args;
-    return { ...rest, agent: subagent_type, ...(task_id === undefined ? {} : { sessionID: task_id }), background: false };
+    return { ...rest, agent: subagent_type, ...(task_id === undefined ? {} : { sessionID: task_id }), ...(verifying ? { background: false } : {}) };
   }
   if (toolName === "shell") { const { cwd, ...rest } = args; return { ...rest, ...(cwd === undefined ? {} : { workdir: cwd }) }; }
   if (["read", "write", "edit"].includes(toolName)) {
@@ -85,6 +86,7 @@ export async function registerV2Hooks(
   const legacy = hooks as unknown as Record<string, LegacyHook | undefined>;
   const registrations: Array<{ dispose(): Promise<void> }> = [];
   const abort = new AbortController();
+  const verifyingCalls = new Set<string>();
   let eventTask: Promise<void> | undefined;
   let disposed = false;
   const within = <T>(context: ToolContext, operation: () => Promise<T>): Promise<T> =>
@@ -224,9 +226,16 @@ export async function registerV2Hooks(
         original.set(part.text, copies);
       }
       const output = { system: event.system.map((part) => part.text) };
+      // The router pushes its own instructions, but may splice edited user text.
+      // Only pushed text belongs to the router and may have its vocabulary translated.
+      const added = new Set<string>();
+      Object.defineProperty(output.system, "push", { value: (...texts: string[]) => {
+        for (const text of texts) added.add(text);
+        return Array.prototype.push.apply(output.system, texts);
+      } });
       await legacy["experimental.chat.system.transform"]?.(input, output);
       event.system = output.system.map((text): SystemPart =>
-        original.get(text)?.shift() ?? { type: "text", text: v2Instructions(text) });
+        original.get(text)?.shift() ?? { type: "text", text: added.has(text) ? v2Instructions(text) : text });
       runtime?.applyChildSystem(event.sessionID, event.system);
       // Native reads load nested AGENTS.md as synthetic user-role messages.
       // Correlate their IDs with durable attribution before removing anything;
@@ -277,18 +286,25 @@ export async function registerV2Hooks(
       await within(hookContext(event), async () => {
         await legacy["tool.execute.before"]?.({ ...event, tool: legacyToolName(event.tool), callID: event.id }, output);
       });
+      const verifying = (output as Record<PropertyKey, unknown>)[TASK_VERIFICATION] === true;
+      if (verifying) {
+        verifyingCalls.add(event.id);
+        while (verifyingCalls.size > 1000) verifyingCalls.delete(verifyingCalls.values().next().value!);
+      }
       if (event.tool === "subagent" && typeof output.args?.prompt === "string") {
         const prompt = typeof original?.prompt === "string" ? original.prompt : typeof original?.description === "string" ? original.description : "";
         output.args.prompt = translateAdded(prompt, output.args.prompt);
       }
-      event.input = nativeArgs(event.tool, output.args, original);
+      event.input = nativeArgs(event.tool, output.args, original, verifying);
     }));
     registrations.push(await ctx.tool.hook("execute.after", async (event) => {
+      const verifying = verifyingCalls.delete(event.id);
       if (event.status !== "completed") return;
       const structured = event.result.output;
       // A user can background a foreground subagent while it is running. That
       // acknowledgement is not a final result and must never enter acceptance.
       if (event.tool === "subagent" && structured?.status === "running") {
+        if (!verifying) return;
         const notice = "[router] This subagent is still running. Its result has not been verified; automatic acceptance requires a completed foreground return.";
         const content = Array.isArray(event.result.content) ? [...event.result.content]
           : typeof event.result.content === "string" ? [{ type: "text" as const, text: event.result.content }] : [];

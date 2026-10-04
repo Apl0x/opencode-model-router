@@ -69,6 +69,8 @@ export function createV2Runtime(ctx: Plugin.Context) {
         : current;
       if (!scope) throw new Error("[model-router] v2 child dispatch requires an active tool context or a retained context matching its parent");
       const toolContext = scope.context;
+      // Retained-scope permission prompts remain attributed to the originating
+      // real call IDs, never fabricated replacements.
       const native = (await ctx.tool.list()).find(tool => tool.id === "subagent");
       if (!native) throw new Error("[model-router] OpenCode v2's native subagent tool is unavailable");
       const controller = new AbortController();
@@ -105,7 +107,12 @@ export function createV2Runtime(ctx: Plugin.Context) {
               if (request.cwd) await ctx.session.move({ sessionID, directory: request.cwd }, { signal });
               signal.throwIfAborted();
             }
-            await toolContext.progress(metadata);
+            // V2 rejects progress outside a running call. Deferred/queued graders
+            // retain settled parent contexts; also tolerate settlement during progress.
+            if (scope.active) {
+              try { await toolContext.progress(metadata); }
+              catch (error) { if (scope.active) throw error; }
+            }
           },
         });
         signal.throwIfAborted();

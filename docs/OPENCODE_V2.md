@@ -91,12 +91,13 @@ history remains attached to its parent. V1 still aborts and deletes its temporar
 sessions. V2's immutable completed-text events require anti-narration warnings
 to appear as separate synthetic entries rather than mutating completed text.
 
-The adapter awaits native subagent completion, even if a dispatch requested
-`background: true`, so the shared acceptance gate never treats an unfinished
-background response as completed work. The router's configured deferred and
-background verification operate on completed artifacts as before.
+The adapter awaits native subagent completion only when the router verifies that
+dispatch, overriding `background: true` in that case. Otherwise background is
+preserved and its running result passes through unverified by design (not graded).
+The router's configured deferred and background verification operate on completed
+artifacts as before.
 
-If a user backgrounds an already-running native job, its pending response is
+If a user backgrounds an already-running verified native job, its pending response is
 explicitly marked unverified. It is never sent to the acceptance gate as if it
 were a completed artifact.
 

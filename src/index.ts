@@ -1,5 +1,6 @@
 import type { Plugin } from "@opencode-ai/plugin";
 import type { RouterPluginInput } from "./compat/child-session";
+import { TASK_VERIFICATION } from "./compat/child-session";
 
 // Imports for internal use within this module
 import {
@@ -1101,6 +1102,7 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
       if (input?.tool === "task" && typeof input.callID === "string" && typeof input.sessionID === "string") {
         const mode = resolveEnforcementMode({ config: cfg, env: process.env }).mode;
         if (shouldVerifyTask("task", mode, cfg.enforcement?.verify?.require)) {
+          if (output && typeof output === "object") output[TASK_VERIFICATION] = true;
           const prompt = typeof output?.args?.prompt === "string" ? output.args.prompt : undefined;
           const description = typeof output?.args?.description === "string" ? output.args.description : undefined;
           // 2.4.2b: the directives come from the orchestrator's own prompt, read here before the

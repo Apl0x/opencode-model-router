@@ -11,6 +11,7 @@ import { randomUUID } from "node:crypto";
 import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
 import { GRADER_SYSTEM } from "../../src/verify/checker";
 import { V2_GRADER_AGENT } from "../../src/compat/v2-client";
+import { TASK_VERIFICATION } from "../../src/compat/child-session";
 
 const cleanups: Array<() => Promise<void>> = [];
 afterEach(async () => {
@@ -135,7 +136,7 @@ describe("OpenCode 2 hook adapter", () => {
     expect(event.system[2].text).toBe("grader only");
   });
 
-  it("repairs native subagent arguments through legacy task hooks and awaits completion", async () => {
+  it("repairs native subagent arguments without overriding unverified background requests", async () => {
     const f = fixture();
     await f.start({ "tool.execute.before": async (input: any, output: any) => {
       expect(input.tool).toBe("task"); expect(input.callID).toBe("call");
@@ -144,7 +145,22 @@ describe("OpenCode 2 hook adapter", () => {
     } });
     const event = { ...call, tool: "subagent", input: { agent: "fast", description: "Read files", sessionID: "previous", background: true } };
     await f.toolHooks["execute.before"](event);
-    expect(event.input).toEqual({ agent: "fast", description: "Read files", sessionID: "previous", prompt: "[router] Read files", background: false });
+    expect(event.input).toEqual({ agent: "fast", description: "Read files", sessionID: "previous", prompt: "[router] Read files", background: true });
+  });
+
+  it("does not add a background argument to unverified calls", async () => {
+    const f = fixture(); await f.start();
+    const event = { ...call, tool: "subagent", input: { agent: "fast", prompt: "work" } };
+    await f.toolHooks["execute.before"](event);
+    expect(event.input).not.toHaveProperty("background");
+  });
+
+  it("forces foreground execution only when the legacy hook marks verification", async () => {
+    const f = fixture();
+    await f.start({ "tool.execute.before": async (_: unknown, output: Record<PropertyKey, unknown>) => { output[TASK_VERIFICATION] = true; } });
+    const event = { ...call, tool: "subagent", input: { agent: "fast", prompt: "work", background: true } };
+    await f.toolHooks["execute.before"](event);
+    expect(event.input.background).toBe(false);
   });
 
   it("propagates enforcement blocks instead of executing a denied native tool", async () => {
@@ -175,13 +191,55 @@ describe("OpenCode 2 hook adapter", () => {
 
   it("never grades a subagent backgrounded by the user while its call was running", async () => {
     const f = fixture(); const after = vi.fn();
-    await f.start({ "tool.execute.after": after });
+    await f.start({
+      "tool.execute.before": async (_: unknown, output: Record<PropertyKey, unknown>) => { output[TASK_VERIFICATION] = true; },
+      "tool.execute.after": after,
+    });
+    await f.toolHooks["execute.before"]({ ...call, tool: "subagent", input: { agent: "fast", prompt: "work" } });
     const event = { ...call, tool: "subagent", status: "completed", result: { output: { sessionID: "child", status: "running", output: "Working in the background" }, content: "Working in the background" } };
     await f.toolHooks["execute.after"](event);
     expect(after).not.toHaveBeenCalled();
     expect(event.result.output.status).toBe("running");
     expect(event.result.output.output).toContain("has not been verified");
     expect(event.result.content).toContainEqual({ type: "text", text: "Working in the background" });
+  });
+
+  it("passes unverified running results through unchanged without calling the legacy after hook", async () => {
+    const f = fixture(); const after = vi.fn();
+    await f.start({ "tool.execute.after": after });
+    const event = { ...call, tool: "subagent", input: { agent: "fast", background: true }, status: "completed", result: { output: { status: "running", output: "Working" }, content: "Working" } };
+    const original = event.result;
+    await f.toolHooks["execute.before"](event);
+    await f.toolHooks["execute.after"](event);
+    expect(event.result).toBe(original);
+    expect(event.result).toEqual({ output: { status: "running", output: "Working" }, content: "Working" });
+    expect(after).not.toHaveBeenCalled();
+  });
+
+  it.each(["completed", "error"])("forgets verification call IDs after %s returns", async (status) => {
+    const f = fixture();
+    await f.start({ "tool.execute.before": async (_: unknown, output: Record<PropertyKey, unknown>) => { output[TASK_VERIFICATION] = true; } });
+    await f.toolHooks["execute.before"]({ ...call, tool: "subagent", input: { agent: "fast", prompt: "work" } });
+    await f.toolHooks["execute.after"]({ ...call, tool: "subagent", status, result: { content: "Done" } });
+    const result = { output: { status: "running" }, content: "Working" };
+    const event = { ...call, tool: "subagent", status: "completed", result };
+    await f.toolHooks["execute.after"](event);
+    expect(event.result).toBe(result);
+  });
+
+  it("evicts the oldest verification call ID beyond the bounded limit", async () => {
+    const f = fixture();
+    await f.start({ "tool.execute.before": async (_: unknown, output: Record<PropertyKey, unknown>) => { output[TASK_VERIFICATION] = true; } });
+    for (let i = 0; i <= 1000; i++) {
+      await f.toolHooks["execute.before"]({ ...call, id: `call-${i}`, tool: "subagent", input: { agent: "fast", prompt: "work" } });
+    }
+    const result = { output: { status: "running" }, content: "Working" };
+    const oldest = { ...call, id: "call-0", tool: "subagent", status: "completed", result };
+    await f.toolHooks["execute.after"](oldest);
+    expect(oldest.result).toBe(result);
+    const newest = { ...oldest, id: "call-1000", result };
+    await f.toolHooks["execute.after"](newest);
+    expect(newest.result).not.toBe(result);
   });
 
   it("registers the real argument schema and carries cancellation into custom tools", async () => {
@@ -247,6 +305,21 @@ describe("OpenCode 2 hook adapter", () => {
     await f.sessionHooks.context(event);
     expect(event.system[0]).toBe(first);
     expect(event.system[1]).toBe(second);
+  });
+
+  it("preserves edited user system text spliced by the child hook verbatim", async () => {
+    const f = fixture();
+    const edited = 'Keep literal Task(subagent_type="fast")';
+    await f.start({ "experimental.chat.system.transform": async (_: unknown, output: { system: string[] }) => {
+      output.system.splice(0, 1, edited);
+      output.system.push('Use Task(subagent_type="fast")');
+    } });
+    const retained = { type: "text", text: "Unchanged", metadata: { source: "host" } };
+    const event = { ...call, model: { providerID: "p", id: "m" }, options: {}, system: [{ type: "text", text: `${edited}\nDelegate everything` }, retained] };
+    await f.sessionHooks.context(event);
+    expect(event.system[0].text).toBe(edited);
+    expect(event.system[1]).toBe(retained);
+    expect(event.system[2].text).toBe('Use subagent(agent="fast")');
   });
 
   it("maps native shell and file arguments without leaking legacy fields into native schemas", async () => {

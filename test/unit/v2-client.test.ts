@@ -141,6 +141,7 @@ describe("native v2 child runner", () => {
       model: { providerID: "p", modelID: "model/path", variant: "high" }, onCreated,
     }))).resolves.toEqual({ sessionID: "child", text: "verified result" });
     const system: SessionContext["system"] = [];
+    expect(toolContext.progress).toHaveBeenCalledWith({ sessionID: "child", status: "running" });
     runtime.applyChildSystem("child", system);
     expect(system).toEqual([]);
     await runtime.childRunner.dispose("child");
@@ -209,6 +210,7 @@ describe("native v2 child runner", () => {
       parentSessionID: "parent", prompt: "deferred grading", onCreated: async () => {},
     }))).resolves.toEqual({ sessionID: "child", text: "verified result" });
     runtime.forgetSession("parent");
+    expect(toolContext.progress).not.toHaveBeenCalled();
     await expect(runtime.childRunner.run({ parentSessionID: "parent", prompt: "again", onCreated: async () => {} }))
       .rejects.toThrow("matching its parent");
   });
@@ -223,6 +225,34 @@ describe("native v2 child runner", () => {
     expect(execute).not.toHaveBeenCalled();
     await expect(runtime.childRunner.run({ parentSessionID: "parent-500", prompt: "latest", onCreated: async () => {} }))
       .resolves.toEqual({ sessionID: "child", text: "verified result" });
+  });
+
+  it("ignores progress rejection if the originating call settled concurrently", async () => {
+    const { runtime, toolContext } = fixture();
+    let progressStarted!: () => void;
+    const started = new Promise<void>(resolve => { progressStarted = resolve; });
+    let rejectProgress!: (error: Error) => void;
+    const pending = new Promise<void>((_resolve, reject) => { rejectProgress = reject; });
+    const progress = vi.fn(() => { progressStarted(); return pending; });
+    let child!: ReturnType<typeof runtime.childRunner.run>;
+    await runtime.withToolContext({ ...toolContext, progress }, async () => {
+      child = runtime.childRunner.run({ prompt: "work", onCreated: async () => {} });
+      await started;
+    });
+    rejectProgress(new Error("Tool progress outside running call"));
+    await expect(child).resolves.toEqual({ sessionID: "child", text: "verified result" });
+    expect(progress).toHaveBeenCalledOnce();
+  });
+
+  it("propagates progress rejection while the originating call remains active", async () => {
+    const { runtime, toolContext, context } = fixture();
+    const error = new Error("progress failed");
+    const progress = vi.fn(async () => { throw error; });
+    await expect(runtime.withToolContext({ ...toolContext, progress }, () => runtime.childRunner.run({
+      prompt: "work", onCreated: async () => {},
+    }))).rejects.toBe(error);
+    expect(progress).toHaveBeenCalledOnce();
+    expect(context.session.interrupt).toHaveBeenCalledWith({ sessionID: "child" });
   });
 
   it("plugin disposal cancels active children and prevents further dispatch", async () => {

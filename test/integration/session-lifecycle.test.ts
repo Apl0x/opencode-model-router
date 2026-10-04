@@ -5,6 +5,7 @@ import { mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import ModelRouterPlugin from "../../src/index";
+import { TASK_VERIFICATION } from "../../src/compat/child-session";
 import { invalidateConfigCache, loadConfig } from "../../src/router/config";
 import { getActiveTiers } from "../../src/router/protocol";
 import * as sessions from "../../src/router/sessions";
@@ -237,6 +238,23 @@ describe("child session lifecycle", () => {
   });
 
   describe("task dispatch headers", () => {
+    it.each(["enforced", "off"])("marks the legacy output only when task verification engages (%s)", async (mode) => {
+      vi.stubEnv("MODEL_ROUTER_ENFORCE", mode === "enforced" ? "1" : "0");
+      const cfg = loadConfig();
+      cfg.enforcement ??= {}; cfg.enforcement.verify ??= {};
+      cfg.enforcement.verify.require = "always";
+      const hooks = await ModelRouterPlugin(makeHarness().ctx as PluginInput);
+      const output = { args: { subagent_type: "fast", prompt: "Do the work" } };
+      try {
+        await hooks["tool.execute.before"]!({ tool: "task", sessionID: ORCHESTRATOR_SID, callID: "verification-marker" }, output);
+        expect((output as Record<PropertyKey, unknown>)[TASK_VERIFICATION]).toBe(mode === "enforced" ? true : undefined);
+        expect(Object.getOwnPropertySymbols(output.args)).toEqual([]);
+      } finally {
+        await hooks.dispose?.();
+        vi.unstubAllEnvs();
+      }
+    });
+
     it.each([
       { prompt: "Do the work", cap: 11 },
       { prompt: "CAP:7\nDo the work", cap: 7 },
@@ -298,7 +316,7 @@ describe("child session lifecycle", () => {
       const output = { args };
       const before = structuredClone(output);
       await hooks["tool.execute.before"]!({ tool, sessionID: ORCHESTRATOR_SID, callID: "dispatch" }, output);
-      expect(output).toEqual(before);
+      expect(output.args).toEqual(before.args);
     });
 
     it("can be disabled by config", async () => {
@@ -336,7 +354,7 @@ describe("child session lifecycle", () => {
       const output = { args: { subagent_type: "fast", description: "greet", prompt: "Do the work" } };
       const before = structuredClone(output);
       await hooks["tool.execute.before"]!(call, output);
-      expect(output).toEqual(before);
+      expect(output.args).toEqual(before.args);
     });
 
     it.each([undefined, null, "", "   \n"])("fills a missing prompt (%j) from the trimmed description", async (prompt) => {
@@ -365,7 +383,7 @@ describe("child session lifecycle", () => {
         "Re-issue the call with the work restated as an instruction in `prompt`. If the request carries no task at all " +
         "(a greeting, an acknowledgement), do not delegate: answer it directly instead.",
       );
-      expect(output).toEqual(before);
+      expect(output.args).toEqual(before.args);
     });
 
     it("can be disabled by config, turning off both the repair and the refusal", async () => {
