@@ -67,7 +67,7 @@ function none(reason: string): ReferenceState {
  * appended (a deleted file keeps its directory's canonical spelling); lexical `resolve` when no
  * ancestor resolves.
  */
-function canonicalPath(path: string): string {
+export function canonicalPath(path: string): string {
   const absolute = resolve(path);
   let head = absolute;
   const tail: string[] = [];

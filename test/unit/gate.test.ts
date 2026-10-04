@@ -1,6 +1,8 @@
 import { describe, it, expect, vi } from "vitest";
-import { join } from "node:path";
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync } from "node:fs";
+import { join, sep } from "node:path";
 import { tmpdir } from "node:os";
+import { canonicalPath } from "../../src/verify/dispatch";
 import { accept } from "../../src/verify/gate";
 import type { Artefact, Delegation, GateDeps } from "../../src/verify/gate";
 import type { DeterministicDeps } from "../../src/verify/types";
@@ -139,6 +141,35 @@ describe("accept() — outside-directory safety net", () => {
     const r = await accept({ dod }, changed([join(`${base}-v2`, "file.ts")]), d);
     expect(r.verdict.outcome).toBe("unverifiable");
     expect(exec).not.toHaveBeenCalled();
+  });
+
+  it("compares canonical paths: another spelling of the base is not outside", async () => {
+    // CI regression: the base arrived as a Windows 8.3 short name (C:\Users\MARQUI~1\...) and the
+    // changed files as long names (C:\Users\Marquinho\...), so a lexical check skipped real work.
+    const { exec, d, dod } = setup();
+    const longBase = join(tmpdir(), "gate-repo-long-name");
+    const canonicalPath = (path: string) =>
+      path === base || path.startsWith(base + sep) ? longBase + path.slice(base.length) : path;
+    const r = await accept({ dod }, changed([join(longBase, "file.ts")]), { ...d, canonicalPath });
+    expect(r.verdict.outcome).toBe("pass");
+    expect(exec).toHaveBeenCalled();
+  });
+
+  it("canonicalizes the real filesystem: a path through a directory link is inside", async () => {
+    const root = mkdtempSync(join(tmpdir(), "gate-canonical-"));
+    try {
+      const real = join(root, "real");
+      const link = join(root, "link");
+      mkdirSync(real);
+      // A junction on Windows needs no privilege; elsewhere a plain directory symlink.
+      symlinkSync(real, link, process.platform === "win32" ? "junction" : "dir");
+      const { exec, d, dod } = setup();
+      const r = await accept({ dod, cwd: link }, changed([join(real, "file.ts")]), { ...d, canonicalPath });
+      expect(r.verdict.outcome).toBe("pass");
+      expect(exec).toHaveBeenCalled();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 
   it("runs checks in delegation.cwd when it contains the changes", async () => {
