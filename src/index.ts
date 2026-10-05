@@ -561,6 +561,7 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
               prompt: args.task,
               acceptance: args.acceptance,
             });
+            const effectiveCwd = typeof args.cwd === "string" && args.cwd.trim() ? args.cwd : dod.cwd;
 
             const policy = buildEscalatePolicy(activeCfg);
             let state = newLadderState(initialTier, policy);
@@ -613,7 +614,7 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
                 if (!baselineID) {
                   baselineID = sid;
                   // Capture before the child gets its first prompt, on either API.
-                  dispatchStart = await startDispatch(changedFileStore, baselineID, args.cwd, dod, args.task, false);
+                  dispatchStart = await startDispatch(changedFileStore, baselineID, effectiveCwd, dod, args.task, false);
                 }
                 // Compose with Layer 1: guard the plugin-created producer session.
                 try {
@@ -695,7 +696,7 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
                     producerSessionID: producerSid,
                     producerTier: tier,
                     description: args.task,
-                    cwd: args.cwd,
+                    cwd: effectiveCwd,
                     dod,
                     dispatchedAt: dispatchStart.dispatchedAt,
                   })
@@ -734,7 +735,7 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
               const gateDeadline = createDeadline(gateBudgetMs);
               let verification;
               try {
-                verification = await prepareVerification(changedFileStore, baselineID, producerSid, args.cwd, gateDeadline);
+                verification = await prepareVerification(changedFileStore, baselineID, producerSid, effectiveCwd, gateDeadline);
               } catch (error) {
                 gateDeadline.dispose();
                 throw error;
@@ -771,7 +772,7 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
                           dod,
                           trivial: false,
                           mode: "modeA",
-                          ...(args.cwd ? { cwd: args.cwd } : {}),
+                          ...(effectiveCwd ? { cwd: effectiveCwd } : {}),
                         },
                         artefact,
                         gateDeps,
@@ -1107,12 +1108,14 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
           if (output && typeof output === "object") output[TASK_VERIFICATION] = true;
           const prompt = typeof output?.args?.prompt === "string" ? output.args.prompt : undefined;
           const description = typeof output?.args?.description === "string" ? output.args.description : undefined;
+          const dod = buildDelegationDoD({ prompt, description });
+          const effectiveCwd = typeof output?.args?.cwd === "string" && output.args.cwd.trim() ? output.args.cwd : dod.cwd;
           // 2.4.2b: the directives come from the orchestrator's own prompt, read here before the
           // dispatch header or any repair touches it, and are kept for the after hook. The capture
           // is awaited for at most VERIFY_WAIT (section 1.5-14) and continues in the background.
           await startDispatch(changedFileStore, `task:${input.sessionID}:${input.callID}`,
-            typeof output?.args?.cwd === "string" ? output.args.cwd : undefined,
-            buildDelegationDoD({ prompt, description }),
+            effectiveCwd,
+            dod,
             dispatchDirectiveText(prompt, description),
             true);
         }
@@ -1300,6 +1303,7 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
               prompt: input?.args?.prompt,
               description: input?.args?.description,
             });
+            const effectiveCwd = typeof input?.args?.cwd === "string" && input.args.cwd.trim() ? input.args.cwd : dod.cwd;
             const dispatchID = `task:${input.sessionID}:${input.callID}`;
             const orchestratorSessionID = typeof input.sessionID === "string" ? input.sessionID : "";
             const taskPrompt = typeof input?.args?.prompt === "string" ? input.args.prompt : undefined;
@@ -1320,7 +1324,7 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
                 producerSessionID: childSessionID ?? "",
                 producerTier,
                 description: taskDescription?.trim() ? taskDescription : (taskPrompt ?? ""),
-                cwd: typeof input?.args?.cwd === "string" ? input.args.cwd : undefined,
+                cwd: effectiveCwd,
                 dod,
                 dispatchedAt: start.dispatchedAt,
               });
@@ -1341,7 +1345,7 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
             const gateDeadline = createDeadline(gateBudgetMs);
             let verification;
             try {
-              verification = await prepareVerification(changedFileStore, dispatchID, childSessionID ?? "", input?.args?.cwd, gateDeadline);
+              verification = await prepareVerification(changedFileStore, dispatchID, childSessionID ?? "", effectiveCwd, gateDeadline);
             } catch (error) {
               gateDeadline.dispose();
               throw error;
@@ -1385,12 +1389,8 @@ const ModelRouterPlugin: Plugin = async (ctx: RouterPluginInput) => {
                     dod,
                     trivial,
                     mode: "modeA",
-                    // The built-in task tool declares no cwd of its own, but if a
-                    // caller supplies one it scopes verification the same way the
-                    // delegate tool's does.
-                    ...(typeof input?.args?.cwd === "string" && input.args.cwd
-                      ? { cwd: input.args.cwd }
-                      : {}),
+                    // Native task has no cwd argument; the acceptance block can supply it.
+                    ...(effectiveCwd ? { cwd: effectiveCwd } : {}),
                   },
                   artefact,
                   gateDeps,

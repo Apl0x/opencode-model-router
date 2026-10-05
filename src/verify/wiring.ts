@@ -65,6 +65,7 @@ import { DEFAULT_IDLE_TTL_MS } from "../router/idle-sweep";
 import {
   buildAcceptedSuffix,
   buildForcingNote,
+  canonicalPath,
   tierModel,
   toolLabel,
   type ChangedFile,
@@ -1398,6 +1399,7 @@ export function createVerificationWiring(deps: {
       },
       require: cfg.enforcement?.verify?.require,
       strictUnverifiable: cfg.enforcement?.verify?.strictUnverifiable,
+      canonicalPath,
     };
   };
 

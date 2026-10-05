@@ -336,11 +336,22 @@ The plugin-owned `delegate` tool produces via the OpenCode client, runs the gate
 
 A delegation may declare a `cwd`. When it does, verification is scoped to that directory instead of the router's own:
 
+The native `task` tool has no `cwd` argument: declare `cwd: <dir>` inside its `[acceptance]` block when the producer works elsewhere (for example, in a git worktree). Paths may be plain or surrounded by single or double quotes. A non-empty `args.cwd`, when a tool supplies one, wins over the block's `cwd`; the custom `delegate` tool follows the same rule, including deferred `router_verify` checks. No directory is inferred from free prompt text.
+
+```text
+[acceptance]
+cwd: "/path/to/worktree"
+check: testsPass
+[/acceptance]
+```
+
 - **Deterministic checks.** `resolveBaseDir` (`src/verify/paths.ts`) resolves the effective base: no `cwd` → the router's directory (byte-identical to the previous behavior), an absolute `cwd` → that path, a relative one → joined onto the router directory. Every `fileExists`, `fileContains`, and command check then resolves through `resolveAgainst` and runs with `cwd` set to that base.
 - **The grader session.** `req.cwd` is passed as `query: { directory: req.cwd }` when the grader session is created. Naming the directory in the prompt text is not enough: without the query parameter the grader's own tools resolve against the router's cwd, so it would report "file not found" for files that are plainly there.
 - **The producer is deliberately NOT scoped.** Only the verification side takes the `cwd`. The producer runs where OpenCode put it.
 
 An absolute check path bypasses the base directory entirely, and the failure reason says so — it names the path that was actually checked rather than claiming the file was missing "in `<cwd>`", a directory the check never looked in.
+
+As a safety net, if the changed-file list is non-empty and **every** path is absolute and outside the effective base, the deterministic gate skips checks and returns **unverifiable**, with this reason (also a caveat): `the producer changed files only outside <base> (e.g. <firstPath>); checks run there cannot see them. Add "cwd: <dir>" to the [acceptance] block to verify where the work landed.` Any relative path or any path inside the base preserves normal checking; sibling-prefix directories are outside. Both sides are compared as canonical paths (`canonicalPath` in `src/verify/dispatch.ts`, injected through `GateDeps.canonicalPath`), so a Windows 8.3 short name, a symlink or a junction to the base is not mistaken for another directory. This does not apply to the grader branch. The usual `strictUnverifiable` policy applies: accepted with a caveat by default, rejected when strict.
 
 ## `verify` config keys
 

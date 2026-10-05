@@ -25,6 +25,7 @@ export interface DoD {
   criteria: string[];     // [] when none
   deliverable: string | null;
   source: DoDSource;
+  cwd?: string;
 }
 
 export interface InferHints {
@@ -79,7 +80,8 @@ export function normalizeDoD(d: DoD): DoD {
   const rawDeliverable = typeof d.deliverable === "string" ? d.deliverable.trim() : "";
   const deliverable: string | null = rawDeliverable.length > 0 ? rawDeliverable : null;
 
-  return { kind, checks, criteria, deliverable, source: d.source };
+  const cwd = typeof d.cwd === "string" ? d.cwd.trim() : "";
+  return { kind, checks, criteria, deliverable, source: d.source, ...(cwd ? { cwd } : {}) };
 }
 
 // ---------------------------------------------------------------------------
@@ -131,6 +133,7 @@ export function parseAcceptanceBlock(text: string, source: DoDSource = "explicit
   const criteria: string[] = [];
   let deliverable: string | null = null;
   let kindHint: DoDKind | null = null;
+  let cwd: string | undefined;
 
   for (const rawLine of innerLines) {
     const line = rawLine.trim();
@@ -153,6 +156,9 @@ export function parseAcceptanceBlock(text: string, source: DoDSource = "explicit
       if (kvPairs["path"] !== undefined) check.path = kvPairs["path"];
       if (kvPairs["schema"] !== undefined) check.schema = kvPairs["schema"];
       checks.push(check);
+    } else if (lline.startsWith("cwd:")) {
+      const rest = line.slice("cwd:".length).trim().replace(/^(["'])(.*)\1$/, "$2").trim();
+      if (rest) cwd = rest;
     } else if (lline.startsWith("criteria:")) {
       const rest = line.slice("criteria:".length).trim();
       if (rest) criteria.push(rest);
@@ -173,6 +179,7 @@ export function parseAcceptanceBlock(text: string, source: DoDSource = "explicit
     criteria,
     deliverable,
     source,
+    ...(cwd ? { cwd } : {}),
   });
 }
 

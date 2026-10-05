@@ -17,7 +17,7 @@ import { e2eEnabled, prepareFixtureRepo, readProbeLog, type FixtureName, type Fi
 import { acceptance, createE2EPlugin, type E2EPlugin } from "./e2e/harness";
 import { mentionsAny, pathSpellings } from "./e2e/sampler";
 
-const d = e2eEnabled() ? describe.sequential : describe.skip;
+const d = e2eEnabled() ? describe : describe.skip;
 
 const TEST_TIMEOUT = 120_000;
 const SETUP_TIMEOUT = 600_000;
@@ -374,7 +374,7 @@ function assertProbes(probes: ProbeEntry[], s: Scenario, r: RunnerSpec, repo: Fi
 }
 
 for (const r of RUNNERS) {
-  d(`guardrail matrix on real ${r.name}`, () => {
+  d(`guardrail matrix on real ${r.name}`, { concurrent: false }, () => {
     let repo: FixtureRepo;
     let plugin: E2EPlugin;
     let basePlain = "";
@@ -481,7 +481,7 @@ for (const r of RUNNERS) {
  * QA-G-2's import-shaped search missed test_combo.py: the scoped pytest argv held only
  * test_mod02_1.py, and the result read `[router ✓ verified: deterministic]` over a failing importer.
  */
-d("QA-G-10: a pytest importer in isort's grid wrap is selected (real pytest-app)", () => {
+d("QA-G-10: a pytest importer in isort's grid wrap is selected (real pytest-app)", { concurrent: false }, () => {
   let repo: FixtureRepo;
   let plugin: E2EPlugin;
   let probeLog = "";

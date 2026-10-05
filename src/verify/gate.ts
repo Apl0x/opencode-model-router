@@ -24,7 +24,8 @@ import { isCheckable } from "./dod";
 import { runDeterministic } from "./deterministic";
 import { runChecker } from "./checker";
 import type { ArtefactView, CheckerDeps } from "./checker";
-import { resolveBaseDir } from "./paths";
+import { isAbsolute } from "node:path";
+import { isWithinDir, resolveBaseDir } from "./paths";
 
 /** The concrete, inspectable result of a delegation (artefact contract §3.3). */
 export interface Artefact {
@@ -62,6 +63,12 @@ export interface GateDeps {
    */
   require?: "never" | "whenDoDPresent" | "always";
   strictUnverifiable?: boolean;
+  /**
+   * Canonicalizes a path for the outside-the-base check: one directory can be spelled several
+   * ways (a Windows 8.3 short name, a symlink such as macOS /var -> /private/var), and a lexical
+   * comparison would call the producer's own files "outside". Absent means lexical comparison.
+   */
+  canonicalPath?: (path: string) => string;
 }
 
 export interface GateResult {
@@ -187,6 +194,14 @@ export async function accept(
 
   let verdict: Verdict;
   if (dod.kind === "deterministic") {
+    const canonical = deps.canonicalPath ?? ((path: string) => path);
+    const canonicalBase = canonical(effectiveBaseDir);
+    if (artefact.changedFiles.length > 0 && artefact.changedFiles.every(
+      ({ path }) => isAbsolute(path) && !isWithinDir(canonical(path), canonicalBase),
+    )) {
+      const reason = `the producer changed files only outside ${effectiveBaseDir} (e.g. ${artefact.changedFiles[0].path}); checks run there cannot see them. Add "cwd: <dir>" to the [acceptance] block to verify where the work landed.`;
+      return gateResult({ pass: false, outcome: "unverifiable", method: "none", reasons: [reason], caveats: [reason] }, dodSource, deps.strictUnverifiable);
+    }
     verdict = await runDeterministic(dod, {
       ...deps.deterministic,
       cwd: effectiveBaseDir,
