@@ -4,7 +4,7 @@
 
 > **Use the cheapest model that can do the job. Automatically.**
 
-An [OpenCode](https://opencode.ai) plugin that routes every coding task to the right-priced AI tier — automatically, on every message, with 3,249–6,221 characters of system-prompt overhead depending on the orchestrator and enforcement mode.
+An [OpenCode](https://opencode.ai) plugin that routes every coding task to the right-priced AI tier — automatically, on every message, with 3,249–6,357 characters of system-prompt overhead depending on the orchestrator and enforcement mode.
 
 ## Why it's different
 
@@ -220,7 +220,7 @@ With router → split:
 | Cross-provider fallback | ✅ | ❌ | ❌ | ❌ | ❌ |
 | Cost ratio awareness | ✅ | ❌ | ❌ | ❌ | ❌ |
 | Plan annotation with tiers | ✅ | ❌ | ❌ | ❌ | ❌ |
-| Measured prompt overhead: 3,249–6,221 chars | ✅ | — | ❌ | ❌ | ❌ |
+| Measured prompt overhead: 3,249–6,357 chars | ✅ | — | ❌ | ❌ | ❌ |
 
 **Claude native**: single model for everything, no cost routing. If you're using claude.ai or OpenCode without plugins, you're paying the same price for `grep` as for architecture design.
 
@@ -917,7 +917,7 @@ Defines provider fallback order when a delegated task fails:
 
 ## Delegation enforcement (advisory by default)
 
-The read-only cap banners described above are advisory: a well-behaved subagent will respect them, but nothing prevents a model from making one more read after the `[⚠ CAP REACHED]` banner. The **enforcement layer** turns delegation into a produce → verify → accept/escalate loop with independent acceptance and quality escalation. As of v1.3.0 it runs in **`advisory` mode by default**: non-trivial delegations are verified and any genuine failure surfaces a forcing-note, except that a DoD with `testsPass` is deferred by default and returns unverified with a `vrf_` handle until you call `router_verify`, use `VERIFY:required` or enable background verification; nothing is ever hard-blocked (the DoD/acceptance section adds 2,200 characters to the orchestrator system prompt, roughly 550–612 tokens at 3.6–4.0 characters per token, and subagents may receive non-blocking guard banners). Unavailable verification is accepted with explicit caveats by default; `enforcement.verify.strictUnverifiable: true` restores rejection without producer escalation. Set `"mode": "off"` — or run `/router enforce off` — to restore byte-for-byte-unchanged routing with zero added prompt tokens and zero new latency. Hard-blocks only activate in `"mode": "enforced"`.
+The read-only cap banners described above are advisory: a well-behaved subagent will respect them, but nothing prevents a model from making one more read after the `[⚠ CAP REACHED]` banner. The **enforcement layer** turns delegation into a produce → verify → accept/escalate loop with independent acceptance and quality escalation. As of v1.3.0 it runs in **`advisory` mode by default**: non-trivial delegations are verified and any genuine failure surfaces a forcing-note, except that a DoD with `testsPass` is deferred by default and returns unverified with a `vrf_` handle until you call `router_verify`, use `VERIFY:required` or enable background verification; nothing is ever hard-blocked (the DoD/acceptance section adds 2,336 characters to the orchestrator system prompt, roughly 584–649 tokens at 3.6–4.0 characters per token, and subagents may receive non-blocking guard banners). Unavailable verification is accepted with explicit caveats by default; `enforcement.verify.strictUnverifiable: true` restores rejection without producer escalation. Set `"mode": "off"` — or run `/router enforce off` — to restore byte-for-byte-unchanged routing with zero added prompt tokens and zero new latency. Hard-blocks only activate in `"mode": "enforced"`.
 
 That deferral is the v1.15.0 default (`enforcement.verify.defaultVerify: "deferred"`, `enforcement.verify.background: false`). It applies only to root-orchestrator dispatches whose DoD carries `testsPass`; see [deferred verification](docs/CONFIG_REFERENCE.md#deferred-verification) for the full conditions.
 
@@ -942,6 +942,9 @@ Advisory is the default. To change the level:
 
 `taskPromptRepair` (top-level, default `true`) fills an absent, null or blank `task` prompt from a non-empty trimmed description, or refuses the call readably if none is usable.
 Set `taskPromptRepair: false` to restore the previous behaviour; see [configuration details](docs/CONFIG_REFERENCE.md#taskpromptrepair).
+
+For work outside the router directory (e.g. a git worktree), add `cwd: <dir>` inside the task's `[acceptance]` block; a non-empty tool `args.cwd` takes precedence.
+If every changed file is absolute and outside the verification base, deterministic checks return unverifiable instead of running in the wrong directory.
 
 **Modes:** `off` — no-op, byte-for-byte-unchanged routing (must now be set explicitly, since `advisory` is the default); `advisory` (default) — evaluates and surfaces guidance, never blocks; `enforced` — hard-blocks active, full produce → verify → accept/escalate pipeline.
 
@@ -1044,7 +1047,7 @@ After `/annotate-plan`:
 
 ## Token overhead
 
-Measured with the bundled Anthropic preset in normal mode (the shipped `activePreset`/`activeMode` defaults), the routing protocol is 3,249 characters for a non-Claude orchestrator. A Claude orchestrator receives 4,021 characters after its authority prefix, or 6,221 characters when the 2,200-character DoD/enforcement section is enabled. That is roughly 812–1,728 tokens across the three paths at 3.6–4.0 characters per token. The optional anti-narration clause adds another 650 characters to the Claude path.
+Measured with the bundled Anthropic preset in normal mode (the shipped `activePreset`/`activeMode` defaults), the routing protocol is 3,249 characters for a non-Claude orchestrator. A Claude orchestrator receives 4,021 characters after its authority prefix, or 6,357 characters when the 2,336-character DoD/enforcement section is enabled. That is roughly 812–1,766 tokens across the three paths at 3.6–4.0 characters per token. The optional anti-narration clause adds another 650 characters to the Claude path.
 
 These are character counts of the prompts the shipped config actually produces, so they move whenever the protocol text does. `test/unit/docs-drift.test.ts` recomputes all three from `tiers.json` on every run and fails unless this section still quotes them, so a change that grows the protocol cannot land without updating these numbers.
 
