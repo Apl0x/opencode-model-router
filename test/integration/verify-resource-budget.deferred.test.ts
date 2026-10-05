@@ -27,7 +27,7 @@ import {
   type Snapshot,
 } from "./e2e/sampler";
 
-const suite = e2eEnabled() ? describe.sequential : describe.skip;
+const suite = e2eEnabled() ? describe : describe.skip;
 
 const TEST_TIMEOUT_MS = 180_000;
 /** Default VERIFY_WAIT (captureWaitMs). */
@@ -109,7 +109,7 @@ function mod(i: number): string {
   return `src/m${String(i).padStart(2, "0")}.js`;
 }
 
-suite("verify resource budget: deferred (3.1.2.f-h)", () => {
+suite("verify resource budget: deferred (3.1.2.f-h)", { concurrent: false }, () => {
   let root = "";
   let slotDir = "";
   let homeA = "";
