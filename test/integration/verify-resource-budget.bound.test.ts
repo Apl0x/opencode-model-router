@@ -42,7 +42,7 @@ import {
 } from "./e2e/sampler";
 import type { ChildConfig, ChildSummary } from "./e2e/child-instance";
 
-const suite = e2eEnabled() ? describe.sequential : describe.skip;
+const suite = e2eEnabled() ? describe : describe.skip;
 
 const TEST_TIMEOUT_MS = 480_000;
 const ENV_TMP_KEYS = ["TEMP", "TMP", "TMPDIR"] as const;
@@ -331,7 +331,7 @@ function peakTopMains(snapshots: Snapshot[], rootPid: number, exclude: number[],
   return max;
 }
 
-suite("verify resource budget: machine-wide bound (3.1.2.b-e)", () => {
+suite("verify resource budget: machine-wide bound (3.1.2.b-e)", { concurrent: false }, () => {
   let root = "";
   let tmpDir = "";
   const repos: FixtureRepo[] = [];
