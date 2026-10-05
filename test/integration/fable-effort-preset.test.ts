@@ -72,7 +72,7 @@ test("applies fable-effort preset options through config hook", async () => {
   }
 });
 
-test("registers an effort key only for the tiers that set one", async () => {
+test("registers each anthropic tier's effort as `effort`", async () => {
   const { mkdtemp, rm } = await import("node:fs/promises");
   const { tmpdir } = await import("node:os");
   const path = await import("node:path");
@@ -97,16 +97,9 @@ test("registers an effort key only for the tiers that set one", async () => {
     const ocCfg: any = {};
     await hooks.config(ocCfg);
 
-    // The bundled anthropic preset sets `effort` on medium ("low") and heavy
-    // ("xhigh"), both Anthropic models, so they map onto `effort` (not
-    // `reasoning_effort`). fast sets no effort and so carries no key.
-    const fastOptions = ocCfg.agent.fast.options;
-    if (fastOptions !== undefined) {
-      expect(fastOptions).not.toHaveProperty("effort");
-      expect(fastOptions).not.toHaveProperty("reasoning_effort");
-    }
-
-    for (const [name, effort] of [["medium", "low"], ["heavy", "xhigh"]]) {
+    // The bundled anthropic preset sets `effort` on all three tiers. All use
+    // Anthropic models, so they map onto `effort` (not `reasoning_effort`).
+    for (const [name, effort] of [["fast", "low"], ["medium", "medium"], ["heavy", "xhigh"]]) {
       const options = ocCfg.agent[name].options;
       expect(options.effort).toBe(effort);
       expect(options).not.toHaveProperty("reasoning_effort");
