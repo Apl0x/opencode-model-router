@@ -6,6 +6,7 @@ vi.mock("../../src/verify/tree", () => ({ snapshotTree: async () => undefined })
 
 async function captureGraderParams(
   params: Record<string, unknown> = {},
+  temperatureCapability?: boolean,
 ): Promise<Record<string, unknown>> {
   let hooks: any;
   const graderSessionID = "grader-session";
@@ -21,7 +22,7 @@ async function captureGraderParams(
         create: async () => ({ data: { id: graderSessionID } }),
         prompt: async (request: any) => {
           if (request.body.system !== undefined) {
-            await hooks["chat.params"]({ sessionID: graderSessionID }, params);
+            await hooks["chat.params"]({ sessionID: graderSessionID, model: { capabilities: { temperature: temperatureCapability } } }, params);
             return {
               data: { parts: [{ type: "text", text: '{"pass":true,"reasons":[]}' }] },
             };
@@ -79,14 +80,14 @@ describe("grader temperature hook", () => {
     await expect(captureGraderParams()).resolves.not.toHaveProperty("temperature");
   });
 
-  it("removes a pre-existing temperature when graderTemperature is null", async () => {
+  it.each([false, true, undefined])("removes a pre-existing temperature when graderTemperature is null with capability %s", async (capability) => {
     const cfg = loadConfig();
     cfg.enforcement ??= {};
     cfg.enforcement.verify ??= {};
     cfg.enforcement.verify.graderTemperature = null;
 
     await expect(
-      captureGraderParams({ temperature: 0.8 }),
+      captureGraderParams({ temperature: 0.8 }, capability),
     ).resolves.not.toHaveProperty("temperature");
   });
 
@@ -100,5 +101,16 @@ describe("grader temperature hook", () => {
       "temperature",
       0,
     );
+  });
+
+  it.each([false, true, undefined])("respects the host temperature capability %s", async (capability) => {
+    const cfg = loadConfig();
+    cfg.enforcement ??= {};
+    cfg.enforcement.verify ??= {};
+    cfg.enforcement.verify.graderTemperature = 0.65;
+
+    const params = await captureGraderParams({}, capability);
+    if (capability === false) expect(params).not.toHaveProperty("temperature");
+    else expect(params).toHaveProperty("temperature", 0.65);
   });
 });

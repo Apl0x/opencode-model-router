@@ -204,8 +204,14 @@ suite("e2e harness self-check", () => {
       const system = await plugin.systemPrompt("orch1");
       expect(system.some(s => s.includes(handle as string))).toBe(true);
       console.log(`[self-check] task beforeMs=${res.beforeMs.toFixed(1)} afterMs=${res.afterMs.toFixed(1)} handle=${handle}`);
-      // Keep sampling long enough for a stable interval estimate.
-      await new Promise(resolve => setTimeout(resolve, 2500));
+      // Keep sampling long enough for a stable interval estimate. A fixed wait is not enough on a
+      // cold Windows runner: powershell.exe startup and the first Get-CimInstance (WMI warm-up)
+      // can take most of it (CI: 1 snapshot after 2.5 s), so also wait for the snapshots themselves.
+      const minUntil = Date.now() + 2500;
+      const deadline = Date.now() + 30_000;
+      while ((Date.now() < minUntil || sampler.count() < 5) && Date.now() < deadline) {
+        await new Promise(resolve => setTimeout(resolve, 100));
+      }
     } finally {
       await plugin.dispose();
       snapshots = await sampler.stop();

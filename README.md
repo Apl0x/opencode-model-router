@@ -4,7 +4,7 @@
 
 > **Use the cheapest model that can do the job. Automatically.**
 
-An [OpenCode](https://opencode.ai) plugin that routes every coding task to the right-priced AI tier — automatically, on every message, with 3,238–5,229 characters of system-prompt overhead depending on the orchestrator and enforcement mode.
+An [OpenCode](https://opencode.ai) plugin that routes every coding task to the right-priced AI tier — automatically, on every message, with 3,249–6,221 characters of system-prompt overhead depending on the orchestrator and enforcement mode.
 
 ## Why it's different
 
@@ -14,7 +14,7 @@ Most AI coding tools give you one model for everything. You pay Opus prices to r
 The orchestrator runs on *every* message. Put Sonnet there, not Opus. Sonnet reads a routing protocol and delegates just as well as Opus — at 4x lower cost. Reserve Opus for when it genuinely matters.
 
 **Inject a compressed, LLM-optimized routing protocol.**
-Instead of duplicated prose, the plugin injects a dense, machine-readable routing protocol. The protocol itself is 3,238 characters; a Claude orchestrator receives 4,010 characters after its authority prefix (roughly 1,000–1,115 tokens at 3.6–4.0 characters per token). Every message, every session.
+Instead of duplicated prose, the plugin injects a dense, machine-readable routing protocol. The protocol itself is 3,249 characters; a Claude orchestrator receives 4,021 characters after its authority prefix (roughly 1,005–1,117 tokens at 3.6–4.0 characters per token). Every message, every session.
 
 **Match task to tier using a configurable taxonomy.**
 A keyword routing guide (`@fast→search/grep/read`, `@medium→impl/refactor/test`, `@heavy→arch/debug/security`) tells the orchestrator exactly which tier fits each task type. Fully customizable. No ambiguity.
@@ -67,7 +67,7 @@ opencode-model-router injects a **delegation protocol** into the system prompt t
 4. **Never over-qualify** — use the cheapest tier that can reliably handle the task
 5. **Fallback** across providers when one fails
 
-All of this adds 3,238 characters for a non-Claude orchestrator or 4,010 characters for a Claude orchestrator (roughly 810–1,115 tokens at 3.6–4.0 characters per token).
+All of this adds 3,249 characters for a non-Claude orchestrator or 4,021 characters for a Claude orchestrator (roughly 812–1,117 tokens at 3.6–4.0 characters per token).
 
 ## Understanding how it works
 
@@ -168,13 +168,13 @@ Task distribution: 18 exploration (60%), 10 implementation (33%), 2 architecture
 
 ## How it works
 
-On every message, the plugin injects a 3,238-character routing protocol. A Claude orchestrator receives 4,010 characters after its authority prefix (roughly 1,000–1,115 tokens at 3.6–4.0 characters per token). The notation is intentionally dense and compressed — it's **optimized for LLM comprehension, not human readability**. An agent reads it as a precise routing grammar; a human might squint at it.
+On every message, the plugin injects a 3,249-character routing protocol. A Claude orchestrator receives 4,021 characters after its authority prefix (roughly 1,005–1,117 tokens at 3.6–4.0 characters per token). The notation is intentionally dense and compressed — it's **optimized for LLM comprehension, not human readability**. An agent reads it as a precise routing grammar; a human might squint at it.
 
 What the orchestrator sees (Anthropic preset, normal mode):
 
 ```
 ## Model Delegation Protocol
-Preset: anthropic. Tiers: @fast=claude-sonnet-5(1x) @medium=claude-opus-5/high(5x) @heavy=claude-fable-5/max(20x). mode:normal
+Preset: anthropic. Tiers: @fast=claude-sonnet-5-5/low(1x) @medium=claude-sonnet-5-5/medium(5x) @heavy=claude-opus-5-5/xhigh(20x). mode:normal
 R: @fast→search/grep/read/git-info/ls/lookup-docs/types/count/exists-check/rename @medium→impl-feature/refactor/write-tests/bugfix(≤2)/edit-logic/code-review/build-fix/create-file/db-migrate/api-endpoint/config-update @heavy→arch-design/debug(≥3fail)/sec-audit/perf-opt/migrate-strategy/multi-system-integration/tradeoff-analysis/rca
 Multi-phase: prefer explore(@fast)→execute(@medium) when phases are separable. Cheapest-first when practical.
 1.[tier:X] tag in plan → delegate to X 2.plan:fast/cheap→@fast | plan:medium→@medium | plan:heavy→@heavy 3.default preference: read-only work → @fast; implementation → @medium 4.orchestrate=self, execute=subagent (info-gathering IS execution, not orchestration) 5.trivial (≤1 tool call, no expected follow-up) → direct, spent from the orchestrator read-only allowance 6.orchestrator read-only allowance (TARGET): dispatch is default; ≤2 direct read-only calls per turn; 3rd need → dispatch @fast (exceed only with 1-line reason) 7.dispatch caps baseline: @fast=CAP:8, @medium=CAP:5, @heavy=CAP:3 (omit directive = baseline; include CAP:N to override; CAP:none disables the cap only when the dispatch also carries a `reason:` line) 8.before dispatching @heavy: gather context first (usually via @fast); if context is already sufficient, dispatch directly 9.if self is opus: skip-@heavy (do locally); still prefer routing broader read-only exploration to @fast 10.min(cost, adequate-tier)
@@ -220,7 +220,7 @@ With router → split:
 | Cross-provider fallback | ✅ | ❌ | ❌ | ❌ | ❌ |
 | Cost ratio awareness | ✅ | ❌ | ❌ | ❌ | ❌ |
 | Plan annotation with tiers | ✅ | ❌ | ❌ | ❌ | ❌ |
-| Measured prompt overhead: 3,238–5,229 chars | ✅ | — | ❌ | ❌ | ❌ |
+| Measured prompt overhead: 3,249–6,221 chars | ✅ | — | ❌ | ❌ | ❌ |
 
 **Claude native**: single model for everything, no cost routing. If you're using claude.ai or OpenCode without plugins, you're paying the same price for `grep` as for architecture design.
 
@@ -249,6 +249,47 @@ In your `opencode.json`:
 Then install and configure model-router to handle the rest.
 
 ## Installation
+
+### OpenCode v2
+
+The v2 adapter supports OpenCode hosts **2.0.20 or later** and typechecks against
+`@opencode/plugin` **2.0.22**. Use the v2 `plugins` key:
+
+```json
+{
+  "plugins": ["opencode-model-router"]
+}
+```
+
+For a local checkout, replace the package name with its absolute directory path.
+V2 loads the package's `server.ts` definition; v1 continues to load the original
+function from `src/index.ts`. Existing v1 configuration does not need to change.
+
+Routing, tool guards and verification use the same engine on both versions. V2
+uses its native `subagent` tool to create real child sessions, preserving the
+host's permissions and cancellation. There are a few host differences:
+
+- Delegations the router verifies run in the foreground so verification receives
+  a completed result; other `background` requests are kept. The router's own
+  deferred/background verification remains a separate setting.
+- Temporary child sessions are removed after use on v2 ≥2.0.21; 2.0.20 can only
+  interrupt them, so their history is retained.
+- Graders send no temperature unless the exact `provider/model` is listed in
+  `enforcement.verify.graderTemperatureModels`
+  ([details](docs/OPENCODE_V2.md#grader-temperature-on-v2)).
+- Anti-narration warnings appear as separate synthetic transcript entries, because
+  completed v2 text events cannot be rewritten.
+- Tier options (`effort`/`variant`/`reasoning_effort`, `budget_tokens`, etc.) are
+  applied per turn through the v2 `session` context hook, filling only keys not
+  already present, because v2 does not read `Agent.Info.request.settings`.
+
+**Smoke tests:** Set `OPENCODE_V2_BIN` to the absolute path of an OpenCode v2
+executable. `npm run smoke:v2` checks loading and registration without provider
+credentials. `npm run smoke:v2:e2e` opts in to the end-to-end smoke (the script sets
+`RUN_OC_SMOKE_V2_E2E=1`), driving `opencode run --standalone` against a local
+deterministic OpenAI-compatible provider, also without provider credentials.
+
+See [the v2 compatibility notes](docs/OPENCODE_V2.md) for the API mapping and validation.
 
 ### From npm (recommended)
 ```bash
@@ -378,23 +419,23 @@ The plugin ships with seven presets (switch with `/preset <name>`):
 **anthropic** (default):
 | Tier | Model | Cost ratio |
 |------|-------|-----------|
-| @fast | `anthropic/claude-sonnet-5` | 1x |
-| @medium | `anthropic/claude-opus-5` (high) | 5x |
-| @heavy | `anthropic/claude-fable-5` (max) | 20x |
+| @fast | `anthropic/claude-sonnet-5-5` (variant/effort: low) | 1x |
+| @medium | `anthropic/claude-sonnet-5-5` (variant/effort: medium) | 5x |
+| @heavy | `anthropic/claude-opus-5-5` (variant/effort: xhigh) | 20x |
 
 **openai**:
 | Tier | Model | Cost ratio |
 |------|-------|-----------|
-| @fast | `openai/gpt-5.6-luna-fast` | 1x |
-| @medium | `openai/gpt-5.6-terra-fast` (high) | 5x |
-| @heavy | `openai/gpt-5.6-sol-fast` (xhigh) | 20x |
+| @fast | `openai/gpt-6-luna-fast` | 1x |
+| @medium | `openai/gpt-6.1-sol-fast` (xhigh) | 5x |
+| @heavy | `openai/gpt-6-astra-fast` (max) | 20x |
 
 **github-copilot**:
 | Tier | Model | Cost ratio |
 |------|-------|-----------|
 | @fast | `github-copilot/claude-haiku-4.5` | 1x |
 | @medium | `github-copilot/claude-sonnet-5` | 5x |
-| @heavy | `github-copilot/claude-fable-5` | 20x |
+| @heavy | `github-copilot/claude-fable-5-1` | 20x |
 
 **google**:
 | Tier | Model | Cost ratio |
@@ -403,19 +444,19 @@ The plugin ships with seven presets (switch with `/preset <name>`):
 | @medium | `google/gemini-3.7-flash` | 5x |
 | @heavy | `google/gemini-3.1-pro-preview` | 20x |
 
-**hybrid** — Anthropic for exploration and heavy analysis, OpenAI for implementation:
+**hybrid** — OpenAI for exploration and implementation, Anthropic for heavy analysis:
 | Tier | Model | Cost ratio |
 |------|-------|-----------|
-| @fast | `anthropic/claude-haiku-4-5` | 1x |
-| @medium | `openai/gpt-5.6-terra-fast` (high) | 5x |
-| @heavy | `anthropic/claude-opus-5` (max) | 20x |
+| @fast | `openai/gpt-6-luna-fast` (medium) | 1x |
+| @medium | `openai/gpt-6-astra-fast` (high) | 5x |
+| @heavy | `anthropic/claude-opus-5-5` (variant/effort: xhigh) | 20x |
 
 **fable-effort** — one model, three reasoning depths (see [per-tier `effort`](#per-tier-effort)):
 | Tier | Model | Effort | Cost ratio |
 |------|-------|--------|-----------|
-| @fast | `anthropic/claude-fable-5` | `low` | 1x |
-| @medium | `anthropic/claude-fable-5` | `high` | 3x |
-| @heavy | `anthropic/claude-fable-5` | `xhigh` | 6x |
+| @fast | `anthropic/claude-fable-5-1` | `low` | 1x |
+| @medium | `anthropic/claude-fable-5-1` | `high` | 3x |
+| @heavy | `anthropic/claude-fable-5-1` | `xhigh` | 6x |
 
 Because the model string is identical across tiers, escalating a task keeps the prompt
 cache warm. The cost ratios are estimated token-spend multipliers, not price differences.
@@ -440,6 +481,9 @@ highest first:
 2. `effort`.
 
 **Unset means unset**: no `effort` (and no `reasoning_effort`) key is registered at all.
+
+Explicit fields are gated by model family: Claude drops `reasoning.effort`/`reasoning.summary`; adaptive-only Claude also ignores `thinking.budgetTokens`, leaving `effort` applicable.
+Each drop warns once per tier; non-Claude explicit fields are unchanged. See the [provider gate](docs/CONFIG_REFERENCE.md#provider-gate-for-explicit-thinking-and-reasoning-fields).
 
 | Model family | Registered as | Caveats |
 |---|---|---|
@@ -665,9 +709,9 @@ Each tier (`@fast`, `@medium`, `@heavy`) has a system prompt that describes its 
   },
   "presets": {
     "anthropic": {
-      "fast":   { "model": "anthropic/claude-sonnet-5", ... },
-      "medium": { "model": "anthropic/claude-opus-5", ... },
-      "heavy":  { "model": "anthropic/claude-fable-5", ... }
+      "fast":   { "model": "anthropic/claude-sonnet-5-5", ... },
+      "medium": { "model": "anthropic/claude-sonnet-5-5", ... },
+      "heavy":  { "model": "anthropic/claude-opus-5-5", ... }
     }
   }
 }
@@ -875,6 +919,8 @@ Defines provider fallback order when a delegated task fails:
 
 The read-only cap banners described above are advisory: a well-behaved subagent will respect them, but nothing prevents a model from making one more read after the `[⚠ CAP REACHED]` banner. The **enforcement layer** turns delegation into a produce → verify → accept/escalate loop with independent acceptance and quality escalation. As of v1.3.0 it runs in **`advisory` mode by default**: non-trivial delegations are verified and any genuine failure surfaces a forcing-note, except that a DoD with `testsPass` is deferred by default and returns unverified with a `vrf_` handle until you call `router_verify`, use `VERIFY:required` or enable background verification; nothing is ever hard-blocked (the DoD/acceptance section adds 2,200 characters to the orchestrator system prompt, roughly 550–612 tokens at 3.6–4.0 characters per token, and subagents may receive non-blocking guard banners). Unavailable verification is accepted with explicit caveats by default; `enforcement.verify.strictUnverifiable: true` restores rejection without producer escalation. Set `"mode": "off"` — or run `/router enforce off` — to restore byte-for-byte-unchanged routing with zero added prompt tokens and zero new latency. Hard-blocks only activate in `"mode": "enforced"`.
 
+That deferral is the v1.15.0 default (`enforcement.verify.defaultVerify: "deferred"`, `enforcement.verify.background: false`). It applies only to root-orchestrator dispatches whose DoD carries `testsPass`; see [deferred verification](docs/CONFIG_REFERENCE.md#deferred-verification) for the full conditions.
+
 ### The three enforcement layers
 
 - **Layer 1 — hard-block guard.** A `tool.execute.before` hook throws before a disallowed tool call executes, stopping budget overruns, redundant reads, and throwaway-script sidesteps in subagent sessions.
@@ -883,7 +929,7 @@ The read-only cap banners described above are advisory: a well-behaved subagent 
 
 ### Two operating modes
 
-- **Mode A — on-the-fly.** The orchestrator delegates through the native `Task()` tool — observed and verified automatically by the enforcement pipeline, and rendered inline in the TUI. (An optional, independently-verified `delegate` tool can be enabled via `experimental.verifiedDelegateTool` in `tiers.json` or `MODEL_ROUTER_VERIFIED_DELEGATE=1`; it is hidden by default so delegation stays visible.)
+- **Mode A — on-the-fly.** The orchestrator delegates through the native `Task()` tool — observed by the enforcement pipeline, verified according to the settings above, and rendered inline in the TUI. (An optional, independently-verified `delegate` tool can be enabled via `experimental.verifiedDelegateTool` in `tiers.json` or `MODEL_ROUTER_VERIFIED_DELEGATE=1`; it is hidden by default so delegation stays visible.)
 - **Mode B — plan-annotated.** `/annotate-plan` emits `[tier:X]` plus an `[acceptance]` block per task; the enforcement loop is wired up at execution time based on those annotations.
 
 ### Tuning enforcement
@@ -893,6 +939,9 @@ Advisory is the default. To change the level:
 1. Add or edit the `enforcement` block in `tiers.json` — `"mode": "off"`, `"advisory"`, or `"enforced"` (see `docs/CONFIG_REFERENCE.md`).
 2. Set `MODEL_ROUTER_ENFORCE=1` to force `enforced` for a session, or `MODEL_ROUTER_ENFORCE=0` to force `off`.
 3. Run `/router enforce <off|advisory|enforced>` from the chat to toggle at runtime.
+
+`taskPromptRepair` (top-level, default `true`) fills an absent, null or blank `task` prompt from a non-empty trimmed description, or refuses the call readably if none is usable.
+Set `taskPromptRepair: false` to restore the previous behaviour; see [configuration details](docs/CONFIG_REFERENCE.md#taskpromptrepair).
 
 **Modes:** `off` — no-op, byte-for-byte-unchanged routing (must now be set explicitly, since `advisory` is the default); `advisory` (default) — evaluates and surfaces guidance, never blocks; `enforced` — hard-blocks active, full produce → verify → accept/escalate pipeline.
 
@@ -995,7 +1044,7 @@ After `/annotate-plan`:
 
 ## Token overhead
 
-Measured with the bundled Anthropic preset in normal mode (the shipped `activePreset`/`activeMode` defaults), the routing protocol is 3,238 characters for a non-Claude orchestrator. A Claude orchestrator receives 4,010 characters after its authority prefix, or 6,210 characters when the 2,200-character DoD/enforcement section is enabled. That is roughly 810–1,725 tokens across the three paths at 3.6–4.0 characters per token. The optional anti-narration clause adds another 650 characters to the Claude path.
+Measured with the bundled Anthropic preset in normal mode (the shipped `activePreset`/`activeMode` defaults), the routing protocol is 3,249 characters for a non-Claude orchestrator. A Claude orchestrator receives 4,021 characters after its authority prefix, or 6,221 characters when the 2,200-character DoD/enforcement section is enabled. That is roughly 812–1,728 tokens across the three paths at 3.6–4.0 characters per token. The optional anti-narration clause adds another 650 characters to the Claude path.
 
 These are character counts of the prompts the shipped config actually produces, so they move whenever the protocol text does. `test/unit/docs-drift.test.ts` recomputes all three from `tiers.json` on every run and fails unless this section still quotes them, so a change that grows the protocol cannot land without updating these numbers.
 
@@ -1007,7 +1056,7 @@ These are character counts of the prompts the shipped config actually produces, 
 
 ## Requirements
 
-- [OpenCode](https://opencode.ai) v1.0 or later
+- [OpenCode](https://opencode.ai) v1 (`>=1.0.0 <2.0.0`) or v2 **2.0.20+**
 - Node.js 20+
 - Provider API keys configured in OpenCode
 

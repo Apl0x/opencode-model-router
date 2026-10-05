@@ -294,8 +294,12 @@ Builds a skeptical grading prompt from the DoD criteria + assembled artefact and
 
 - Structural producer ≠ grader guarantee, plus a defensive sessionID-inequality check.
 - Grader tier = `atLeastProducerTier(producer)`, raised to `verify.minGraderTier`, never below the producer.
-- Grader temperature defaults to `0` to reduce sampling variability via a `chat.params` hook;
-  set `null` to remove any temperature value from grader params, including one set earlier.
+- Grader temperature is configured via `graderTemperature` (default `0`). V1's
+  `chat.params` hook skips it when the host sets `capabilities.temperature: false`.
+  V2's context hook omits it unless the exact `providerID/modelID` is listed in
+  `graderTemperatureModels`; v2 exposes no model temperature capability flag.
+  Set `graderTemperature` to `null` to remove any temperature value from grader params,
+  including one set earlier or on a v2 allowlisted model.
 - Prompt is anti-rubber-stamp: cite evidence per criterion, default to FAIL on any uncertainty, no benefit of the doubt.
 - Grader must return strict one-line JSON `{"pass":boolean,"reasons":[...]}` — unparseable response → FAIL.
 - All artefact text, file paths, declared outputs, and grader reasons are scrubbed before reaching or leaving the grader.
@@ -346,7 +350,8 @@ An absolute check path bypasses the base directory entirely, and the failure rea
 | `preferDeterministic` | `true` | — |
 | `graderPolicy` | `"atLeastProducerTier"` | — |
 | `minGraderTier` | — | Floor on grader tier regardless of producer |
-| `graderTemperature` | `0` | Numeric values set grader temperature; `null` removes any temperature value from grader params, even if set earlier, for endpoints that do not support it. |
+| `graderTemperature` | `0` | Numeric values respect v1 host temperature capability and are sent on v2 only for listed models. `null` removes any temperature value, even if set earlier or allowlisted. |
+| `graderTemperatureModels` | absent | `string[]`; v2-only exact `providerID/modelID` allowlist (absent means none). Override arrays replace rather than concatenate; `[]` clears it. |
 | `requireExplicitDoD` | `false` | Mode A: `true` = demand explicit block, no inference |
 | `delegateTimeoutMs` | `600000` | Producer turn ceiling — see [Time-boxes](#time-boxes) |
 | `graderTimeoutMs` | `60000` | Grader turn ceiling |

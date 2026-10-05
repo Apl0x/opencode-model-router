@@ -97,7 +97,9 @@ describe("Git tree fingerprint adapter", () => {
     expect(seen.map(o => o.lowPriority)).toEqual(Array(7).fill(false));
   });
   it("QA-3.1-8: the default git seam lowers the process's priority as exec.ts does", async () => {
-    const opts = { cwd: process.cwd(), signal: new AbortController().signal, timeoutMs: 5, maxBuffer: 5, lowPriority: true };
+    // Generous timeout: this test is about priority, and a 5 ms timer could fire on a slow
+    // runner before the fake child closes, reaching the unmocked taskkill path.
+    const opts = { cwd: process.cwd(), signal: new AbortController().signal, timeoutMs: 30_000, maxBuffer: 5, lowPriority: true };
     expect(await execGit(["--no-pager", "rev-parse", "HEAD"], opts)).toBe("head1");
     if (process.platform === "win32") {
       // The child is spawned as git and lowered right after the spawn.

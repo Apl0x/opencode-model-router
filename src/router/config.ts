@@ -124,7 +124,7 @@ export interface EnforcementConfig {
   envGate?: string;
   perTier?: Record<string, "off" | "advisory" | "enforced">;
   guard?: { readDraftCap?: number; sameOpRetryCap?: number; blockSelfScript?: boolean; deliverableFirst?: boolean; budget?: number; blockScriptWrites?: boolean };
-  verify?: { require?: "never" | "whenDoDPresent" | "always"; requireExplicitDoD?: boolean; preferDeterministic?: boolean; graderPolicy?: "atLeastProducerTier"; graderTemperature?: number | null; minGraderTier?: string | null;
+  verify?: { require?: "never" | "whenDoDPresent" | "always"; requireExplicitDoD?: boolean; preferDeterministic?: boolean; graderPolicy?: "atLeastProducerTier"; graderTemperature?: number | null; graderTemperatureModels?: string[]; minGraderTier?: string | null;
     /** Ceiling for one producer `session.prompt` turn, in ms. Default 600000. */
     delegateTimeoutMs?: number;
     /** Reject unavailable verification. Default false; never escalates it. */
@@ -778,6 +778,17 @@ function validateEnforcement(obj: Record<string, unknown>): void {
           throw new Error(
             "tiers.json: enforcement.verify.graderTemperature must be a number >= 0 or null",
           );
+        }
+      }
+      if (verify.graderTemperatureModels !== undefined) {
+        if (!Array.isArray(verify.graderTemperatureModels)) {
+          throw new Error("tiers.json: enforcement.verify.graderTemperatureModels must be an array");
+        }
+        for (const entry of verify.graderTemperatureModels) {
+          const slash = typeof entry === "string" ? entry.indexOf("/") : -1;
+          if (typeof entry !== "string" || slash < 1 || !entry.slice(0, slash).trim() || !entry.slice(slash + 1).trim()) {
+            throw new Error("tiers.json: enforcement.verify.graderTemperatureModels entries must be non-empty provider/model strings");
+          }
         }
       }
       // Time-box ceilings. `>= 1` and not `>= 0`: a 0 or negative budget is

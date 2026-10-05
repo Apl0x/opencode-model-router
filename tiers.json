@@ -45,9 +45,11 @@
   "presets": {
     "anthropic": {
       "fast": {
-        "model": "anthropic/claude-sonnet-5",
+        "model": "anthropic/claude-sonnet-5-5",
+        "variant": "low",
+        "effort": "low",
         "costRatio": 1,
-        "description": "Sonnet 5 for exploration, search, and simple reads",
+        "description": "Sonnet 5.5 low for exploration, search, and simple reads",
         "steps": 30,
         "whenToUse": [
           "Codebase exploration and search",
@@ -57,11 +59,11 @@
         ]
       },
       "medium": {
-        "model": "anthropic/claude-opus-5-5",
-        "variant": "low",
-        "effort": "low",
+        "model": "anthropic/claude-sonnet-5-5",
+        "variant": "medium",
+        "effort": "medium",
         "costRatio": 5,
-        "description": "Opus 5.5 low for implementation, refactoring, and tests",
+        "description": "Sonnet 5.5 medium for implementation, refactoring, and tests",
         "steps": 50,
         "whenToUse": [
           "Feature implementation",
@@ -99,10 +101,10 @@
         ]
       },
       "medium": {
-        "model": "openai/gpt-6-astra-fast",
-        "variant": "high",
+        "model": "openai/gpt-6.1-sol-fast",
+        "variant": "xhigh",
         "costRatio": 5,
-        "description": "GPT-5.6 Sol Fast (high) for implementation and standard coding",
+        "description": "GPT-6.1 Sol Fast (xhigh) for implementation and standard coding",
         "steps": 50,
         "whenToUse": [
           "Feature implementation",
@@ -154,7 +156,7 @@
       "heavy": {
         "model": "github-copilot/claude-fable-5-1",
         "costRatio": 20,
-        "description": "Claude Fable 5 via GitHub Copilot for architecture, complex debugging, and security",
+        "description": "Claude Fable 5.1 via GitHub Copilot for architecture, complex debugging, and security",
         "steps": 120,
         "whenToUse": [
           "Architecture decisions",
@@ -247,9 +249,9 @@
     "hybrid": {
       "fast": {
         "model": "openai/gpt-6-luna-fast",
-        "variant": "low",
+        "variant": "medium",
         "costRatio": 1,
-        "description": "GPT 6 Luna (low) for exploration, search, and simple reads",
+        "description": "GPT 6 Luna (medium) for exploration, search, and simple reads",
         "steps": 30,
         "whenToUse": [
           "Codebase exploration and search",
@@ -260,9 +262,9 @@
       },
       "medium": {
         "model": "openai/gpt-6-astra-fast",
-        "variant": "low",
+        "variant": "high",
         "costRatio": 5,
-        "description": "GPT-6 Astra Fast (low) for implementation and standard coding",
+        "description": "GPT-6 Astra Fast (high) for implementation and standard coding",
         "steps": 50,
         "whenToUse": [
           "Feature implementation",
@@ -272,10 +274,11 @@
         ]
       },
       "heavy": {
-        "model": "anthropic/claude-fable-5-1",
-        "variant": "max",
+        "model": "anthropic/claude-opus-5-5",
+        "variant": "xhigh",
+        "effort": "xhigh",
         "costRatio": 20,
-        "description": "Claude Fable 5.1 max for architecture, complex debugging, and security",
+        "description": "Claude Opus 5.5 xhigh for architecture, complex debugging, and security",
         "steps": 120,
         "whenToUse": [
           "Architecture decisions",
